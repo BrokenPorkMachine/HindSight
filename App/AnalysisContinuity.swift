@@ -949,6 +949,10 @@ extension WorkbenchModel {
         guard let recordID = selectedID, let projectPath = project?.path,
               let collection = analysisCollections.first(where: { $0.id == collectionID }) else { return }
         let note = vgBoundedUTF8(rawNote.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: VGAnalysisContinuityStore.maximumReviewNoteBytes)
+        guard (state != .approved && state != .rejected) || !note.isEmpty else {
+            status = "Approved and Rejected decisions require a bounded rationale note."
+            return
+        }
         guard !note.isEmpty || state != latestAnalysisReviewState(for: collectionID) else {
             status = "Add a note or change the workflow state before recording another review entry."
             return
@@ -1051,6 +1055,21 @@ extension WorkbenchModel {
         )
     }
 
+    func analysisCollectionHandoffReadinessDetail(_ collectionID: String) -> String? {
+        guard let collection = analysisCollections.first(where: { $0.id == collectionID }) else { return nil }
+        let baseline = analysisReviewBaselines[collectionID]
+        guard let baseline else { return "Create an exact-identity review baseline before handoff." }
+        if baseline.recordID != selectedID { return "The review baseline belongs to a different artifact record; refresh the review baseline." }
+        if baseline.sourceSHA256 != selected?.result.source_sha256 { return "The artifact source SHA-256 changed since review; refresh the review baseline." }
+        if let drift = analysisCollectionReviewDrift(collection, currentPinIDs: currentAnalysisPinIDs()), drift.hasMembershipDrift || drift.hasPresenceDrift {
+            return "Exact collection membership or current/preserved presence drifted since review; refresh the review baseline."
+        }
+        let state = latestAnalysisReviewState(for: collectionID)
+        guard state == .approved || state == .rejected else { return "Record an Approved or Rejected decision with a rationale before handoff." }
+        let open = analysisFollowUps(for: collectionID, includeCompleted: false).count
+        return open == 0 ? "Decision and evidence baseline match the current artifact." : "Resolve or explain the \(open) open follow-up(s) before treating the handoff as ready."
+    }
+
     func analysisCollectionHandoff(_ collectionID: String) -> String? {
         guard let collection = analysisCollections.first(where: { $0.id == collectionID }) else { return nil }
         let currentPinIDs = currentAnalysisPinIDs()
@@ -1071,6 +1090,7 @@ extension WorkbenchModel {
             "Collection health: \(health.label)",
             "Review drift: \(drift?.label ?? "no review baseline")",
             "Handoff readiness: \(readiness.rawValue)",
+            "Readiness detail: \(analysisCollectionHandoffReadinessDetail(collectionID) ?? "unknown")",
             "Generated: \(Date().formatted(date: .abbreviated, time: .shortened))",
             "",
             "## Preserved Evidence"

@@ -801,7 +801,7 @@ struct VGCollectionReviewView: View {
                         model.appendAnalysisReviewEntry(collectionID: reviewCollectionID, state: reviewState, note: reviewNote)
                         reviewNote = ""
                     }
-                    .disabled(reviewCollectionID.isEmpty || (reviewNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && reviewState == model.latestAnalysisReviewState(for: reviewCollectionID)))
+                    .disabled(reviewCollectionID.isEmpty || (reviewNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (reviewState == model.latestAnalysisReviewState(for: reviewCollectionID) || reviewState == .approved || reviewState == .rejected)))
 
                     Button("Copy Handoff") {
                         model.copyAnalysisCollectionHandoff(reviewCollectionID)
@@ -839,6 +839,12 @@ struct VGCollectionReviewView: View {
                         VGTagPill(text: "\(entries.count) journal entries", systemImage: "list.bullet.rectangle")
                         let openFollowUps = model.analysisFollowUps(for: collection.id, includeCompleted: false).count
                         VGTagPill(text: "\(openFollowUps) open follow-ups", systemImage: openFollowUps == 0 ? "checkmark.circle" : "checklist")
+                    }
+                    if let detail = model.analysisCollectionHandoffReadinessDetail(collection.id) {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if entries.isEmpty {

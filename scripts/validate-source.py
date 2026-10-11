@@ -809,6 +809,9 @@ assert 'governedCapabilities' in scripting, 'extension capability policy is not 
 assert 'policy_status' in scripting and 'blocked by local policy' in scripting, 'extension policy is not fail-closed at execution'
 assert 'HindSight.extensions.mode.v1' in scripting and 'verified-only' in scripting and 'disabled' in scripting, 'managed extension policy modes are not enforced'
 assert 'Local policy' in (R/'App/ContentView.swift').read_text(), 'extension policy status is not visible in the UI'
+continuity=(R/'App/AnalysisContinuity.swift').read_text()
+assert 'Approved and Rejected decisions require a bounded rationale note.' in continuity
+assert 'analysisCollectionHandoffReadinessDetail' in continuity and 'refresh the review baseline' in continuity
 runtime_host=(R/'PlatformServices/CoordinatorService/FirmwareRuntimeHost.swift').read_text()
 for token in ['SynchronousResult','BoundedOutputBuffer','readabilityHandler','SIGKILL','(200..<300).contains(http.statusCode)']:
     assert token in runtime_host, f'firmware/runtime hardening missing: {token}'

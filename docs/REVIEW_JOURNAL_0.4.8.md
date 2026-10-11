@@ -29,6 +29,10 @@ The Review surface can generate a Markdown handoff for one collection and copy i
 
 The handoff keeps the same interpretability boundary as the rest of Analysis Triage: health, review drift, workflow state, and collection membership are provenance/continuity signals, not risk or semantic scoring.
 
+## Final decisions and conflict-safe handoff
+
+The Review workflow supports explicit **Approved** and **Rejected** decisions. Both require a bounded rationale note. A handoff is ready only when the decision has an exact-identity baseline for the current artifact record and source SHA-256, the collection has no membership/presence drift, and no follow-ups remain open. Otherwise the Review surface and handoff report the blocking condition and the available remediation, such as refreshing the baseline or resolving the follow-up.
+
 ## Responsive review workflow
 
 Review Journal & Handoff works with a single collection. Pairwise collection comparison remains available when two or more collections exist. Controls use `VGFlowLayout`, and the visible journal is bounded to 12 recent entries so the Review surface does not reintroduce fixed-width or unbounded-density regressions.
