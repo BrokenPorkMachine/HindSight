@@ -44,7 +44,7 @@ Acceptance: every new inference is provenance-labelled, bounded, and covered by 
 - [x] Distinguish module/slide address correlation from validated static-function correlation in runtime explanations.
 - [x] Add bounded `.vgcase` runtime trace capture/replay and restore the saved timeline into Trace Explorer without debugger attachment.
 - [x] Add clearer host capability, permission, and entitlement diagnostics, including explicit architecture gates and honest deferred runtime-probe status.
-- [ ] Expand Intel and Apple Silicon qualification coverage.
+- [x] Expand Intel and Apple Silicon qualification coverage for host gates and non-ARM64 semantic classification; full hardware release qualification remains open.
 
 Acceptance: an analyst can connect a static finding to a reproducible runtime observation and include both in a handoff.
 
@@ -73,4 +73,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, explicit runtime correlation strength, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, and persisted startup/layout preferences are complete. Next loop: prioritize deeper non-ARM64 lifting or Intel/Apple Silicon qualification coverage.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, explicit runtime correlation strength, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, and architecture-focused qualification tests are complete. Next loop: prioritize deeper non-ARM64 lifting or release/memory/crash gates.

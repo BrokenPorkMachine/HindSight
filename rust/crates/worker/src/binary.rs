@@ -2585,4 +2585,12 @@ mod tests {
             "pop {r7, pc}"
         ));
     }
+    #[test]
+    fn non_arm_semantics_preserve_control_flow_shape() {
+        assert_eq!(semantic_hint(Arch::X64, &[0xe8], "callq 0x1000"), Some("direct-call"));
+        assert_eq!(semantic_hint(Arch::X64, &[0xff], "callq *%rax"), Some("indirect-call"));
+        assert_eq!(semantic_hint(Arch::X64, &[0x75], "jne 0x1000"), Some("conditional-control-flow"));
+        assert_eq!(semantic_hint(Arch::X64, &[0xff], "jmpq *%rax"), Some("indirect-control-flow"));
+        assert_eq!(semantic_hint(Arch::X64, &[0x8d], "leaq 0x10(%rax), %rcx"), Some("data-movement"));
+    }
 }

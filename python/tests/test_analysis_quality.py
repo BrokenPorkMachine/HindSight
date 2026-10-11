@@ -64,6 +64,7 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn('"compare-test"', body)
         self.assertIn('"indirect-call"', body)
         self.assertIn('"conditional-control-flow"', body)
+        self.assertIn('non_arm_semantics_preserve_control_flow_shape', source)
 
 if __name__ == "__main__":
     unittest.main()
