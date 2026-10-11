@@ -90,9 +90,43 @@ private struct HindSightSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("Support & Readiness") {
+                VGReadinessRow(label: "Build", value: buildIdentity)
+                VGReadinessRow(label: "Host", value: hostIdentity)
+                VGReadinessRow(label: "Coordinator", value: coordinatorIdentity)
+                VGReadinessRow(label: "Project session", value: model.projectSessionReady ? "Ready" : "Not ready")
+                VGReadinessRow(label: "Native debugger", value: VGHostPlatform.supportsArm64NativeDebugger ? "Available" : "Unavailable")
+                VGReadinessRow(label: "Hypervisor", value: VGHostPlatform.supportsAppleSiliconHypervisor ? "Available" : "Unavailable")
+                Divider()
+                HStack {
+                    Button("Copy diagnostics") { model.copyDiagnostics() }
+                    Button("Reconnect Coordinator") { model.reconnect() }
+                        .disabled(model.busy || model.connectingToCoordinator || model.restoringProjectSession)
+                }
+                Text("Diagnostics contain runtime and capability state, not target-file contents. Share them only with your support team.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
         .frame(width: 460)
         .padding()
+    }
+
+    private var buildIdentity: String { "\(VGProduct.version) · \(VGProduct.releaseChannel)" }
+    private var hostIdentity: String { "\(VGHostPlatform.displayName) · \(VGHostPlatform.architecture.rawValue)" }
+    private var coordinatorIdentity: String {
+        guard model.connected else { return "Disconnected" }
+        return "Connected · \(model.coordinatorVersion.isEmpty ? "version pending" : model.coordinatorVersion)"
+    }
+}
+
+private struct VGReadinessRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        LabeledContent(label, value: value)
+            .textSelection(.enabled)
     }
 }
