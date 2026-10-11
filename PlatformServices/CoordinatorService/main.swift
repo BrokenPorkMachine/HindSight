@@ -134,6 +134,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let scriptingHost = ScriptingHost()
     private let virtualizationHost = VirtualizationHost()
     private let firmwareRuntimeHost = FirmwareRuntimeHost()
+    private let reaAgentHost = REAAgentHost()
     private let firmwareLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.firmware", qos: .utility, maxConcurrent: 1, maxPending: 16, reservationBytes: 192 * 1_048_576)
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
     private let analysisCacheEngineVersion = "arm64-analysis-v15-schema71"
@@ -392,6 +393,9 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     }
     func firmwareRuntime(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
         firmwareLane.submit(priority: .initiated, reply: reply) { [firmwareRuntimeHost] in firmwareRuntimeHost.command(requestJSON) }
+    }
+    func reaProbe(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
+        queue.async { [self] in reply(reaAgentHost.probe(requestJSON: requestJSON)) }
     }
     func saveNote(_ recordID: String, expectedRevision: Int, text: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in

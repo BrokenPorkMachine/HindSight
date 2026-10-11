@@ -33,6 +33,7 @@
     "PlatformServices/CoordinatorService/DebugServer.swift",
     "PlatformServices/CoordinatorService/FirmwareRuntimeHost.swift",
     "PlatformServices/CoordinatorService/ProjectStore.swift",
+    "PlatformServices/CoordinatorService/REAAgentHost.swift",
     "PlatformServices/CoordinatorService/ScriptingHost.swift",
     "PlatformServices/CoordinatorService/VerifiedPageCache.swift",
     "PlatformServices/CoordinatorService/VirtualizationHost.swift",
@@ -44,6 +45,7 @@
     "Shared/DebugMessages.swift",
     "Shared/FirmwareRuntimeMessages.swift",
     "Shared/HostPlatform.swift",
+    "Shared/REAAgentMessages.swift",
     "Shared/ScriptingMessages.swift",
     "Shared/TargetModel.swift",
     "Shared/VirtualizationMessages.swift",
@@ -84,6 +86,7 @@
       "App/CoordinatorClient.swift",
       "App/TargetWorkspace.swift",
       "Shared/CoordinatorProtocol.swift",
+      "Shared/REAAgentMessages.swift",
       "Shared/WorkbenchMessages.swift",
       "Shared/DebugMessages.swift",
       "Shared/ScriptingMessages.swift",
@@ -95,9 +98,11 @@
     "CoordinatorService": [
       "PlatformServices/CoordinatorService/VerifiedPageCache.swift",
       "PlatformServices/CoordinatorService/main.swift",
+      "PlatformServices/CoordinatorService/REAAgentHost.swift",
       "PlatformServices/CoordinatorService/ProjectStore.swift",
       "PlatformServices/CoordinatorService/WorkerSupervisor.swift",
       "Shared/CoordinatorProtocol.swift",
+      "Shared/REAAgentMessages.swift",
       "Shared/WorkbenchMessages.swift",
       "Shared/DebugMessages.swift",
       "Shared/ScriptingMessages.swift",
@@ -114,5 +119,5 @@
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "b0ec3dcd0e757275cd40ff98ff27ebb30ff66e943a8ab0a0a293a21af1a13271"
+  "project_sha256": "3df9557b1b2e4f3a764258a8a96d73108c311412f8203ad5add28d8ec87f57fb"
 }

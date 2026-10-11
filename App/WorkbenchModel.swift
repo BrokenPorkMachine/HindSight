@@ -228,6 +228,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var vectorEmuRegisters = ""
     @Published var vectorEmuDisassembly = ""
     @Published var vectorEmuTrace = ""
+    @Published private(set) var reaStatus = "REA agents not probed."
     @Published var vectorEmuRegions = ""
     @Published var vectorEmuRaw = ""
     @Published var iphemeralExecutable = ""
@@ -646,6 +647,37 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 self.coordinatorABI = 0
                 self.startupPhase = "Coordinator unavailable"
                 self.status = "Coordinator unavailable: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func probeREAAgents() {
+        guard !busy, connected else {
+            reaStatus = connected ? "Wait for the current operation to finish." : "Connect the Coordinator before probing REA."
+            return
+        }
+        let request = REAProbeRequest(executable: "/usr/bin/env",
+                                      arguments: ["npx", "-y", "rea-agents@6.4.0", "mcp"],
+                                      timeout_ms: 10_000)
+        guard let data = try? JSONEncoder().encode(request), let payload = String(data: data, encoding: .utf8) else {
+            reaStatus = "Could not encode the REA probe request."
+            return
+        }
+        reaStatus = "Starting local REA agent…"
+        client.request(timeout: 15, maxReplyBytes: 4 * 1024 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.reaProbe(payload, withReply: $1) }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let response):
+                if let data = response.data(using: .utf8),
+                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let message = object["message"] as? String {
+                    self.reaStatus = message
+                } else {
+                    self.reaStatus = response
+                }
+            case .failure(let error):
+                self.reaStatus = "REA probe failed: \(error.localizedDescription)"
             }
         }
     }

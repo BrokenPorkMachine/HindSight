@@ -99,6 +99,9 @@ private struct HindSightSettingsView: View {
                 Text("Upstream project: github.com/morluto/rea")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                VGReadinessRow(label: "Probe", value: model.reaStatus)
+                Button("Probe local REA agent") { model.probeREAAgents() }
+                    .disabled(!model.connected || model.busy)
             }
             Section("Support & Readiness") {
                 VGReadinessRow(label: "Build", value: buildIdentity)

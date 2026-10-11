@@ -19,8 +19,9 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 
 - [x] Document the MCP/evidence boundary and local-first safety rules.
 - [x] Expose an opt-in REA readiness panel in Settings.
-- [ ] Add a coordinator-owned stdio MCP session with cancellation and bounded I/O.
-- [ ] Add provider/catalog discovery and capability-aware operation selection.
+- [x] Add a coordinator-owned stdio MCP probe with timeout cleanup and bounded I/O.
+- [x] Add initial provider discovery through REA's `binary_session` tool.
+- [ ] Add capability-aware operation selection for discovered providers.
 - [ ] Add a REA Agent workspace with target picker, operation scope, progress, and retained evidence.
 - [ ] Import REA evidence into cases and the evidence graph with compatibility checks.
 - [ ] Add contract tests using deterministic MCP fixtures and release qualification coverage.

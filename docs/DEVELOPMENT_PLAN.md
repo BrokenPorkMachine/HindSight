@@ -68,6 +68,16 @@ Acceptance: a clean install is understandable, testable, supportable, and distri
 
 Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a local investigation without guessing which build, capability, policy, or evidence boundary is active.
 
+### Phase 6 — Optional REA agent bridge
+
+- [x] Define a local-first REA/MCP integration boundary and evidence-provenance requirements.
+- [x] Add a coordinator-owned, bounded REA probe with explicit Settings opt-in.
+- [ ] Add target-scoped REA operations, progress, cancellation, and retained evidence handles.
+- [ ] Import REA evidence into HindSight cases and the evidence graph with compatibility checks.
+- [ ] Add deterministic MCP fixtures and release qualification coverage for the bridge.
+
+Acceptance: an analyst can explicitly select a local target and REA operation, inspect bounded provider output, and retain the resulting evidence in a HindSight case without losing provenance or silently expanding scope.
+
 ## Work loop
 
 For every loop:
