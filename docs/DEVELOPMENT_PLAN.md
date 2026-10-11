@@ -50,7 +50,7 @@ Acceptance: an analyst can connect a static finding to a reproducible runtime ob
 
 ### Phase 4 — Product readiness
 
-- [ ] Add a bundled sample project or synthetic tutorial artifact.
+- [x] Surface the bundled synthetic ARM64 Mach-O tutorial fixture in Quick Start with a reproducible analyst walkthrough.
 - [x] Add workspace-level help and unsupported-capability explanations.
 - [x] Add bounded recent-project management with stale-path cleanup and persisted startup/layout preferences.
 - [ ] Add UI regression coverage for compact, medium, and wide layouts.
@@ -73,4 +73,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, explicit runtime stop-event/reason context, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, and startup-pressure diagnostics are complete. Next loop: prioritize type/variable recovery, deeper non-ARM64 lifting, or release/memory/crash gates.
+The Phase 1 usability slices, bundled synthetic tutorial fixture and walkthrough, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, explicit runtime stop-event/reason context, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, and startup-pressure diagnostics are complete. Next loop: prioritize type/variable recovery, deeper non-ARM64 lifting, or release/memory/crash gates.

@@ -2868,6 +2868,20 @@ struct ContentView: View {
                 .padding(8)
             }
 
+            GroupBox("Bundled tutorial fixture") {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Try Tests/Fixtures/arm64-integer-sample.macho for a deterministic first investigation. It is synthetic, non-runnable test data with visible ARM64 instructions and deliberate unsupported words.")
+                    Text("Expected path: import → capture → analyze → open Analysis Triage, Annotated Code, and Analysis Quality → annotate one result → export the ledger.")
+                    Text("Full walkthrough: docs/HINDSIGHT_TUTORIAL.md")
+                        .font(.system(.caption, design: .monospaced))
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(8)
+            }
+
             Divider()
             HStack {
                 Text("Tip: turn on Mentor mode in the workspace header for contextual guidance.")
