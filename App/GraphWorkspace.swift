@@ -139,7 +139,12 @@ struct VGGraphWorkspace: View {
                 Button { setZoom(zoom - 0.1) } label: { Image(systemName: "minus.magnifyingglass") }.buttonStyle(.borderless)
                 Text("\(Int(zoom * 100))%").font(.system(size: 10, weight: .medium, design: .monospaced)).frame(width: 42)
                 Button { setZoom(zoom + 0.1) } label: { Image(systemName: "plus.magnifyingglass") }.buttonStyle(.borderless)
-                Button("Fit") { setZoom(0.72) }.controlSize(.small)
+                Button("Fit") {
+                    setZoom(0.72)
+                    mapOffset = .zero
+                    mapOffsetAnchor = .zero
+                }
+                .controlSize(.small)
             }
         }
         .padding(.horizontal, 12)
