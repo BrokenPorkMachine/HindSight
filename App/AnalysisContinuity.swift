@@ -231,6 +231,8 @@ enum VGInvestigationReviewState: String, Codable, CaseIterable, Hashable {
     case inReview = "In Review"
     case followUp = "Follow Up"
     case reviewed = "Reviewed"
+    case approved = "Approved"
+    case rejected = "Rejected"
 
     var icon: String {
         switch self {
@@ -238,6 +240,8 @@ enum VGInvestigationReviewState: String, Codable, CaseIterable, Hashable {
         case .inReview: return "clock"
         case .followUp: return "arrow.triangle.branch"
         case .reviewed: return "checkmark.circle"
+        case .approved: return "checkmark.seal.fill"
+        case .rejected: return "xmark.seal.fill"
         }
     }
 }

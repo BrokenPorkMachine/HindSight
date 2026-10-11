@@ -90,6 +90,16 @@ private struct HindSightSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("REA Agents") {
+                LabeledContent("Integration", value: "Optional · local MCP bridge")
+                LabeledContent("Provider", value: "rea-agents")
+                Text("REA support is designed to run as a separately versioned local process. HindSight will request an explicit target and preserve REA evidence provenance when the bridge is enabled.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Upstream project: github.com/morluto/rea")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Support & Readiness") {
                 VGReadinessRow(label: "Build", value: buildIdentity)
                 VGReadinessRow(label: "Host", value: hostIdentity)

@@ -43,8 +43,9 @@ management, or shared collaboration without an enterprise service boundary.
 
 ### 3. Team investigation workflow
 
-- [ ] Add review assignment, approval state, and immutable review decisions to
+- [x] Add explicit Approved/Rejected states to the append-only review journal and
   case exports.
+- [ ] Add review assignment and multi-user authorization to review decisions.
 - [ ] Add conflict-safe case merge/diff for independently authored evidence.
 - [ ] Add deterministic case manifest/version compatibility checks.
 - [ ] Add a documented isolated/on-prem handoff boundary for organizations that
