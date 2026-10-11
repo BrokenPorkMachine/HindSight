@@ -1855,13 +1855,23 @@ fn semantic_hint(a: Arch, bytes: &[u8], text: &str) -> Option<&'static str> {
     match a {
         Arch::X86 | Arch::X64 => {
             if text.starts_with("call") {
-                Some("direct-call")
+                if text.contains('*') || text.contains("indirect") {
+                    Some("indirect-call")
+                } else {
+                    Some("direct-call")
+                }
             } else if text.starts_with("j") || text.starts_with("loop") {
-                Some("control-flow")
+                if text.contains('*') || text.contains("indirect") {
+                    Some("indirect-control-flow")
+                } else if text.starts_with("jmp") || text.starts_with("loop") {
+                    Some("control-flow")
+                } else {
+                    Some("conditional-control-flow")
+                }
             } else {
                 match bytes.first().copied()? {
                     0x50..=0x5f | 0x68 | 0x6a => Some("stack-operation"),
-                    0x88..=0x8b | 0xb0..=0xbf | 0xc6 | 0xc7 => Some("data-movement"),
+                    0x88..=0x8d | 0xb0..=0xbf | 0xc6 | 0xc7 => Some("data-movement"),
                     0x01 | 0x03 | 0x05 | 0x09 | 0x0b | 0x0d | 0x21 | 0x23 | 0x29
                     | 0x2b | 0x2d | 0x31 | 0x33 | 0x35 | 0x81 | 0x83 => Some("arithmetic-logic"),
                     0x39 | 0x3b | 0x3d | 0x85 => Some("compare-test"),

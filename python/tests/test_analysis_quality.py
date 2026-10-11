@@ -62,6 +62,8 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn('"stack-operation"', body)
         self.assertIn('"data-movement"', body)
         self.assertIn('"compare-test"', body)
+        self.assertIn('"indirect-call"', body)
+        self.assertIn('"conditional-control-flow"', body)
 
 if __name__ == "__main__":
     unittest.main()

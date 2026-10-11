@@ -34,6 +34,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [x] Add bounded IMG4/IM4P container inspection with compression-marker inventory; plaintext analysis remains explicit.
 - [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
 - [x] Add bounded non-ARM64 opcode-semantic labels to annotated disassembly; full lifting/decompilation remains open.
+- [x] Distinguish bounded direct versus indirect calls and unconditional versus conditional/indirect control flow in non-ARM64 labels; operand recovery and full lifting remain open.
 
 Acceptance: every new inference is provenance-labelled, bounded, and covered by synthetic and real-input regression tests.
 
@@ -72,4 +73,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels, explicit runtime correlation strength, `.vgcase` runtime trace replay, and host capability/permission/entitlement diagnostics are complete. Next loop: prioritize deeper non-ARM64 lifting or workspace-level help and unsupported-capability explanations.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, explicit runtime correlation strength, `.vgcase` runtime trace replay, and host capability/permission/entitlement diagnostics are complete. Next loop: prioritize deeper non-ARM64 lifting or workspace-level help and unsupported-capability explanations.
