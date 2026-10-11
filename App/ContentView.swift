@@ -2304,7 +2304,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .disabled(!available)
-        .help(available ? descriptor.subtitle : VGHostPlatform.unavailableReason(for: descriptor.name))
+        .help(available ? descriptor.helpText : VGHostPlatform.unavailableReason(for: descriptor.name))
     }
 
     @ViewBuilder private func workbenchSidebar() -> some View {

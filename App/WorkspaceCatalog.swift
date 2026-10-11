@@ -33,6 +33,22 @@ struct VGWorkspaceDescriptor: Identifiable, Hashable {
 
     var id: String { name }
     var appearsInSidebar: Bool { sidebarPriority != nil }
+
+    /// Short, user-facing guidance shown before a workspace is opened. Keep
+    /// capability boundaries explicit so advanced tools are discoverable on
+    /// every host without implying that a disabled path is broken.
+    var helpText: String {
+        switch name {
+        case "Debugger":
+            return "Native ARM64 attach/launch; requires an arm64 process on Apple Silicon and may require macOS debugging permission."
+        case "SoC Virtualization", "Hypervisor RE Suite", "Guest Memory", "Guest Disassembly", "Firmware Loader", "VM Snapshots", "Guest Search", "vCPU Monitor", "VM Breakpoints", "VM Trace", "GPA Map", "DART Inspector", "Interrupt Trace":
+            return "Apple-Silicon Hypervisor.framework workflow; entitlement and runtime availability are checked when the service starts."
+        case "VectorEmu Lab", "VectorEmu Registers", "VectorEmu Code", "VectorEmu Trace", "Full-System iPhemeral":
+            return "Bounded software emulation; useful as the cross-host fallback for runtime-oriented inspection."
+        default:
+            return "Evidence stays bounded and provenance-labelled; use the Inspector and handoff tools to preserve analyst context."
+        }
+    }
 }
 
 enum VGWorkspaceCatalog {

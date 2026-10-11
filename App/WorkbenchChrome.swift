@@ -124,6 +124,10 @@ struct VGCommandPalette: View {
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                             .lineLimit(1)
+                                        Text(descriptor.helpText)
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                            .lineLimit(1)
                                     }
                                     Spacer()
                                     Image(systemName: "return")
@@ -193,6 +197,10 @@ struct VGWorkspaceTitle: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                Text(descriptor.helpText)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
             }
         }
     }

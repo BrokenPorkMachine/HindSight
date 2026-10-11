@@ -54,6 +54,14 @@ def test_host_diagnostics_explain_capability_and_runtime_boundaries():
     assert 'apple_silicon_hypervisor_status=' in model
     assert 'unavailable on this host' in ui
 
+def test_workspace_catalog_explains_advanced_capability_boundaries():
+    catalog = read('App/WorkspaceCatalog.swift')
+    chrome = read('App/WorkbenchChrome.swift')
+    assert 'var helpText: String' in catalog
+    assert 'requires an arm64 process on Apple Silicon' in catalog
+    assert 'entitlement and runtime availability are checked when the service starts' in catalog
+    assert 'Text(descriptor.helpText)' in chrome
+
 def test_typecheck_and_release_gates_cover_both_architectures():
     for script in ('scripts/test-app-typecheck.sh', 'scripts/test-coordinator-typecheck.sh'):
         text = read(script)
