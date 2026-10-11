@@ -243,17 +243,8 @@ struct VGGraphWorkspace: View {
                             }
                             .onEnded { _ in zoomAnchor = zoom }
                     )
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 4)
-                            .onChanged { value in
-                                mapOffset = CGSize(
-                                    width: mapOffsetAnchor.width + value.translation.width,
-                                    height: mapOffsetAnchor.height + value.translation.height
-                                )
-                            }
-                            .onEnded { _ in mapOffsetAnchor = mapOffset }
-                    )
                 }
+                .simultaneousGesture(mapPanGesture)
                 .background {
                     Canvas { context, size in
                         let step: CGFloat = 22
@@ -568,6 +559,17 @@ struct VGGraphWorkspace: View {
     private func setZoom(_ value: CGFloat) {
         zoom = clampZoom(value)
         zoomAnchor = zoom
+    }
+
+    private var mapPanGesture: some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { value in
+                mapOffset = CGSize(
+                    width: mapOffsetAnchor.width + value.translation.width,
+                    height: mapOffsetAnchor.height + value.translation.height
+                )
+            }
+            .onEnded { _ in mapOffsetAnchor = mapOffset }
     }
 
     private func copyToPasteboard(_ value: String) {
