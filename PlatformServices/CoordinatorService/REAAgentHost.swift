@@ -1,61 +1,127 @@
 import Foundation
 
-/// One-shot, bounded MCP probe for the optional local REA provider.
-/// A future analysis session can reuse this framing while adding cancellation
-/// and retained evidence handles; the coordinator owns the child process so the
-/// SwiftUI process never blocks on provider startup or stdout parsing.
+private final class REAOutputReader {
+    private let handle: FileHandle
+    private let lock = NSLock()
+    private let signal = DispatchSemaphore(value: 0)
+    private var buffer = Data()
+
+    init(handle: FileHandle) {
+        self.handle = handle
+        handle.readabilityHandler = { [weak self] handle in
+            guard let self else { return }
+            let chunk = handle.availableData
+            self.lock.lock()
+            if !chunk.isEmpty { self.buffer.append(chunk) }
+            self.lock.unlock()
+            self.signal.signal()
+        }
+    }
+    deinit { handle.readabilityHandler = nil }
+
+    func nextLine(until deadline: Date, maxBytes: Int) -> Data? {
+        while Date() < deadline {
+            lock.lock()
+            if let newline = buffer.firstIndex(of: 10) {
+                let line = Data(buffer[..<newline])
+                buffer.removeSubrange(...newline)
+                lock.unlock()
+                return line
+            }
+            let size = buffer.count
+            lock.unlock()
+            if size > maxBytes { return nil }
+            let remaining = max(0, deadline.timeIntervalSinceNow)
+            guard signal.wait(timeout: .now() + remaining) == .success else { return nil }
+        }
+        return nil
+    }
+}
+
+/// Bounded, one-shot MCP client for the optional local REA provider.
 final class REAAgentHost {
     private let maxLineBytes = 4 * 1024 * 1024
 
     func probe(requestJSON: String) -> String {
         guard let data = requestJSON.data(using: .utf8), data.count <= 64 * 1024,
               let request = try? JSONDecoder().decode(REAProbeRequest.self, from: data),
-              let validated = request.validated else {
-            return failure("Invalid REA probe request.")
-        }
+              let validated = request.validated else { return failure("Invalid REA probe request.") }
+        return run(executable: validated.executable, arguments: validated.arguments,
+                   targetPath: nil, providerID: "auto", tool: nil, timeoutMS: validated.timeout_ms)
+    }
 
+    func analyze(requestJSON: String) -> String {
+        guard let data = requestJSON.data(using: .utf8), data.count <= 64 * 1024,
+              let request = try? JSONDecoder().decode(REAOperationRequest.self, from: data),
+              let validated = request.validated else { return failure("Invalid REA operation request.") }
+        guard FileManager.default.fileExists(atPath: validated.target_path) else {
+            return failure("REA target does not exist: \(validated.target_path)")
+        }
+        return run(executable: validated.executable, arguments: validated.arguments,
+                   targetPath: validated.target_path, providerID: validated.provider_id,
+                   tool: validated.tool, timeoutMS: validated.timeout_ms)
+    }
+
+    private func run(executable: String, arguments: [String], targetPath: String?, providerID: String,
+                     tool: String?, timeoutMS: Int) -> String {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        process.executableURL = URL(fileURLWithPath: validated.executable)
-        process.arguments = validated.arguments
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
         do { try process.run() } catch { return failure("REA launch failed: \(error.localizedDescription)") }
-
+        let reader = REAOutputReader(handle: output.fileHandleForReading)
         defer {
             input.fileHandleForWriting.closeFile()
-            output.fileHandleForReading.readabilityHandler = nil
             if process.isRunning { process.terminate() }
         }
 
-        let deadline = Date().addingTimeInterval(Double(validated.timeout_ms) / 1000)
+        let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1000)
         var nextID = 1
         do {
             let initializeID = nextID; nextID += 1
             try write(Self.message(id: initializeID, method: "initialize", params: [
-                "protocolVersion": "2025-06-18",
-                "capabilities": [String: String](),
+                "protocolVersion": "2025-06-18", "capabilities": [String: Any](),
                 "clientInfo": ["name": "HindSight", "version": "0.5.7"]
             ]), to: input)
-            guard let initialize = try readResponse(id: initializeID, from: output, until: deadline) else {
+            guard let initialize = try readResponse(id: initializeID, from: reader, until: deadline) else {
                 return failure("REA initialize timed out or returned no response.")
             }
             guard initialize["error"] == nil else { return response(initialize, method: "initialize") }
-
             try write(Self.notification(method: "notifications/initialized"), to: input)
-            let toolsID = nextID; nextID += 1
-            try write(Self.message(id: toolsID, method: "tools/call", params: [
-                "name": "binary_session", "arguments": [String: String]()
+
+            let sessionID = nextID; nextID += 1
+            try write(Self.message(id: sessionID, method: "tools/call", params: [
+                "name": "binary_session", "arguments": [String: Any]()
             ]), to: input)
-            guard let result = try readResponse(id: toolsID, from: output, until: deadline) else {
+            guard let session = try readResponse(id: sessionID, from: reader, until: deadline) else {
                 return failure("REA binary_session timed out or returned no response.")
             }
-            return response(result, method: "binary_session")
-        } catch {
-            return failure("REA probe failed: \(error.localizedDescription)")
-        }
+            guard session["error"] == nil else { return response(session, method: "binary_session") }
+            guard let targetPath, let tool else { return response(session, method: "binary_session") }
+
+            let openID = nextID; nextID += 1
+            try write(Self.message(id: openID, method: "tools/call", params: [
+                "name": "open_binary", "arguments": ["path": targetPath, "provider_id": providerID]
+            ]), to: input)
+            guard let opened = try readResponse(id: openID, from: reader, until: deadline) else {
+                return failure("REA open_binary timed out or returned no response.")
+            }
+            guard opened["error"] == nil else { return response(opened, method: "open_binary") }
+
+            let operationID = nextID; nextID += 1
+            try write(Self.message(id: operationID, method: "tools/call", params: [
+                "name": tool, "arguments": [String: Any](),
+                "_meta": ["progressToken": "hindsight-\(operationID)"]
+            ]), to: input)
+            guard let result = try readResponse(id: operationID, from: reader, until: deadline) else {
+                return failure("REA \(tool) timed out or returned no response.")
+            }
+            return response(result, method: tool)
+        } catch { return failure("REA operation failed: \(error.localizedDescription)") }
     }
 
     private func write(_ object: [String: Any], to pipe: Pipe) throws {
@@ -64,32 +130,10 @@ final class REAAgentHost {
         pipe.fileHandleForWriting.write(Data([10]))
     }
 
-    private func readResponse(id: Int, from pipe: Pipe, until deadline: Date) throws -> [String: Any]? {
-        var buffer = Data()
-        let lock = NSLock()
-        let signal = DispatchSemaphore(value: 0)
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            lock.lock()
-            if !chunk.isEmpty { buffer.append(chunk) }
-            lock.unlock()
-            signal.signal()
-        }
-        defer { pipe.fileHandleForReading.readabilityHandler = nil }
-        while Date() < deadline {
-            let remaining = max(0, deadline.timeIntervalSinceNow)
-            guard signal.wait(timeout: .now() + remaining) == .success else { return nil }
-            lock.lock()
-            let snapshot = buffer
-            buffer.removeAll(keepingCapacity: true)
-            lock.unlock()
-            guard snapshot.count <= maxLineBytes else { throw HostError(message: "REA response exceeded the bounded line size.") }
-            buffer.append(snapshot)
-            while let newline = buffer.firstIndex(of: 10) {
-                let line = Data(buffer[..<newline]); buffer.removeSubrange(...newline)
-                guard !line.isEmpty, let object = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
-                if let responseID = object["id"] as? Int, responseID == id { return object }
-            }
+    private func readResponse(id: Int, from reader: REAOutputReader, until deadline: Date) throws -> [String: Any]? {
+        while let line = reader.nextLine(until: deadline, maxBytes: maxLineBytes) {
+            guard !line.isEmpty, let object = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            if let responseID = object["id"] as? Int, responseID == id { return object }
         }
         return nil
     }
@@ -97,10 +141,7 @@ final class REAAgentHost {
     private static func message(id: Int, method: String, params: [String: Any]) -> [String: Any] {
         ["jsonrpc": "2.0", "id": id, "method": method, "params": params]
     }
-
-    private static func notification(method: String) -> [String: Any] {
-        ["jsonrpc": "2.0", "method": method]
-    }
+    private static func notification(method: String) -> [String: Any] { ["jsonrpc": "2.0", "method": method] }
 
     private func response(_ object: [String: Any], method: String) -> String {
         let value: [String: Any] = ["ok": object["error"] == nil, "method": method, "response": object]
@@ -110,8 +151,9 @@ final class REAAgentHost {
     }
 
     private func failure(_ message: String) -> String {
-        "{\"ok\":false,\"provider\":\"rea-agents\",\"message\":\"\(message.replacingOccurrences(of: "\\\"", with: "'"))\"}"
+        let value: [String: Any] = ["ok": false, "provider": "rea-agents", "message": message]
+        guard let data = try? JSONSerialization.data(withJSONObject: value, options: []),
+              let text = String(data: data, encoding: .utf8) else { return "{\"ok\":false}" }
+        return text
     }
-
-    private struct HostError: LocalizedError { let message: String; var errorDescription: String? { message } }
 }

@@ -30,6 +30,7 @@ import Foundation
     func virtualizationRE(_ requestJSON: String, withReply reply: @escaping (String) -> Void)
     func firmwareRuntime(_ requestJSON: String, withReply reply: @escaping (String) -> Void)
     func reaProbe(_ requestJSON: String, withReply reply: @escaping (String) -> Void)
+    func reaAnalyze(_ requestJSON: String, withReply reply: @escaping (String) -> Void)
     func saveNote(_ recordID: String, expectedRevision: Int, text: String, withReply reply: @escaping (String) -> Void)
 }
 enum ServiceIdentity { static let coordinator = "ca.zensoftware.VectorGlass.CoordinatorService" }

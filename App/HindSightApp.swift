@@ -102,6 +102,21 @@ private struct HindSightSettingsView: View {
                 VGReadinessRow(label: "Probe", value: model.reaStatus)
                 Button("Probe local REA agent") { model.probeREAAgents() }
                     .disabled(!model.connected || model.busy)
+                TextField("Absolute target path", text: $model.reaTargetPath)
+                    .textFieldStyle(.roundedBorder)
+                Picker("Operation", selection: $model.reaOperation) {
+                    Text("Binary overview").tag("binary_overview")
+                    Text("List procedures").tag("list_procedures")
+                    Text("List names").tag("list_names")
+                }
+                Picker("Provider", selection: $model.reaProvider) {
+                    Text("Automatic").tag("auto")
+                    Text("Hopper").tag("hopper")
+                    Text("Ghidra").tag("ghidra")
+                    Text("IDA").tag("ida")
+                }
+                Button("Analyze selected target with REA") { model.runREAOperation() }
+                    .disabled(!model.connected || model.busy || model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             Section("Support & Readiness") {
                 VGReadinessRow(label: "Build", value: buildIdentity)
