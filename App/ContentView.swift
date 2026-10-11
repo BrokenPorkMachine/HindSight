@@ -17,6 +17,7 @@ private func vgStructuralPseudocode(_ ir: String) -> String {
         let kind = String(fields[1]).lowercased()
         let assembly = fields.dropFirst(2).joined(separator: " ")
         let mnemonic = assembly.split(separator: " ").first.map(String.init) ?? ""
+        let operandText = String(assembly.dropFirst(mnemonic.count)).trimmingCharacters(in: .whitespaces)
         switch kind {
         case "cbranch": result.append("if (/* condition unresolved */) goto /* branch target unresolved */; // " + raw)
         case "branch": result.append("goto /* branch target unresolved */; // " + raw)
@@ -29,15 +30,16 @@ private func vgStructuralPseudocode(_ ir: String) -> String {
             // No register value, inferred type, or side effect is fabricated.
             let op = mnemonic.lowercased()
             if ["bl", "blr", "call", "callq"].contains(op) {
-                result.append("/* call: target and signature unresolved */ // " + raw)
+                let target = operandText.isEmpty ? "target unresolved" : operandText
+                result.append("call_target(\(target)); /* signature and side effects unresolved */ // " + raw)
             } else if ["ldr", "ldrb", "ldrh", "ldrsw", "mov", "movz", "movk", "lea"].contains(op) {
-                result.append("/* value definition; operand semantics pending */ // " + raw)
+                result.append("value_flow(\(operandText.isEmpty ? "operands unresolved" : operandText)); /* direction and types unresolved */ // " + raw)
             } else if ["str", "strb", "strh", "stp"].contains(op) {
-                result.append("/* memory write; address/value unresolved */ // " + raw)
+                result.append("memory_write(\(operandText.isEmpty ? "address/value unresolved" : operandText)); /* layout and aliasing unresolved */ // " + raw)
             } else if ["cmp", "cmn", "test", "tst"].contains(op) {
-                result.append("/* condition flags updated; predicate unresolved */ // " + raw)
+                result.append("compare_flags(\(operandText.isEmpty ? "operands unresolved" : operandText)); /* predicate unresolved */ // " + raw)
             } else if ["adr", "adrp", "add", "sub", "and", "orr", "eor", "xor", "imul"].contains(op) {
-                result.append("/* arithmetic/address computation; operands unresolved */ // " + raw)
+                result.append("compute(\(operandText.isEmpty ? "operands unresolved" : operandText)); /* result and types unresolved */ // " + raw)
             } else {
                 result.append("/* instruction semantics not lifted */ // " + raw)
             }

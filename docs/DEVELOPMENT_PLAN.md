@@ -32,7 +32,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [x] Add metadata-guided automatic ARM/Thumb control-flow transitions; register-indirect mode changes remain explicit unresolved evidence.
 - [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
 - [x] Add bounded IMG4/IM4P container inspection with compression-marker inventory; plaintext analysis remains explicit.
-- [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
+- [x] Improve bounded structural pseudocode with operand-preserving call, value-flow, memory-write, compare, and arithmetic sketches; full type/side-effect lifting remains open.
 - [x] Add bounded non-ARM64 opcode-semantic labels to annotated disassembly; full lifting/decompilation remains open.
 - [x] Distinguish bounded direct versus indirect calls and unconditional versus conditional/indirect control flow in non-ARM64 labels; operand recovery and full lifting remain open.
 
@@ -73,4 +73,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, explicit runtime correlation strength, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, and startup-pressure diagnostics are complete. Next loop: prioritize deeper non-ARM64 lifting or release/memory/crash gates.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, and startup-pressure diagnostics are complete. Next loop: prioritize type/variable recovery, deeper non-ARM64 lifting, or release/memory/crash gates.

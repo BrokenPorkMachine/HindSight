@@ -32,6 +32,8 @@ class SchedulerDemanglePseudocodeContracts(unittest.TestCase):
         self.assertIn('vgStructuralPseudocode', code)
         self.assertIn('prefix(120)', code)
         self.assertIn('Structural pseudocode preview', code)
+        for token in ('call_target(', 'value_flow(', 'memory_write(', 'compare_flags(', 'compute('):
+            self.assertIn(token, code)
 
     def test_cli_references_swift_demangler_without_shell(self):
         code = (ROOT/'scripts/vg-symbol-tools.swift').read_text()
