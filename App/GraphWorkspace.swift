@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum VGSemanticPaneMode: String, CaseIterable, Identifiable {
@@ -29,6 +30,8 @@ struct VGGraphWorkspace: View {
     @State private var graph: VGCFGGraph
     @State private var functions: [VGFunctionRecord]
     @State private var layout: VGCFGLayout
+    @State private var mapOffset: CGSize = .zero
+    @State private var mapOffsetAnchor: CGSize = .zero
 
     private let nodeWidth: CGFloat = 290
     private let nodeHeight: CGFloat = 126
@@ -102,6 +105,8 @@ struct VGGraphWorkspace: View {
             functions = parsedFunctions
             graph = VGGraphParser.cfg(newValue, functionStarts: Set(parsedFunctions.map(\.start)))
             layout = graph.layout(limit: 240)
+            mapOffset = .zero
+            mapOffsetAnchor = .zero
             synchronizeSelection()
         }
         .onChange(of: functionsText) { _, newValue in
@@ -109,6 +114,8 @@ struct VGGraphWorkspace: View {
             functions = parsedFunctions
             graph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
             layout = graph.layout(limit: 240)
+            mapOffset = .zero
+            mapOffsetAnchor = .zero
             synchronizeSelection()
         }
         .onChange(of: selectedAddress) { _, _ in synchronizeSelection() }
@@ -193,6 +200,11 @@ struct VGGraphWorkspace: View {
                             }
                         }
                         .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Select Function") { selectAddress(function.start) }
+                                Button("Copy Function Address") { copyToPasteboard(function.startText) }
+                                Button("Copy Function Name") { copyToPasteboard(function.name) }
+                            }
                     }
                 }
                 .padding(5)
@@ -218,12 +230,23 @@ struct VGGraphWorkspace: View {
                     .frame(width: CGFloat(layout.width), height: CGFloat(layout.height), alignment: .topLeading)
                     .scaleEffect(zoom, anchor: .topLeading)
                     .frame(width: CGFloat(layout.width) * zoom, height: CGFloat(layout.height) * zoom, alignment: .topLeading)
+                    .offset(mapOffset)
                     .gesture(
                         MagnificationGesture()
                             .onChanged { value in
                                 zoom = clampZoom(zoomAnchor * value)
                             }
                             .onEnded { _ in zoomAnchor = zoom }
+                    )
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 4)
+                            .onChanged { value in
+                                mapOffset = CGSize(
+                                    width: mapOffsetAnchor.width + value.translation.width,
+                                    height: mapOffsetAnchor.height + value.translation.height
+                                )
+                            }
+                            .onEnded { _ in mapOffsetAnchor = mapOffset }
                     )
                 }
                 .background {
@@ -347,6 +370,15 @@ struct VGGraphWorkspace: View {
             .contentShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            Button("Select Block") { selectAddress(block.start) }
+            if let function {
+                Button("Select Function (function.name)") { selectAddress(function.start) }
+            }
+            Divider()
+            Button("Copy Block Address") { copyToPasteboard(block.startText) }
+            Button("Copy Block ID") { copyToPasteboard(block.id) }
+        }
         .contextMenu {
             Button("Select Block") { selectedBlockID = block.id; selectAddress(block.start) }
             Button("Use Start Address") { selectAddress(block.start) }
@@ -531,5 +563,10 @@ struct VGGraphWorkspace: View {
     private func setZoom(_ value: CGFloat) {
         zoom = clampZoom(value)
         zoomAnchor = zoom
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 }
