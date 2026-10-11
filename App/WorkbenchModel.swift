@@ -21,6 +21,10 @@ final class WorkbenchModel: ObservableObject {
     @Published var selectedID: String? {
         didSet {
             if oldValue != selectedID {
+                selectedEvidenceAnnotation = nil
+                annotationDraft = ""
+                annotationTagsText = ""
+                annotationConfidence = .unclassified
                 instructionPage = nil; pageStarts.removeAll(); traversingPreviousPage = false; analysisReport = nil; pageRecordID = nil; analysisRecordID = nil; evidenceIndexTask?.cancel(); analysisEvidenceIndex = nil; evidenceIndexRecordID = nil; analysisEvidenceIndexing = false; analysisEvidenceStatus = "Evidence index unavailable."; navigationGeneration = UUID(); resetWorkspaceHistory(); analysisHistoryCursor = -1; refreshAnalysisContinuityProjection()
                 if !suppressLedgerRecording, let selected { recordLedger(kind: .recordSelected, provenance: .observed, detail: "Selected artifact \(selected.name).") }
                 persistLaunchSessionIfPossible()
@@ -103,6 +107,10 @@ final class WorkbenchModel: ObservableObject {
     @Published var cfgFocus = "" { didSet { if oldValue != cfgFocus { persistLaunchSessionIfPossible() } } }
     @Published var inspectorPinned = false
     @Published var selectedEvidence = ""
+    @Published var selectedEvidenceAnnotation: VGAnalysisAnnotation?
+    @Published var annotationDraft = ""
+    @Published var annotationTagsText = ""
+    @Published var annotationConfidence: VGAnalysisConfidence = .unclassified
     @Published var selectedSymbol = "" { didSet { if oldValue != selectedSymbol { persistLaunchSessionIfPossible() } } }
     @Published var diffBaselineID = ""
     @Published var diffCandidateID = ""
@@ -1736,10 +1744,46 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
 
     func selectEvidence(_ line: String) {
         selectedEvidence = line
+        loadSelectedEvidenceAnnotation()
         if let address = firstHexAddress(in: line) { addressText = String(format: "0x%llx", address); cfgFocus = String(format: "0x%llx", address) }
         if let range = line.range(of: "symbol=") { let tail = line[range.upperBound...]; selectedSymbol = String(tail.prefix { !$0.isWhitespace }) }
         else if line.hasPrefix("symbol ") { selectedSymbol = String(line.dropFirst(7).prefix { !$0.isWhitespace }) }
         if !selectedSymbol.isEmpty { triggerPluginEvent("on_symbol_selected") }
+    }
+
+    private func loadSelectedEvidenceAnnotation() {
+        guard let recordID = selectedID, !selectedEvidence.isEmpty else {
+            selectedEvidenceAnnotation = nil
+            annotationDraft = ""
+            annotationTagsText = ""
+            annotationConfidence = .unclassified
+            return
+        }
+        let id = "\(recordID)|\(vgContinuityFingerprint(selectedEvidence))"
+        let annotation = analysisContinuityDocument.annotations[id]
+        selectedEvidenceAnnotation = annotation
+        annotationDraft = annotation?.note ?? ""
+        annotationTagsText = annotation?.tags.joined(separator: ", ") ?? ""
+        annotationConfidence = annotation?.confidence ?? .unclassified
+    }
+
+    func saveSelectedEvidenceAnnotation() {
+        guard let recordID = selectedID, let projectPath = project?.path, !selectedEvidence.isEmpty else { return }
+        let tags = annotationTagsText.split(separator: ",").map(String.init)
+        let annotation = VGAnalysisAnnotation(recordID: recordID, evidence: selectedEvidence, note: annotationDraft, tags: tags, confidence: annotationConfidence)
+        let isEmpty = annotation.note.isEmpty && annotation.tags.isEmpty && annotation.confidence == .unclassified
+        if isEmpty {
+            analysisContinuityDocument.annotations.removeValue(forKey: annotation.id)
+            selectedEvidenceAnnotation = nil
+            status = "Removed evidence annotation."
+        } else {
+            analysisContinuityDocument.annotations[annotation.id] = annotation
+            selectedEvidenceAnnotation = annotation
+            annotationDraft = annotation.note
+            annotationTagsText = annotation.tags.joined(separator: ", ")
+            status = "Saved evidence annotation."
+        }
+        persistAnalysisContinuity(projectPath: projectPath)
     }
     func symbolEvidence(_ text: String) -> String {
         let q = selectedSymbol.trimmingCharacters(in: .whitespacesAndNewlines)

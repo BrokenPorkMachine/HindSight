@@ -138,6 +138,7 @@ struct ContentView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var focusMode = false
     @State private var inspectorBeforeFocus = true
+    @State private var quickStartPresented = false
 
 
     private func parsedShortcut(_ spec: String?) -> (KeyEquivalent, EventModifiers)? {
@@ -1841,7 +1842,10 @@ struct ContentView: View {
                         Text("See the machine, not just the file.").font(.largeTitle).fontWeight(.semibold)
                         Text("Static semantics, live process state, deterministic emulation and evidence provenance share one project. Every surface is designed to make the next investigative move obvious without hiding uncertainty.").font(.title3).foregroundStyle(.secondary).frame(maxWidth:900,alignment:.leading)
                         if model.mentorMode { Text("Mentor: begin with Navigator for broad orientation, then pivot to Annotated Code/CFG for proven static facts. Use Debugger or VectorEmu only when you need runtime evidence.").font(.caption).foregroundStyle(.secondary) }
+                        Button("Quick Start…", systemImage: "questionmark.circle") { quickStartPresented = true }
+                            .buttonStyle(.bordered)
                     }.padding(.bottom,4)
+                    investigationPath(record)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], spacing: 10) {
                         VGMetricTile(title: "Functions", value: String(model.currentAnalysis?.function_count ?? 0), detail: model.currentAnalysis == nil ? "Run analysis" : "bounded discoveries", icon: "function")
                         VGMetricTile(title: "Basic Blocks", value: String(model.currentAnalysis?.basic_block_count ?? 0), detail: model.currentAnalysis?.truncated == true ? "bounded scan" : "control-flow units", icon: "point.3.connected.trianglepath.dotted")
@@ -2310,7 +2314,7 @@ struct ContentView: View {
                     }
                     .frame(width: 36, height: 36)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("VECTORGLASS")
+                        Text("HindSight")
                             .font(.system(size: 14, weight: .bold, design: .rounded))
                             .tracking(1.0)
                         Text("Reverse-engineering studio")
@@ -2435,6 +2439,12 @@ struct ContentView: View {
                 }
 
                 Section {
+                    Button {
+                        quickStartPresented = true
+                    } label: {
+                        Label("Quick Start…", systemImage: "questionmark.circle")
+                    }
+                    .buttonStyle(.plain)
                     Button {
                         commandPalettePresented = true
                     } label: {
@@ -2598,6 +2608,33 @@ struct ContentView: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    GroupBox("Analyst annotation") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            TextEditor(text: $model.annotationDraft)
+                                .font(.caption)
+                                .frame(minHeight: 72, maxHeight: 120)
+                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
+                            TextField("Tags, separated by commas", text: $model.annotationTagsText)
+                                .textFieldStyle(.roundedBorder)
+                            HStack {
+                                Picker("Confidence", selection: $model.annotationConfidence) {
+                                    ForEach(VGAnalysisConfidence.allCases) { value in
+                                        Text(value.rawValue).tag(value)
+                                    }
+                                }
+                                .labelsHidden()
+                                .frame(maxWidth: 170)
+                                Spacer()
+                                Button("Save annotation", action: model.saveSelectedEvidenceAnnotation)
+                                    .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
+                            }
+                            Text("Stored with this project and attached to the exact selected evidence identity.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(6)
+                    }
                 }
                 GroupBox("Related Evidence") {
                     VGRelatedAnalysisEvidenceView(model: model)
@@ -2691,6 +2728,8 @@ struct ContentView: View {
                     Button("Open Project…", action: model.openProject)
                         .buttonStyle(.bordered)
                         .disabled(model.busy || !model.connected || model.connectingToCoordinator || model.restoringProjectSession)
+                    Button("Quick Start…") { quickStartPresented = true }
+                        .buttonStyle(.bordered)
                     if !model.connected && !model.connectingToCoordinator {
                         Button("Reconnect Coordinator", action: model.reconnect)
                             .buttonStyle(.bordered)
@@ -2731,6 +2770,8 @@ struct ContentView: View {
                     Button("Refresh Project", action: model.refreshProject)
                         .buttonStyle(.bordered)
                         .disabled(model.busy || model.restoringProjectSession)
+                    Button("Quick Start…") { quickStartPresented = true }
+                        .buttonStyle(.bordered)
                     if !model.connected && !model.connectingToCoordinator {
                         Button("Reconnect", action: model.reconnect)
                             .buttonStyle(.bordered)
@@ -2755,6 +2796,203 @@ struct ContentView: View {
             .padding(40)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    @ViewBuilder private func quickStartGuide() -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "scope")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Quick Start")
+                        .font(.title2.weight(.semibold))
+                    Text("A short path from bytes to a defensible investigation handoff.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                quickStartGuideStep(
+                    "1", "Create or open a project",
+                    "Projects keep captured sources, notes, evidence pins, and review state together.",
+                    actionTitle: "New Project…", action: model.newProject,
+                    enabled: model.connected && !model.busy
+                )
+                quickStartGuideStep(
+                    "2", "Import an artifact",
+                    "Use Auto for Mach-O or composite images. Raw firmware requires an explicit architecture and load address.",
+                    actionTitle: "Import Binary…", action: model.selectBinary,
+                    enabled: model.projectSessionReady && !model.busy
+                )
+                quickStartGuideStep(
+                    "3", "Run bounded analysis",
+                    "Start with Analysis Triage, then follow address- and symbol-backed evidence into code or CFG.",
+                    actionTitle: "Open Triage", action: { model.workspace = "Analysis Triage" },
+                    enabled: model.currentAnalysis != nil
+                )
+                quickStartGuideStep(
+                    "4", "Document and export",
+                    "Keep conclusions separate from findings, then create a case, Markdown, PDF, or JSON handoff from the Investigation Ledger.",
+                    actionTitle: "Open Ledger", action: { model.workspace = "Investigation Ledger" },
+                    enabled: model.project != nil
+                )
+            }
+
+            GroupBox("Evidence boundaries") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Verified structure and decoded observations are kept separate from inferred semantics.", systemImage: "checkmark.seal")
+                    Label("Unresolved branches, indirect targets, source lines, and types remain explicitly unresolved.", systemImage: "questionmark.diamond")
+                    Label("Encrypted or compressed firmware containers must be unpacked before import.", systemImage: "lock.doc")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(8)
+            }
+
+            Divider()
+            HStack {
+                Text("Tip: turn on Mentor mode in the workspace header for contextual guidance.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { quickStartPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+    }
+
+    @ViewBuilder private func quickStartGuideStep(
+        _ number: String,
+        _ title: String,
+        _ detail: String,
+        actionTitle: String,
+        action: @escaping () -> Void,
+        enabled: Bool
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(number)
+                .font(.system(.body, design: .rounded).weight(.bold))
+                .frame(width: 28, height: 28)
+                .background(Color.accentColor.opacity(0.14), in: Circle())
+                .foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button(actionTitle, action: action)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!enabled)
+        }
+    }
+
+    @ViewBuilder private func investigationPath(_ record: ProjectRecord) -> some View {
+        let analyzed = model.currentAnalysis != nil
+        let hasNotes = !record.note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasReviewContext = !model.analysisPins.isEmpty || !model.analysisCollections.isEmpty || model.investigationLedger != nil
+
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Label("Investigation path", systemImage: "arrow.right.circle")
+                        .font(.headline)
+                    Spacer()
+                    Text(analyzed ? "Analysis loaded" : "Ready for analysis")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text("Follow the evidence from the imported artifact to an analyst-owned conclusion. Each step keeps uncertainty and provenance visible.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 8)], spacing: 8) {
+                    investigationPathStep(
+                        number: "1", title: "Import source",
+                        detail: record.result.captured ? "Captured and identity-verified" : "Capture a binary before analysis",
+                        icon: record.result.captured ? "checkmark.circle.fill" : "doc.badge.plus",
+                        tint: record.result.captured ? .green : .accentColor,
+                        actionTitle: "Targets", action: { model.workspace = "Targets" }, enabled: true
+                    )
+                    investigationPathStep(
+                        number: "2", title: "Analyze",
+                        detail: analyzed ? "Report and evidence index are available" : "Recover functions, flow, symbols, and data",
+                        icon: analyzed ? "checkmark.circle.fill" : "waveform.path.ecg",
+                        tint: analyzed ? .green : .accentColor,
+                        actionTitle: analyzed ? "Analyze again" : "Analyze binary", action: model.analyzeSelected,
+                        enabled: !model.busy && model.projectServiceReady && record.result.captured
+                    )
+                    investigationPathStep(
+                        number: "3", title: "Triage evidence",
+                        detail: model.analysisPins.isEmpty ? "Search, correlate, and pin exact findings" : "\(model.analysisPins.count) pinned finding\(model.analysisPins.count == 1 ? "" : "s")",
+                        icon: hasReviewContext ? "checkmark.circle.fill" : "scope",
+                        tint: hasReviewContext ? .green : .accentColor,
+                        actionTitle: "Open Triage", action: { model.workspace = "Analysis Triage" }, enabled: analyzed
+                    )
+                    investigationPathStep(
+                        number: "4", title: "Document conclusion",
+                        detail: hasNotes ? "Project note saved" : "Record notes, hypotheses, and follow-ups",
+                        icon: hasNotes ? "checkmark.circle.fill" : "note.text",
+                        tint: hasNotes ? .green : .accentColor,
+                        actionTitle: "Open Notes", action: { model.workspace = "Notes" }, enabled: true
+                    )
+                    investigationPathStep(
+                        number: "5", title: "Export handoff",
+                        detail: "Share a bounded case, Markdown, PDF, or JSON record",
+                        icon: "square.and.arrow.up", tint: .accentColor,
+                        actionTitle: "Open Ledger", action: { model.workspace = "Investigation Ledger" },
+                        enabled: hasReviewContext
+                    )
+                }
+            }
+            .padding(8)
+        }
+    }
+
+    @ViewBuilder private func investigationPathStep(
+        number: String,
+        title: String,
+        detail: String,
+        icon: String,
+        tint: Color,
+        actionTitle: String,
+        action: @escaping () -> Void,
+        enabled: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(number)
+                    .font(.system(.caption, design: .rounded).weight(.bold))
+                    .frame(width: 22, height: 22)
+                    .background(tint.opacity(0.16), in: Circle())
+                    .foregroundStyle(tint)
+                Image(systemName: icon)
+                    .foregroundStyle(tint)
+                Spacer()
+            }
+            Text(title).font(.subheadline.weight(.semibold))
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(actionTitle, action: action)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!enabled)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, minHeight: 132, alignment: .topLeading)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     @ViewBuilder private func selectedWorkspaceContent(_ record: ProjectRecord) -> some View {
@@ -2960,6 +3198,9 @@ struct ContentView: View {
                 currentWorkspace: model.workspace,
                 onSelect: { model.workspace = $0 }
             )
+        }
+        .sheet(isPresented: $quickStartPresented) {
+            quickStartGuide()
         }
         .onAppear {
             rememberWorkspace(model.workspace)

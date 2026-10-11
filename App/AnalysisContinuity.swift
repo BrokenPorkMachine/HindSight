@@ -60,6 +60,42 @@ struct VGAnalysisPin: Codable, Identifiable, Hashable {
     }
 }
 
+enum VGAnalysisConfidence: String, Codable, CaseIterable, Identifiable, Hashable {
+    case unclassified = "Unclassified"
+    case confirmed = "Confirmed"
+    case likely = "Likely"
+    case uncertain = "Uncertain"
+
+    var id: String { rawValue }
+}
+
+struct VGAnalysisAnnotation: Codable, Identifiable, Hashable {
+    let id: String
+    let recordID: String
+    let evidence: String
+    var note: String
+    var tags: [String]
+    var confidence: VGAnalysisConfidence
+    var updatedAt: Date
+
+    init(
+        recordID: String,
+        evidence: String,
+        note: String,
+        tags: [String],
+        confidence: VGAnalysisConfidence,
+        updatedAt: Date = Date()
+    ) {
+        self.id = "\(recordID)|\(vgContinuityFingerprint(evidence))"
+        self.recordID = recordID
+        self.evidence = String(evidence.prefix(3_072))
+        self.note = vgBoundedUTF8(note.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 2_048)
+        self.tags = Array(tags.map { vgBoundedUTF8($0.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 64) }.filter { !$0.isEmpty }.prefix(16))
+        self.confidence = confidence
+        self.updatedAt = updatedAt
+    }
+}
+
 struct VGAnalysisVisit: Codable, Identifiable, Hashable {
     let id: String
     let recordID: String
@@ -278,8 +314,9 @@ struct VGAnalysisContinuityDocument: Codable {
     var followUps: [VGInvestigationFollowUp] = []
     var snapshots: [String: VGAnalysisSnapshot] = [:]
     var deltas: [String: VGAnalysisDelta] = [:]
+    var annotations: [String: VGAnalysisAnnotation] = [:]
 
-    enum CodingKeys: String, CodingKey { case schema, pins, recent, collections, reviewBaselines, reviewEntries, followUps, snapshots, deltas }
+    enum CodingKeys: String, CodingKey { case schema, pins, recent, collections, reviewBaselines, reviewEntries, followUps, snapshots, deltas, annotations }
 
     init() {}
 
@@ -294,6 +331,7 @@ struct VGAnalysisContinuityDocument: Codable {
         followUps = try container.decodeIfPresent([VGInvestigationFollowUp].self, forKey: .followUps) ?? []
         snapshots = try container.decodeIfPresent([String: VGAnalysisSnapshot].self, forKey: .snapshots) ?? [:]
         deltas = try container.decodeIfPresent([String: VGAnalysisDelta].self, forKey: .deltas) ?? [:]
+        annotations = try container.decodeIfPresent([String: VGAnalysisAnnotation].self, forKey: .annotations) ?? [:]
     }
 
     func encode(to encoder: Encoder) throws {
@@ -307,6 +345,7 @@ struct VGAnalysisContinuityDocument: Codable {
         try container.encode(followUps, forKey: .followUps)
         try container.encode(snapshots, forKey: .snapshots)
         try container.encode(deltas, forKey: .deltas)
+        try container.encode(annotations, forKey: .annotations)
     }
 
     static var empty: VGAnalysisContinuityDocument { VGAnalysisContinuityDocument() }
@@ -328,6 +367,7 @@ enum VGAnalysisContinuityStore {
     static let maximumFollowUpTitleBytes = 256
     static let maximumFollowUpNoteBytes = 1_024
     static let maximumFollowUpEvidenceIDs = 16
+    static let maximumAnnotations = 512
     private static let directoryName = ".vectorglass"
     private static let fileName = "analysis-continuity-v1.json"
 
@@ -388,6 +428,10 @@ enum VGAnalysisContinuityStore {
                 .prefix(maximumFollowUps))
             document.snapshots = Dictionary(uniqueKeysWithValues: document.snapshots.filter { validSnapshot(key: $0.key, value: $0.value) }.prefix(256).map { ($0.key, $0.value) })
             document.deltas = Dictionary(uniqueKeysWithValues: document.deltas.filter { validDelta(key: $0.key, value: $0.value) }.prefix(256).map { ($0.key, $0.value) })
+            document.annotations = Dictionary(uniqueKeysWithValues: document.annotations
+                .filter { validAnnotation(key: $0.key, value: $0.value) }
+                .prefix(maximumAnnotations)
+                .map { ($0.key, $0.value) })
             return document
         } catch { return .empty }
     }
@@ -526,6 +570,16 @@ enum VGAnalysisContinuityStore {
     private static func validDelta(key: String, value: VGAnalysisDelta) -> Bool {
         guard key == value.recordID, key.utf8.count <= 256, value.summary.utf8.count <= 2_048, value.changedChannels.count <= 96, value.unchangedChannels >= 0 else { return false }
         return value.changedChannels.allSatisfy { $0.utf8.count <= 256 }
+    }
+
+    private static func validAnnotation(key: String, value: VGAnalysisAnnotation) -> Bool {
+        key == value.id &&
+            key.utf8.count <= 768 &&
+            value.recordID.utf8.count <= 256 &&
+            value.evidence.utf8.count <= 3_072 &&
+            value.note.utf8.count <= 2_048 &&
+            value.tags.count <= 16 &&
+            value.tags.allSatisfy { $0.utf8.count <= 64 }
     }
 
 }
@@ -884,6 +938,18 @@ extension WorkbenchModel {
             for hit in hits.prefix(VGAnalysisContinuityStore.maximumPinsPerCollection) {
                 let location = hit.addressLabel.map { " @ \($0)" } ?? ""
                 lines.append("- [\(hit.source)]\(location) \(hit.text.replacingOccurrences(of: "\n", with: " "))")
+            }
+        }
+        lines.append(contentsOf: ["", "## Analyst Annotations"])
+        let annotationIDs = Set(hits.map { "\(selectedID ?? "")|\(vgContinuityFingerprint($0.text))" })
+        let annotations = analysisContinuityDocument.annotations.values.filter { annotationIDs.contains($0.id) }.sorted { $0.updatedAt > $1.updatedAt }
+        if annotations.isEmpty {
+            lines.append("- No analyst annotations recorded.")
+        } else {
+            for annotation in annotations {
+                let tags = annotation.tags.isEmpty ? "" : " · tags: \(annotation.tags.joined(separator: ", "))"
+                lines.append("- [\(annotation.confidence.rawValue)\(tags)] \(annotation.note.isEmpty ? "(no note)" : annotation.note.replacingOccurrences(of: "\n", with: " "))")
+                lines.append("  Evidence: \(annotation.evidence.replacingOccurrences(of: "\n", with: " "))")
             }
         }
         lines.append(contentsOf: ["", "## Follow-Up Queue"])
