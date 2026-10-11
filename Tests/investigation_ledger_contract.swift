@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 @main
 struct InvestigationLedgerContract {
@@ -18,6 +19,8 @@ struct InvestigationLedgerContract {
         precondition(ledger.bookmarks.count == 1)
         precondition(ledger.snapshots.count == 1)
 
+        let reaResponse = "{\"ok\":true,\"method\":\"binary_overview\"}"
+        let reaDigest = SHA256.hash(data: Data(reaResponse.utf8)).map { String(format: "%02x", $0) }.joined()
         let bundle = VGCaseBundle(
             format: "com.zensoftware.vectorglass.case",
             schema: 1,
@@ -28,7 +31,8 @@ struct InvestigationLedgerContract {
             artifacts: [VGCaseArtifactIdentity(id: "r1", name: "target", sourceSHA256: "abc", architecture: "arm64", size: "4096")],
             evidence: nil,
             runtime: [],
-            memory: []
+            memory: [],
+            reaEvidence: [VGREAAgentEvidence(id: "rea-1", capturedAt: now, operation: "binary_overview", targetPath: "/tmp/target", provider: "hopper", responseSHA256: reaDigest, response: reaResponse)]
         )
         let data = try VGLedgerStore.encodeCase(bundle)
         let boundedCase = try VGLedgerStore.decodeCase(data)
@@ -37,6 +41,7 @@ struct InvestigationLedgerContract {
         let decoded = try decoder.decode(VGCaseBundle.self, from: data)
         precondition(decoded.ledger.caseID == "case-1")
         precondition(decoded.ledger.hypotheses[0].status == .supported)
+        precondition(decoded.reaEvidence?.first?.responseSHA256 == reaDigest)
         let markdown = VGLedgerStore.markdown(bundle)
         precondition(markdown.contains("Auth branch controls access"))
         precondition(markdown.contains("Evidence boundary"))

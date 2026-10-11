@@ -557,7 +557,8 @@ enum VGLedgerStore {
         decoder.dateDecodingStrategy = .iso8601
         let bundle = try decoder.decode(VGCaseBundle.self, from: data)
         guard bundle.format == "com.zensoftware.vectorglass.case", bundle.schema == 1,
-              bundle.runtime.count <= 256, bundle.memory.count <= 64, bundle.artifacts.count <= 256 else {
+              bundle.runtime.count <= 256, bundle.memory.count <= 64, bundle.artifacts.count <= 256,
+              (bundle.reaEvidence ?? []).count <= 32 else {
             throw NSError(domain: "HindSightCase", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unsupported or oversized HindSight case bundle."])
         }
         guard bundle.runtime.allSatisfy({ event in
@@ -566,6 +567,14 @@ enum VGLedgerStore {
             event.registers.values.allSatisfy({ $0.utf8.count <= 256 }) && event.breakpoints.count <= 256
         }), bundle.memory.allSatisfy({ $0.address.utf8.count <= 32 && $0.bytesHex.utf8.count <= 8192 }) else {
             throw NSError(domain: "HindSightCase", code: 3, userInfo: [NSLocalizedDescriptionKey: "Case runtime evidence exceeds a bounded field limit."])
+        }
+        guard (bundle.reaEvidence ?? []).allSatisfy({ evidence in
+            evidence.operation.utf8.count <= 128 && evidence.targetPath.utf8.count <= 16_384 &&
+            evidence.provider.utf8.count <= 64 && evidence.responseSHA256.count == 64 &&
+            evidence.response.utf8.count <= 2 * 1024 * 1024 &&
+            SHA256.hash(data: Data(evidence.response.utf8)).map { String(format: "%02x", $0) }.joined() == evidence.responseSHA256
+        }) else {
+            throw NSError(domain: "HindSightCase", code: 7, userInfo: [NSLocalizedDescriptionKey: "Case REA evidence failed bounded integrity validation."])
         }
         if let manifest = bundle.integrity {
             let payload = VGCaseBundle(

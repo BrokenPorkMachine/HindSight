@@ -75,6 +75,7 @@ Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a 
 - [x] Add explicit target-scoped REA overview, procedure, and name operations.
 - [x] Add coordinator-owned cancellation for active REA operations.
 - [x] Expose retained REA records as provenance nodes in the Evidence Graph.
+- [x] Restore retained REA records during `.vgcase` import with hash validation.
 - [ ] Add streamed progress and retained evidence handles.
 - [ ] Import REA evidence into HindSight cases and the evidence graph with compatibility checks.
 - [ ] Add deterministic MCP fixtures and release qualification coverage for the bridge.

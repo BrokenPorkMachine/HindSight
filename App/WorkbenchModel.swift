@@ -1877,11 +1877,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             }
             runtimeSamples = restored
             runtimeMemoryObservations = memory
+            reaEvidence = Array((bundle.reaEvidence ?? []).suffix(32))
             runtimeSequence = restored.map(\.id).max() ?? 0
             runtimeMemorySequence = memory.map(\.id).max() ?? 0
             if let artifact = bundle.artifacts.first, project?.records.contains(where: { $0.id == artifact.id }) == true { selectedID = artifact.id }
-            workspace = "Trace Explorer"
-            ledgerStatus = "Imported \(restored.count) runtime observations from \(url.lastPathComponent); debugger remains detached."
+            workspace = reaEvidence.isEmpty ? "Trace Explorer" : "REA Agent"
+            ledgerStatus = "Imported \(restored.count) runtime observations and \(reaEvidence.count) REA evidence record(s) from \(url.lastPathComponent); debugger remains detached."
             status = ledgerStatus
         } catch { status = "Case import failed: \(error.localizedDescription)" }
     }
