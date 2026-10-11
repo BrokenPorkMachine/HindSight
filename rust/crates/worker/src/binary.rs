@@ -10,7 +10,11 @@ use std::{
         raw::{c_char, c_void},
         unix::fs::MetadataExt,
     },
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
+#[path = "compression.rs"]
+mod compression;
 const SCAN: usize = 4 * 1024 * 1024;
 const TEXT: usize = 60_000;
 fn bad(s: &str) -> io::Error {
@@ -888,18 +892,32 @@ fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, Str
             .take(32)
             .collect()
     };
+    let img3 = marker(b"IMG3");
     let img4 = marker(b"IMG4");
     let im4p = marker(b"IM4P");
-    if img4.is_empty() && im4p.is_empty() {
-        return Ok(None);
-    }
     let bvx2 = marker(b"bvx2");
     let bvxn = marker(b"bvxn");
+    let bvx_stored = marker(b"bvx-");
     let complzss = marker(b"complzss");
+    let zip = marker(b"PK\x03\x04");
+    if img3.is_empty()
+        && img4.is_empty()
+        && im4p.is_empty()
+        && bvx2.is_empty()
+        && bvxn.is_empty()
+        && bvx_stored.is_empty()
+        && complzss.is_empty()
+        && zip.is_empty()
+    {
+        return Ok(None);
+    }
     let mut out = format!(
         "Container marker inventory (first {:#x} bytes; at most 32 matches per marker)\n",
         bytes.len()
     );
+    if !img3.is_empty() {
+        push(&mut out, &format!("IMG3 marker offsets: {:?}\n", img3));
+    }
     if !img4.is_empty() {
         push(&mut out, &format!("IMG4 marker offsets: {:?}\n", img4));
     }
@@ -927,6 +945,36 @@ fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, Str
             &format!("complzss compression marker offsets: {:?}\n", complzss),
         );
     }
+    if !bvx_stored.is_empty() {
+        push(
+            &mut out,
+            &format!("bvx- stored-block offsets: {:?}\n", bvx_stored),
+        );
+    }
+    if !zip.is_empty() {
+        push(
+            &mut out,
+            &format!("IPSW/ZIP local-header offsets: {:?}\n", zip),
+        );
+    }
+    if let Some((scheme, decoded)) = compression::decode_payload(&bytes) {
+        push(
+            &mut out,
+            &format!(
+                "Decoded plaintext candidate: scheme={} bytes={:#x} validated_macho_header=true\n",
+                scheme,
+                decoded.len()
+            ),
+        );
+    } else if !bvx2.is_empty() || !bvxn.is_empty() || !complzss.is_empty() {
+        push(
+            &mut out,
+            &format!(
+                "Compression candidate={} was detected but no bounded plaintext Mach-O was produced on this host.\n",
+                compression::marker_name(&bytes)
+            ),
+        );
+    }
     if bytes.first() == Some(&0x30) {
         push(&mut out, "DER-like sequence prefix observed at file offset 0; complete ASN.1 structure is not decoded.\n");
     }
@@ -935,6 +983,10 @@ fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, Str
     ));
     let kind = if !img4.is_empty() {
         "IMG4 firmware container"
+    } else if !img3.is_empty() {
+        "IMG3 firmware container"
+    } else if !zip.is_empty() {
+        "IPSW/ZIP firmware archive"
     } else {
         "IM4P firmware payload"
     };
@@ -972,6 +1024,40 @@ fn verified(path: &str, digest: &str, size: &str, id: &str) -> io::Result<(File,
     }
     Ok((file, before, size))
 }
+
+struct TemporaryPayload(Option<PathBuf>);
+impl Drop for TemporaryPayload {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn decoded_payload(source: &mut File) -> io::Result<(File, TemporaryPayload)> {
+    let size = source.metadata()?.len();
+    let bytes = read(source, 0, size.min(16 * 1024 * 1024) as usize)?;
+    let has_marker = [b"IMG3".as_slice(), b"IMG4", b"IM4P", b"bvx2", b"bvxn", b"complzss"]
+        .iter()
+        .any(|marker| bytes.windows(marker.len()).any(|window| window == *marker));
+    if !has_marker {
+        return Ok((source.try_clone()?, TemporaryPayload(None)));
+    }
+    if let Some((_, payload)) = compression::decode_payload(&bytes) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("hindsight-payload-{}-{nonce:x}.bin", std::process::id()));
+        let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        use std::io::Write;
+        output.write_all(&payload)?;
+        output.sync_all()?;
+        drop(output);
+        return Ok((File::open(&path)?, TemporaryPayload(Some(path))));
+    }
+    Ok((source.try_clone()?, TemporaryPayload(None)))
+}
 pub fn request(
     path: &str,
     digest: &str,
@@ -980,11 +1066,12 @@ pub fn request(
     id: &str,
     o: &Options,
 ) -> io::Result<String> {
-    let (mut file, before, _) = verified(path, digest, size, id)?;
+    let (mut source, before, _) = verified(path, digest, size, id)?;
+    let (mut file, _temporary) = decoded_payload(&mut source)?;
     let i = load(&mut file, o)?;
     let start: u64 = start.parse().map_err(|_| bad("Invalid page start"))?;
     let (text, count) = page(&mut file, &i, start)?;
-    if fingerprint(&before) != fingerprint(&file.metadata()?) {
+    if fingerprint(&before) != fingerprint(&source.metadata()?) {
         return Err(bad("Captured object changed during page request"));
     }
     let s = &i.sections[i.code.ok_or_else(|| bad("No instruction section"))?];
@@ -1326,6 +1413,80 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
         }
     }
     Ok((out, limited))
+}
+
+fn kernel_name_like(value: &str) -> bool {
+    let value = value.trim_matches(|c: char| c == '_' || c == ' ');
+    if value.len() < 4 || value.len() > 160 || value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    value.starts_with("ZN")
+        || value.starts_with('Z')
+        || value.starts_with("Apple")
+        || value.starts_with("IO")
+        || value.starts_with("com.apple.")
+        || value.starts_with("panic")
+        || value.starts_with("assert")
+        || value.starts_with("mach_")
+        || value.starts_with("vm_")
+        || value.starts_with("bsd_")
+        || value.starts_with("kmod_")
+        || value.starts_with("os_")
+}
+
+/// Recover only names that are present as readable kernel/driver strings near
+/// a bounded function start. These are useful on stripped SEP/XNU images, but
+/// remain explicitly heuristic and never outrank nlist/export metadata.
+fn function_name_guesses(
+    file: &mut File,
+    i: &Image,
+    functions: &BTreeMap<u64, (String, String)>,
+) -> io::Result<String> {
+    if functions.is_empty() {
+        return Ok(String::new());
+    }
+    let starts: Vec<u64> = functions.keys().copied().collect();
+    let mut output = String::new();
+    let mut budget = 256 * 1024usize;
+    for section in i.sections.iter().filter(|s| !s.zero && !s.executable) {
+        if budget == 0 {
+            break;
+        }
+        let n = section.size.min(SCAN as u64).min(budget as u64) as usize;
+        let bytes = read(file, section.offset, n)?;
+        budget -= n;
+        let mut at = 0;
+        while at < bytes.len() && output.len() < TEXT - 2048 {
+            let begin = at;
+            while at < bytes.len() && (bytes[at].is_ascii_graphic() || bytes[at] == b' ') {
+                at += 1;
+            }
+            if at - begin >= 4 {
+                let candidate = name(&bytes[begin..at.min(begin + 160)]);
+                if kernel_name_like(&candidate) {
+                    let address = section.address + begin as u64;
+                    if let Some((function, distance)) = starts
+                        .iter()
+                        .filter(|start| **start <= address)
+                        .map(|start| (*start, address - *start))
+                        .min_by_key(|(_, distance)| *distance)
+                    {
+                        if distance <= 0x800 {
+                            push(
+                                &mut output,
+                                &format!(
+                                    "0x{function:016x} candidate-name={candidate:?} source=nearby-kernel-string distance={distance:#x} section={}\n",
+                                    section.name
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            at += 1;
+        }
+    }
+    Ok(output)
 }
 fn relocations(file: &mut File, i: &Image, symbols: &[Symbol]) -> io::Result<String> {
     if i.be {
@@ -1872,8 +2033,8 @@ fn semantic_hint(a: Arch, bytes: &[u8], text: &str) -> Option<&'static str> {
                 match bytes.first().copied()? {
                     0x50..=0x5f | 0x68 | 0x6a => Some("stack-operation"),
                     0x88..=0x8d | 0xb0..=0xbf | 0xc6 | 0xc7 => Some("data-movement"),
-                    0x01 | 0x03 | 0x05 | 0x09 | 0x0b | 0x0d | 0x21 | 0x23 | 0x29
-                    | 0x2b | 0x2d | 0x31 | 0x33 | 0x35 | 0x81 | 0x83 => Some("arithmetic-logic"),
+                    0x01 | 0x03 | 0x05 | 0x09 | 0x0b | 0x0d | 0x21 | 0x23 | 0x29 | 0x2b | 0x2d
+                    | 0x31 | 0x33 | 0x35 | 0x81 | 0x83 => Some("arithmetic-logic"),
                     0x39 | 0x3b | 0x3d | 0x85 => Some("compare-test"),
                     0xc3 | 0xc2 | 0xcb | 0xca => Some("return"),
                     _ => None,
@@ -1885,7 +2046,8 @@ fn semantic_hint(a: Arch, bytes: &[u8], text: &str) -> Option<&'static str> {
                 Some("direct-call")
             } else if text.starts_with('b') || text.starts_with("bx") {
                 Some("control-flow")
-            } else if text.starts_with("ldr") || text.starts_with("str") || text.starts_with("mov") {
+            } else if text.starts_with("ldr") || text.starts_with("str") || text.starts_with("mov")
+            {
                 Some("data-movement")
             } else if return_instruction(a, bytes, text) {
                 Some("return")
@@ -1898,7 +2060,8 @@ fn semantic_hint(a: Arch, bytes: &[u8], text: &str) -> Option<&'static str> {
 }
 
 pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> io::Result<String> {
-    let (mut file, before, _) = verified(path, digest, size, id)?;
+    let (mut source, before, _) = verified(path, digest, size, id)?;
+    let (mut file, _temporary) = decoded_payload(&mut source)?;
     let image = load(&mut file, o)?;
     eprintln!(
         "VG_PROGRESS\t10\tmetadata\tWalking validated headers, sections and linkedit tables."
@@ -2051,9 +2214,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
                 &primary_decoder
             };
             let unit = mode.unit();
-            let in_data = ranges
-                .iter()
-                .any(|&(lo, hi)| pos < hi && pos + unit > lo);
+            let in_data = ranges.iter().any(|&(lo, hi)| pos < hi && pos + unit > lo);
             let (n, text, known) = if in_data {
                 (
                     (unit as usize).min(code.len() - at),
@@ -2228,6 +2389,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         }
     }
     push(&mut code_references, &pointers);
+    let name_guesses = function_name_guesses(&mut file, &image, &functions)?;
     let mut function_text = String::new();
     for (&a, (name, source)) in &functions {
         push(
@@ -2311,8 +2473,9 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         );
     }
     let mut intelligence = candidates;
+    push(&mut intelligence, &name_guesses);
     push(&mut intelligence, &epilogues);
-    push(&mut intelligence,"Prologues, return instructions, direct-call targets and pointer tables are candidates, not proof of function extent. Mixed ARM/Thumb mode requires a separate import with the correct mode.\n");
+    push(&mut intelligence,"Prologues, return instructions, direct-call targets, nearby kernel-name strings and pointer tables are candidates, not proof of function extent. Mixed ARM/Thumb mode requires a separate import with the correct mode.\n");
     let symbol_text = symbols
         .iter()
         .filter(|s| !s.name.is_empty())
@@ -2360,7 +2523,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         values.insert(key,"Semantic lifting/SSA is unavailable for this structural backend; no register values or decompiler results are invented.".into());
     }
     truncated |= values.values().any(|v| v.len() >= TEXT - 4096);
-    if fingerprint(&before) != fingerprint(&file.metadata()?) {
+    if fingerprint(&before) != fingerprint(&source.metadata()?) {
         return Err(bad("Captured object changed during analysis"));
     }
     eprintln!(
@@ -2587,10 +2750,25 @@ mod tests {
     }
     #[test]
     fn non_arm_semantics_preserve_control_flow_shape() {
-        assert_eq!(semantic_hint(Arch::X64, &[0xe8], "callq 0x1000"), Some("direct-call"));
-        assert_eq!(semantic_hint(Arch::X64, &[0xff], "callq *%rax"), Some("indirect-call"));
-        assert_eq!(semantic_hint(Arch::X64, &[0x75], "jne 0x1000"), Some("conditional-control-flow"));
-        assert_eq!(semantic_hint(Arch::X64, &[0xff], "jmpq *%rax"), Some("indirect-control-flow"));
-        assert_eq!(semantic_hint(Arch::X64, &[0x8d], "leaq 0x10(%rax), %rcx"), Some("data-movement"));
+        assert_eq!(
+            semantic_hint(Arch::X64, &[0xe8], "callq 0x1000"),
+            Some("direct-call")
+        );
+        assert_eq!(
+            semantic_hint(Arch::X64, &[0xff], "callq *%rax"),
+            Some("indirect-call")
+        );
+        assert_eq!(
+            semantic_hint(Arch::X64, &[0x75], "jne 0x1000"),
+            Some("conditional-control-flow")
+        );
+        assert_eq!(
+            semantic_hint(Arch::X64, &[0xff], "jmpq *%rax"),
+            Some("indirect-control-flow")
+        );
+        assert_eq!(
+            semantic_hint(Arch::X64, &[0x8d], "leaq 0x10(%rax), %rcx"),
+            Some("data-movement")
+        );
     }
 }

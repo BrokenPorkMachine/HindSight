@@ -1,0 +1,226 @@
+//! Bounded Apple firmware payload decoding.
+//!
+//! The container is never treated as code.  We only publish a decoded payload
+//! when a decoder returns bytes containing a validated Mach-O header.  On
+//! macOS the system Compression framework supplies the Apple codecs; the
+//! small `complzss` path covers the legacy kernelcache/IMG3 LZSS wrapper.
+
+const MAX_OUTPUT: usize = 512 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn dlopen(path: *const std::os::raw::c_char, mode: i32) -> *mut std::os::raw::c_void;
+    fn dlsym(
+        handle: *mut std::os::raw::c_void,
+        name: *const std::os::raw::c_char,
+    ) -> *mut std::os::raw::c_void;
+}
+
+#[cfg(target_os = "macos")]
+fn system_decode(input: &[u8], algorithm: u32) -> Option<Vec<u8>> {
+    type Decode = unsafe extern "C" fn(*mut u8, usize, *const u8, usize, *mut u8, u32) -> usize;
+    let library =
+        std::ffi::CString::new("/System/Library/Frameworks/Compression.framework/Compression")
+            .ok()?;
+    let symbol = std::ffi::CString::new("compression_decode_buffer").ok()?;
+    let handle = unsafe { dlopen(library.as_ptr(), 1) };
+    if handle.is_null() {
+        return None;
+    }
+    let function = unsafe { dlsym(handle, symbol.as_ptr()) };
+    if function.is_null() {
+        return None;
+    }
+    let decode: Decode = unsafe { std::mem::transmute(function) };
+    let mut capacity = input.len().saturating_mul(4).max(4096);
+    while capacity <= MAX_OUTPUT {
+        let mut output = vec![0; capacity];
+        let size = unsafe {
+            decode(
+                output.as_mut_ptr(),
+                output.len(),
+                input.as_ptr(),
+                input.len(),
+                std::ptr::null_mut(),
+                algorithm,
+            )
+        };
+        if size != 0 {
+            output.truncate(size);
+            return Some(output);
+        }
+        capacity = capacity.saturating_mul(2);
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn system_decode(_input: &[u8], _algorithm: u32) -> Option<Vec<u8>> {
+    None
+}
+
+fn macho_offset(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).take(4 * 1024 * 1024).position(|w| {
+        matches!(
+            w,
+            [0xce, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xce]
+                | [0xcf, 0xfa, 0xed, 0xfe]
+                | [0xfe, 0xed, 0xfa, 0xcf]
+                | [0xca, 0xfe, 0xba, 0xbe]
+                | [0xbe, 0xba, 0xfe, 0xca]
+        )
+    })
+}
+
+fn lzss(input: &[u8]) -> Option<Vec<u8>> {
+    // complzss payloads use the classic 4 KiB window / 3..18 match form.
+    // Try both flag-bit orders used by Apple-era tools and reject malformed
+    // streams rather than returning a plausible partial image.
+    for msb_first in [false, true] {
+        let mut out = Vec::new();
+        let mut at = 0;
+        let mut flags = 0u16;
+        let mut bits = 0;
+        let mut ok = true;
+        while at < input.len() && out.len() < MAX_OUTPUT {
+            if bits == 0 {
+                if at + 2 > input.len() {
+                    ok = false;
+                    break;
+                }
+                flags = u16::from_le_bytes([input[at], input[at + 1]]);
+                at += 2;
+                bits = 16;
+            }
+            let literal = if msb_first {
+                flags & 0x8000 != 0
+            } else {
+                flags & 1 != 0
+            };
+            if msb_first {
+                flags <<= 1;
+            } else {
+                flags >>= 1;
+            }
+            bits -= 1;
+            if literal {
+                if at >= input.len() {
+                    ok = false;
+                    break;
+                }
+                out.push(input[at]);
+                at += 1;
+            } else {
+                if at + 2 > input.len() {
+                    ok = false;
+                    break;
+                }
+                let pair = u16::from_le_bytes([input[at], input[at + 1]]);
+                at += 2;
+                let distance = (pair & 0x0fff) as usize;
+                let length = ((pair >> 12) as usize) + 3;
+                if distance == 0
+                    || distance > out.len()
+                    || out.len().saturating_add(length) > MAX_OUTPUT
+                {
+                    ok = false;
+                    break;
+                }
+                for _ in 0..length {
+                    let index = out.len() - distance;
+                    let byte = out[index];
+                    out.push(byte);
+                }
+            }
+        }
+        if ok && !out.is_empty() {
+            if let Some(offset) = macho_offset(&out) {
+                return Some(out[offset..].to_vec());
+            }
+        }
+    }
+    None
+}
+
+/// Decode a bounded Apple payload and return the first result that contains a
+/// Mach-O header. The returned scheme is evidence, not an assertion that an
+/// encrypted or signed container was validly authenticated.
+pub fn decode_payload(input: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    if input.len() > 8 * 1024 * 1024 * 1024 {
+        return None;
+    }
+    let mut bodies: Vec<&[u8]> = vec![input];
+    if input.len() > 4 {
+        bodies.push(&input[4..]);
+    }
+    if input.len() > 16 {
+        bodies.push(&input[16..]);
+    }
+    if input.len() > 32 {
+        bodies.push(&input[32..]);
+    }
+    for marker in [b"IM4P".as_slice(), b"bvx2", b"bvxn", b"complzss"] {
+        if let Some(offset) = input.windows(marker.len()).position(|window| window == marker) {
+            if input.len() > offset + marker.len() {
+                bodies.push(&input[offset + marker.len()..]);
+            }
+        }
+    }
+
+    let algorithms = [
+        ("LZFSE", 0x801),
+        ("LZ4", 0x100),
+        ("LZ4-raw", 0x101),
+        ("LZMA", 0x306),
+        ("zlib", 0x205),
+    ];
+    for body in bodies {
+        for (name, algorithm) in algorithms {
+            if let Some(decoded) = system_decode(body, algorithm) {
+                if let Some(offset) = macho_offset(&decoded) {
+                    return Some((name, decoded[offset..].to_vec()));
+                }
+            }
+        }
+    }
+    let lzss_input = input.strip_prefix(b"complzss").unwrap_or(input);
+    lzss(lzss_input).map(|decoded| ("complzss-LZSS", decoded))
+}
+
+pub fn marker_name(input: &[u8]) -> &'static str {
+    if input.starts_with(b"bvx2") {
+        "bvx2/LZFSE"
+    } else if input.starts_with(b"bvxn") {
+        "bvxn/LZVN"
+    } else if input.starts_with(b"bvx-") {
+        "bvx-/stored"
+    } else if input.starts_with(b"complzss") {
+        "complzss/LZSS"
+    } else if input.starts_with(b"IMG3") {
+        "IMG3"
+    } else if input.starts_with(b"IMG4") {
+        "IMG4"
+    } else if input.starts_with(b"PK\x03\x04") {
+        "IPSW/ZIP"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_inventory_is_explicit() {
+        assert_eq!(marker_name(b"bvx2xxxx"), "bvx2/LZFSE");
+        assert_eq!(marker_name(b"complzss"), "complzss/LZSS");
+        assert_eq!(marker_name(b"IMG4"), "IMG4");
+    }
+
+    #[test]
+    fn malformed_lzss_is_rejected() {
+        assert!(lzss(b"\0\0").is_none());
+    }
+}
