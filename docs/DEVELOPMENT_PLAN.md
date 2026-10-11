@@ -25,6 +25,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 
 - [x] Add bounded compact-unwind metadata ingestion; DWARF/dSYM sections remain explicitly inventory-only.
 - [ ] Improve type and variable recovery.
+- [x] Label validated Swift type-descriptor names with relative-pointer provenance and confidence.
 - [x] Add bounded AArch64 call-argument/return-register provenance; source-level types and callee prototypes remain explicit unknowns.
 - [x] Validate bounded executable-target pointer runs for jump-table triage; dispatch use and index bounds remain explicit unknowns.
 - [x] Add metadata-guided automatic ARM/Thumb control-flow transitions; register-indirect mode changes remain explicit unresolved evidence.
@@ -68,4 +69,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, and bounded AArch64 call-register provenance are complete. Next loop: prioritize validated type/variable metadata recovery or the remaining non-ARM64 semantic lifting slice.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, and Swift type-descriptor provenance labels are complete. Next loop: prioritize the remaining validated variable metadata or non-ARM64 semantic lifting slice.

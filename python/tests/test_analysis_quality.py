@@ -44,5 +44,11 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn("return-register=x0", body)
         self.assertIn("No source-level types or callee prototypes are inferred", body)
 
+    def test_swift_type_records_carry_validation_provenance(self):
+        source = WORKER.read_text()
+        body = source[source.index("fn swift_context_graph"):source.index("fn chained_page_starts")]
+        self.assertIn("provenance=relative-pointer+mapped-cstring", body)
+        self.assertIn("confidence=validated-record", body)
+
 if __name__ == "__main__":
     unittest.main()
