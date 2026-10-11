@@ -26,13 +26,37 @@ struct VGGraphWorkspace: View {
     @State private var showSemantics = true
     @State private var showCalls = true
     @State private var semanticMode: VGSemanticPaneMode = .code
+    @State private var graph: VGCFGGraph
+    @State private var functions: [VGFunctionRecord]
+    @State private var layout: VGCFGLayout
 
     private let nodeWidth: CGFloat = 290
     private let nodeHeight: CGFloat = 126
 
-    private var graph: VGCFGGraph { VGGraphParser.cfg(cfgText) }
-    private var functions: [VGFunctionRecord] { VGGraphParser.functions(functionsText) }
-    private var layout: VGCFGLayout { graph.layout(limit: 240) }
+    init(
+        cfgText: String,
+        functionsText: String,
+        disassemblyText: String,
+        irText: String,
+        dataflowText: String,
+        selectedAddress: String,
+        debugPC: String?,
+        onSelectAddress: @escaping (String) -> Void
+    ) {
+        self.cfgText = cfgText
+        self.functionsText = functionsText
+        self.disassemblyText = disassemblyText
+        self.irText = irText
+        self.dataflowText = dataflowText
+        self.selectedAddress = selectedAddress
+        self.debugPC = debugPC
+        self.onSelectAddress = onSelectAddress
+
+        let parsedGraph = VGGraphParser.cfg(cfgText)
+        _graph = State(initialValue: parsedGraph)
+        _functions = State(initialValue: VGGraphParser.functions(functionsText))
+        _layout = State(initialValue: parsedGraph.layout(limit: 240))
+    }
 
     private var selectedAddressValue: UInt64? { VGGraphParser.address(from: selectedAddress) }
     private var debugPCValue: UInt64? { debugPC.flatMap { VGGraphParser.address(from: $0) } }
@@ -72,6 +96,15 @@ struct VGGraphWorkspace: View {
         }
         .background(Color.primary.opacity(0.012))
         .onAppear { synchronizeSelection() }
+        .onChange(of: cfgText) { _, newValue in
+            graph = VGGraphParser.cfg(newValue)
+            layout = graph.layout(limit: 240)
+            synchronizeSelection()
+        }
+        .onChange(of: functionsText) { _, newValue in
+            functions = VGGraphParser.functions(newValue)
+            synchronizeSelection()
+        }
         .onChange(of: selectedAddress) { _, _ in synchronizeSelection() }
     }
 
