@@ -16,7 +16,7 @@ The app already has a broad macOS workbench covering project/artifact management
 - [x] Add Quick Start and the Import → Analyze → Triage → Document → Export path.
 - [x] Add evidence annotations with notes, tags, confidence, persistence, handoff export, and Annotated Triage mode.
 - [x] Add saved searches and reusable triage filters.
-- [ ] Make annotations available from every evidence card without requiring the inspector.
+- [x] Make annotations available from every evidence card without requiring the inspector.
 - [ ] Add an analyst-facing “annotated handoff” summary to the main Overview.
 
 Acceptance: a new user can import an artifact, run analysis, find a result, annotate it, retrieve it later, and export a handoff without searching through advanced workspaces.

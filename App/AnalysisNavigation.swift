@@ -321,6 +321,10 @@ struct VGAnalysisEvidenceHitCard: View {
     @ObservedObject var model: WorkbenchModel
     let hit: VGAnalysisEvidenceHit
     var compact = false
+    @State private var annotationPresented = false
+    @State private var annotationNote = ""
+    @State private var annotationTags = ""
+    @State private var annotationConfidence: VGAnalysisConfidence = .unclassified
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 6 : 8) {
@@ -353,8 +357,49 @@ struct VGAnalysisEvidenceHitCard: View {
                     }
                 }
             }
+            if annotationPresented {
+                VStack(alignment: .leading, spacing: 7) {
+                    TextEditor(text: $annotationNote)
+                        .font(.caption)
+                        .frame(minHeight: 58, maxHeight: 100)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(.separator))
+                    TextField("Tags, separated by commas", text: $annotationTags)
+                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Picker("Confidence", selection: $annotationConfidence) {
+                            ForEach(VGAnalysisConfidence.allCases) { value in
+                                Text(value.rawValue).tag(value)
+                            }
+                        }
+                        .labelsHidden()
+                        .frame(maxWidth: 150)
+                        Spacer()
+                        Button("Save") {
+                            model.selectAnalysisHit(hit)
+                            model.annotationDraft = annotationNote
+                            model.annotationTagsText = annotationTags
+                            model.annotationConfidence = annotationConfidence
+                            model.saveSelectedEvidenceAnnotation()
+                            annotationPresented = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(7)
+                .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            }
             VGFlowLayout(horizontalSpacing: 6, verticalSpacing: 5) {
                 Button("Select") { model.selectAnalysisHit(hit) }
+                Button(annotationPresented ? "Close annotation" : "Annotate") {
+                    if !annotationPresented {
+                        let annotation = model.analysisAnnotation(for: hit)
+                        annotationNote = annotation?.note ?? ""
+                        annotationTags = annotation?.tags.joined(separator: ", ") ?? ""
+                        annotationConfidence = annotation?.confidence ?? .unclassified
+                    }
+                    annotationPresented.toggle()
+                }
                 Button(model.isAnalysisHitPinned(hit) ? "Unpin" : "Pin") { model.toggleAnalysisPin(hit) }
                 if !model.analysisCollections.isEmpty {
                     Menu("Collect") {
@@ -385,6 +430,12 @@ struct VGAnalysisEvidenceHitCard: View {
         .overlay {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .strokeBorder(.primary.opacity(0.06), lineWidth: 1)
+        }
+        .onAppear {
+            let annotation = model.analysisAnnotation(for: hit)
+            annotationNote = annotation?.note ?? ""
+            annotationTags = annotation?.tags.joined(separator: ", ") ?? ""
+            annotationConfidence = annotation?.confidence ?? .unclassified
         }
     }
 }
