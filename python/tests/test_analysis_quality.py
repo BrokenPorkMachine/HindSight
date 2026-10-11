@@ -37,5 +37,12 @@ class AnalysisQualityContract(unittest.TestCase):
         for case in ['case "Analysis Quality"', 'case "Function Neighborhoods"', 'case "Tail-Call Candidates"']:
             self.assertIn(case, content)
 
+    def test_call_signature_evidence_keeps_abi_and_observations_separate(self):
+        source = WORKER.read_text()
+        body = source[source.index("fn call_argument_provenance"):source.index("fn annotated_disassembly")]
+        self.assertIn("AArch64 PCS signature evidence", body)
+        self.assertIn("return-register=x0", body)
+        self.assertIn("No source-level types or callee prototypes are inferred", body)
+
 if __name__ == "__main__":
     unittest.main()

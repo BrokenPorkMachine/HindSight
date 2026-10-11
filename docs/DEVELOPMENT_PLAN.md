@@ -24,7 +24,8 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 ### Phase 2 — Analysis quality and depth
 
 - [x] Add bounded compact-unwind metadata ingestion; DWARF/dSYM sections remain explicitly inventory-only.
-- [ ] Improve type, variable, and call-signature recovery.
+- [ ] Improve type and variable recovery.
+- [x] Add bounded AArch64 call-argument/return-register provenance; source-level types and callee prototypes remain explicit unknowns.
 - [x] Validate bounded executable-target pointer runs for jump-table triage; dispatch use and index bounds remain explicit unknowns.
 - [x] Add metadata-guided automatic ARM/Thumb control-flow transitions; register-indirect mode changes remain explicit unresolved evidence.
 - [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
@@ -67,4 +68,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, and metadata-guided mixed ARM/Thumb decoding are complete. Next loop: begin the next safe Phase 2 analysis-depth slice, prioritizing type, variable, or call-signature evidence recovery in the current worker.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, and bounded AArch64 call-register provenance are complete. Next loop: prioritize validated type/variable metadata recovery or the remaining non-ARM64 semantic lifting slice.
