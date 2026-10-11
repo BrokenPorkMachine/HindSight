@@ -417,9 +417,13 @@ struct ContentView: View {
                     }
                     HStack {
                         Button("Probe provider") { model.probeREAAgents() }
-                        Button("Run operation") { model.runREAOperation() }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        if model.reaOperationActive {
+                            Button("Cancel") { model.cancelREAOperation() }
+                        } else {
+                            Button("Run operation") { model.runREAOperation() }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
                     }
                     Text(model.reaStatus)
                         .font(.system(.caption, design: .monospaced))

@@ -397,8 +397,11 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     func reaProbe(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in reply(reaAgentHost.probe(requestJSON: requestJSON)) }
     }
-    func reaAnalyze(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(reaAgentHost.analyze(requestJSON: requestJSON)) }
+    func reaAnalyze(_ requestJSON: String, requestID: String, withReply reply: @escaping (String) -> Void) {
+        queue.async { [self] in reply(reaAgentHost.analyze(requestJSON: requestJSON, requestID: requestID)) }
+    }
+    func reaCancel(_ requestID: String, withReply reply: @escaping (Bool) -> Void) {
+        queue.async { [self] in reply(reaAgentHost.cancel(requestID: requestID)) }
     }
     func saveNote(_ recordID: String, expectedRevision: Int, text: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in

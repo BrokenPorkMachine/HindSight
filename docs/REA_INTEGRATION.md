@@ -24,7 +24,8 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 - [x] Add explicit target/provider selection for bounded overview, procedure, and name operations.
 - [ ] Add capability-aware operation selection for discovered providers.
 - [x] Add a dedicated REA Agent workspace with explicit target/provider controls.
-- [ ] Add progress history and retained evidence to the REA Agent workspace.
+- [x] Add explicit cancellation for active REA operations.
+- [ ] Add streamed progress history and retained evidence to the REA Agent workspace.
 - [ ] Import REA evidence into cases and the evidence graph with compatibility checks.
 - [ ] Add contract tests using deterministic MCP fixtures and release qualification coverage.
 

@@ -233,6 +233,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var reaTargetPath = ""
     @Published var reaOperation = "binary_overview"
     @Published var reaProvider = "auto"
+    @Published private(set) var reaOperationActive = false
+    private var reaRequestID = ""
     @Published var vectorEmuRegions = ""
     @Published var vectorEmuRaw = ""
     @Published var iphemeralExecutable = ""
@@ -701,13 +703,35 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             reaStatus = "Could not encode the REA operation request."
             return
         }
-        reaStatus = "Running REA (reaOperation)…"
+        let requestID = UUID().uuidString
+        reaRequestID = requestID
+        reaOperationActive = true
+        reaStatus = "Running REA \(reaOperation)…"
         client.request(timeout: 65, maxReplyBytes: 4 * 1024 * 1024, invalidateConnectionOnTimeout: false,
-                       operation: { $0.reaAnalyze(payload, withReply: $1) }) { [weak self] result in
+                       operation: { $0.reaAnalyze(payload, requestID: requestID, withReply: $1) }) { [weak self] result in
             guard let self else { return }
+            self.reaOperationActive = false
             switch result {
             case .success(let response): self.reaStatus = response
             case .failure(let error): self.reaStatus = "REA operation failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func cancelREAOperation() {
+        guard reaOperationActive, !reaRequestID.isEmpty else { return }
+        let requestID = reaRequestID
+        reaStatus = "Cancelling REA operation…"
+        client.request(timeout: 5, invalidateConnectionOnTimeout: false,
+                       operation: { service, reply in
+                           service.reaCancel(requestID) { cancelled in
+                               reply(cancelled ? "{\"ok\":true}" : "{\"ok\":false}")
+                           }
+                       }) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let response): self.reaStatus = response
+            case .failure(let error): self.reaStatus = "REA cancellation failed: \(error.localizedDescription)"
             }
         }
     }

@@ -41,6 +41,8 @@ private final class REAOutputReader {
 /// Bounded, one-shot MCP client for the optional local REA provider.
 final class REAAgentHost {
     private let maxLineBytes = 4 * 1024 * 1024
+    private let processLock = NSLock()
+    private var processes: [String: Process] = [:]
 
     func probe(requestJSON: String) -> String {
         guard let data = requestJSON.data(using: .utf8), data.count <= 64 * 1024,
@@ -50,7 +52,7 @@ final class REAAgentHost {
                    targetPath: nil, providerID: "auto", tool: nil, timeoutMS: validated.timeout_ms)
     }
 
-    func analyze(requestJSON: String) -> String {
+    func analyze(requestJSON: String, requestID: String) -> String {
         guard let data = requestJSON.data(using: .utf8), data.count <= 64 * 1024,
               let request = try? JSONDecoder().decode(REAOperationRequest.self, from: data),
               let validated = request.validated else { return failure("Invalid REA operation request.") }
@@ -59,11 +61,20 @@ final class REAAgentHost {
         }
         return run(executable: validated.executable, arguments: validated.arguments,
                    targetPath: validated.target_path, providerID: validated.provider_id,
-                   tool: validated.tool, timeoutMS: validated.timeout_ms)
+                   tool: validated.tool, timeoutMS: validated.timeout_ms, requestID: requestID)
+    }
+
+    func cancel(requestID: String) -> Bool {
+        processLock.lock()
+        let process = processes[requestID]
+        processLock.unlock()
+        guard let process, process.isRunning else { return false }
+        process.terminate()
+        return true
     }
 
     private func run(executable: String, arguments: [String], targetPath: String?, providerID: String,
-                     tool: String?, timeoutMS: Int) -> String {
+                     tool: String?, timeoutMS: Int, requestID: String? = nil) -> String {
         let process = Process()
         let input = Pipe()
         let output = Pipe()
@@ -73,8 +84,12 @@ final class REAAgentHost {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         do { try process.run() } catch { return failure("REA launch failed: \(error.localizedDescription)") }
+        if let requestID {
+            processLock.lock(); processes[requestID] = process; processLock.unlock()
+        }
         let reader = REAOutputReader(handle: output.fileHandleForReading)
         defer {
+            if let requestID { processLock.lock(); processes.removeValue(forKey: requestID); processLock.unlock() }
             input.fileHandleForWriting.closeFile()
             if process.isRunning { process.terminate() }
         }

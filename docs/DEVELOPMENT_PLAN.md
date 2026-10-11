@@ -73,7 +73,8 @@ Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a 
 - [x] Define a local-first REA/MCP integration boundary and evidence-provenance requirements.
 - [x] Add a coordinator-owned, bounded REA probe with explicit Settings opt-in.
 - [x] Add explicit target-scoped REA overview, procedure, and name operations.
-- [ ] Add streamed progress, cancellation, and retained evidence handles.
+- [x] Add coordinator-owned cancellation for active REA operations.
+- [ ] Add streamed progress and retained evidence handles.
 - [ ] Import REA evidence into HindSight cases and the evidence graph with compatibility checks.
 - [ ] Add deterministic MCP fixtures and release qualification coverage for the bridge.
 
