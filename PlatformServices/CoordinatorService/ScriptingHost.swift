@@ -16,6 +16,7 @@ final class ScriptingHost {
     static let maxPersistentBytes = 64 * 1024
     static let maxPluginPackageBytes = 16 * 1024 * 1024
     static let maxPluginPackageEntries = 2048
+    static let extensionPolicyDefaultsKey = "HindSight.extensions.mode.v1"
     static let governedCapabilities: Set<String> = [
         "selection.read", "analysis.read", "debugger.read", "settings.read", "state.read",
         "annotation.read", "data.read", "navigation.write", "breakpoint.write", "debugger.control",
@@ -23,6 +24,26 @@ final class ScriptingHost {
         "analysis.custom"
     ]
     private let fm = FileManager.default
+
+    private func extensionPolicyMode() -> String {
+        switch UserDefaults.standard.string(forKey: Self.extensionPolicyDefaultsKey) {
+        case "disabled": return "disabled"
+        case "verified-only": return "verified-only"
+        case "allow", nil: return "allow"
+        default: return "allow"
+        }
+    }
+
+    private func policyStatus(capabilities: [String], signatureStatus: String) -> String {
+        if let unknown = capabilities.first(where: { !Self.governedCapabilities.contains($0) }) {
+            return "unknown capability \(unknown)"
+        }
+        switch extensionPolicyMode() {
+        case "disabled": return "disabled by managed policy"
+        case "verified-only": return signatureStatus == "verified" ? "allowed" : "verified signature required"
+        default: return "allowed"
+        }
+    }
     // Fixed stripes bound lock-table memory even when an untrusted XPC client
     // sends arbitrarily many distinct plugin IDs.
     private let pluginLocks: [NSRecursiveLock] = (0..<64).map { _ in NSRecursiveLock() }
@@ -297,7 +318,7 @@ except BaseException:
         let signatureStatus=verifySignature(dir:dir)
         let trusted = signatureStatus == "verified" || fm.fileExists(atPath:pluginDataRoot(m.id).appendingPathComponent("trusted.json").path)
         let capabilities=Array((m.capabilities ?? []).prefix(48))
-        let policyStatus = capabilities.first(where: { !Self.governedCapabilities.contains($0) }).map { "unknown capability \($0)" } ?? "allowed"
+        let policyStatus = policyStatus(capabilities: capabilities, signatureStatus: signatureStatus)
         let annotations=loadAnnotations(pluginID:m.id)
         let customData=loadObject(pluginDataRoot(m.id).appendingPathComponent("custom-data.json"))
         return PluginInfo(id:m.id,name:String(m.name.prefix(120)),version:String(m.version.prefix(64)),api_version:m.api_version,entry:m.entry,capabilities:capabilities,events:Array((m.events ?? []).prefix(24)),commands:Array((m.commands ?? []).prefix(48)),panels:Array((m.panels ?? []).prefix(24)),settings:settings,settings_values:values,analysis_passes:Array((m.analysis_passes ?? []).prefix(24)),debugger_filter:m.debugger_filter,package_format:{

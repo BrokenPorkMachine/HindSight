@@ -10,10 +10,10 @@ The application preference domain is `ca.zensoftware.VectorGlass`. A managed dep
 | --- | --- | --- | --- |
 | `HindSight.preferred-layout.v1` | string | Initial layout preset | `Explore` |
 | `HindSight.enterprise.read-only.v1` | boolean | Reserved deployment control; unsupported values must be ignored | absent/false |
-| `HindSight.extensions.mode.v1` | string | Reserved extension policy control: `allow`, `verified-only`, or `disabled` | `allow` |
+| `HindSight.extensions.mode.v1` | string | Extension policy control: `allow`, `verified-only`, or `disabled` | `allow` |
 | `HindSight.diagnostics.opt-in.v1` | boolean | Permits future automated diagnostic collection; it does not upload data by itself | false |
 
-Unknown keys, malformed values, and unsupported policy values must fail closed to the local default. A managed preference must never silently grant an extension capability, debugger entitlement, target access, or external network authority. Until a corresponding key is implemented and surfaced in Support & Readiness, operators must treat it as documentation-only and use the visible local controls.
+Unknown keys, malformed values, and unsupported policy values fail closed to the local default. The Coordinator enforces `HindSight.extensions.mode.v1`: `disabled` blocks every extension, while `verified-only` permits only extensions with a valid Ed25519 package signature. A managed preference must never silently grant an extension capability, debugger entitlement, target access, or external network authority. The Extension Manager exposes the resulting local policy status for each discovered extension.
 
 The current application persists startup/layout state in bounded `UserDefaults` records and does not transmit preferences or diagnostics. `HindSight.preferred-layout.v1` is validated against the finite workspace-layout list before use; launch-session data is bounded to 32 KiB and recent projects to eight entries.
 

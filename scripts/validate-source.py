@@ -807,6 +807,7 @@ assert 'sys.modules["reworkbench"]=mod' in scripting  # migration compatibility 
 assert '.vgplugin' in scripting
 assert 'governedCapabilities' in scripting, 'extension capability policy is not explicit'
 assert 'policy_status' in scripting and 'blocked by local policy' in scripting, 'extension policy is not fail-closed at execution'
+assert 'HindSight.extensions.mode.v1' in scripting and 'verified-only' in scripting and 'disabled' in scripting, 'managed extension policy modes are not enforced'
 assert 'Local policy' in (R/'App/ContentView.swift').read_text(), 'extension policy status is not visible in the UI'
 runtime_host=(R/'PlatformServices/CoordinatorService/FirmwareRuntimeHost.swift').read_text()
 for token in ['SynchronousResult','BoundedOutputBuffer','readabilityHandler','SIGKILL','(200..<300).contains(http.statusCode)']:
