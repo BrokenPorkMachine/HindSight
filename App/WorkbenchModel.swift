@@ -755,7 +755,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
 
     private func pollREAProgress(requestID: String) {
         client.request(timeout: 3, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
-                       operation: { $0.reaProgress(requestID) { $1($0) } }) { [weak self] result in
+                       operation: { coordinator, reply in coordinator.reaProgress(requestID, withReply: reply) }) { [weak self] result in
             guard let self, case .success(let response) = result,
                   let data = response.data(using: .utf8),
                   let events = try? JSONDecoder().decode([String].self, from: data) else { return }
@@ -781,7 +781,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         if reaEvidence.count > 32 { reaEvidence.removeFirst(reaEvidence.count - 32) }
         let name = URL(fileURLWithPath: reaTargetPath).lastPathComponent
         recordLedger(kind: .reaEvidenceCaptured, provenance: .observed,
-                     detail: "Captured REA (reaOperation) evidence for (name) · SHA-256 (digest)\(identity.evidenceID.map { " · provider ID \($0)" } ?? "").")
+                     detail: "Captured REA (\(reaOperation)) evidence for \(name) · SHA-256 \(digest)\(identity.evidenceID.map { " · provider ID \($0)" } ?? "").")
     }
 
     private func reaIdentityFields(_ response: String) -> (evidenceID: String?, targetSHA256: String?, analysisProfileDigest: String?) {
