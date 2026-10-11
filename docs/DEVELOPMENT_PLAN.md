@@ -63,7 +63,7 @@ Acceptance: a clean install is understandable, testable, supportable, and distri
 - [x] Add a visible Support & Readiness center with build identity, Coordinator health, host capability status, and diagnostics actions.
 - [x] Add structured operation/error taxonomy with recovery guidance and support-safe export.
 - [x] Complete review decisions and conflict-safe handoff workflows; final decisions require rationale, exact baseline conflicts are explained/remediable, and case integrity manifests, bounded verification, and visible trust status are implemented.
-- [ ] Complete local policy and extension-governance surfaces; explicit capability allowlisting, blocked policy status, and fail-closed execution/enablement are implemented.
+- [x] Complete local policy and extension-governance surfaces; explicit capability allowlisting, managed policy modes, blocked policy status, and fail-closed execution/enablement are implemented.
 - [x] Document managed-defaults namespace and fail-closed expectations, signed-release-manifest requirements, bounded retention, and the opt-in/manual crash-diagnostics boundary.
 
 Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a local investigation without guessing which build, capability, policy, or evidence boundary is active.
@@ -78,9 +78,9 @@ Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a 
 - [x] Restore retained REA records during `.vgcase` import with hash validation.
 - [x] Add bounded streamed progress history and retained evidence handles.
 - [x] Gate REA operations on explicit provider capability reports when supplied.
-- [ ] Import REA evidence into HindSight cases and the evidence graph with compatibility checks.
+- [x] Import REA evidence into HindSight cases and the evidence graph with compatibility checks.
 - [x] Add deterministic MCP fixtures for handshake, capability gating, and progress retention.
-- [ ] Add release qualification coverage for the bridge.
+- [x] Add deterministic release-preflight qualification coverage for the bridge; real-provider qualification remains a manual release-host gate.
 
 Acceptance: an analyst can explicitly select a local target and REA operation, inspect bounded provider output, and retain the resulting evidence in a HindSight case without losing provenance or silently expanding scope.
 
