@@ -139,12 +139,13 @@ enum VGWorkspaceCatalog {
             ])
 
         add(.automation,
-            ["Python Console", "Plugins", "Automation SDK", "Extensions Platform", "Extension Manager"],
-            sidebar: ["Python Console", "Extensions Platform", "Extension Manager"],
+            ["Python Console", "Plugins", "Automation SDK", "REA Agent", "Extensions Platform", "Extension Manager"],
+            sidebar: ["Python Console", "REA Agent", "Extensions Platform", "Extension Manager"],
             subtitle: "Automate repeatable work and extend the workbench safely.",
             icon: "terminal",
             overrides: [
                 "Python Console": ("Python Console", "terminal"),
+                "REA Agent": ("REA Agent", "sparkles.rectangle.stack"),
                 "Extensions Platform": ("Extensions", "puzzlepiece.extension"),
                 "Extension Manager": ("Extension Manager", "checkmark.shield")
             ])
@@ -163,7 +164,7 @@ enum VGWorkspaceCatalog {
         return result
     }()
 
-    static let layouts = ["Explore", "Targets", "Code", "Binary Diff", "Analysis Triage", "Control Flow", "Data", "Deep Dive", "SSA Structure", "Apple Runtime", "Semantic RE", "Semantic Graph", "Runtime Linking", "Type Graph", "Evidence Graph", "Investigation Ledger", "Resolution Graph", "Pointer Auth", "Linker Evidence", "Import Resolution", "Linker Semantics", "Linkage Explorer", "Selected Symbol", "Debug", "Trace Explorer", "Runtime Correlation", "Dynamic Analysis", "Debug Triage", "Scripting", "Plugins", "Automation SDK", "Extensions Platform", "Extension Manager", "SoC Virtualization", "Hypervisor RE", "Firmware & Runtime", "dyld Cache", "IPSW Lab", "Machine Lab", "Software Emulation", "Notes"]
+    static let layouts = ["Explore", "Targets", "Code", "Binary Diff", "Analysis Triage", "Control Flow", "Data", "Deep Dive", "SSA Structure", "Apple Runtime", "Semantic RE", "Semantic Graph", "Runtime Linking", "Type Graph", "Evidence Graph", "Investigation Ledger", "Resolution Graph", "Pointer Auth", "Linker Evidence", "Import Resolution", "Linker Semantics", "Linkage Explorer", "Selected Symbol", "Debug", "Trace Explorer", "Runtime Correlation", "Dynamic Analysis", "Debug Triage", "Scripting", "Plugins", "Automation SDK", "REA Agent", "Extensions Platform", "Extension Manager", "SoC Virtualization", "Hypervisor RE", "Firmware & Runtime", "dyld Cache", "IPSW Lab", "Machine Lab", "Software Emulation", "Notes"]
 
     static var allNames: [String] { descriptors.map(\.name) }
 

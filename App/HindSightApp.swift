@@ -61,6 +61,7 @@ struct HindSightApp: App {
                     .help(VGHostPlatform.supportsArm64NativeDebugger ? "Open the native ARM64 debugger." : VGHostPlatform.unavailableReason(for: "Native ARM64 debugging"))
                 Button("VectorEmu") { model.workspace = "VectorEmu Lab" }
                     .keyboardShortcut("5", modifiers: .command)
+                Button("REA Agent") { model.workspace = "REA Agent" }
                 Divider()
                 Button("Notes") { model.workspace = "Notes" }
                     .keyboardShortcut("0", modifiers: .command)

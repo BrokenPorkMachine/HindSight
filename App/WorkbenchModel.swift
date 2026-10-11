@@ -90,6 +90,7 @@ final class WorkbenchModel: ObservableObject {
             case "Scripting": workspace = "Python Console"
             case "Plugins": workspace = "Plugins"
             case "Automation SDK": workspace = "Automation SDK"
+            case "REA Agent": workspace = "REA Agent"
             case "Extensions Platform": workspace = "Extensions Platform"
             case "Extension Manager": workspace = "Extension Manager"
             case "SoC Virtualization": workspace = "SoC Virtualization"

@@ -394,6 +394,47 @@ struct ContentView: View {
         }.onAppear { if model.plugins.isEmpty { model.refreshPlugins() } }
     }
 
+    @ViewBuilder private func reaAgentWorkspace() -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            GroupBox("REA Agent • Local MCP") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Run an explicit, local REA operation against one target. HindSight sends the selected path and provider directly to REA; it does not infer a broader target scope.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    TextField("Absolute target path", text: $model.reaTargetPath)
+                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        Picker("Operation", selection: $model.reaOperation) {
+                            Text("Binary overview").tag("binary_overview")
+                            Text("List procedures").tag("list_procedures")
+                            Text("List names").tag("list_names")
+                        }
+                        Picker("Provider", selection: $model.reaProvider) {
+                            Text("Automatic").tag("auto")
+                            Text("Hopper").tag("hopper")
+                            Text("Ghidra").tag("ghidra")
+                            Text("IDA").tag("ida")
+                        }
+                    }
+                    HStack {
+                        Button("Probe provider") { model.probeREAAgents() }
+                        Button("Run operation") { model.runREAOperation() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    Text(model.reaStatus)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }.padding(8)
+            }
+            GroupBox("Safety boundary") {
+                Text("Operations are opt-in, local, bounded, and provider-scoped. Full Evidence retention and progress history will be added after the transport contract is stable.")
+                    .font(.caption).foregroundStyle(.secondary).padding(8)
+            }
+            Spacer()
+        }
+    }
+
     @ViewBuilder private func extensionsPlatformWorkspace() -> some View {
         VStack(alignment: .leading, spacing: 12) {
             GroupBox("Extensions Platform • API v2") {
@@ -1815,6 +1856,8 @@ struct ContentView: View {
                 pluginsWorkspace()
             case "Automation SDK":
                 automationSDKWorkspace()
+            case "REA Agent":
+                reaAgentWorkspace()
             case "Extensions Platform":
                 extensionsPlatformWorkspace()
             case "Extension Manager":

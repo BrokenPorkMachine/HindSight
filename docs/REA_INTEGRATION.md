@@ -23,7 +23,8 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 - [x] Add initial provider discovery through REA's `binary_session` tool.
 - [x] Add explicit target/provider selection for bounded overview, procedure, and name operations.
 - [ ] Add capability-aware operation selection for discovered providers.
-- [ ] Add a dedicated REA Agent workspace with progress and retained evidence.
+- [x] Add a dedicated REA Agent workspace with explicit target/provider controls.
+- [ ] Add progress history and retained evidence to the REA Agent workspace.
 - [ ] Import REA evidence into cases and the evidence graph with compatibility checks.
 - [ ] Add contract tests using deterministic MCP fixtures and release qualification coverage.
 
