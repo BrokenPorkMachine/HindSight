@@ -79,6 +79,12 @@ def test_preferences_persist_bounded_startup_and_guidance_choices():
     assert 'Preferred layout' in app
     assert 'Show mentor guidance' in app
 
+def test_diagnostics_include_startup_pressure_context():
+    model = read('App/WorkbenchModel.swift')
+    assert 'startup_phase=' in model
+    assert 'startup_pressure=' in model
+    assert 'active_request=' in model
+
 def test_typecheck_and_release_gates_cover_both_architectures():
     for script in ('scripts/test-app-typecheck.sh', 'scripts/test-coordinator-typecheck.sh'):
         text = read(script)
