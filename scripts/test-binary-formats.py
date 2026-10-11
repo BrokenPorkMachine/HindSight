@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert 'fixture string' in a['strings'] and 'UTF16-LE' in a['strings'] and '漢字仮名' in a['strings']
         assert 'prologue candidate' in a['function_intelligence']
         assert 'epilogue candidate' in a['function_intelligence']
-        assert 'pointer-table candidate count=3' in a['jump_tables']
+        assert 'validated executable-target run count=3' in a['jump_tables']
         assert 'Section __TEXT.__const' in a['metadata']
         assert a['cfg'].startswith('block B0000 0x')
         assert len(a['summary'].encode())<32768

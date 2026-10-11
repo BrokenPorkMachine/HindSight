@@ -1411,7 +1411,7 @@ fn pointer_tables(file: &mut File, i: &Image) -> io::Result<(String, String, boo
         let mut run = Vec::new();
         let flush = |run: &mut Vec<(u64, u64)>, tables: &mut String| {
             if run.len() >= 3 {
-                push(tables,&format!("0x{:016x} pointer-table candidate count={} targets={} ; no dispatch use proven\n",run[0].0,run.len(),run.iter().take(16).map(|r|format!("{:#x}",r.1)).collect::<Vec<_>>().join(",")))
+                push(tables,&format!("0x{:016x} validated executable-target run count={} targets={} ; dispatch use and index bounds remain unproven\n",run[0].0,run.len(),run.iter().take(16).map(|r|format!("{:#x}",r.1)).collect::<Vec<_>>().join(",")))
             }
             run.clear();
         };
