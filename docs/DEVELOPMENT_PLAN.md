@@ -26,7 +26,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [x] Add bounded compact-unwind metadata ingestion; DWARF/dSYM sections remain explicitly inventory-only.
 - [ ] Improve type, variable, and call-signature recovery.
 - [x] Validate bounded executable-target pointer runs for jump-table triage; dispatch use and index bounds remain explicit unknowns.
-- [ ] Add automatic mixed ARM/Thumb control-flow transitions.
+- [ ] Add automatic mixed ARM/Thumb control-flow transitions; explicit Thumb-tagged target evidence is surfaced in validated pointer runs.
 - [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
 - [x] Add bounded IMG4/IM4P container inspection with compression-marker inventory; plaintext analysis remains explicit.
 - [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
