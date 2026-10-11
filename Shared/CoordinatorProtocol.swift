@@ -32,6 +32,7 @@ import Foundation
     func reaProbe(_ requestJSON: String, withReply reply: @escaping (String) -> Void)
     func reaAnalyze(_ requestJSON: String, requestID: String, withReply reply: @escaping (String) -> Void)
     func reaCancel(_ requestID: String, withReply reply: @escaping (Bool) -> Void)
+    func reaProgress(_ requestID: String, withReply reply: @escaping (String) -> Void)
     func saveNote(_ recordID: String, expectedRevision: Int, text: String, withReply reply: @escaping (String) -> Void)
 }
 enum ServiceIdentity { static let coordinator = "ca.zensoftware.VectorGlass.CoordinatorService" }

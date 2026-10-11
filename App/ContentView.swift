@@ -432,8 +432,22 @@ struct ContentView: View {
                 }.padding(8)
             }
             GroupBox("Safety boundary") {
-                Text("Operations are opt-in, local, bounded, and provider-scoped. Results are retained with a SHA-256 identity in the current case export; streamed progress and full Evidence views remain next.")
+                    Text("Operations are opt-in, local, bounded, and provider-scoped. Results are retained with a SHA-256 identity in the current case export. Live provider progress is request-scoped and bounded.")
                     .font(.caption).foregroundStyle(.secondary).padding(8)
+            }
+            if !model.reaProgressHistory.isEmpty {
+                GroupBox("Live operation history") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(model.reaProgressHistory.enumerated()), id: \.offset) { _, event in
+                                Label(event, systemImage: "arrow.right.circle")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 150).padding(8)
+                }
             }
             if !model.reaEvidence.isEmpty {
                 GroupBox("Retained REA evidence") {

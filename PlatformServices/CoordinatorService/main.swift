@@ -137,6 +137,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let reaAgentHost = REAAgentHost()
     private let firmwareLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.firmware", qos: .utility, maxConcurrent: 1, maxPending: 16, reservationBytes: 192 * 1_048_576)
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
+    private let reaLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.rea", qos: .utility, maxConcurrent: 1, maxPending: 4, reservationBytes: 128 * 1_048_576)
     private let analysisCacheEngineVersion = "arm64-analysis-v15-schema71"
     private let analysisCacheProducerVersion = "0.5.7"
     private let compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]
@@ -395,13 +396,16 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         firmwareLane.submit(priority: .initiated, reply: reply) { [firmwareRuntimeHost] in firmwareRuntimeHost.command(requestJSON) }
     }
     func reaProbe(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(reaAgentHost.probe(requestJSON: requestJSON)) }
+        reaLane.submit(priority: .initiated, reply: reply) { [reaAgentHost] in reaAgentHost.probe(requestJSON: requestJSON) }
     }
     func reaAnalyze(_ requestJSON: String, requestID: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(reaAgentHost.analyze(requestJSON: requestJSON, requestID: requestID)) }
+        reaLane.submit(priority: .initiated, reply: reply) { [reaAgentHost] in reaAgentHost.analyze(requestJSON: requestJSON, requestID: requestID) }
     }
     func reaCancel(_ requestID: String, withReply reply: @escaping (Bool) -> Void) {
-        queue.async { [self] in reply(reaAgentHost.cancel(requestID: requestID)) }
+        reply(reaAgentHost.cancel(requestID: requestID))
+    }
+    func reaProgress(_ requestID: String, withReply reply: @escaping (String) -> Void) {
+        reply(reaAgentHost.progress(requestID: requestID))
     }
     func saveNote(_ recordID: String, expectedRevision: Int, text: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in
@@ -411,7 +415,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
     }
-    func disconnect() { queue.async { [self] in supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); debugServer.shutdown(); pageCache.clear(); store = nil } }
+    func disconnect() { queue.async { [self] in supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); reaLane.cancelQueued(); debugServer.shutdown(); pageCache.clear(); store = nil } }
 }
 final class ServiceDelegate: NSObject, NSXPCListenerDelegate {
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {

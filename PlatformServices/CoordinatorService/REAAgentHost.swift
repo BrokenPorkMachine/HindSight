@@ -5,6 +5,7 @@ private final class REAOutputReader {
     private let lock = NSLock()
     private let signal = DispatchSemaphore(value: 0)
     private var buffer = Data()
+    private var reachedEOF = false
 
     init(handle: FileHandle) {
         self.handle = handle
@@ -13,6 +14,7 @@ private final class REAOutputReader {
             let chunk = handle.availableData
             self.lock.lock()
             if !chunk.isEmpty { self.buffer.append(chunk) }
+            else { self.reachedEOF = true }
             self.lock.unlock()
             self.signal.signal()
         }
@@ -29,7 +31,9 @@ private final class REAOutputReader {
                 return line
             }
             let size = buffer.count
+            let eof = reachedEOF
             lock.unlock()
+            if eof { return nil }
             if size > maxBytes { return nil }
             let remaining = max(0, deadline.timeIntervalSinceNow)
             guard signal.wait(timeout: .now() + remaining) == .success else { return nil }
@@ -43,6 +47,7 @@ final class REAAgentHost {
     private let maxLineBytes = 4 * 1024 * 1024
     private let processLock = NSLock()
     private var processes: [String: Process] = [:]
+    private var progressHistory: [String: [String]] = [:]
 
     func probe(requestJSON: String) -> String {
         guard let data = requestJSON.data(using: .utf8), data.count <= 64 * 1024,
@@ -62,6 +67,15 @@ final class REAAgentHost {
         return run(executable: validated.executable, arguments: validated.arguments,
                    targetPath: validated.target_path, providerID: validated.provider_id,
                    tool: validated.tool, timeoutMS: validated.timeout_ms, requestID: requestID)
+    }
+
+    func progress(requestID: String) -> String {
+        processLock.lock()
+        let events = progressHistory[requestID] ?? []
+        processLock.unlock()
+        guard let data = try? JSONSerialization.data(withJSONObject: events, options: []),
+              let text = String(data: data, encoding: .utf8) else { return "[]" }
+        return text
     }
 
     func cancel(requestID: String) -> Bool {
@@ -85,7 +99,13 @@ final class REAAgentHost {
         process.arguments = arguments
         do { try process.run() } catch { return failure("REA launch failed: \(error.localizedDescription)") }
         if let requestID {
-            processLock.lock(); processes[requestID] = process; processLock.unlock()
+            processLock.lock()
+            processes[requestID] = process
+            progressHistory[requestID] = ["Launching local REA MCP server."]
+            if progressHistory.count > 16, let oldest = progressHistory.keys.first, oldest != requestID {
+                progressHistory.removeValue(forKey: oldest)
+            }
+            processLock.unlock()
         }
         let reader = REAOutputReader(handle: output.fileHandleForReading)
         defer {
@@ -102,7 +122,7 @@ final class REAAgentHost {
                 "protocolVersion": "2025-06-18", "capabilities": [String: Any](),
                 "clientInfo": ["name": "HindSight", "version": "0.5.7"]
             ]), to: input)
-            guard let initialize = try readResponse(id: initializeID, from: reader, until: deadline) else {
+            guard let initialize = try readResponse(id: initializeID, from: reader, until: deadline, requestID: requestID) else {
                 return failure("REA initialize timed out or returned no response.")
             }
             guard initialize["error"] == nil else { return response(initialize, method: "initialize") }
@@ -112,7 +132,7 @@ final class REAAgentHost {
             try write(Self.message(id: sessionID, method: "tools/call", params: [
                 "name": "binary_session", "arguments": [String: Any]()
             ]), to: input)
-            guard let session = try readResponse(id: sessionID, from: reader, until: deadline) else {
+            guard let session = try readResponse(id: sessionID, from: reader, until: deadline, requestID: requestID) else {
                 return failure("REA binary_session timed out or returned no response.")
             }
             guard session["error"] == nil else { return response(session, method: "binary_session") }
@@ -122,7 +142,7 @@ final class REAAgentHost {
             try write(Self.message(id: openID, method: "tools/call", params: [
                 "name": "open_binary", "arguments": ["path": targetPath, "provider_id": providerID]
             ]), to: input)
-            guard let opened = try readResponse(id: openID, from: reader, until: deadline) else {
+            guard let opened = try readResponse(id: openID, from: reader, until: deadline, requestID: requestID) else {
                 return failure("REA open_binary timed out or returned no response.")
             }
             guard opened["error"] == nil else { return response(opened, method: "open_binary") }
@@ -132,7 +152,7 @@ final class REAAgentHost {
                 "name": tool, "arguments": [String: Any](),
                 "_meta": ["progressToken": "hindsight-\(operationID)"]
             ]), to: input)
-            guard let result = try readResponse(id: operationID, from: reader, until: deadline) else {
+            guard let result = try readResponse(id: operationID, from: reader, until: deadline, requestID: requestID) else {
                 return failure("REA \(tool) timed out or returned no response.")
             }
             return response(result, method: tool)
@@ -145,10 +165,30 @@ final class REAAgentHost {
         pipe.fileHandleForWriting.write(Data([10]))
     }
 
-    private func readResponse(id: Int, from reader: REAOutputReader, until deadline: Date) throws -> [String: Any]? {
+    private func readResponse(id: Int, from reader: REAOutputReader, until deadline: Date, requestID: String?) throws -> [String: Any]? {
         while let line = reader.nextLine(until: deadline, maxBytes: maxLineBytes) {
             guard !line.isEmpty, let object = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
             if let responseID = object["id"] as? Int, responseID == id { return object }
+            if let requestID, let method = object["method"] as? String, method == "notifications/progress" {
+                let summary: String
+                if let params = object["params"] as? [String: Any],
+                   let message = params["message"] as? String, !message.isEmpty {
+                    summary = message
+                } else if let params = object["params"] as? [String: Any],
+                          let progress = params["progress"] {
+                    let total = params["total"].map { "/\($0)" } ?? ""
+                    summary = "Progress \(progress)\(total)"
+                } else {
+                    summary = "REA provider progress notification received."
+                }
+                processLock.lock()
+                var events = progressHistory[requestID] ?? []
+                let bounded = String(summary.prefix(512))
+                if events.last != bounded { events.append(bounded) }
+                if events.count > 64 { events.removeFirst(events.count - 64) }
+                progressHistory[requestID] = events
+                processLock.unlock()
+            }
         }
         return nil
     }

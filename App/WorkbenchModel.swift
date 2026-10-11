@@ -236,6 +236,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var reaProvider = "auto"
     @Published private(set) var reaOperationActive = false
     @Published private(set) var reaEvidence: [VGREAAgentEvidence] = []
+    @Published private(set) var reaProgressHistory: [String] = []
     private var reaRequestID = ""
     @Published var vectorEmuRegions = ""
     @Published var vectorEmuRaw = ""
@@ -245,6 +246,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var iphemeralRunning = false
     @Published var iphemeralOutput = ""
     private var debugPollTimer: Timer?
+    private var reaProgressTimer: Timer?
     private var analysisMonitorTask: Task<Void, Never>?
     private var evidenceIndexTask: Task<Void, Never>?
     private var evidenceIndexRecordID: String?
@@ -708,17 +710,43 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         let requestID = UUID().uuidString
         reaRequestID = requestID
         reaOperationActive = true
+        reaProgressHistory = []
+        startREAProgressPolling(requestID: requestID)
         reaStatus = "Running REA \(reaOperation)…"
         client.request(timeout: 65, maxReplyBytes: 4 * 1024 * 1024, invalidateConnectionOnTimeout: false,
                        operation: { $0.reaAnalyze(payload, requestID: requestID, withReply: $1) }) { [weak self] result in
             guard let self else { return }
             self.reaOperationActive = false
+            self.stopREAProgressPolling()
+            self.pollREAProgress(requestID: requestID)
             switch result {
             case .success(let response):
                 self.reaStatus = response
                 self.captureREAResponse(response, requestID: requestID)
             case .failure(let error): self.reaStatus = "REA operation failed: \(error.localizedDescription)"
             }
+        }
+    }
+
+    private func startREAProgressPolling(requestID: String) {
+        stopREAProgressPolling()
+        reaProgressTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pollREAProgress(requestID: requestID) }
+        }
+    }
+
+    private func stopREAProgressPolling() {
+        reaProgressTimer?.invalidate()
+        reaProgressTimer = nil
+    }
+
+    private func pollREAProgress(requestID: String) {
+        client.request(timeout: 3, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.reaProgress(requestID) { $1($0) } }) { [weak self] result in
+            guard let self, case .success(let response) = result,
+                  let data = response.data(using: .utf8),
+                  let events = try? JSONDecoder().decode([String].self, from: data) else { return }
+            self.reaProgressHistory = Array(events.suffix(64))
         }
     }
 
