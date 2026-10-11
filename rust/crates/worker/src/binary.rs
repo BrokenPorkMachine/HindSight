@@ -1909,6 +1909,36 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     }
     let (strings, strings_limited) = strings(&mut file, &image)?;
     let (pointers, tables, tables_limited) = pointer_tables(&mut file, &image)?;
+    let mut thumb_ranges = Vec::<(u64, u64)>::new();
+    if image.arch == Arch::Arm {
+        for symbol in symbols.iter().filter(|s| s.desc & 8 != 0 && s.section != 0) {
+            let section = &image.sections[symbol.section as usize - 1];
+            let start = symbol.address & !1;
+            if !section.executable || !section.contains(start) {
+                continue;
+            }
+            let end = functions
+                .keys()
+                .copied()
+                .filter(|address| *address > start && section.contains(*address))
+                .min()
+                .unwrap_or(section.address + section.size);
+            if end > start {
+                thumb_ranges.push((start, end));
+            }
+        }
+        thumb_ranges.sort_unstable();
+        thumb_ranges.dedup();
+    }
+    if !thumb_ranges.is_empty() {
+        push(
+            &mut metadata,
+            &format!(
+                "Mixed ARM/Thumb decode: {} metadata-marked Thumb range(s) selected; register-indirect mode changes remain unresolved.\n",
+                thumb_ranges.len()
+            ),
+        );
+    }
     let no_code = Section::default();
     let s = image
         .code
@@ -1936,7 +1966,9 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         }
     };
     if ready.is_ok() {
-        let decoder = Decoder::new(image.arch)?;
+        let arm_decoder = Decoder::new(Arch::Arm)?;
+        let thumb_decoder = Decoder::new(Arch::Thumb)?;
+        let primary_decoder = Decoder::new(image.arch)?;
         let ranges = data_ranges(&mut file, &image)?;
         let n = s.size.min(SCAN as u64) as usize;
         scan_bytes = n;
@@ -1958,17 +1990,32 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             }
             let pc = s.address + at as u64;
             let pos = s.offset + at as u64;
+            let mode = if image.arch == Arch::Arm
+                && thumb_ranges.iter().any(|(lo, hi)| pc >= *lo && pc < *hi)
+            {
+                Arch::Thumb
+            } else {
+                image.arch
+            };
+            let decoder = if image.arch == Arch::Arm && mode == Arch::Thumb {
+                &thumb_decoder
+            } else if image.arch == Arch::Arm {
+                &arm_decoder
+            } else {
+                &primary_decoder
+            };
+            let unit = mode.unit();
             let in_data = ranges
                 .iter()
-                .any(|&(lo, hi)| pos < hi && pos + image.arch.unit() > lo);
+                .any(|&(lo, hi)| pos < hi && pos + unit > lo);
             let (n, text, known) = if in_data {
                 (
-                    (image.arch.unit() as usize).min(code.len() - at),
+                    (unit as usize).min(code.len() - at),
                     ".data-in-code".into(),
                     false,
                 )
             } else {
-                decoder.instruction(&code[at..], pc, image.arch)
+                decoder.instruction(&code[at..], pc, mode)
             };
             let known = known
                 && !ranges
@@ -1976,7 +2023,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
                     .any(|&(lo, hi)| pos < hi && pos + n as u64 > lo);
             if known {
                 decode_count += 1;
-                if prologue(image.arch, &code[at..], &text) {
+                if prologue(mode, &code[at..], &text) {
                     functions
                         .entry(pc)
                         .or_insert((format!("sub_{pc:x}"), "prologue candidate".into()));
@@ -2001,11 +2048,11 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             };
             let bytes = code[at..at + n].to_vec();
             let transfer = if known {
-                branch(image.arch, &bytes, pc)
+                branch(mode, &bytes, pc)
             } else {
                 None
             };
-            let ret = known && return_instruction(image.arch, &bytes, &text);
+            let ret = known && return_instruction(mode, &bytes, &text);
             let op = text.split_whitespace().next().unwrap_or("");
             let unknown_transfer = transfer.is_none()
                 && (matches!(

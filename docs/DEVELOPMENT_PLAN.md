@@ -26,7 +26,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [x] Add bounded compact-unwind metadata ingestion; DWARF/dSYM sections remain explicitly inventory-only.
 - [ ] Improve type, variable, and call-signature recovery.
 - [x] Validate bounded executable-target pointer runs for jump-table triage; dispatch use and index bounds remain explicit unknowns.
-- [ ] Add automatic mixed ARM/Thumb control-flow transitions; explicit Thumb-tagged target evidence is surfaced in validated pointer runs.
+- [x] Add metadata-guided automatic ARM/Thumb control-flow transitions; register-indirect mode changes remain explicit unresolved evidence.
 - [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
 - [x] Add bounded IMG4/IM4P container inspection with compression-marker inventory; plaintext analysis remains explicit.
 - [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
@@ -67,4 +67,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, and executable-target pointer-run validation are complete. Next loop: begin the next safe Phase 2 analysis-depth slice, prioritizing automatic mixed ARM/Thumb control-flow transitions in the current worker.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, and metadata-guided mixed ARM/Thumb decoding are complete. Next loop: begin the next safe Phase 2 analysis-depth slice, prioritizing type, variable, or call-signature evidence recovery in the current worker.

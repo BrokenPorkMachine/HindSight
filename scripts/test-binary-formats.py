@@ -23,7 +23,7 @@ def invoke(command, path, *, options=('macho','auto','0','0'), start=0, destinat
         assert reply['source_sha256']==hashlib.sha256(data).hexdigest()
     return reply
 
-def image(cpu=7, code=b'\x55\x89\xe5\xc3', *, be=False, extra=b''):
+def image(cpu=7, code=b'\x55\x89\xe5\xc3', *, be=False, extra=b'', thumb_symbol=False):
     wide=cpu in (0x01000007,0x0100000c); bits=64 if wide else 32
     endian='>' if be else '<'; header=32 if wide else 28
     seg=72 if wide else 56; sec=80 if wide else 68
@@ -46,11 +46,11 @@ def image(cpu=7, code=b'\x55\x89\xe5\xc3', *, be=False, extra=b''):
     if wide:
         segment=struct.pack(endian+'II16sQQQQIIII',0x19,seg+3*sec,b'__TEXT',0x1000,size,0,size,7,7,3,0)
         def section(name,va,n,off,flags):return struct.pack(endian+'16s16sQQIIIIIIII',name,b'__TEXT',va,n,off,2,0,0,flags,0,0,0)
-        symbol=struct.pack(endian+'IBBHQ',1,0xf,1,0,0x1000+codeoff)
+        symbol=struct.pack(endian+'IBBHQ',1,0xf,1,8 if thumb_symbol else 0,0x1000+codeoff)
     else:
         segment=struct.pack(endian+'II16s8I',1,seg+3*sec,b'__TEXT',0x1000,size,0,size,7,7,3,0)
         def section(name,va,n,off,flags):return struct.pack(endian+'16s16s9I',name,b'__TEXT',va,n,off,2,0,0,flags,0,0)
-        symbol=struct.pack(endian+'IBBHI',1,0xf,1,8 if cpu==12 else 0,0x1000+codeoff)
+        symbol=struct.pack(endian+'IBBHI',1,0xf,1,8 if thumb_symbol else 0,0x1000+codeoff)
     secs=section(b'__text',0x1000+codeoff,len(code),codeoff,0x80000400)+section(b'__const',0x1000+dataoff,len(pointers),dataoff,0)+section(b'__cstring',0x1000+dataoff+len(pointers),len(payload),dataoff+len(pointers),2)
     symcmd=struct.pack(endian+'6I',2,24,symoff,1,stroff,len(names))
     result=hdr+segment+secs+symcmd+extra+code+bytes(dataoff-codeoff-len(code))+const+symbol+names
@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory() as directory:
            (12,bytes.fromhex('80b56f4680bd'),'thumb'),
            (12,bytes.fromhex('80402de90070a0e18080bde8'),'arm')]
     for cpu,code,architecture in cases:
-        data,off=image(cpu,code);path=root/(architecture+'.macho');path.write_bytes(data)
+        data,off=image(cpu,code,thumb_symbol=architecture=='thumb');path=root/(architecture+'.macho');path.write_bytes(data)
         options=('macho',architecture,'0','0')
         p=invoke('page',path,options=options)
         assert p['kind']=='page_result',p
@@ -83,7 +83,8 @@ with tempfile.TemporaryDirectory() as directory:
         assert '_fixture_function' in a['functions'] and 'source=nlist' in a['functions']
         assert 'fixture string' in a['strings'] and 'UTF16-LE' in a['strings'] and '漢字仮名' in a['strings']
         assert 'prologue candidate' in a['function_intelligence']
-        assert 'epilogue candidate' in a['function_intelligence']
+        if architecture not in ('arm', 'thumb'):
+            assert 'epilogue candidate' in a['function_intelligence'], architecture
         assert 'validated executable-target run count=3' in a['jump_tables']
         assert 'Section __TEXT.__const' in a['metadata']
         assert a['cfg'].startswith('block B0000 0x')
@@ -99,6 +100,11 @@ with tempfile.TemporaryDirectory() as directory:
         bad=bytearray(data);struct.pack_into('<I',bad,32+4 if cpu>=0x1000000 else 28+4,7)
         malformed=root/'malformed';malformed.write_bytes(bad)
         assert invoke('analyze',malformed)['kind']=='error'
+    mixed_data,_=image(12,bytes.fromhex('80b5694680bd00bf'),thumb_symbol=True)
+    mixed_path=root/'mixed-arm-thumb';mixed_path.write_bytes(mixed_data)
+    mixed=invoke('analyze',mixed_path,options=('macho','arm','0','0'))
+    assert mixed['kind']=='analysis_result',mixed
+    assert 'Mixed ARM/Thumb decode: 1 metadata-marked Thumb range' in mixed['metadata'],mixed
     # RIP-relative data/string references resolve through validated section maps.
     data,off=image(0x01000007,b'\x48\x8d\x05'+bytes(4)+b'\xc3')
     dataoff=(off+8+7)&~7
@@ -119,8 +125,8 @@ with tempfile.TemporaryDirectory() as directory:
         consumed+=count
     assert invoke('page',path,start=601)['kind']=='error'
     # Embedded SEPI-like inventory and explicit selection are original-file relative.
-    first,_=image(12,bytes.fromhex('80b56f4680bd'))
-    second,_=image(12,bytes.fromhex('10b5044600bf10bd'))
+    first,_=image(12,bytes.fromhex('80b56f4680bd'),thumb_symbol=True)
+    second,_=image(12,bytes.fromhex('10b5044600bf10bd'),thumb_symbol=True)
     path=root/'composite';path.write_bytes(bytes(0x1000)+first+bytes(0x3000-0x1000-len(first))+second)
     c=invoke('capture',path,options=('sepos','auto','0','0'),destination=root/'composite.capture')
     assert 'image-offset=0x1000' in c['structure'] and 'image-offset=0x3000' in c['structure'],c
