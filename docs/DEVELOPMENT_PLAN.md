@@ -54,7 +54,7 @@ Acceptance: an analyst can connect a static finding to a reproducible runtime ob
 - [x] Add workspace-level help and unsupported-capability explanations.
 - [x] Add bounded recent-project management with stale-path cleanup and persisted startup/layout preferences.
 - [x] Add explicit compact, medium, and wide adaptive-layout modes with source-level regression coverage for the shared pane primitive.
-- [ ] Complete signing, notarization, release-host, memory-pressure, and crash-diagnostics gates.
+- [ ] Complete signing, notarization, release-host, memory-pressure, and crash-diagnostics gates. Source-side identity, crash parser, startup-pressure, universal-slice, and gate-coverage checks pass; Developer ID/notary credentials and real-host qualification remain required.
 
 Acceptance: a clean install is understandable, testable, supportable, and distributable on supported macOS hosts.
 

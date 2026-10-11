@@ -21,6 +21,15 @@ class CompletionAuditTests(unittest.TestCase):
         self.assertIn("0.5.7", server)
         self.assertIn('version = "0.5.7"', cargo)
 
+    def test_release_readiness_matches_active_identity(self):
+        readiness = self.read("docs/RELEASE_READINESS.md")
+        release_script = self.read("scripts/test-release-macos.sh")
+        self.assertIn("HindSight 0.5.7", readiness)
+        self.assertIn("bundle build is `5700`", readiness)
+        self.assertNotIn("0.5.0", readiness)
+        self.assertIn('expected stable version 0.5.7', release_script)
+        self.assertIn('expected build 5700', release_script)
+
     def test_hfsplus_reader_is_not_a_placeholder(self):
         src = self.read("Engines/VectorEmu/crates/iphem-devices/src/hfsplus.rs")
         self.assertIn("fn parse_catalog_records", src)

@@ -44,6 +44,13 @@ class ReleaseGateCoverageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown generated target", result.stderr)
 
+    def test_runtime_contract_includes_case_event_dependency(self):
+        validator = (ROOT / "scripts/validate-source.py").read_text()
+        runtime_block = validator.split("vectorglass-runtime-correlation-", 1)[1].split("vectorglass-trace-explorer-", 1)[0]
+        self.assertIn("App/InvestigationLedgerModel.swift", runtime_block)
+        trace_block = validator.split("vectorglass-trace-explorer-", 1)[1].split("vectorglass-evidence-graph-", 1)[0]
+        self.assertIn("App/InvestigationLedgerModel.swift", trace_block)
+
 
 if __name__ == "__main__":
     unittest.main()

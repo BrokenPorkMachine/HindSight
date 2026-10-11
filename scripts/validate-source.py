@@ -910,11 +910,11 @@ if swiftc:
         subprocess.run([str(exe)],check=True)
     with tempfile.TemporaryDirectory(prefix='vectorglass-runtime-correlation-') as tmp:
         exe=pathlib.Path(tmp)/'runtime-correlation-contract'
-        subprocess.run([swiftc,str(R/'Shared/TargetModel.swift'),str(R/'Shared/DebugMessages.swift'),str(R/'App/GraphModel.swift'),str(R/'App/RuntimeCorrelationModel.swift'),str(R/'Tests/runtime_correlation_contract.swift'),'-o',str(exe)],check=True)
+        subprocess.run([swiftc,str(R/'Shared/TargetModel.swift'),str(R/'Shared/DebugMessages.swift'),str(R/'App/GraphModel.swift'),str(R/'App/InvestigationLedgerModel.swift'),str(R/'App/RuntimeCorrelationModel.swift'),str(R/'Tests/runtime_correlation_contract.swift'),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
     with tempfile.TemporaryDirectory(prefix='vectorglass-trace-explorer-') as tmp:
         exe=pathlib.Path(tmp)/'trace-explorer-contract'
-        subprocess.run([swiftc,str(R/'Shared/TargetModel.swift'),str(R/'Shared/DebugMessages.swift'),str(R/'App/DisassemblyModel.swift'),str(R/'App/GraphModel.swift'),str(R/'App/RuntimeCorrelationModel.swift'),str(R/'App/TraceExplorerModel.swift'),str(R/'Tests/trace_explorer_contract.swift'),'-o',str(exe)],check=True)
+        subprocess.run([swiftc,str(R/'Shared/TargetModel.swift'),str(R/'Shared/DebugMessages.swift'),str(R/'App/DisassemblyModel.swift'),str(R/'App/GraphModel.swift'),str(R/'App/InvestigationLedgerModel.swift'),str(R/'App/RuntimeCorrelationModel.swift'),str(R/'App/TraceExplorerModel.swift'),str(R/'Tests/trace_explorer_contract.swift'),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
     with tempfile.TemporaryDirectory(prefix='vectorglass-evidence-graph-') as tmp:
         exe=pathlib.Path(tmp)/'evidence-graph-contract'
