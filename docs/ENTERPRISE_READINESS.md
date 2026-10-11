@@ -25,7 +25,8 @@ management, or shared collaboration without an enterprise service boundary.
 - [x] Surface product version, channel, host capability, coordinator health, and
   diagnostics actions in Settings.
 - [ ] Add structured operation/error taxonomy with recovery guidance.
-- [ ] Add support-bundle export with redaction preview and explicit consent.
+- [x] Add support-safe diagnostics export with explicit user-selected destination.
+- [ ] Add full support-bundle export with redaction preview and explicit consent.
 - [ ] Add case integrity manifest and verification status to every export.
 - [ ] Add startup, memory-pressure, crash, and worker-health history to support
   diagnostics without collecting target-file contents.

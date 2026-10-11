@@ -1840,6 +1840,20 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         status = "Diagnostics copied to the clipboard."
     }
 
+    func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.title = "Export HindSight Diagnostics"
+        panel.nameFieldStringValue = "HindSight-diagnostics.txt"
+        panel.allowedContentTypes = [.plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try Data(diagnosticsText().utf8).write(to: url, options: .atomic)
+            status = "Diagnostics exported to (url.lastPathComponent)."
+        } catch {
+            status = "Diagnostics export failed: (error.localizedDescription)"
+        }
+    }
+
     private func firstHexAddress(in text: String) -> UInt64? {
         guard let range = text.range(
             of: #"(?i)\b0x[0-9a-f]{1,16}\b"#,

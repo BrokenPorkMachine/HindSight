@@ -100,6 +100,7 @@ private struct HindSightSettingsView: View {
                 Divider()
                 HStack {
                     Button("Copy diagnostics") { model.copyDiagnostics() }
+                    Button("Export diagnostics…") { model.exportDiagnostics() }
                     Button("Reconnect Coordinator") { model.reconnect() }
                         .disabled(model.busy || model.connectingToCoordinator || model.restoringProjectSession)
                 }
