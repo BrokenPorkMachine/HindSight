@@ -62,7 +62,7 @@ fn build_target(soc: SoCId, rom: &[u8]) -> Result<Machine, String> {
 }
 
 fn help() {
-    println!("HindSight VectorEmu 0.5.8\n\nUsage:\n  vg-emu-server --rom PATH [--soc t8020] [--port 37920]\n\nThe server binds only to 127.0.0.1 and starts paused. It accepts the\nnewline-delimited JSON debugger protocol documented in docs/VECTOREMU_PROTOCOL.md.");
+    println!("HindSight VectorEmu 0.5.9\n\nUsage:\n  vg-emu-server --rom PATH [--soc t8020] [--port 37920]\n\nThe server binds only to 127.0.0.1 and starts paused. It accepts the\nnewline-delimited JSON debugger protocol documented in docs/VECTOREMU_PROTOCOL.md.");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--rom" if index + 1 < args.len() => { rom = Some(args[index + 1].clone()); index += 2; }
             "--soc" if index + 1 < args.len() => { soc = parse_soc(&args[index + 1])?; index += 2; }
             "--port" if index + 1 < args.len() => { port = args[index + 1].parse()?; index += 2; }
-            "--version" => { println!("vg-emu-server 0.5.8"); return Ok(()); }
+            "--version" => { println!("vg-emu-server 0.5.9"); return Ok(()); }
             "--help" | "-h" => { help(); return Ok(()); }
             other => return Err(format!("unknown argument: {other}").into()),
         }

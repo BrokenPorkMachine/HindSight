@@ -7,6 +7,11 @@
 - Bound SwiftUI workspace type expansion to fix the reproduced Swift 6.4 SIL-generation crash in ContentView.
 - Regenerate consistent build settings and add clean, commit-based source recreation without Git metadata, DerivedData, or Xcode user state.
 
+# 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses
+
+- Add bounded Apple firmware container/codec detection and macOS Compression.framework decoding for LZFSE, LZ4, LZMA, and zlib, plus guarded legacy `complzss`/LZSS handling.
+- Add heuristic XNU/SEP kernel function-name candidates from nearby strings with explicit provenance.
+
 # 0.5.8 — Pressure-Aware Launch and Enterprise Operations
 
 - Add pressure-aware startup deferral with explicit manual-connect recovery.

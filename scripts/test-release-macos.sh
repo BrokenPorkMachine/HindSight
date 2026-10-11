@@ -11,9 +11,9 @@ source "$(dirname "$0")/common.sh"
 app="$ROOT/build/DerivedData/Build/Products/Release/HindSight.app"
 version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
 build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
-[[ "$version" == "0.5.8" ]] || { echo "error: expected stable version 0.5.8, got $version" >&2; exit 1; }
-[[ "$build" == "5800" ]] || { echo "error: expected build 5800, got $build" >&2; exit 1; }
+[[ "$version" == "0.5.9" ]] || { echo "error: expected stable version 0.5.9, got $version" >&2; exit 1; }
+[[ "$build" == "5900" ]] || { echo "error: expected build 5900, got $build" >&2; exit 1; }
 xcrun stapler validate "$app"
 printf '%s\n' \
-  "HindSight Research Tool 0.5.8 stable release-host gates passed." \
+  "HindSight Research Tool 0.5.9 stable release-host gates passed." \
   "Complete the real-target and 8 GiB pressure matrix in docs/RELEASE_READINESS.md before distribution."

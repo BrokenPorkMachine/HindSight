@@ -1,6 +1,6 @@
-# Validation — HindSight 0.5.8
+# Validation — HindSight 0.5.9
 
-Portable validation covers source topology, release identity, local dependency closure, Python/native contracts, plist/JSON/TOML parsing, shell syntax, deterministic Xcode project topology, Swift syntax parsing where available, Cargo lockfile structure, Rust 1.90 source admission, and compile checks of both the Apple-Silicon Hypervisor implementation and Intel fallback path. 0.5.8 validates the 71-field unified-symbol contract in addition to the 0.5.4 scalability budgets, indexed CFG/predecessor construction, selective Symbolication scanning, off-main analysis-result decoding, worker-native typed evidence sideband filtering, cache-v3/v2 compatibility, stage fingerprints, and Swift compatibility merging. Full Xcode/Rust linking still requires the native macOS release host.
+Portable validation covers source topology, release identity, local dependency closure, Python/native contracts, plist/JSON/TOML parsing, shell syntax, deterministic Xcode project topology, Swift syntax parsing where available, Cargo lockfile structure, Rust 1.90 source admission, and compile checks of both the Apple-Silicon Hypervisor implementation and Intel fallback path. 0.5.9 validates the 71-field unified-symbol contract in addition to the 0.5.4 scalability budgets, indexed CFG/predecessor construction, selective Symbolication scanning, off-main analysis-result decoding, worker-native typed evidence sideband filtering, cache-v3/v2 compatibility, stage fingerprints, and Swift compatibility merging. Full Xcode/Rust linking still requires the native macOS release host.
 
 
 ## Universal macOS / Intel compatibility
@@ -36,7 +36,7 @@ These checks complement the project-root/database symlink rejection and the nati
 
 ## Analysis/runtime invariants retained
 
-- Product/service/worker identity is `0.5.8`, release channel `stable`, bundle build `5800`, protocol ABI 1.
+- Product/service/worker identity is `0.5.9`, release channel `stable`, bundle build `5900`, protocol ABI 1.
 - Swift/Rust agree on the exact 71-field `AnalysisReport`.
 - Cache envelope schema 2 binds source SHA-256 and `arm64-analysis-v15-schema71`; only the explicit validated 0.4.1 legacy cache path is admitted.
 - Staged worker progress remains bounded, monotonic pipeline telemetry and is filtered from ordinary diagnostics.

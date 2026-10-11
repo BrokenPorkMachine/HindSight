@@ -26,7 +26,7 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.8)
+## Current baseline (0.5.9)
 
 ## 0.5.8 — Scheduler, Demangling, Structural Pseudocode
 

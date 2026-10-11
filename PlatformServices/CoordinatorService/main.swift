@@ -139,7 +139,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
     private let reaLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.rea", qos: .utility, maxConcurrent: 1, maxPending: 4, reservationBytes: 128 * 1_048_576)
     private let analysisCacheEngineVersion = "arm64-analysis-v15-schema71"
-    private let analysisCacheProducerVersion = "0.5.8"
+    private let analysisCacheProducerVersion = "0.5.9"
     private let compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]
     func capabilities(withReply reply: @escaping (String) -> Void) {
         guard let value = reworkbench_capabilities_json() else { reply("Bridge unavailable"); return }

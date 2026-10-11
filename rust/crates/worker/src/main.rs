@@ -85,7 +85,7 @@ fn capture_image(source:&str,destination:&str,id:&str,options:&binary::Options)-
 fn run()->io::Result<()>{
  let args:Vec<String>=std::env::args().collect();
  if args.len()==2 && args[1]=="--self-test"{
-  let response=r#"{"protocol":1,"kind":"health","version":"0.5.8","worker":true}"#;
+  let response=r#"{"protocol":1,"kind":"health","version":"0.5.9","worker":true}"#;
   return write_frame(&mut io::stdout().lock(),response.as_bytes());
  }
  if args.len()==2 && args[1]=="--echo-frames"{
@@ -111,8 +111,8 @@ fn main(){if let Err(e)=run(){eprintln!("reworker: {e}");std::process::exit(1);}
  #[test]fn json_quote(){assert_eq!(quote("a\n\"\\"),"\"a\\n\\\"\\\\\"");}
  #[test]fn relative_path_rejected(){assert!(inspect("file","00000000-0000-0000-0000-000000000000").is_err());}
  #[test]fn health_payload_version(){
-  let payload=r#"{"protocol":1,"kind":"health","version":"0.5.8","worker":true}"#;
-  assert!(payload.contains("\"version\":\"0.5.8\""));
+  let payload=r#"{"protocol":1,"kind":"health","version":"0.5.9","worker":true}"#;
+  assert!(payload.contains("\"version\":\"0.5.9\""));
  }
  #[test]fn arm64_header(){
   let p=std::env::temp_dir().join(format!("reworker-test-{}",std::process::id()));
