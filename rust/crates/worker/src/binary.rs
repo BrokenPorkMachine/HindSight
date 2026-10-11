@@ -1851,6 +1851,42 @@ fn epilogue(a: Arch, bytes: &[u8], text: &str) -> bool {
         }
 }
 
+fn semantic_hint(a: Arch, bytes: &[u8], text: &str) -> Option<&'static str> {
+    match a {
+        Arch::X86 | Arch::X64 => {
+            if text.starts_with("call") {
+                Some("direct-call")
+            } else if text.starts_with("j") || text.starts_with("loop") {
+                Some("control-flow")
+            } else {
+                match bytes.first().copied()? {
+                    0x50..=0x5f | 0x68 | 0x6a => Some("stack-operation"),
+                    0x88..=0x8b | 0xb0..=0xbf | 0xc6 | 0xc7 => Some("data-movement"),
+                    0x01 | 0x03 | 0x05 | 0x09 | 0x0b | 0x0d | 0x21 | 0x23 | 0x29
+                    | 0x2b | 0x2d | 0x31 | 0x33 | 0x35 | 0x81 | 0x83 => Some("arithmetic-logic"),
+                    0x39 | 0x3b | 0x3d | 0x85 => Some("compare-test"),
+                    0xc3 | 0xc2 | 0xcb | 0xca => Some("return"),
+                    _ => None,
+                }
+            }
+        }
+        Arch::Arm | Arch::Thumb => {
+            if text.starts_with("bl") {
+                Some("direct-call")
+            } else if text.starts_with('b') || text.starts_with("bx") {
+                Some("control-flow")
+            } else if text.starts_with("ldr") || text.starts_with("str") || text.starts_with("mov") {
+                Some("data-movement")
+            } else if return_instruction(a, bytes, text) {
+                Some("return")
+            } else {
+                None
+            }
+        }
+        Arch::A64 => None,
+    }
+}
+
 pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> io::Result<String> {
     let (mut file, before, _) = verified(path, digest, size, id)?;
     let image = load(&mut file, o)?;
@@ -2245,10 +2281,13 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             .get(&v.address)
             .map(|v| format!(" ; name={} source={}", v.0, v.1))
             .unwrap_or_default();
+        let semantic = semantic_hint(image.arch, &v.bytes, &v.text)
+            .map(|hint| format!(" ; semantic={hint}"))
+            .unwrap_or_default();
         push(
             &mut annotated,
             &format!(
-                "0x{:016x} 0x{:016x} {:<30} {}{}\n",
+                "0x{:016x} 0x{:016x} {:<30} {}{}{}\n",
                 v.address,
                 v.offset,
                 v.bytes
@@ -2256,7 +2295,8 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
                     .map(|v| format!("{v:02x}"))
                     .collect::<String>(),
                 v.text,
-                label
+                label,
+                semantic
             ),
         );
     }

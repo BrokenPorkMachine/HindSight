@@ -50,5 +50,12 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn("provenance=relative-pointer+mapped-cstring", body)
         self.assertIn("confidence=validated-record", body)
 
+    def test_non_arm_semantic_hints_are_bounded_and_not_decompilation(self):
+        source = (ROOT / "rust/crates/worker/src/binary.rs").read_text()
+        body = source[source.index("fn semantic_hint"):source.index("pub fn analyze")]
+        self.assertIn('"stack-operation"', body)
+        self.assertIn('"data-movement"', body)
+        self.assertIn('"compare-test"', body)
+
 if __name__ == "__main__":
     unittest.main()

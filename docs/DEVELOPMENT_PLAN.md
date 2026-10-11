@@ -32,6 +32,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
 - [x] Add bounded IMG4/IM4P container inspection with compression-marker inventory; plaintext analysis remains explicit.
 - [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
+- [x] Add bounded non-ARM64 opcode-semantic labels to annotated disassembly; full lifting/decompilation remains open.
 
 Acceptance: every new inference is provenance-labelled, bounded, and covered by synthetic and real-input regression tests.
 
@@ -69,4 +70,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, and Swift type-descriptor provenance labels are complete. Next loop: prioritize the remaining validated variable metadata or non-ARM64 semantic lifting slice.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, and bounded non-ARM64 semantic labels are complete. Next loop: prioritize the remaining validated variable metadata or deeper non-ARM64 lifting slice.

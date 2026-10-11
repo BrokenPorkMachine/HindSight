@@ -82,6 +82,8 @@ with tempfile.TemporaryDirectory() as directory:
         assert set(a)==REPORT_FIELDS, set(a)^REPORT_FIELDS
         assert '_fixture_function' in a['functions'] and 'source=nlist' in a['functions']
         assert 'fixture string' in a['strings'] and 'UTF16-LE' in a['strings'] and '漢字仮名' in a['strings']
+        if architecture in ('i386', 'x86_64'):
+            assert 'semantic=stack-operation' in a['annotated_disassembly'], a['annotated_disassembly']
         assert 'prologue candidate' in a['function_intelligence']
         if architecture not in ('arm', 'thumb'):
             assert 'epilogue candidate' in a['function_intelligence'], architecture
