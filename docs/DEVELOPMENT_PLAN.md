@@ -28,7 +28,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [ ] Add validated indirect-dispatch and jump-table reconstruction.
 - [ ] Add automatic mixed ARM/Thumb control-flow transitions.
 - [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
-- [ ] Add IMG4/IM4P container inspection and supported decompression paths.
+- [x] Add bounded IMG4/IM4P container inspection with compression-marker inventory; plaintext analysis remains explicit.
 - [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
 
 Acceptance: every new inference is provenance-labelled, bounded, and covered by synthetic and real-input regression tests.
@@ -67,4 +67,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices are complete through saved searches, inline annotation editing, and the Overview handoff summary. Next loop: begin Phase 2 with a bounded analysis-depth improvement, starting with the most useful metadata path available in the current worker.
+The Phase 1 usability slices and bounded IMG4/IM4P container inventory are complete. Next loop: begin the next safe Phase 2 analysis-depth slice, prioritizing metadata or unwind information that can be surfaced with clear provenance in the current worker.

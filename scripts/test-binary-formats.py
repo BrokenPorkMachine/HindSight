@@ -136,6 +136,17 @@ with tempfile.TemporaryDirectory() as directory:
     page=invoke('page',path,options=('securerom','aarch64','0x100000000','0'))
     assert page['section_address']=='4294967296' and 'ret' in page['text']
     assert invoke('page',path,options=('raw','aarch64','0xfffffffffffffff8','0'))['kind']=='error'
+    # Encoded firmware is inventoried without pretending that its payload is
+    # decoded. The capture remains useful for triage, while page requests stay
+    # blocked until a plaintext image is supplied.
+    path=root/'firmware.img4'
+    path.write_bytes(b'\x30\x82\x00\x20IMG4' + bytes(0x80) + b'IM4P' + bytes(0x40) + b'bvx2' + bytes(0x20))
+    container=invoke('capture',path,options=('auto','auto','0','0'),destination=root/'firmware.capture')
+    assert container['file_kind']=='IMG4 firmware container',container
+    assert 'IMG4 marker offsets' in container['structure'] and 'IM4P payload marker offsets' in container['structure'],container
+    assert 'bvx2 compression marker offsets' in container['structure'] and 'DER-like sequence prefix' in container['structure'],container
+    assert container['disassembly_status']=='unavailable' and 'plaintext payload' in container['disassembly'],container
+    assert invoke('page',path,options=('auto','auto','0','0'))['kind']=='error'
     # Valid universal FAT32/FAT64, plus overlapping slices rejected before selection.
     one,_=image(7);two,_=image(0x01000007,b'\x55\x48\x89\xe5\xc3')
     for wide in [False,True]:

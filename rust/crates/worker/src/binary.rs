@@ -834,7 +834,22 @@ pub fn describe(
     file: &mut File,
     o: &Options,
 ) -> io::Result<(String, String, String, String, String, String)> {
-    let i = load(file, o)?;
+    let i = match load(file, o) {
+        Ok(image) => image,
+        Err(error) => {
+            if let Some((kind, structure)) = inspect_firmware_container(file)? {
+                return Ok((
+                    kind,
+                    "Container".into(),
+                    "checked".into(),
+                    structure,
+                    "unavailable".into(),
+                    "Instruction analysis requires a validated plaintext payload; container unpacking is not performed by HindSight.".into(),
+                ));
+            }
+            return Err(error);
+        }
+    };
     let structure = metadata(&i);
     let (status, preview) = match page(file, &i, 0) {
         Ok((text, _)) => ("preview".into(), text),
@@ -856,6 +871,74 @@ pub fn describe(
         status,
         preview,
     ))
+}
+
+/// Inventory recognizable firmware-container markers without interpreting or
+/// unpacking their payload. This keeps capture useful for triage while making
+/// the boundary explicit: offsets are observations, not validated ASN.1 fields.
+fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, String)>> {
+    const BUDGET: usize = 4 * 1024 * 1024;
+    let size = file.metadata()?.len();
+    let bytes = read(file, 0, size.min(BUDGET as u64) as usize)?;
+    let marker = |needle: &[u8]| -> Vec<usize> {
+        bytes
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(offset, window)| (window == needle).then_some(offset))
+            .take(32)
+            .collect()
+    };
+    let img4 = marker(b"IMG4");
+    let im4p = marker(b"IM4P");
+    if img4.is_empty() && im4p.is_empty() {
+        return Ok(None);
+    }
+    let bvx2 = marker(b"bvx2");
+    let bvxn = marker(b"bvxn");
+    let complzss = marker(b"complzss");
+    let mut out = format!(
+        "Container marker inventory (first {:#x} bytes; at most 32 matches per marker)\n",
+        bytes.len()
+    );
+    if !img4.is_empty() {
+        push(&mut out, &format!("IMG4 marker offsets: {:?}\n", img4));
+    }
+    if !im4p.is_empty() {
+        push(
+            &mut out,
+            &format!("IM4P payload marker offsets: {:?}\n", im4p),
+        );
+    }
+    if !bvx2.is_empty() {
+        push(
+            &mut out,
+            &format!("bvx2 compression marker offsets: {:?}\n", bvx2),
+        );
+    }
+    if !bvxn.is_empty() {
+        push(
+            &mut out,
+            &format!("bvxn compression marker offsets: {:?}\n", bvxn),
+        );
+    }
+    if !complzss.is_empty() {
+        push(
+            &mut out,
+            &format!("complzss compression marker offsets: {:?}\n", complzss),
+        );
+    }
+    if bytes.first() == Some(&0x30) {
+        push(&mut out, "DER-like sequence prefix observed at file offset 0; complete ASN.1 structure is not decoded.\n");
+    }
+    push(&mut out, &format!(
+        "File size={size:#x}; scan budget={BUDGET:#x}. Payload boundaries, encryption and compression validity are not established.\n"
+    ));
+    let kind = if !img4.is_empty() {
+        "IMG4 firmware container"
+    } else {
+        "IM4P firmware payload"
+    };
+    Ok(Some((kind.into(), out)))
 }
 fn verified(path: &str, digest: &str, size: &str, id: &str) -> io::Result<(File, Metadata, u64)> {
     if path.len() > 16384
@@ -1215,9 +1298,9 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
             let boundary = start == 0 || b[start - 1] == 0 || !b[start - 1].is_ascii_graphic();
             if plausible_start && boundary && terminated && units.len() >= 4 {
                 if let Ok(text) = String::from_utf16(&units) {
-                    let printable = text.chars().all(|character| {
-                        !character.is_control() || character.is_whitespace()
-                    });
+                    let printable = text
+                        .chars()
+                        .all(|character| !character.is_control() || character.is_whitespace());
                     if printable {
                         let encoding = if i.be { "UTF16-BE" } else { "UTF16-LE" };
                         push(
@@ -1235,7 +1318,11 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
                     }
                 }
             }
-            at = if emitted { start + units.len() * 2 + 2 } else { start + 1 };
+            at = if emitted {
+                start + units.len() * 2 + 2
+            } else {
+                start + 1
+            };
         }
     }
     Ok((out, limited))
