@@ -44,6 +44,8 @@ The 0.4.9 feature line added bounded analyst Follow-Up Queue workflow over the e
 
 The source archive is portable/source validated in this environment, but this Linux container cannot complete the macOS-only release matrix. Before distribution run `./scripts/test-release-macos.sh` with Developer ID/notarization credentials and complete the dual-host Intel + Apple-Silicon matrix, including real-target, visual, Function Neighborhoods stress, symlink-boundary, universal-slice, and 8 GiB pressure checks in [`RELEASE_READINESS.md`](RELEASE_READINESS.md).
 
+Enterprise deployment and support boundaries are documented in [`ENTERPRISE_OPERATIONS.md`](ENTERPRISE_OPERATIONS.md). Managed defaults and signed-manifest publication remain operator/release-host responsibilities; HindSight does not perform background diagnostic uploads.
+
 ## Experimental surfaces
 
 A12/T2/SEP research virtualization profiles and external full-system iPhemeral integration remain experimental. Stable HindSight product identity does not imply 1:1 hardware equivalence for those profiles.
