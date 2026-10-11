@@ -46,6 +46,8 @@ The source archive is portable/source validated in this environment, but this Li
 
 Enterprise deployment and support boundaries are documented in [`ENTERPRISE_OPERATIONS.md`](ENTERPRISE_OPERATIONS.md). Managed defaults and signed-manifest publication remain operator/release-host responsibilities; HindSight does not perform background diagnostic uploads.
 
+Extension governance is active: capability allowlisting and managed `allow`/`verified-only`/`disabled` modes are enforced by Coordinator, with policy status visible in Extension Manager.
+
 ## Experimental surfaces
 
 A12/T2/SEP research virtualization profiles and external full-system iPhemeral integration remain experimental. Stable HindSight product identity does not imply 1:1 hardware equivalence for those profiles.
