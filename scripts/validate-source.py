@@ -794,6 +794,7 @@ assert cap_schema['properties']['release_channel']['enum'] == ['beta','rc','stab
 assert cap_schema['properties']['stable_release_channel']['const'] is True
 assert cap_schema['properties']['runtime_governor']['const'] is True
 assert 'CONFIGURATION="${CONFIGURATION:-Debug}"' in (R/'scripts/build-app.sh').read_text()
+assert 'HINDSIGHT_SWIFT_DISABLE_SANDBOX' in (R/'scripts/build-app.sh').read_text()
 
 # VectorGlass product split: public naming and built-in deterministic engine.
 assert 'from hindsight import api as vg' in (R/'App/WorkbenchModel.swift').read_text()
