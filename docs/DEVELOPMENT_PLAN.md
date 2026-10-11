@@ -61,7 +61,7 @@ Acceptance: a clean install is understandable, testable, supportable, and distri
 ### Phase 5 — Enterprise-grade trust and operations
 
 - [x] Add a visible Support & Readiness center with build identity, Coordinator health, host capability status, and diagnostics actions.
-- [ ] Add structured operation/error taxonomy with recovery guidance and support-safe export.
+- [x] Add structured operation/error taxonomy with recovery guidance and support-safe export.
 - [ ] Add case integrity manifests, verification, review decisions, and conflict-safe handoff workflows.
 - [ ] Add local policy and extension-governance surfaces with fail-closed validation.
 - [ ] Add managed-defaults, signed-release-manifest, retention, and opt-in crash-diagnostics documentation.

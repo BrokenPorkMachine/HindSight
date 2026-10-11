@@ -133,6 +133,13 @@ private struct HindSightSettingsView: View {
                     Button("Reconnect Coordinator") { model.reconnect() }
                         .disabled(model.busy || model.connectingToCoordinator || model.restoringProjectSession)
                 }
+                if let error = model.operationErrors.last {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Last operation issue · \(error.code)").font(.caption).fontWeight(.semibold)
+                        Text(error.message).font(.caption).foregroundStyle(.secondary)
+                        Text("Recovery: \(error.recovery)").font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
                 Text("Diagnostics contain runtime and capability state, not target-file contents. Share them only with your support team.")
                     .font(.caption)
                     .foregroundStyle(.secondary)

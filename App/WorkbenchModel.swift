@@ -24,6 +24,14 @@ struct VGRecentProject: Codable, Hashable, Identifiable {
     var id: String { path }
     var displayName: String { URL(fileURLWithPath: path, isDirectory: true).lastPathComponent }
 }
+
+private struct VGSupportDiagnosticsExport: Codable {
+    let schema: Int
+    let generatedAt: Date
+    let product: String
+    let diagnostics: String
+    let recentErrors: [VGOperationError]
+}
 @MainActor
 final class WorkbenchModel: ObservableObject {
     @Published var project: ProjectSnapshot?
@@ -324,6 +332,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
 
     @Published var status = "Create or open a project."
+    @Published private(set) var operationErrors: [VGOperationError] = []
     @Published var capabilities = "Not queried"
     @Published var busy = false
     @Published var connected = false
@@ -688,6 +697,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 }
             case .failure(let error):
                 self.reaStatus = "REA probe failed: \(error.localizedDescription)"
+                self.recordOperationError(operation: "rea.probe", code: "rea_probe_failed", message: error.localizedDescription, recovery: "Confirm Node/REA is installed locally, then retry the probe.", retryable: true)
             }
         }
     }
@@ -723,7 +733,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             case .success(let response):
                 self.reaStatus = response
                 self.captureREAResponse(response, requestID: requestID)
-            case .failure(let error): self.reaStatus = "REA operation failed: \(error.localizedDescription)"
+            case .failure(let error):
+                self.reaStatus = "REA operation failed: \(error.localizedDescription)"
+                self.recordOperationError(operation: "rea.\(self.reaOperation)", code: "rea_operation_failed", message: error.localizedDescription, recovery: "Check the selected target, provider readiness, and capability report before retrying.", retryable: true)
             }
         }
     }
@@ -753,6 +765,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private func captureREAResponse(_ response: String, requestID: String) {
         guard response.utf8.count <= 2 * 1024 * 1024 else {
             reaStatus = "REA response exceeded the retained evidence limit; result was not retained."
+            recordOperationError(operation: "rea.\(reaOperation)", code: "rea_response_too_large", message: reaStatus, recovery: "Use a narrower REA operation or export provider Evidence through REA’s bounded continuation flow.", retryable: true)
             return
         }
         let digest = SHA256.hash(data: Data(response.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -803,7 +816,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             guard let self else { return }
             switch result {
             case .success(let response): self.reaStatus = response
-            case .failure(let error): self.reaStatus = "REA cancellation failed: \(error.localizedDescription)"
+            case .failure(let error):
+                self.reaStatus = "REA cancellation failed: \(error.localizedDescription)"
+                self.recordOperationError(operation: "rea.cancel", code: "rea_cancel_failed", message: error.localizedDescription, recovery: "Wait for the current operation deadline, then reconnect the Coordinator if it remains active.", retryable: true)
             }
         }
     }
@@ -2008,6 +2023,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             "analysis_phase=\(analysisPhase)",
             "analysis_stage=\(analysisStage)",
             "analysis_progress_percent=\(analysisProgress)",
+            "operation_errors=\(operationErrors.count)",
+            "recent_operation_errors=\(operationErrors.suffix(8).map { "\($0.code): \($0.message.replacingOccurrences(of: "\n", with: " "))" }.joined(separator: " | "))",
             "debug_attached=\(debugAttached)",
             "vectoremu_running=\(vectorEmuRunning)",
             "status=\(status.replacingOccurrences(of: "\n", with: " "))"
@@ -2024,15 +2041,28 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     func exportDiagnostics() {
         let panel = NSSavePanel()
         panel.title = "Export HindSight Diagnostics"
-        panel.nameFieldStringValue = "HindSight-diagnostics.txt"
-        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "HindSight-diagnostics.json"
+        panel.allowedContentTypes = [.json]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            try Data(diagnosticsText().utf8).write(to: url, options: .atomic)
-            status = "Diagnostics exported to (url.lastPathComponent)."
+            let payload = VGSupportDiagnosticsExport(schema: 1, generatedAt: Date(), product: VGProduct.displayName,
+                                                     diagnostics: diagnosticsText(), recentErrors: Array(operationErrors.suffix(32)))
+            let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601; encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(payload).write(to: url, options: .atomic)
+            status = "Diagnostics exported to \(url.lastPathComponent)."
         } catch {
-            status = "Diagnostics export failed: (error.localizedDescription)"
+            status = "Diagnostics export failed: \(error.localizedDescription)"
+            recordOperationError(operation: "support.export", code: "diagnostics_export_failed", message: error.localizedDescription, recovery: "Choose a writable local destination and retry.", retryable: true)
         }
+    }
+
+    private func recordOperationError(operation: String, code: String, message: String, recovery: String, retryable: Bool) {
+        let redactedMessage = message.replacingOccurrences(of: reaTargetPath, with: "<target>")
+        let error = VGOperationError(id: UUID(), timestamp: Date(), operation: String(operation.prefix(96)),
+                                     code: String(code.prefix(96)), message: String(redactedMessage.prefix(2048)),
+                                     recovery: String(recovery.prefix(2048)), retryable: retryable)
+        operationErrors.append(error)
+        if operationErrors.count > 64 { operationErrors.removeFirst(operationErrors.count - 64) }
     }
 
     private func firstHexAddress(in text: String) -> UInt64? {

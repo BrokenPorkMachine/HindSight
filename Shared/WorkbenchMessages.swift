@@ -348,3 +348,13 @@ struct AnalysisReply: Codable, Sendable {
         return String(decoding: data, as: UTF8.self)
     }
 }
+
+struct VGOperationError: Codable, Hashable, Identifiable {
+    let id: UUID
+    let timestamp: Date
+    let operation: String
+    let code: String
+    let message: String
+    let recovery: String
+    let retryable: Bool
+}
