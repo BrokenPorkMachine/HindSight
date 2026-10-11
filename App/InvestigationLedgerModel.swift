@@ -327,6 +327,39 @@ struct VGREAAgentEvidence: Codable, Hashable, Identifiable {
     let provider: String
     let responseSHA256: String
     let response: String
+    /// Provider-issued identity fields are optional because older REA servers may only return raw output.
+    let evidenceID: String?
+    let targetSHA256: String?
+    let analysisProfileDigest: String?
+
+    init(id: String, capturedAt: Date, operation: String, targetPath: String, provider: String,
+         responseSHA256: String, response: String, evidenceID: String? = nil,
+         targetSHA256: String? = nil, analysisProfileDigest: String? = nil) {
+        self.id = id; self.capturedAt = capturedAt; self.operation = operation; self.targetPath = targetPath
+        self.provider = provider; self.responseSHA256 = responseSHA256; self.response = response
+        self.evidenceID = evidenceID; self.targetSHA256 = targetSHA256; self.analysisProfileDigest = analysisProfileDigest
+    }
+
+    private enum CodingKeys: String, CodingKey { case id, capturedAt, operation, targetPath, provider, responseSHA256, response, evidenceID, targetSHA256, analysisProfileDigest }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id); capturedAt = try c.decode(Date.self, forKey: .capturedAt)
+        operation = try c.decode(String.self, forKey: .operation); targetPath = try c.decode(String.self, forKey: .targetPath)
+        provider = try c.decode(String.self, forKey: .provider); responseSHA256 = try c.decode(String.self, forKey: .responseSHA256)
+        response = try c.decode(String.self, forKey: .response)
+        evidenceID = try c.decodeIfPresent(String.self, forKey: .evidenceID)
+        targetSHA256 = try c.decodeIfPresent(String.self, forKey: .targetSHA256)
+        analysisProfileDigest = try c.decodeIfPresent(String.self, forKey: .analysisProfileDigest)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id); try c.encode(capturedAt, forKey: .capturedAt); try c.encode(operation, forKey: .operation)
+        try c.encode(targetPath, forKey: .targetPath); try c.encode(provider, forKey: .provider); try c.encode(responseSHA256, forKey: .responseSHA256)
+        try c.encode(response, forKey: .response); try c.encodeIfPresent(evidenceID, forKey: .evidenceID)
+        try c.encodeIfPresent(targetSHA256, forKey: .targetSHA256); try c.encodeIfPresent(analysisProfileDigest, forKey: .analysisProfileDigest)
+    }
 }
 
 struct VGCaseIntegrityManifest: Codable, Hashable {
@@ -571,6 +604,9 @@ enum VGLedgerStore {
         guard (bundle.reaEvidence ?? []).allSatisfy({ evidence in
             evidence.operation.utf8.count <= 128 && evidence.targetPath.utf8.count <= 16_384 &&
             evidence.provider.utf8.count <= 64 && evidence.responseSHA256.count == 64 &&
+            (evidence.evidenceID?.utf8.count ?? 0) <= 256 &&
+            (evidence.targetSHA256 == nil || evidence.targetSHA256?.count == 64) &&
+            (evidence.analysisProfileDigest == nil || evidence.analysisProfileDigest?.count == 64) &&
             evidence.response.utf8.count <= 2 * 1024 * 1024 &&
             SHA256.hash(data: Data(evidence.response.utf8)).map { String(format: "%02x", $0) }.joined() == evidence.responseSHA256
         }) else {

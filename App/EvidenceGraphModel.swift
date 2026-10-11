@@ -372,7 +372,7 @@ enum VGEvidenceGraphBuilder {
                 provenance: .analysis,
                 confidence: .observed,
                 title: "REA \(evidence.operation)",
-                detail: "\(URL(fileURLWithPath: evidence.targetPath).lastPathComponent) · \(evidence.provider) · SHA-256 \(evidence.responseSHA256)",
+                detail: "\(URL(fileURLWithPath: evidence.targetPath).lastPathComponent) · \(evidence.provider) · SHA-256 \(evidence.responseSHA256)\(evidence.evidenceID.map { " · Evidence \($0)" } ?? "")",
                 address: nil
             ))
             appendEdge(rootID, id, .contains, .observed, "REA response retained with explicit target, provider, and SHA-256 provenance.")

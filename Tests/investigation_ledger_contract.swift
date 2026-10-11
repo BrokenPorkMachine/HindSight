@@ -32,7 +32,7 @@ struct InvestigationLedgerContract {
             evidence: nil,
             runtime: [],
             memory: [],
-            reaEvidence: [VGREAAgentEvidence(id: "rea-1", capturedAt: now, operation: "binary_overview", targetPath: "/tmp/target", provider: "hopper", responseSHA256: reaDigest, response: reaResponse)]
+            reaEvidence: [VGREAAgentEvidence(id: "rea-1", capturedAt: now, operation: "binary_overview", targetPath: "/tmp/target", provider: "hopper", responseSHA256: reaDigest, response: reaResponse, evidenceID: "ev_fixture", targetSHA256: String(repeating: "a", count: 64), analysisProfileDigest: String(repeating: "b", count: 64))]
         )
         let data = try VGLedgerStore.encodeCase(bundle)
         let boundedCase = try VGLedgerStore.decodeCase(data)
@@ -42,6 +42,7 @@ struct InvestigationLedgerContract {
         precondition(decoded.ledger.caseID == "case-1")
         precondition(decoded.ledger.hypotheses[0].status == .supported)
         precondition(decoded.reaEvidence?.first?.responseSHA256 == reaDigest)
+        precondition(decoded.reaEvidence?.first?.evidenceID == "ev_fixture")
         let markdown = VGLedgerStore.markdown(bundle)
         precondition(markdown.contains("Auth branch controls access"))
         precondition(markdown.contains("Evidence boundary"))

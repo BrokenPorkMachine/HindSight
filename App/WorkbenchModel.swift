@@ -756,14 +756,38 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             return
         }
         let digest = SHA256.hash(data: Data(response.utf8)).map { String(format: "%02x", $0) }.joined()
+        let identity = reaIdentityFields(response)
         let evidence = VGREAAgentEvidence(id: requestID, capturedAt: Date(), operation: reaOperation,
                                            targetPath: reaTargetPath, provider: reaProvider,
-                                           responseSHA256: digest, response: response)
+                                           responseSHA256: digest, response: response,
+                                           evidenceID: identity.evidenceID,
+                                           targetSHA256: identity.targetSHA256,
+                                           analysisProfileDigest: identity.analysisProfileDigest)
         reaEvidence.append(evidence)
         if reaEvidence.count > 32 { reaEvidence.removeFirst(reaEvidence.count - 32) }
         let name = URL(fileURLWithPath: reaTargetPath).lastPathComponent
         recordLedger(kind: .reaEvidenceCaptured, provenance: .observed,
-                     detail: "Captured REA (reaOperation) evidence for (name) · SHA-256 (digest).")
+                     detail: "Captured REA (reaOperation) evidence for (name) · SHA-256 (digest)\(identity.evidenceID.map { " · provider ID \($0)" } ?? "").")
+    }
+
+    private func reaIdentityFields(_ response: String) -> (evidenceID: String?, targetSHA256: String?, analysisProfileDigest: String?) {
+        guard let data = response.data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data) else {
+            return (nil, nil, nil)
+        }
+        func find(_ key: String, in value: Any) -> String? {
+            if let dictionary = value as? [String: Any] {
+                if let result = dictionary[key] as? String, !result.isEmpty { return String(result.prefix(256)) }
+                for child in dictionary.values {
+                    if let result = find(key, in: child) { return result }
+                }
+            } else if let array = value as? [Any] {
+                for child in array {
+                    if let result = find(key, in: child) { return result }
+                }
+            }
+            return nil
+        }
+        return (find("evidence_id", in: object), find("target_sha256", in: object), find("analysis_profile_digest", in: object))
     }
 
     func cancelREAOperation() {
