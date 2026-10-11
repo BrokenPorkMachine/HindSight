@@ -5,7 +5,7 @@ def read(p): return (ROOT/p).read_text()
 class SymbolicationContract(unittest.TestCase):
  def test_static_symbolication_is_wired(self):
   w=read("rust/crates/worker/src/preview.rs")
-  for t in ["fn macho_uuid(","fn symbolication_records(","LC_FUNCTION_STARTS","debug-section","image_uuid="]:
+  for t in ["fn macho_uuid(","fn symbolication_records(","fn compact_unwind_records(","LC_FUNCTION_STARTS","debug-section","compact-unwind","image_uuid="]:
    self.assertIn(t,w)
   m=read("Shared/WorkbenchMessages.swift")
   self.assertIn('"symbolication"',m); self.assertIn('let symbolication: String',m)

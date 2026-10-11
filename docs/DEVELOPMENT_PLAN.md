@@ -23,7 +23,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 
 ### Phase 2 — Analysis quality and depth
 
-- [ ] Add DWARF/dSYM and unwind metadata ingestion where available.
+- [x] Add bounded compact-unwind metadata ingestion; DWARF/dSYM sections remain explicitly inventory-only.
 - [ ] Improve type, variable, and call-signature recovery.
 - [ ] Add validated indirect-dispatch and jump-table reconstruction.
 - [ ] Add automatic mixed ARM/Thumb control-flow transitions.
@@ -67,4 +67,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices and bounded IMG4/IM4P container inventory are complete. Next loop: begin the next safe Phase 2 analysis-depth slice, prioritizing metadata or unwind information that can be surfaced with clear provenance in the current worker.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, and compact-unwind record ingestion are complete. Next loop: begin the next safe Phase 2 analysis-depth slice, prioritizing validated indirect-dispatch or jump-table reconstruction in the current worker.
