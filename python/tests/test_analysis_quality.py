@@ -58,10 +58,12 @@ class AnalysisQualityContract(unittest.TestCase):
 
     def test_stack_slot_candidates_bound_variable_recovery(self):
         source = (ROOT / "rust/crates/worker/src/preview.rs").read_text()
-        body = source[source.index("fn stack_slot_candidates"):source.index("fn analysis_quality_report")]
+        body = source[source.index("fn stack_slot_value_shape"):source.index("fn analysis_quality_report")]
         self.assertIn("classification=stack-slot-candidate", body)
         self.assertIn("provenance=decoded-stack-relative-address", body)
         self.assertIn("type=unknown", body)
+        self.assertIn("value-shape=", body)
+        self.assertIn('"integer-u8"', body)
 
     def test_non_arm_semantic_hints_are_bounded_and_not_decompilation(self):
         source = (ROOT / "rust/crates/worker/src/binary.rs").read_text()

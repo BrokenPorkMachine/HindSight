@@ -836,10 +836,19 @@ fn function_neighborhood_report(starts:&[u64],calls:&[(u64,u64,u64)],tails:&[(u6
 }
 /// Recover only decoded instructions whose textual operands explicitly use
 /// the stack pointer and an immediate offset. These are variable-location
-/// candidates, not source variables: names, lifetimes, layouts, and types stay
-/// unresolved until matching debug information is available.
+/// candidates, not source variables: names, lifetimes, layouts, and source
+/// types stay unresolved until matching debug information is available.
+fn stack_slot_value_shape(mnemonic:&str,assembly:&str)->&'static str{
+ if mnemonic.ends_with('b'){"integer-u8"}
+ else if mnemonic.ends_with('h'){"integer-u16"}
+ else if mnemonic=="ldrsw"{"signed-i32"}
+ else if mnemonic.ends_with('p')&&assembly.contains(" w"){"pair-u32"}
+ else if mnemonic.ends_with('p'){"pair-u64-or-pointer-width"}
+ else if assembly.contains(" w"){"integer-u32"}
+ else{"u64-or-pointer-width"}
+}
 fn stack_slot_candidates(ir:&str)->String{
- let mut out=String::from("Bounded stack-slot candidates (decoded stack-relative operands; names, lifetimes, layouts, and types remain unresolved)\n");
+ let mut out=String::from("Bounded stack-slot candidates (decoded stack-relative operands; source names, lifetimes, layouts, and types remain unresolved)\n");
  let mut count=0usize;
  for line in ir.lines().take(20_000){
   let mut fields=line.split_whitespace();
@@ -850,11 +859,12 @@ fn stack_slot_candidates(ir:&str)->String{
   let mnemonic=assembly.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
   if !matches!(mnemonic.as_str(),"ldr"|"ldrb"|"ldrh"|"ldrsw"|"ldp"|"str"|"strb"|"strh"|"stp")||!assembly.contains("sp")||!assembly.contains('#'){continue}
   if out.len()>58_000{break}
-  out.push_str(&format!("  {address} {assembly}  classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown\n"));
+  let value_shape=stack_slot_value_shape(&mnemonic,&assembly);
+  out.push_str(&format!("  {address} {assembly}  classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown value-shape={value_shape}\n"));
   count+=1;
  }
  if count==0{out.push_str("No decoded stack-relative load/store candidates were recovered.\n");}
- else{out.push_str(&format!("Candidates recovered: {count}. Source variable identity and type recovery remain unresolved.\n"));}
+ else{out.push_str(&format!("Candidates recovered: {count}. Value shape is operand-derived; source variable identity and type recovery remain unresolved.\n"));}
  out
 }
 fn analysis_quality_report(map_bytes:u64,scan_bytes:u64,encrypted:bool,truncated:bool,instructions:usize,decoded:usize,data_words:usize,functions:usize,blocks:usize,calls:usize,tails:usize,relocations:usize,data_refs:&str,dominators:&str)->String{
