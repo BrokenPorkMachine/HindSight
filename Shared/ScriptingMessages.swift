@@ -96,6 +96,7 @@ struct PluginInfo: Codable, Identifiable {
     let dependencies: [PluginDependency]
     let dependency_status: String
     let signature_status: String
+    let policy_status: String
     let trusted: Bool
     let annotations: [PluginAnnotation]
     let custom_data_keys: [String]

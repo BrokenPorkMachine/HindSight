@@ -8,6 +8,8 @@ HindSight executes extension Python out of process. Trust is a second gate in ad
 
 Dependencies are declared by plugin ID with an optional minimum version and are rechecked at execution time. Trust never bypasses dependency failure or capability checks.
 
+The Coordinator also applies a local fail-closed capability policy. Unknown manifest capabilities are surfaced as blocked policy status and prevent execution or enabling; adding local trust cannot grant an undeclared capability.
+
 Annotations and custom data are extension-owned, bounded to the persistent plugin-data budget, and cannot mutate core analysis results directly.
 
 ## Signing a bundle

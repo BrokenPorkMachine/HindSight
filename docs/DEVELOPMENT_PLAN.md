@@ -63,7 +63,7 @@ Acceptance: a clean install is understandable, testable, supportable, and distri
 - [x] Add a visible Support & Readiness center with build identity, Coordinator health, host capability status, and diagnostics actions.
 - [x] Add structured operation/error taxonomy with recovery guidance and support-safe export.
 - [ ] Complete review decisions and conflict-safe handoff workflows; case integrity manifests, bounded verification, and visible trust status are implemented.
-- [ ] Add local policy and extension-governance surfaces with fail-closed validation.
+- [ ] Complete local policy and extension-governance surfaces; explicit capability allowlisting, blocked policy status, and fail-closed execution/enablement are implemented.
 - [ ] Add managed-defaults, signed-release-manifest, retention, and opt-in crash-diagnostics documentation.
 
 Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a local investigation without guessing which build, capability, policy, or evidence boundary is active.

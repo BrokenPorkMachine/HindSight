@@ -16,6 +16,12 @@ final class ScriptingHost {
     static let maxPersistentBytes = 64 * 1024
     static let maxPluginPackageBytes = 16 * 1024 * 1024
     static let maxPluginPackageEntries = 2048
+    static let governedCapabilities: Set<String> = [
+        "selection.read", "analysis.read", "debugger.read", "settings.read", "state.read",
+        "annotation.read", "data.read", "navigation.write", "breakpoint.write", "debugger.control",
+        "notes.write", "settings.write", "state.write", "annotation.write", "data.write",
+        "analysis.custom"
+    ]
     private let fm = FileManager.default
     // Fixed stripes bound lock-table memory even when an untrusted XPC client
     // sends arbitrarily many distinct plugin IDs.
@@ -198,6 +204,7 @@ except BaseException:
         let executionLock = pluginLock(for: id)
         executionLock.lock(); defer { executionLock.unlock() }
         guard let (info,dir)=findPlugin(id:id,projectPath:projectPath), info.enabled else { return encodeRun(ok:false,stderr:"",message:"Plugin not found or disabled.",duration:0) }
+        guard info.policy_status == "allowed" else { return encodeRun(ok:false,stderr:"",message:"Extension blocked by local policy: \(info.policy_status).",duration:0) }
         guard info.trusted else { return encodeRun(ok:false,stderr:"",message:"Extension is not trusted. Review it in Extension Manager before execution.",duration:0) }
         guard dependenciesSatisfied(info.dependencies, projectPath: projectPath) else { return encodeRun(ok:false,stderr:"",message:"Extension dependencies are not satisfied.",duration:0) }
         let allowed = info.events.contains(event) || info.commands.contains(where:{$0.event==event}) || info.panels.contains(where:{$0.event==event}) || info.analysis_passes.contains(where:{$0.event==event})
@@ -224,6 +231,7 @@ except BaseException:
         let executionLock = pluginLock(for: id)
         executionLock.lock(); defer { executionLock.unlock() }
         guard let (info,dir)=findPlugin(id:id,projectPath:projectPath) else { return "{\"ok\":false,\"message\":\"Plugin not found.\"}" }
+        guard info.policy_status == "allowed" || !enabled else { return "{\"ok\":false,\"message\":\"Extension is blocked by local policy and cannot be enabled.\"}" }
         let marker=dir.appendingPathComponent(".disabled")
         do { if enabled { if fm.fileExists(atPath:marker.path){try fm.removeItem(at:marker)} } else { fm.createFile(atPath:marker.path,contents:Data()) }; return "{\"ok\":true,\"message\":\"Plugin \(jsonEscape(info.name)) \(enabled ? "enabled" : "disabled").\"}" } catch { return "{\"ok\":false,\"message\":\"\(jsonEscape(error.localizedDescription))\"}" }
     }
@@ -288,12 +296,14 @@ except BaseException:
         let deps=Array((m.dependencies ?? []).prefix(32)).filter{validID($0.plugin_id)}
         let signatureStatus=verifySignature(dir:dir)
         let trusted = signatureStatus == "verified" || fm.fileExists(atPath:pluginDataRoot(m.id).appendingPathComponent("trusted.json").path)
+        let capabilities=Array((m.capabilities ?? []).prefix(48))
+        let policyStatus = capabilities.first(where: { !Self.governedCapabilities.contains($0) }).map { "unknown capability \($0)" } ?? "allowed"
         let annotations=loadAnnotations(pluginID:m.id)
         let customData=loadObject(pluginDataRoot(m.id).appendingPathComponent("custom-data.json"))
-        return PluginInfo(id:m.id,name:String(m.name.prefix(120)),version:String(m.version.prefix(64)),api_version:m.api_version,entry:m.entry,capabilities:Array((m.capabilities ?? []).prefix(48)),events:Array((m.events ?? []).prefix(24)),commands:Array((m.commands ?? []).prefix(48)),panels:Array((m.panels ?? []).prefix(24)),settings:settings,settings_values:values,analysis_passes:Array((m.analysis_passes ?? []).prefix(24)),debugger_filter:m.debugger_filter,package_format:{
+        return PluginInfo(id:m.id,name:String(m.name.prefix(120)),version:String(m.version.prefix(64)),api_version:m.api_version,entry:m.entry,capabilities:capabilities,events:Array((m.events ?? []).prefix(24)),commands:Array((m.commands ?? []).prefix(48)),panels:Array((m.panels ?? []).prefix(24)),settings:settings,settings_values:values,analysis_passes:Array((m.analysis_passes ?? []).prefix(24)),debugger_filter:m.debugger_filter,package_format:{
             let ext=dir.pathExtension.lowercased()
             return ext=="vgplugin" ? "vgplugin" : (ext=="rewplugin" ? "legacy-rewplugin" : "folder")
-        }(),dependencies:deps,dependency_status:"unchecked",signature_status:signatureStatus,trusted:trusted,annotations:annotations,custom_data_keys:customData.keys.sorted(),path:dir.path,source:source,enabled:!disabled)
+        }(),dependencies:deps,dependency_status:"unchecked",signature_status:signatureStatus,policy_status:policyStatus,trusted:trusted,annotations:annotations,custom_data_keys:customData.keys.sorted(),path:dir.path,source:source,enabled:!disabled)
     }
 
     private func augmentContext(_ contextJSON:String,info:PluginInfo)->String {

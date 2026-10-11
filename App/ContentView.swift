@@ -959,6 +959,7 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 9)], alignment: .leading, spacing: 9) {
                                 VGKeyValueField(label: "Signature", value: plugin.signature_status, monospaced: true)
+                                VGKeyValueField(label: "Local policy", value: plugin.policy_status, monospaced: true)
                                 VGKeyValueField(label: "Trusted", value: plugin.trusted ? "yes" : "no", monospaced: true)
                                 VGKeyValueField(label: "Package", value: "\(plugin.package_format) • \(plugin.source)")
                                 VGKeyValueField(label: "Capabilities", value: plugin.capabilities.joined(separator: ", "))
@@ -971,6 +972,7 @@ struct ContentView: View {
                                 Button(plugin.enabled ? "Disable" : "Enable") {
                                     model.setSelectedPluginEnabled(!plugin.enabled)
                                 }
+                                .disabled(plugin.policy_status != "allowed" && !plugin.enabled)
                             }
                         }
                         .padding(6)
