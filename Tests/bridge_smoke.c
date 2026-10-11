@@ -4,7 +4,7 @@
 #include <string.h>
 int main(void) {
     assert(reworkbench_abi_version() == 1);
-    assert(strstr(reworkbench_capabilities_json(), "\"analysis\":false") != 0);
+    assert(strstr(reworkbench_capabilities_json(), "\"analysis\":true") != 0);
     uint64_t result = 99;
     assert(reworkbench_checked_address_add(0xfffffff000000000ULL, 8, &result));
     assert(result == 0xfffffff000000008ULL);

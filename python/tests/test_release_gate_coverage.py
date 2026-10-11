@@ -57,6 +57,12 @@ class ReleaseGateCoverageTests(unittest.TestCase):
         self.assertIn('let source="cache";', build_script)
         self.assertGreater(bridge_source.rfind("#[cfg(test)]"), bridge_source.rfind("pub unsafe extern"))
 
+    def test_beta_gate_handles_optional_release_arguments_and_current_capability(self):
+        gate = (ROOT / "scripts/test-beta-macos.sh").read_text()
+        smoke = (ROOT / "Tests/bridge_smoke.c").read_text()
+        self.assertIn('if ((${#release_build_args[@]})); then', gate)
+        self.assertIn('"\\"analysis\\":true"', smoke)
+
 
 if __name__ == "__main__":
     unittest.main()

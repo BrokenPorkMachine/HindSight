@@ -13,7 +13,7 @@ private func vgBoundedUTF8(_ text: String, maxBytes: Int) -> String {
     return result
 }
 
-private func vgContinuityFingerprint(_ text: String) -> String {
+func vgContinuityFingerprint(_ text: String) -> String {
     var value: UInt64 = 0xcbf29ce484222325
     for byte in text.utf8 {
         value ^= UInt64(byte)
@@ -1129,7 +1129,7 @@ extension WorkbenchModel {
         refreshAnalysisContinuityProjection()
     }
 
-    private func persistAnalysisContinuity(projectPath: String) {
+    func persistAnalysisContinuity(projectPath: String) {
         do { try VGAnalysisContinuityStore.save(analysisContinuityDocument, projectPath: projectPath) }
         catch { status = "Analysis continuity state was not saved: \(error.localizedDescription)" }
     }

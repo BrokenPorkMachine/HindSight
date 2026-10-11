@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 
 private struct VGAnalysisDecodeResult: Sendable {
     let reply: AnalysisReply?
@@ -1717,7 +1718,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     func importInvestigationCase() {
         let panel = NSOpenPanel()
         panel.title = "Import HindSight Case"
-        panel.allowedFileTypes = ["vgcase"]
+        if let caseType = UTType(filenameExtension: "vgcase") {
+            panel.allowedContentTypes = [caseType]
+        }
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }

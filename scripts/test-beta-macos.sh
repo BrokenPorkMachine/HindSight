@@ -21,7 +21,11 @@ if [[ -n "${VECTORGLASS_NOTARIZE_PROFILE:-}" ]]; then
         "ENABLE_HARDENED_RUNTIME=YES"
     )
 fi
-CONFIGURATION=Release "$ROOT/scripts/build-app.sh" "${release_build_args[@]}"
+if ((${#release_build_args[@]})); then
+    CONFIGURATION=Release "$ROOT/scripts/build-app.sh" "${release_build_args[@]}"
+else
+    CONFIGURATION=Release "$ROOT/scripts/build-app.sh"
+fi
 app="$ROOT/build/DerivedData/Build/Products/Release/HindSight.app"
 "$ROOT/scripts/verify-app-signing.sh" "$app"
 service="$app/Contents/XPCServices/CoordinatorService.xpc"
