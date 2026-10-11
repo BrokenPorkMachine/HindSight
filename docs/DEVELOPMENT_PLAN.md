@@ -27,7 +27,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 - [ ] Improve type, variable, and call-signature recovery.
 - [ ] Add validated indirect-dispatch and jump-table reconstruction.
 - [ ] Add automatic mixed ARM/Thumb control-flow transitions.
-- [ ] Expand Unicode and string decoding.
+- [x] Expand bounded UTF-16 Unicode string decoding with provenance-preserving output.
 - [ ] Add IMG4/IM4P container inspection and supported decompression paths.
 - [ ] Improve non-ARM64 semantic lifting and pseudocode quality.
 

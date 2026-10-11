@@ -35,7 +35,7 @@ def image(cpu=7, code=b'\x55\x89\xe5\xc3', *, be=False, extra=b''):
     dataoff=(dataoff+7)&~7
     pointer_width=8 if wide else 4
     pointers=struct.pack(endian+('Q' if wide else 'I')*3,*([0x1000+codeoff]*3))
-    payload=b'fixture string\0'+b'W\0i\0d\0e\0\0\0'
+    payload=b'fixture string\0'+b'W\0i\0d\0e\0\0\0'+ '漢字仮名'.encode('utf-16-le') + b'\0\0'
     const=pointers+payload
     symoff=dataoff+len(const); stroff=symoff+(16 if wide else 12)
     names=b'\0_fixture_function\0'
@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory() as directory:
         assert a['kind']=='analysis_result',a
         assert set(a)==REPORT_FIELDS, set(a)^REPORT_FIELDS
         assert '_fixture_function' in a['functions'] and 'source=nlist' in a['functions']
-        assert 'fixture string' in a['strings'] and 'UTF16-LE' in a['strings']
+        assert 'fixture string' in a['strings'] and 'UTF16-LE' in a['strings'] and '漢字仮名' in a['strings']
         assert 'prologue candidate' in a['function_intelligence']
         assert 'epilogue candidate' in a['function_intelligence']
         assert 'pointer-table candidate count=3' in a['jump_tables']

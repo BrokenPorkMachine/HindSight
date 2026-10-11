@@ -1188,29 +1188,54 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
             at += 1;
         }
         let mut at = 0;
-        while at + 8 <= b.len() {
+        while at + 1 < b.len() {
             let start = at;
-            while at + 1 < b.len() && b[at + 1] == 0 && (b[at].is_ascii_graphic() || b[at] == b' ')
-            {
-                at += 2
+            let mut units = Vec::new();
+            let mut terminated = false;
+            while at + 1 < b.len() && units.len() < 512 {
+                let unit = if i.be {
+                    u16::from_be_bytes([b[at], b[at + 1]])
+                } else {
+                    u16::from_le_bytes([b[at], b[at + 1]])
+                };
+                if unit == 0 {
+                    terminated = true;
+                    break;
+                }
+                units.push(unit);
+                at += 2;
             }
-            if at - start >= 8 {
-                let text: String = b[start..at.min(start + 1024)]
-                    .chunks_exact(2)
-                    .map(|c| c[0] as char)
-                    .collect();
-                push(
-                    &mut out,
-                    &format!(
-                        "0x{:016x} file={:#x} UTF16-LE {:?} section={}\n",
-                        s.address + start as u64,
-                        s.offset + start as u64,
-                        text,
-                        s.name
-                    ),
-                );
+            let mut emitted = false;
+            let preceded_by_terminator = start > 0 && b[start - 1] == 0;
+            let plausible_start = preceded_by_terminator
+                || b[start] == 0
+                || b[start + 1] == 0
+                || b[start] >= 0x80
+                || b[start + 1] >= 0x80;
+            let boundary = start == 0 || b[start - 1] == 0 || !b[start - 1].is_ascii_graphic();
+            if plausible_start && boundary && terminated && units.len() >= 4 {
+                if let Ok(text) = String::from_utf16(&units) {
+                    let printable = text.chars().all(|character| {
+                        !character.is_control() || character.is_whitespace()
+                    });
+                    if printable {
+                        let encoding = if i.be { "UTF16-BE" } else { "UTF16-LE" };
+                        push(
+                            &mut out,
+                            &format!(
+                                "0x{:016x} file={:#x} {} {:?} section={}\n",
+                                s.address + start as u64,
+                                s.offset + start as u64,
+                                encoding,
+                                text,
+                                s.name
+                            ),
+                        );
+                        emitted = true;
+                    }
+                }
             }
-            at = if at > start { at } else { start + 1 };
+            at = if emitted { start + units.len() * 2 + 2 } else { start + 1 };
         }
     }
     Ok((out, limited))
