@@ -1,0 +1,1038 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HindSight capability response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "release_channel",
+    "abi",
+    "project_integrity_check",
+    "case_recovery",
+    "coordinator_handshake_validation",
+    "coordinator_session_rehydration",
+    "beta_diagnostics",
+    "launch_session_continuity",
+    "automatic_last_project_reopen",
+    "stale_launch_session_recovery",
+    "adaptive_workspace_topology",
+    "responsive_workbench_chrome",
+    "overflow_safe_metric_bands",
+    "experimental_machine_profiles",
+    "rust_bridge",
+    "analysis",
+    "execution",
+    "runtime_governor",
+    "header_worker",
+    "project_notes",
+    "source_capture",
+    "macho_layout",
+    "arm64_preview",
+    "instruction_pages",
+    "bounded_page_cache",
+    "integer_memory_decode",
+    "function_discovery",
+    "cfg",
+    "xrefs",
+    "call_graph",
+    "string_scan",
+    "dataflow",
+    "function_intelligence",
+    "pc_relative_data_references",
+    "analysis_insights",
+    "bounded_dominator_solver",
+    "per_function_dominator_budget",
+    "analysis_worker_signal_diagnostics",
+    "task_layouts",
+    "dominators",
+    "phi_sites",
+    "runtime_metadata",
+    "cross_navigation",
+    "dominance_frontiers",
+    "runtime_records",
+    "annotated_disassembly",
+    "ssa_rename",
+    "runtime_graph",
+    "swift_nominal_types",
+    "selector_xrefs",
+    "dyld_chained_fixups",
+    "objc_protocol_graph",
+    "swift_field_descriptors",
+    "interblock_value_flow",
+    "dyld_chained_page_starts",
+    "swift_field_records",
+    "predecessor_value_flow",
+    "evidence_layout",
+    "dyld_chained_pointer_decode",
+    "swift_field_ownership",
+    "iterative_value_propagation",
+    "indirect_call_resolution",
+    "resolution_layout",
+    "navigation_history",
+    "arm64e_pointer_format_recognition",
+    "arm64e_pointer_field_decode",
+    "dyld_multistart_expansion",
+    "context_navigation_history",
+    "context_inspector",
+    "dylib_ordinal_resolution",
+    "resolved_dyld_imports",
+    "authenticated_bind_target_composition",
+    "clickable_evidence_rows",
+    "indirect_symbol_table",
+    "lazy_nonlazy_pointer_resolution",
+    "export_trie",
+    "symbol_provenance",
+    "linkage_explorer",
+    "joined_linkage_records",
+    "symbol_caller_provenance",
+    "got_auth_got_reconstruction",
+    "import_export_collision_analysis",
+    "selected_symbol_workspace",
+    "native_debug_server",
+    "debug_attach_launch",
+    "debug_registers",
+    "debug_memory",
+    "software_breakpoints",
+    "debug_event_stream",
+    "debug_workspace",
+    "debug_thread_selection",
+    "debug_memory_map",
+    "debug_module_enumeration",
+    "debug_backtrace",
+    "debug_live_disassembly",
+    "dynamic_analysis_layout",
+    "debug_stop_context",
+    "debug_module_slide_resolution",
+    "debug_pc_follow",
+    "debug_memory_browser",
+    "python_scripting",
+    "plugin_api_v1",
+    "plugin_discovery",
+    "plugin_capabilities",
+    "plugin_api_v2",
+    "plugin_dock_views",
+    "plugin_persistent_settings",
+    "plugin_persistent_state",
+    "plugin_analysis_passes",
+    "plugin_debug_filters",
+    "plugin_hotkeys",
+    "rewplugin_bundles",
+    "extensions_platform",
+    "hypervisor_vm",
+    "apple_soc_virtualization",
+    "soc_device_graph",
+    "hypervisor_re_suite",
+    "guest_memory_inspector",
+    "guest_disassembly",
+    "vm_snapshot_diff",
+    "guest_search",
+    "vm_trace",
+    "guest_breakpoints",
+    "gpa_device_map",
+    "dyld_cache_browser",
+    "dyld_cache_bounded_read",
+    "dyld_legacy_linking_decode",
+    "soft_linking_decode",
+    "static_symbolication_decode",
+    "unified_symbol_resolver",
+    "apple_symbolication_framework_decode",
+    "ipsw_catalog",
+    "ipsw_import",
+    "public_firmware_key_lookup",
+    "iphemeral_software_backend",
+    "firmware_runtime_lab",
+    "unified_target_model",
+    "target_capability_discovery",
+    "address_pivot",
+    "session_headers",
+    "analyst_desk",
+    "workspace_tabs",
+    "rich_disassembly",
+    "focus_mode",
+    "inspector_modes",
+    "graph_workspace",
+    "cfg_canvas",
+    "graph_minimap",
+    "synchronized_semantics",
+    "debugger_graph_highlight",
+    "dockable_analysis_panes",
+    "binary_workspace",
+    "synchronized_code_workspace",
+    "conservative_lifted_view",
+    "function_browser",
+    "xref_inspector",
+    "instruction_data_inspector",
+    "runtime_correlation_workspace",
+    "runtime_stop_history",
+    "register_delta_tracking",
+    "runtime_static_slide_correlation",
+    "runtime_memory_observations",
+    "runtime_execution_heat",
+    "trace_explorer",
+    "observed_transition_timeline",
+    "register_change_band",
+    "trace_function_summary",
+    "nearby_memory_evidence",
+    "evidence_graph_workspace",
+    "provenance_graph",
+    "evidence_confidence_edges",
+    "analyst_note_nodes",
+    "runtime_evidence_links",
+    "investigation_ledger",
+    "persistent_case_state",
+    "hypothesis_tracking",
+    "case_bookmarks",
+    "session_snapshots",
+    "vgcase_export",
+    "case_markdown_export",
+    "case_json_export",
+    "case_pdf_export",
+    "binary_diff_workspace",
+    "semantic_binary_diff",
+    "cfg_diff",
+    "xref_diff",
+    "layout_resilient_function_matching",
+    "analysis_job_status",
+    "analysis_progress_phases",
+    "bounded_analysis_deadline",
+    "nonfatal_status_polling",
+    "modern_macho_metadata_admission",
+    "encrypted_metadata_analysis",
+    "data_in_code_barriers",
+    "analysis_quality_ledger",
+    "function_neighborhoods",
+    "cross_function_tail_candidates",
+    "project_analysis_cache",
+    "analysis_cache_identity_binding",
+    "stable_release_channel",
+    "analysis_scalability_budgets",
+    "off_main_analysis_decode",
+    "off_main_continuity_fingerprinting",
+    "analysis_stage_progress",
+    "analysis_progress_percent",
+    "analysis_progress_diagnostic_separation",
+    "analysis_cache_patch_compatibility",
+    "analysis_cache_envelope_v2",
+    "structured_analysis_navigation",
+    "analysis_triage_workspace",
+    "correlated_evidence_navigation",
+    "persistent_analysis_pins",
+    "recent_evidence_history",
+    "analysis_change_ledger",
+    "launch_context_continuity",
+    "investigation_collections",
+    "collection_aware_pins",
+    "evidence_resume",
+    "collection_search",
+    "collection_health",
+    "collection_rename",
+    "evidence_history_navigation",
+    "collection_comparison",
+    "collection_review_baselines",
+    "collection_evidence_drift",
+    "investigation_review_mode",
+    "collection_review_journal",
+    "collection_workflow_state",
+    "investigation_handoff",
+    "review_timeline",
+    "review_follow_up_queue",
+    "follow_up_evidence_binding",
+    "collection_review_summary",
+    "handoff_follow_up_context",
+    "universal_macos_binary",
+    "intel_macos_host_support",
+    "host_architecture_feature_gating",
+    "cross_host_arm64_analysis",
+    "vector_emu_cross_host",
+    "typed_evidence_core",
+    "off_main_evidence_index",
+    "semantic_evidence_identity",
+    "indexed_evidence_navigation",
+    "evidence_core_compat_adapter",
+    "bounded_resident_analysis_reports",
+    "debounced_launch_session_persistence",
+    "worker_native_typed_evidence",
+    "typed_evidence_sideband_v1",
+    "analysis_cache_envelope_v3",
+    "analysis_stage_fingerprints",
+    "typed_evidence_compatibility_merge",
+    "aging_priority_dispatch",
+    "bounded_concurrent_task_lanes",
+    "resource_aware_queueing",
+    "disconnect_queue_cancellation"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "release_channel": {
+      "enum": [
+        "beta",
+        "rc",
+        "stable"
+      ]
+    },
+    "abi": {
+      "const": 1
+    },
+    "project_integrity_check": {
+      "const": true
+    },
+    "case_recovery": {
+      "const": true
+    },
+    "coordinator_handshake_validation": {
+      "const": true
+    },
+    "coordinator_session_rehydration": {
+      "const": true
+    },
+    "beta_diagnostics": {
+      "const": true
+    },
+    "launch_session_continuity": {
+      "const": true
+    },
+    "automatic_last_project_reopen": {
+      "const": true
+    },
+    "stale_launch_session_recovery": {
+      "const": true
+    },
+    "adaptive_workspace_topology": {
+      "const": true
+    },
+    "responsive_workbench_chrome": {
+      "const": true
+    },
+    "overflow_safe_metric_bands": {
+      "const": true
+    },
+    "experimental_machine_profiles": {
+      "const": true
+    },
+    "rust_bridge": {
+      "const": true
+    },
+    "analysis": {
+      "const": true
+    },
+    "execution": {
+      "const": true
+    },
+    "runtime_governor": {
+      "const": true
+    },
+    "header_worker": {
+      "const": true
+    },
+    "project_notes": {
+      "const": true
+    },
+    "source_capture": {
+      "const": true
+    },
+    "macho_layout": {
+      "const": true
+    },
+    "arm64_preview": {
+      "const": true
+    },
+    "instruction_pages": {
+      "const": true
+    },
+    "bounded_page_cache": {
+      "const": true
+    },
+    "integer_memory_decode": {
+      "const": true
+    },
+    "function_discovery": {
+      "const": true
+    },
+    "cfg": {
+      "const": true
+    },
+    "xrefs": {
+      "const": true
+    },
+    "call_graph": {
+      "const": true
+    },
+    "string_scan": {
+      "const": true
+    },
+    "dataflow": {
+      "const": true
+    },
+    "function_intelligence": {
+      "const": true
+    },
+    "pc_relative_data_references": {
+      "const": true
+    },
+    "analysis_insights": {
+      "const": true
+    },
+    "bounded_dominator_solver": {
+      "const": true
+    },
+    "per_function_dominator_budget": {
+      "const": true
+    },
+    "analysis_worker_signal_diagnostics": {
+      "const": true
+    },
+    "task_layouts": {
+      "const": true
+    },
+    "dominators": {
+      "const": true
+    },
+    "phi_sites": {
+      "const": true
+    },
+    "runtime_metadata": {
+      "const": true
+    },
+    "cross_navigation": {
+      "const": true
+    },
+    "dominance_frontiers": {
+      "const": true
+    },
+    "runtime_records": {
+      "const": true
+    },
+    "annotated_disassembly": {
+      "const": true
+    },
+    "ssa_rename": {
+      "const": true
+    },
+    "runtime_graph": {
+      "const": true
+    },
+    "swift_nominal_types": {
+      "const": true
+    },
+    "selector_xrefs": {
+      "const": true
+    },
+    "dyld_chained_fixups": {
+      "const": true
+    },
+    "objc_protocol_graph": {
+      "const": true
+    },
+    "swift_field_descriptors": {
+      "const": true
+    },
+    "interblock_value_flow": {
+      "const": true
+    },
+    "dyld_chained_page_starts": {
+      "const": true
+    },
+    "swift_field_records": {
+      "const": true
+    },
+    "predecessor_value_flow": {
+      "const": true
+    },
+    "evidence_layout": {
+      "const": true
+    },
+    "dyld_chained_pointer_decode": {
+      "const": true
+    },
+    "swift_field_ownership": {
+      "const": true
+    },
+    "iterative_value_propagation": {
+      "const": true
+    },
+    "indirect_call_resolution": {
+      "const": true
+    },
+    "resolution_layout": {
+      "const": true
+    },
+    "navigation_history": {
+      "const": true
+    },
+    "arm64e_pointer_format_recognition": {
+      "const": true
+    },
+    "arm64e_pointer_field_decode": {
+      "const": true
+    },
+    "dyld_multistart_expansion": {
+      "const": true
+    },
+    "context_navigation_history": {
+      "const": true
+    },
+    "context_inspector": {
+      "const": true
+    },
+    "dylib_ordinal_resolution": {
+      "const": true
+    },
+    "resolved_dyld_imports": {
+      "const": true
+    },
+    "authenticated_bind_target_composition": {
+      "const": true
+    },
+    "clickable_evidence_rows": {
+      "const": true
+    },
+    "indirect_symbol_table": {
+      "const": true
+    },
+    "lazy_nonlazy_pointer_resolution": {
+      "const": true
+    },
+    "export_trie": {
+      "const": true
+    },
+    "symbol_provenance": {
+      "const": true
+    },
+    "linkage_explorer": {
+      "const": true
+    },
+    "joined_linkage_records": {
+      "const": true
+    },
+    "symbol_caller_provenance": {
+      "const": true
+    },
+    "got_auth_got_reconstruction": {
+      "const": true
+    },
+    "import_export_collision_analysis": {
+      "const": true
+    },
+    "selected_symbol_workspace": {
+      "const": true
+    },
+    "native_debug_server": {
+      "const": true
+    },
+    "debug_attach_launch": {
+      "const": true
+    },
+    "debug_registers": {
+      "const": true
+    },
+    "debug_memory": {
+      "const": true
+    },
+    "software_breakpoints": {
+      "const": true
+    },
+    "debug_event_stream": {
+      "const": true
+    },
+    "debug_workspace": {
+      "const": true
+    },
+    "debug_thread_selection": {
+      "const": true
+    },
+    "debug_memory_map": {
+      "const": true
+    },
+    "debug_module_enumeration": {
+      "const": true
+    },
+    "debug_backtrace": {
+      "const": true
+    },
+    "debug_live_disassembly": {
+      "const": true
+    },
+    "dynamic_analysis_layout": {
+      "const": true
+    },
+    "debug_stop_context": {
+      "const": true
+    },
+    "debug_module_slide_resolution": {
+      "const": true
+    },
+    "debug_pc_follow": {
+      "const": true
+    },
+    "debug_memory_browser": {
+      "const": true
+    },
+    "python_scripting": {
+      "const": true
+    },
+    "plugin_api_v1": {
+      "const": true
+    },
+    "plugin_discovery": {
+      "const": true
+    },
+    "plugin_capabilities": {
+      "const": true
+    },
+    "plugin_api_v2": {
+      "const": true
+    },
+    "plugin_dock_views": {
+      "const": true
+    },
+    "plugin_persistent_settings": {
+      "const": true
+    },
+    "plugin_persistent_state": {
+      "const": true
+    },
+    "plugin_analysis_passes": {
+      "const": true
+    },
+    "plugin_debug_filters": {
+      "const": true
+    },
+    "plugin_hotkeys": {
+      "const": true
+    },
+    "rewplugin_bundles": {
+      "const": true
+    },
+    "extensions_platform": {
+      "const": true
+    },
+    "hypervisor_vm": {
+      "const": true
+    },
+    "apple_soc_virtualization": {
+      "const": true
+    },
+    "soc_device_graph": {
+      "const": true
+    },
+    "hypervisor_re_suite": {
+      "const": true
+    },
+    "guest_memory_inspector": {
+      "const": true
+    },
+    "guest_disassembly": {
+      "const": true
+    },
+    "vm_snapshot_diff": {
+      "const": true
+    },
+    "guest_search": {
+      "const": true
+    },
+    "vm_trace": {
+      "const": true
+    },
+    "guest_breakpoints": {
+      "const": true
+    },
+    "gpa_device_map": {
+      "const": true
+    },
+    "dyld_cache_browser": {
+      "const": true
+    },
+    "dyld_cache_bounded_read": {
+      "const": true
+    },
+    "dyld_legacy_linking_decode": {
+      "const": true
+    },
+    "soft_linking_decode": {
+      "const": true
+    },
+    "static_symbolication_decode": {
+      "const": true
+    },
+    "unified_symbol_resolver": {
+      "const": true
+    },
+    "apple_symbolication_framework_decode": {
+      "const": true
+    },
+    "ipsw_catalog": {
+      "const": true
+    },
+    "ipsw_import": {
+      "const": true
+    },
+    "public_firmware_key_lookup": {
+      "const": true
+    },
+    "iphemeral_software_backend": {
+      "const": true
+    },
+    "firmware_runtime_lab": {
+      "const": true
+    },
+    "unified_target_model": {
+      "const": true
+    },
+    "target_capability_discovery": {
+      "const": true
+    },
+    "address_pivot": {
+      "const": true
+    },
+    "session_headers": {
+      "const": true
+    },
+    "analyst_desk": {
+      "const": true
+    },
+    "workspace_tabs": {
+      "const": true
+    },
+    "rich_disassembly": {
+      "const": true
+    },
+    "focus_mode": {
+      "const": true
+    },
+    "inspector_modes": {
+      "const": true
+    },
+    "graph_workspace": {
+      "const": true
+    },
+    "cfg_canvas": {
+      "const": true
+    },
+    "graph_minimap": {
+      "const": true
+    },
+    "synchronized_semantics": {
+      "const": true
+    },
+    "debugger_graph_highlight": {
+      "const": true
+    },
+    "dockable_analysis_panes": {
+      "const": true
+    },
+    "binary_workspace": {
+      "const": true
+    },
+    "synchronized_code_workspace": {
+      "const": true
+    },
+    "conservative_lifted_view": {
+      "const": true
+    },
+    "function_browser": {
+      "const": true
+    },
+    "xref_inspector": {
+      "const": true
+    },
+    "instruction_data_inspector": {
+      "const": true
+    },
+    "runtime_correlation_workspace": {
+      "const": true
+    },
+    "runtime_stop_history": {
+      "const": true
+    },
+    "register_delta_tracking": {
+      "const": true
+    },
+    "runtime_static_slide_correlation": {
+      "const": true
+    },
+    "runtime_memory_observations": {
+      "const": true
+    },
+    "runtime_execution_heat": {
+      "const": true
+    },
+    "trace_explorer": {
+      "const": true
+    },
+    "observed_transition_timeline": {
+      "const": true
+    },
+    "register_change_band": {
+      "const": true
+    },
+    "trace_function_summary": {
+      "const": true
+    },
+    "nearby_memory_evidence": {
+      "const": true
+    },
+    "evidence_graph_workspace": {
+      "const": true
+    },
+    "provenance_graph": {
+      "const": true
+    },
+    "evidence_confidence_edges": {
+      "const": true
+    },
+    "analyst_note_nodes": {
+      "const": true
+    },
+    "runtime_evidence_links": {
+      "const": true
+    },
+    "investigation_ledger": {
+      "const": true
+    },
+    "persistent_case_state": {
+      "const": true
+    },
+    "hypothesis_tracking": {
+      "const": true
+    },
+    "case_bookmarks": {
+      "const": true
+    },
+    "session_snapshots": {
+      "const": true
+    },
+    "vgcase_export": {
+      "const": true
+    },
+    "case_markdown_export": {
+      "const": true
+    },
+    "case_json_export": {
+      "const": true
+    },
+    "case_pdf_export": {
+      "const": true
+    },
+    "binary_diff_workspace": {
+      "const": true
+    },
+    "semantic_binary_diff": {
+      "const": true
+    },
+    "cfg_diff": {
+      "const": true
+    },
+    "xref_diff": {
+      "const": true
+    },
+    "layout_resilient_function_matching": {
+      "const": true
+    },
+    "analysis_job_status": {
+      "const": true
+    },
+    "analysis_progress_phases": {
+      "const": true
+    },
+    "bounded_analysis_deadline": {
+      "const": true
+    },
+    "nonfatal_status_polling": {
+      "const": true
+    },
+    "modern_macho_metadata_admission": {
+      "const": true
+    },
+    "encrypted_metadata_analysis": {
+      "const": true
+    },
+    "data_in_code_barriers": {
+      "const": true
+    },
+    "analysis_quality_ledger": {
+      "const": true
+    },
+    "function_neighborhoods": {
+      "const": true
+    },
+    "cross_function_tail_candidates": {
+      "const": true
+    },
+    "project_analysis_cache": {
+      "const": true
+    },
+    "analysis_cache_identity_binding": {
+      "const": true
+    },
+    "stable_release_channel": {
+      "const": true
+    },
+    "analysis_scalability_budgets": {
+      "const": true
+    },
+    "off_main_analysis_decode": {
+      "const": true
+    },
+    "off_main_continuity_fingerprinting": {
+      "const": true
+    },
+    "analysis_stage_progress": {
+      "const": true
+    },
+    "analysis_progress_percent": {
+      "const": true
+    },
+    "analysis_progress_diagnostic_separation": {
+      "const": true
+    },
+    "analysis_cache_patch_compatibility": {
+      "const": true
+    },
+    "analysis_cache_envelope_v2": {
+      "const": true
+    },
+    "structured_analysis_navigation": {
+      "const": true
+    },
+    "analysis_triage_workspace": {
+      "const": true
+    },
+    "correlated_evidence_navigation": {
+      "const": true
+    },
+    "persistent_analysis_pins": {
+      "const": true
+    },
+    "recent_evidence_history": {
+      "const": true
+    },
+    "analysis_change_ledger": {
+      "const": true
+    },
+    "launch_context_continuity": {
+      "const": true
+    },
+    "investigation_collections": {
+      "const": true
+    },
+    "collection_aware_pins": {
+      "const": true
+    },
+    "evidence_resume": {
+      "const": true
+    },
+    "collection_search": {
+      "const": true
+    },
+    "collection_health": {
+      "const": true
+    },
+    "collection_rename": {
+      "const": true
+    },
+    "evidence_history_navigation": {
+      "const": true
+    },
+    "collection_comparison": {
+      "const": true
+    },
+    "collection_review_baselines": {
+      "const": true
+    },
+    "collection_evidence_drift": {
+      "const": true
+    },
+    "investigation_review_mode": {
+      "const": true
+    },
+    "collection_review_journal": {
+      "const": true
+    },
+    "collection_workflow_state": {
+      "const": true
+    },
+    "investigation_handoff": {
+      "const": true
+    },
+    "review_timeline": {
+      "const": true
+    },
+    "review_follow_up_queue": {
+      "const": true
+    },
+    "follow_up_evidence_binding": {
+      "const": true
+    },
+    "collection_review_summary": {
+      "const": true
+    },
+    "handoff_follow_up_context": {
+      "const": true
+    },
+    "universal_macos_binary": {
+      "const": true
+    },
+    "intel_macos_host_support": {
+      "const": true
+    },
+    "host_architecture_feature_gating": {
+      "const": true
+    },
+    "cross_host_arm64_analysis": {
+      "const": true
+    },
+    "vector_emu_cross_host": {
+      "const": true
+    },
+    "typed_evidence_core": {
+      "const": true
+    },
+    "off_main_evidence_index": {
+      "const": true
+    },
+    "semantic_evidence_identity": {
+      "const": true
+    },
+    "indexed_evidence_navigation": {
+      "const": true
+    },
+    "evidence_core_compat_adapter": {
+      "const": true
+    },
+    "bounded_resident_analysis_reports": {
+      "const": true
+    },
+    "debounced_launch_session_persistence": {
+      "const": true
+    },
+    "worker_native_typed_evidence": {
+      "const": true
+    },
+    "typed_evidence_sideband_v1": {
+      "const": true
+    },
+    "analysis_cache_envelope_v3": {
+      "const": true
+    },
+    "analysis_stage_fingerprints": {
+      "const": true
+    },
+    "typed_evidence_compatibility_merge": {
+      "const": true
+    },
+    "aging_priority_dispatch": {
+      "const": true
+    },
+    "bounded_concurrent_task_lanes": {
+      "const": true
+    },
+    "resource_aware_queueing": {
+      "const": true
+    },
+    "disconnect_queue_cancellation": {
+      "const": true
+    }
+  }
+}

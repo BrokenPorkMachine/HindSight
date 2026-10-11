@@ -1,0 +1,13 @@
+[package]
+name = "reworkbench-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "reworkbench_bridge"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+reworkbench-model = { path = "../model" }
+reworkbench-scheduler = { path = "../scheduler" }

@@ -1,0 +1,71 @@
+{
+  "id": "ca.zensoftware.reworkbench.example.extensions-platform",
+  "name": "Extensions Platform Demo",
+  "version": "1.0.0",
+  "api_version": 2,
+  "entry": "main.py",
+  "capabilities": [
+    "selection.read",
+    "analysis.read",
+    "navigation.write",
+    "settings.read",
+    "settings.write",
+    "state.read",
+    "state.write",
+    "analysis.custom",
+    "annotation.read",
+    "annotation.write",
+    "data.read",
+    "data.write"
+  ],
+  "events": [
+    "on_symbol_selected"
+  ],
+  "commands": [
+    {
+      "id": "open-code",
+      "title": "Open Selected Address",
+      "shortcut": "cmd+shift+o",
+      "event": "command.open-code"
+    }
+  ],
+  "panels": [
+    {
+      "id": "summary",
+      "title": "Selection Summary",
+      "event": "panel.summary",
+      "description": "Docked view for the current selection.",
+      "dock": "inspector",
+      "min_width": 280
+    }
+  ],
+  "settings": [
+    {
+      "id": "show_addresses",
+      "title": "Show Addresses",
+      "type": "bool",
+      "default_value": "true",
+      "description": "Include addresses in panel output."
+    }
+  ],
+  "analysis_passes": [
+    {
+      "id": "symbol-audit",
+      "title": "Symbol Audit",
+      "event": "analysis.pass.symbol-audit",
+      "description": "Run a custom read-only analysis pass over the current analysis snapshot."
+    }
+  ],
+  "debugger_filter": {
+    "signals": [
+      5,
+      11
+    ],
+    "reasons": [
+      "breakpoint",
+      "segv",
+      "trap"
+    ]
+  },
+  "dependencies": []
+}

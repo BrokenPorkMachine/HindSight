@@ -1,0 +1,18 @@
+[workspace]
+members = [
+  "crates/iphem-core",
+  "crates/iphem-arm",
+  "crates/iphem-devices",
+  "crates/iphem-soc",
+  "crates/vg-emu-server",
+]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = "thin"
+# Stripping also affects host proc-macro dylibs. Rust's bundled objcopy can
+# misalign their LINKEDIT string pool, which macOS 27 refuses to load.
+# Keep symbols until the upstream fix reaches our pinned Rust toolchain.
+strip = "none"

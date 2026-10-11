@@ -1,0 +1,11 @@
+[package]
+name = "vg-emu-server"
+version = "0.5.7"
+edition = "2021"
+rust-version = "1.90"
+
+[dependencies]
+iphem-arm = { path = "../iphem-arm" }
+iphem-core = { path = "../iphem-core" }
+iphem-soc = { path = "../iphem-soc" }
+serde_json = "1.0"

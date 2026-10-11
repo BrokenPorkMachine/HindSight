@@ -1,0 +1,66 @@
+import pathlib
+import re
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+NAV = (ROOT / "App/AnalysisNavigation.swift").read_text()
+CONTENT = (ROOT / "App/ContentView.swift").read_text()
+CATALOG = (ROOT / "App/WorkspaceCatalog.swift").read_text()
+TOPOLOGY = (ROOT / "Config/project-topology.json").read_text()
+
+
+def test_structured_navigation_is_bounded_and_address_aware():
+    assert 'limit: Int = 500' in NAV
+    assert 'min(max(limit, 1), 1000)' in NAV
+    assert 'limit: Int = 180' in NAV
+    assert 'min(max(limit, 1), 300)' in NAV
+    assert 'maxLineBytes = 16 * 1024' in NAV
+    assert r'(?i)\b0x[0-9a-f]{1,16}\b' in NAV
+    assert 'address: UInt64?' in NAV
+    assert 'symbol: String?' in NAV
+
+
+def test_focus_queue_is_explicitly_navigation_not_risk_scoring():
+    assert 'source-prioritized investigation queue' in NAV
+    assert 'not a vulnerability, severity, exploitability, or semantic-importance score' in NAV
+    for source in [
+        'Analysis Insights', 'Analysis Quality', 'Function Intelligence',
+        'Function Neighborhoods', 'Data References', 'Symbol Callers',
+        'Indirect Calls', 'Tail-Call Candidates', 'Import/Export Collisions'
+    ]:
+        assert source in NAV
+
+
+def test_hits_route_to_source_code_cfg_and_symbol_without_protocol_changes():
+    for destination in ['case .source:', 'case .disassembly:', 'case .cfg:', 'case .selectedSymbol:']:
+        assert destination in NAV
+    assert 'workspace = hit.workspace' in NAV
+    assert 'workspace = "Disassembly"' in NAV
+    assert 'workspace = "CFG"' in NAV
+    assert 'workspace = "Selected Symbol"' in NAV
+    assert 'AnalysisReport.jsonFields' not in NAV
+
+
+def test_navigator_and_inspector_use_structured_evidence_views():
+    assert 'case "Analysis Triage"' in CONTENT
+    assert 'VGAnalysisTriageView(model: model)' in CONTENT
+    assert 'VGAnalysisSearchResults(model: model)' in CONTENT
+    assert 'VGRelatedAnalysisEvidenceView(model: model)' in CONTENT
+    nav_start = CONTENT.index('case "Navigator":')
+    nav_end = CONTENT.index('case "Dominators":', nav_start)
+    assert 'monospaced(model.filteredAnalysisLines())' not in CONTENT[nav_start:nav_end]
+    assert '"Analysis Triage"' in CATALOG
+    assert 'App/AnalysisNavigation.swift' in TOPOLOGY
+
+
+def test_generic_clickable_evidence_keeps_context_navigation():
+    list_start = CONTENT.index('private struct VGBoundedEvidenceList: View')
+    list_end = CONTENT.index('@MainActor\nstruct ContentView: View', list_start)
+    renderer = CONTENT[list_start:list_end]
+    start = CONTENT.index('@ViewBuilder private func clickableEvidence')
+    end = CONTENT.index('@ViewBuilder private func pythonWorkspace', start)
+    body = CONTENT[start:end]
+    assert 'VGBoundedEvidenceList(model: model, text: text)' in body
+    assert '.contextMenu' in renderer
+    assert 'Open 0x' in renderer
+    assert 'in Disassembly' in renderer
+    assert 'in CFG' in renderer

@@ -1,0 +1,7 @@
+[package]
+name="iphem-devices"
+version="1.9.0-pre-internal"
+edition="2021"
+rust-version="1.90"
+[dependencies]
+iphem-core={path="../iphem-core"}

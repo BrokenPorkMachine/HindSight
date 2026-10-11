@@ -1,0 +1,11 @@
+{
+  "id": "ca.zensoftware.reworkbench.example.automation-demo",
+  "name": "Automation Demo",
+  "version": "1.0.0",
+  "api_version": 2,
+  "entry": "main.py",
+  "capabilities": ["selection.read", "navigation.write"],
+  "events": ["on_symbol_selected"],
+  "commands": [{"id":"open-code","title":"Open Selected Address","shortcut":"cmd+shift+o","event":"command.open-code"}],
+  "panels": [{"id":"summary","title":"Selection Summary","event":"panel.summary","description":"Inspect the current selection and pivot to annotated code."}]
+}
