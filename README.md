@@ -4,6 +4,22 @@ The app bundle and executable are **HindSight.app** and **HindSight**. Open `Hin
 
 This source release extends the bounded pseudocode preview to distinguish ARM64 and Intel x86-64 instruction-effect categories without claiming source-level recovery.
 
+## Build and launch
+
+On macOS, build HindSight from the project root with:
+
+```sh
+./build.sh
+```
+
+To build and launch the app in one step:
+
+```sh
+./run.sh
+```
+
+The scripts build the `Debug` configuration by default. Set `CONFIGURATION=Release` to build or launch the release configuration instead.
+
 ## Firmware and multi-architecture imports
 
 Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM32/Thumb-2 for SEPOS composites. The import dialog exposes format, instruction mode, raw load address and embedded image offset. Plaintext SecureROM/iBoot images use explicit raw mappings. The worker extracts headers/sections, symbol and export names, function starts, strings, relocations, indirect-symbol/pointer tables, direct control-flow references and prologue/epilogue candidates. LLVM provides the instruction display; the established ARM64 semantic analyzer remains available for ordinary thin ARM64 images.
