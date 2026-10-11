@@ -25,6 +25,8 @@ enum VGLedgerEntryKind: String, Codable, CaseIterable, Hashable {
     case snapshotCreated = "snapshot-created"
     case snapshotRestored = "snapshot-restored"
     case caseExported = "case-exported"
+    case extensionTrustChanged = "extension-trust-changed"
+    case extensionStateChanged = "extension-state-changed"
 
     var title: String {
         switch self {
@@ -42,6 +44,8 @@ enum VGLedgerEntryKind: String, Codable, CaseIterable, Hashable {
         case .snapshotCreated: return "Session snapshot"
         case .snapshotRestored: return "Snapshot restored"
         case .caseExported: return "Case exported"
+        case .extensionTrustChanged: return "Extension trust changed"
+        case .extensionStateChanged: return "Extension state changed"
         }
     }
 }

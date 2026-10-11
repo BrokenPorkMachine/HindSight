@@ -38,7 +38,8 @@ management, or shared collaboration without an enterprise service boundary.
 - [ ] Add extension allowlist, signature/trust status, capability disclosure,
   and per-extension enable/disable controls.
 - [ ] Add explicit data-retention and export destination controls.
-- [ ] Add an append-only, exportable audit stream for analyst and policy events.
+- [x] Record extension trust and enable/disable decisions in the durable case ledger.
+- [ ] Add an append-only, exportable audit stream for all analyst and policy events.
 
 ### 3. Team investigation workflow
 

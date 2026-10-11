@@ -1399,13 +1399,33 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     func setSelectedPluginEnabled(_ enabled: Bool) {
         guard !selectedPluginID.isEmpty else { return }
         client.request(timeout: 5, operation: { $0.pluginSetEnabled(self.selectedPluginID, enabled: enabled, withReply: $1) }) { [weak self] result in
-            guard let self else { return }; do { let data=Data(try result.get().utf8); let obj=try JSONSerialization.jsonObject(with:data) as? [String:Any]; self.status=(obj?["message"] as? String) ?? "Plugin state updated."; self.refreshPlugins() } catch { self.status=error.localizedDescription }
+            guard let self else { return }
+            do {
+                let data = Data(try result.get().utf8)
+                let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                self.status = (object?["message"] as? String) ?? "Plugin state updated."
+                if (object?["ok"] as? Bool) == true {
+                    let decision = enabled ? "enabled" : "disabled"
+                    self.recordLedger(kind: .extensionStateChanged, provenance: .asserted, detail: "Extension " + self.selectedPluginID + " " + decision + " by the analyst.")
+                }
+                self.refreshPlugins()
+            } catch { self.status = error.localizedDescription }
         }
     }
     func setSelectedPluginTrusted(_ trusted: Bool) {
         guard !selectedPluginID.isEmpty else { return }
         client.request(timeout: 5, operation: { $0.pluginSetTrusted(self.selectedPluginID, trusted: trusted, withReply: $1) }) { [weak self] result in
-            guard let self else { return }; do { let data=Data(try result.get().utf8); let obj=try JSONSerialization.jsonObject(with:data) as? [String:Any]; self.status=(obj?["message"] as? String) ?? "Extension trust updated."; self.refreshPlugins() } catch { self.status=error.localizedDescription }
+            guard let self else { return }
+            do {
+                let data = Data(try result.get().utf8)
+                let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                self.status = (object?["message"] as? String) ?? "Extension trust updated."
+                if (object?["ok"] as? Bool) == true {
+                    let decision = trusted ? "granted" : "revoked"
+                    self.recordLedger(kind: .extensionTrustChanged, provenance: .asserted, detail: "Extension " + self.selectedPluginID + " trust " + decision + " by the analyst.")
+                }
+                self.refreshPlugins()
+            } catch { self.status = error.localizedDescription }
         }
     }
 
