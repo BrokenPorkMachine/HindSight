@@ -249,7 +249,7 @@ enum VGGraphParser {
         // edges. A normal sequential transfer between two adjacent leaders is
         // still real CFG structure, so restore it here unless the next leader
         // starts a known function or the block already has a terminating edge.
-        for index in blocks.indices.dropLast() {
+        for index in blocks.indices.dropLast() where !functionStarts.isEmpty {
             let current = blocks[index]
             let next = blocks[index + 1]
             guard current.end == next.start,
