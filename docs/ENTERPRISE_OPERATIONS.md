@@ -1,6 +1,6 @@
 # Enterprise Operations Contract
 
-This document records the local deployment, release-trust, retention, and diagnostics boundaries for HindSight 0.5.7. It is an operator contract, not a claim that Developer ID signing, notarization, or managed-device enrollment has been completed in this source environment.
+This document records the local deployment, release-trust, retention, and diagnostics boundaries for HindSight 0.5.8. It is an operator contract, not a claim that Developer ID signing, notarization, or managed-device enrollment has been completed in this source environment.
 
 ## Managed defaults
 
@@ -25,10 +25,10 @@ Stable distribution requires a detached release manifest next to the notarized a
 {
   "schema": 1,
   "product": "HindSight",
-  "version": "0.5.7",
-  "build": "5700",
+  "version": "0.5.8",
+  "build": "5800",
   "release_channel": "stable",
-  "artifacts": [{"name": "HindSight-0.5.7.dmg", "sha256": "…", "bytes": 0}],
+  "artifacts": [{"name": "HindSight-0.5.8.dmg", "sha256": "…", "bytes": 0}],
   "minimum_macos": "14.0",
   "required_architectures": ["arm64", "x86_64"],
   "analysis_engine": "arm64-analysis-v15-schema71",

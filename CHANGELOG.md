@@ -7,6 +7,14 @@
 - Bound SwiftUI workspace type expansion to fix the reproduced Swift 6.4 SIL-generation crash in ContentView.
 - Regenerate consistent build settings and add clean, commit-based source recreation without Git metadata, DerivedData, or Xcode user state.
 
+# 0.5.8 — Pressure-Aware Launch and Enterprise Operations
+
+- Add pressure-aware startup deferral with explicit manual-connect recovery.
+- Enforce managed extension policy modes and fail-closed capability governance.
+- Add conflict-safe review decisions, handoff readiness explanations, and case integrity visibility.
+- Document enterprise deployment, signed-release-manifest, retention, and diagnostics boundaries.
+- Preserve protocol ABI 1, the exact 71-field analysis report, and analysis engine identity.
+
 # 0.5.7 — Scheduling, Swift Demangling, Structural Pseudocode
 
 - Priority-aware bounded scripting/firmware lanes with stale-reply invalidation and cancellation hooks.

@@ -10,11 +10,11 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.7)
+## Current baseline (0.5.8)
 
-## 0.5.7 — Scheduler, Demangling, Structural Pseudocode
+## 0.5.8 — Scheduler, Demangling, Structural Pseudocode
 
-Adds bounded priority-aware dispatch lanes for scripting/firmware, a Rust scheduling policy with memory-lease/generation gating, a Swift ABI demangler CLI, and a conservative pseudocode preview in the IR workspace. The worker remains on its existing admission governor; see `docs/SCHEDULING_DEMANGLING_PSEUDOCODE_0.5.7.md` for integration boundaries.
+Adds bounded priority-aware dispatch lanes for scripting/firmware, a Rust scheduling policy with memory-lease/generation gating, a Swift ABI demangler CLI, and a conservative pseudocode preview in the IR workspace. The worker remains on its existing admission governor; see `docs/SCHEDULING_DEMANGLING_PSEUDOCODE_0.5.8.md` for integration boundaries.
 
 ## Completion-audit hotfix
 

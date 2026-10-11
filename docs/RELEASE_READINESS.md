@@ -1,10 +1,10 @@
-# HindSight 0.5.7 — Release readiness
+# HindSight 0.5.8 — Release readiness
 
-HindSight 0.5.7 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
+HindSight 0.5.8 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
 
 ## Source invariants already enforced
 
-- Product/service/worker identity is exactly `0.5.7`; release channel is `stable`; bundle build is `5700`.
+- Product/service/worker identity is exactly `0.5.8`; release channel is `stable`; bundle build is `5800`.
 - App and Coordinator require the same version, release channel, ABI, and required capabilities before project actions are enabled.
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
@@ -16,7 +16,7 @@ HindSight 0.5.7 uses the stable product/release-channel identity in source. That
 - Project `objects`, `staging`, and `analysis-cache` path components must be real non-symlink directories; staged capture and existing cache destinations must be regular non-symlink files before publication/admission.
 - Function Neighborhoods presentation is incrementally revealed (200 interactive rows per batch) and worker-side detailed neighborhood materialization is bounded while complete connectivity counts remain available.
 
-- The 0.5.7 Evidence Core builds a maximum 50,000-record typed index off the SwiftUI render path; Search/Triage/Related Evidence must consume that index rather than reparsing report strings.
+- The 0.5.8 Evidence Core builds a maximum 50,000-record typed index off the SwiftUI render path; Search/Triage/Related Evidence must consume that index rather than reparsing report strings.
 - Resident full compatibility reports are bounded to an 8-entry LRU; the selected artifact owns at most one typed evidence index.
 - Launch-session persistence is coalesced with a 350 ms debounce.
 - The optional REA bridge has a deterministic MCP fixture contract covering handshake, capability gating, progress retention, and fail-closed unavailable-tool behavior; real provider qualification remains manual and local-first.
@@ -64,7 +64,7 @@ checklist for those host-specific steps.
 
 ## Manual distribution matrix
 
-Before distributing 0.5.7, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
+Before distributing 0.5.8, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
 
 1. Re-run the large firmware image that exposed the beta.12 pressure failure; record peak RSS and confirm bounded dominator behavior.
 2. Analyze several real arm64 Mach-O inputs: stripped, symbol-rich, data-in-code, and encrypted-metadata cases.

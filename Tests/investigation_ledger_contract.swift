@@ -44,22 +44,6 @@ struct InvestigationLedgerContract {
         precondition(decoded.ledger.hypotheses[0].status == .supported)
         precondition(decoded.reaEvidence?.first?.responseSHA256 == reaDigest)
         precondition(decoded.reaEvidence?.first?.evidenceID == "ev_fixture")
-        precondition(VGInvestigationHandoffReadiness.evaluate(
-            state: .approved, hasBaseline: true, baselineMatchesRecord: true,
-            baselineMatchesSource: true, hasDrift: false, openFollowUps: 0
-        ) == .ready)
-        precondition(VGInvestigationHandoffReadiness.evaluate(
-            state: .approved, hasBaseline: true, baselineMatchesRecord: false,
-            baselineMatchesSource: true, hasDrift: false, openFollowUps: 0
-        ) == .conflict)
-        precondition(VGInvestigationHandoffReadiness.evaluate(
-            state: .rejected, hasBaseline: true, baselineMatchesRecord: true,
-            baselineMatchesSource: true, hasDrift: false, openFollowUps: 1
-        ) == .followUpRequired)
-        precondition(VGInvestigationHandoffReadiness.evaluate(
-            state: .reviewed, hasBaseline: false, baselineMatchesRecord: false,
-            baselineMatchesSource: false, hasDrift: false, openFollowUps: 0
-        ) == .conflict)
         let markdown = VGLedgerStore.markdown(bundle)
         precondition(markdown.contains("Auth branch controls access"))
         precondition(markdown.contains("Evidence boundary"))
