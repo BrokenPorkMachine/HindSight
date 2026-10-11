@@ -2370,6 +2370,15 @@ struct ContentView: View {
                                     .disabled(model.busy)
                                 Button("Open Project…", action: model.openProject)
                                     .disabled(model.busy)
+                                if !model.recentProjects.isEmpty {
+                                    Divider()
+                                    Section("Recent Projects") {
+                                        ForEach(model.recentProjects) { recent in
+                                            Button(recent.displayName) { model.openRecentProject(recent) }
+                                                .help(recent.path)
+                                        }
+                                    }
+                                }
                                 Divider()
                                 Button("Import Binary…", action: model.selectBinary)
                                     .disabled(!model.canImportBinary)

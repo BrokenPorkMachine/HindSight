@@ -15,6 +15,13 @@ private struct VGAnalysisDecodeResult: Sendable {
         }
     }
 }
+
+struct VGRecentProject: Codable, Hashable, Identifiable {
+    let path: String
+    let lastOpened: Date
+    var id: String { path }
+    var displayName: String { URL(fileURLWithPath: path, isDirectory: true).lastPathComponent }
+}
 @MainActor
 final class WorkbenchModel: ObservableObject {
     @Published var project: ProjectSnapshot?
@@ -312,6 +319,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var drafts: [String: String] = [:]
     @Published private(set) var savedLaunchSessionAvailable = false
     @Published private(set) var savedLaunchProjectName = ""
+    @Published private(set) var recentProjects: [VGRecentProject] = []
 
     private struct LaunchSession: Codable {
         let schema: Int
@@ -326,6 +334,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         let updatedAt: Date
     }
     private static let launchSessionDefaultsKey = "HindSight.launch-session.v1"
+    private static let recentProjectsDefaultsKey = "HindSight.recent-projects.v1"
+    private static let maxRecentProjects = 8
     private static let maxLaunchSessionBytes = 32 * 1024
     private var savedLaunchSession: LaunchSession?
     private var applyingLaunchSession = false
@@ -334,6 +344,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         savedLaunchSession = Self.readSavedLaunchSession()
         savedLaunchSessionAvailable = savedLaunchSession != nil
         savedLaunchProjectName = savedLaunchSession.map { URL(fileURLWithPath: $0.projectPath, isDirectory: true).lastPathComponent } ?? ""
+        recentProjects = Self.readRecentProjects()
         client.onDisconnect = { [weak self] in
             guard let self else { return }
             self.connected = false
@@ -370,6 +381,26 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             return nil
         }
         return session
+    }
+
+    private static func readRecentProjects() -> [VGRecentProject] {
+        guard let data = UserDefaults.standard.data(forKey: recentProjectsDefaultsKey),
+              data.count <= maxLaunchSessionBytes,
+              let values = try? JSONDecoder().decode([VGRecentProject].self, from: data) else { return [] }
+        return Array(values.filter { value in
+            value.path.hasPrefix("/") && value.path.utf8.count <= 4096 &&
+            URL(fileURLWithPath: value.path, isDirectory: true).standardizedFileURL.path == value.path
+        }.prefix(maxRecentProjects))
+    }
+
+    private func rememberRecentProject(_ path: String) {
+        let normalized = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+        guard normalized.hasPrefix("/"), normalized.utf8.count <= 4096 else { return }
+        recentProjects.removeAll { $0.path == normalized }
+        recentProjects.insert(VGRecentProject(path: normalized, lastOpened: Date()), at: 0)
+        recentProjects = Array(recentProjects.prefix(Self.maxRecentProjects))
+        guard let data = try? JSONEncoder().encode(recentProjects), data.count <= Self.maxLaunchSessionBytes else { return }
+        UserDefaults.standard.set(data, forKey: Self.recentProjectsDefaultsKey)
     }
 
     private func persistLaunchSessionIfPossible() {
@@ -672,7 +703,21 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         client.request(operation: { $0.openProject(path, create: create, withReply: $1) }) { [weak self] result in
             guard let self else { return }; self.busy = false
             if self.apply(result), clearDrafts { self.drafts.removeAll() }
+            if self.project != nil, let path = self.project?.path { self.rememberRecentProject(path) }
         }
+    }
+
+    func openRecentProject(_ recent: VGRecentProject) {
+        guard !busy, discardDraftsIfNeeded() else { return }
+        guard connected, !connectingToCoordinator, !restoringProjectSession else { status = "Reconnect the Coordinator before opening a recent project."; return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: recent.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            recentProjects.removeAll { $0.path == recent.path }
+            if let data = try? JSONEncoder().encode(recentProjects) { UserDefaults.standard.set(data, forKey: Self.recentProjectsDefaultsKey) }
+            status = "Recent project is no longer available: \(recent.displayName)."
+            return
+        }
+        open(path: recent.path, create: false)
     }
     func selectBinary() {
         guard !busy else { status = "Finish or cancel the active operation before importing another artifact."; return }

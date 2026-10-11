@@ -62,6 +62,14 @@ def test_workspace_catalog_explains_advanced_capability_boundaries():
     assert 'entitlement and runtime availability are checked when the service starts' in catalog
     assert 'Text(descriptor.helpText)' in chrome
 
+def test_recent_projects_are_bounded_and_reopenable():
+    model = read('App/WorkbenchModel.swift')
+    ui = read('App/ContentView.swift')
+    assert 'HindSight.recent-projects.v1' in model
+    assert 'maxRecentProjects = 8' in model
+    assert 'func openRecentProject' in model
+    assert 'Section("Recent Projects")' in ui
+
 def test_typecheck_and_release_gates_cover_both_architectures():
     for script in ('scripts/test-app-typecheck.sh', 'scripts/test-coordinator-typecheck.sh'):
         text = read(script)
