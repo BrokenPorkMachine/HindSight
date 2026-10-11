@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import CryptoKit
 import Foundation
 import UniformTypeIdentifiers
 
@@ -234,6 +235,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var reaOperation = "binary_overview"
     @Published var reaProvider = "auto"
     @Published private(set) var reaOperationActive = false
+    @Published private(set) var reaEvidence: [VGREAAgentEvidence] = []
     private var reaRequestID = ""
     @Published var vectorEmuRegions = ""
     @Published var vectorEmuRaw = ""
@@ -712,10 +714,28 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             guard let self else { return }
             self.reaOperationActive = false
             switch result {
-            case .success(let response): self.reaStatus = response
+            case .success(let response):
+                self.reaStatus = response
+                self.captureREAResponse(response, requestID: requestID)
             case .failure(let error): self.reaStatus = "REA operation failed: \(error.localizedDescription)"
             }
         }
+    }
+
+    private func captureREAResponse(_ response: String, requestID: String) {
+        guard response.utf8.count <= 2 * 1024 * 1024 else {
+            reaStatus = "REA response exceeded the retained evidence limit; result was not retained."
+            return
+        }
+        let digest = SHA256.hash(data: Data(response.utf8)).map { String(format: "%02x", $0) }.joined()
+        let evidence = VGREAAgentEvidence(id: requestID, capturedAt: Date(), operation: reaOperation,
+                                           targetPath: reaTargetPath, provider: reaProvider,
+                                           responseSHA256: digest, response: response)
+        reaEvidence.append(evidence)
+        if reaEvidence.count > 32 { reaEvidence.removeFirst(reaEvidence.count - 32) }
+        let name = URL(fileURLWithPath: reaTargetPath).lastPathComponent
+        recordLedger(kind: .reaEvidenceCaptured, provenance: .observed,
+                     detail: "Captured REA (reaOperation) evidence for (name) · SHA-256 (digest).")
     }
 
     func cancelREAOperation() {
@@ -1796,6 +1816,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             evidence: evidence,
             runtime: runtime,
             memory: memory,
+            reaEvidence: reaEvidence,
             integrity: nil
         )
     }

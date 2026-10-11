@@ -27,6 +27,7 @@ enum VGLedgerEntryKind: String, Codable, CaseIterable, Hashable {
     case caseExported = "case-exported"
     case extensionTrustChanged = "extension-trust-changed"
     case extensionStateChanged = "extension-state-changed"
+    case reaEvidenceCaptured = "rea-evidence-captured"
 
     var title: String {
         switch self {
@@ -46,6 +47,7 @@ enum VGLedgerEntryKind: String, Codable, CaseIterable, Hashable {
         case .caseExported: return "Case exported"
         case .extensionTrustChanged: return "Extension trust changed"
         case .extensionStateChanged: return "Extension state changed"
+        case .reaEvidenceCaptured: return "REA evidence captured"
         }
     }
 }
@@ -317,6 +319,16 @@ struct VGCaseMemoryObservation: Codable, Hashable {
     let bytesHex: String
 }
 
+struct VGREAAgentEvidence: Codable, Hashable, Identifiable {
+    let id: String
+    let capturedAt: Date
+    let operation: String
+    let targetPath: String
+    let provider: String
+    let responseSHA256: String
+    let response: String
+}
+
 struct VGCaseIntegrityManifest: Codable, Hashable {
     let algorithm: String
     let payloadSHA256: String
@@ -337,9 +349,43 @@ struct VGCaseBundle: Codable, Hashable {
     let evidence: VGCaseEvidenceSnapshot?
     let runtime: [VGCaseRuntimeEvent]
     let memory: [VGCaseMemoryObservation]
+    /// Optional so older case bundles remain decodable.
+    var reaEvidence: [VGREAAgentEvidence]? = nil
     /// Optional for backward compatibility with schema-1 bundles exported before
     /// integrity manifests were introduced.
     let integrity: VGCaseIntegrityManifest?
+
+    init(format: String, schema: Int, product: String, productVersion: String, exportedAt: Date,
+         ledger: VGInvestigationLedger, artifacts: [VGCaseArtifactIdentity], evidence: VGCaseEvidenceSnapshot?,
+         runtime: [VGCaseRuntimeEvent], memory: [VGCaseMemoryObservation],
+         reaEvidence: [VGREAAgentEvidence]? = nil, integrity: VGCaseIntegrityManifest? = nil) {
+        self.format = format; self.schema = schema; self.product = product; self.productVersion = productVersion
+        self.exportedAt = exportedAt; self.ledger = ledger; self.artifacts = artifacts; self.evidence = evidence
+        self.runtime = runtime; self.memory = memory; self.reaEvidence = reaEvidence; self.integrity = integrity
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case format, schema, product, productVersion, exportedAt, ledger, artifacts, evidence, runtime, memory, reaEvidence, integrity
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        format = try c.decode(String.self, forKey: .format); schema = try c.decode(Int.self, forKey: .schema)
+        product = try c.decode(String.self, forKey: .product); productVersion = try c.decode(String.self, forKey: .productVersion)
+        exportedAt = try c.decode(Date.self, forKey: .exportedAt); ledger = try c.decode(VGInvestigationLedger.self, forKey: .ledger)
+        artifacts = try c.decode([VGCaseArtifactIdentity].self, forKey: .artifacts); evidence = try c.decodeIfPresent(VGCaseEvidenceSnapshot.self, forKey: .evidence)
+        runtime = try c.decode([VGCaseRuntimeEvent].self, forKey: .runtime); memory = try c.decode([VGCaseMemoryObservation].self, forKey: .memory)
+        reaEvidence = try c.decodeIfPresent([VGREAAgentEvidence].self, forKey: .reaEvidence)
+        integrity = try c.decodeIfPresent(VGCaseIntegrityManifest.self, forKey: .integrity)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(format, forKey: .format); try c.encode(schema, forKey: .schema); try c.encode(product, forKey: .product)
+        try c.encode(productVersion, forKey: .productVersion); try c.encode(exportedAt, forKey: .exportedAt); try c.encode(ledger, forKey: .ledger)
+        try c.encode(artifacts, forKey: .artifacts); try c.encodeIfPresent(evidence, forKey: .evidence); try c.encode(runtime, forKey: .runtime)
+        try c.encode(memory, forKey: .memory); try c.encodeIfPresent(reaEvidence, forKey: .reaEvidence); try c.encodeIfPresent(integrity, forKey: .integrity)
+    }
 }
 
 struct VGLedgerLoadResult {
@@ -474,6 +520,7 @@ enum VGLedgerStore {
             evidence: bundle.evidence,
             runtime: bundle.runtime,
             memory: bundle.memory,
+            reaEvidence: bundle.reaEvidence,
             integrity: nil
         )
         let payloadData = try encoder.encode(payload)
@@ -496,6 +543,7 @@ enum VGLedgerStore {
             evidence: payload.evidence,
             runtime: payload.runtime,
             memory: payload.memory,
+            reaEvidence: payload.reaEvidence,
             integrity: manifest
         )
         return try encoder.encode(complete)
@@ -531,6 +579,7 @@ enum VGLedgerStore {
                 evidence: bundle.evidence,
                 runtime: bundle.runtime,
                 memory: bundle.memory,
+                reaEvidence: bundle.reaEvidence,
                 integrity: nil
             )
             let encoder = JSONEncoder()

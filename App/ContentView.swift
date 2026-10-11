@@ -432,8 +432,22 @@ struct ContentView: View {
                 }.padding(8)
             }
             GroupBox("Safety boundary") {
-                Text("Operations are opt-in, local, bounded, and provider-scoped. Full Evidence retention and progress history will be added after the transport contract is stable.")
+                Text("Operations are opt-in, local, bounded, and provider-scoped. Results are retained with a SHA-256 identity in the current case export; streamed progress and full Evidence views remain next.")
                     .font(.caption).foregroundStyle(.secondary).padding(8)
+            }
+            if !model.reaEvidence.isEmpty {
+                GroupBox("Retained REA evidence") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.reaEvidence.reversed()) { evidence in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(evidence.operation) · \(evidence.provider) · \(URL(fileURLWithPath: evidence.targetPath).lastPathComponent)")
+                                    .font(.caption).fontWeight(.semibold)
+                                Text("SHA-256 \(evidence.responseSHA256) · \(evidence.response.utf8.count) bytes")
+                                    .font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary)
+                            }
+                        }
+                    }.padding(8)
+                }
             }
             Spacer()
         }
