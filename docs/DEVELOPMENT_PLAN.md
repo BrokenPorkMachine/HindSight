@@ -15,7 +15,7 @@ The app already has a broad macOS workbench covering project/artifact management
 - [x] Replace visible legacy branding with HindSight.
 - [x] Add Quick Start and the Import → Analyze → Triage → Document → Export path.
 - [x] Add evidence annotations with notes, tags, confidence, persistence, handoff export, and Annotated Triage mode.
-- [ ] Add saved searches and reusable triage filters.
+- [x] Add saved searches and reusable triage filters.
 - [ ] Make annotations available from every evidence card without requiring the inspector.
 - [ ] Add an analyst-facing “annotated handoff” summary to the main Overview.
 
@@ -67,4 +67,4 @@ For every loop:
 
 ## Today's workload
 
-Start with Phase 1 saved searches and reusable triage filters. Prefer project-local, bounded state and preserve compatibility with existing continuity documents. After that, make annotation editing available directly from evidence cards, then add the Overview handoff summary if validation remains clean.
+Saved searches are complete. Next: make annotation editing available directly from evidence cards, then add the Overview handoff summary if validation remains clean. Keep each slice project-local, bounded, and compatible with existing continuity documents.

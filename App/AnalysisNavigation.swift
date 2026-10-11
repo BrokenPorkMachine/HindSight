@@ -394,6 +394,7 @@ struct VGAnalysisTriageView: View {
     @State private var filter = ""
     @State private var mode = "Focus"
     @State private var newCollectionName = ""
+    @State private var newSavedSearchName = ""
     @State private var collectionFilter = ""
     @State private var renamingCollectionID: String?
     @State private var renamingCollectionName = ""
@@ -475,6 +476,29 @@ struct VGAnalysisTriageView: View {
                     Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary)
                     TextField(mode == "Focus" ? "Filter the focus queue…" : mode == "Annotated" ? "Filter annotations…" : "Filter preserved evidence…", text: $filter)
                         .textFieldStyle(.roundedBorder)
+                    if !filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        TextField("Saved search name", text: $newSavedSearchName)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 150)
+                        Button("Save") {
+                            model.saveAnalysisSearch(named: newSavedSearchName, query: filter)
+                            newSavedSearchName = ""
+                        }
+                        .disabled(newSavedSearchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if !model.analysisSavedSearches.isEmpty {
+                        Menu("Saved") {
+                            ForEach(model.analysisSavedSearches) { search in
+                                Button(search.name) { filter = search.query }
+                            }
+                            Divider()
+                            ForEach(model.analysisSavedSearches) { search in
+                                Button("Delete \(search.name)", role: .destructive) {
+                                    model.deleteAnalysisSearch(search.id)
+                                }
+                            }
+                        }
+                    }
                     if !filter.isEmpty { Button("Clear") { filter = "" } }
                     if mode == "Recent", !model.analysisRecentVisits.isEmpty {
                         Button("Previous", action: model.navigateAnalysisHistoryBackward)

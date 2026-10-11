@@ -96,6 +96,24 @@ struct VGAnalysisAnnotation: Codable, Identifiable, Hashable {
     }
 }
 
+struct VGAnalysisSavedSearch: Codable, Identifiable, Hashable {
+    let id: String
+    let recordID: String
+    var name: String
+    var query: String
+    let createdAt: Date
+    var updatedAt: Date
+
+    init(recordID: String, name: String, query: String, createdAt: Date = Date()) {
+        self.id = UUID().uuidString
+        self.recordID = recordID
+        self.name = vgBoundedUTF8(name.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 96)
+        self.query = vgBoundedUTF8(query.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 256)
+        self.createdAt = createdAt
+        self.updatedAt = createdAt
+    }
+}
+
 struct VGAnalysisVisit: Codable, Identifiable, Hashable {
     let id: String
     let recordID: String
@@ -315,8 +333,9 @@ struct VGAnalysisContinuityDocument: Codable {
     var snapshots: [String: VGAnalysisSnapshot] = [:]
     var deltas: [String: VGAnalysisDelta] = [:]
     var annotations: [String: VGAnalysisAnnotation] = [:]
+    var savedSearches: [VGAnalysisSavedSearch] = []
 
-    enum CodingKeys: String, CodingKey { case schema, pins, recent, collections, reviewBaselines, reviewEntries, followUps, snapshots, deltas, annotations }
+    enum CodingKeys: String, CodingKey { case schema, pins, recent, collections, reviewBaselines, reviewEntries, followUps, snapshots, deltas, annotations, savedSearches }
 
     init() {}
 
@@ -332,6 +351,7 @@ struct VGAnalysisContinuityDocument: Codable {
         snapshots = try container.decodeIfPresent([String: VGAnalysisSnapshot].self, forKey: .snapshots) ?? [:]
         deltas = try container.decodeIfPresent([String: VGAnalysisDelta].self, forKey: .deltas) ?? [:]
         annotations = try container.decodeIfPresent([String: VGAnalysisAnnotation].self, forKey: .annotations) ?? [:]
+        savedSearches = try container.decodeIfPresent([VGAnalysisSavedSearch].self, forKey: .savedSearches) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -346,6 +366,7 @@ struct VGAnalysisContinuityDocument: Codable {
         try container.encode(snapshots, forKey: .snapshots)
         try container.encode(deltas, forKey: .deltas)
         try container.encode(annotations, forKey: .annotations)
+        try container.encode(savedSearches, forKey: .savedSearches)
     }
 
     static var empty: VGAnalysisContinuityDocument { VGAnalysisContinuityDocument() }
@@ -368,6 +389,7 @@ enum VGAnalysisContinuityStore {
     static let maximumFollowUpNoteBytes = 1_024
     static let maximumFollowUpEvidenceIDs = 16
     static let maximumAnnotations = 512
+    static let maximumSavedSearches = 64
     private static let directoryName = ".vectorglass"
     private static let fileName = "analysis-continuity-v1.json"
 
@@ -432,6 +454,7 @@ enum VGAnalysisContinuityStore {
                 .filter { validAnnotation(key: $0.key, value: $0.value) }
                 .prefix(maximumAnnotations)
                 .map { ($0.key, $0.value) })
+            document.savedSearches = Array(document.savedSearches.filter(validSavedSearch).prefix(maximumSavedSearches))
             return document
         } catch { return .empty }
     }
@@ -582,6 +605,10 @@ enum VGAnalysisContinuityStore {
             value.tags.allSatisfy { $0.utf8.count <= 64 }
     }
 
+    private static func validSavedSearch(_ value: VGAnalysisSavedSearch) -> Bool {
+        !value.name.isEmpty && !value.query.isEmpty && value.id.utf8.count <= 256 && value.recordID.utf8.count <= 256 && value.name.utf8.count <= 96 && value.query.utf8.count <= 256
+    }
+
 }
 
 @MainActor
@@ -599,6 +626,7 @@ extension WorkbenchModel {
             analysisReviewBaselines = [:]
             analysisReviewEntries = []
             analysisFollowUps = []
+            analysisSavedSearches = []
             analysisDelta = nil
             return
         }
@@ -611,6 +639,9 @@ extension WorkbenchModel {
             if lhs.state != rhs.state { return lhs.state == .open }
             return lhs.createdAt > rhs.createdAt
         }
+        analysisSavedSearches = analysisContinuityDocument.savedSearches
+            .filter { $0.recordID == recordID }
+            .sorted { $0.updatedAt > $1.updatedAt }
         analysisDelta = analysisContinuityDocument.deltas[recordID]
     }
 
@@ -706,6 +737,38 @@ extension WorkbenchModel {
         return annotation.note.localizedCaseInsensitiveContains(needle) ||
             annotation.tags.contains { $0.localizedCaseInsensitiveContains(needle) } ||
             annotation.confidence.rawValue.localizedCaseInsensitiveContains(needle)
+    }
+
+    func saveAnalysisSearch(named rawName: String, query rawQuery: String) {
+        guard let recordID = selectedID, let projectPath = project?.path else { return }
+        let name = vgBoundedUTF8(rawName.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 96)
+        let query = vgBoundedUTF8(rawQuery.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 256)
+        guard !name.isEmpty, !query.isEmpty else {
+            status = "Saved search name and filter cannot be empty."
+            return
+        }
+        guard analysisContinuityDocument.savedSearches.filter({ $0.recordID == recordID }).count < VGAnalysisContinuityStore.maximumSavedSearches else {
+            status = "Saved search limit reached."
+            return
+        }
+        guard !analysisContinuityDocument.savedSearches.contains(where: { $0.recordID == recordID && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            status = "A saved search with that name already exists for this artifact."
+            return
+        }
+        analysisContinuityDocument.savedSearches.insert(VGAnalysisSavedSearch(recordID: recordID, name: name, query: query), at: 0)
+        persistAnalysisContinuity(projectPath: projectPath)
+        refreshAnalysisContinuityProjection()
+        status = "Saved Triage filter ‘\(name)’."
+    }
+
+    func deleteAnalysisSearch(_ searchID: String) {
+        guard let projectPath = project?.path else { return }
+        let before = analysisContinuityDocument.savedSearches.count
+        analysisContinuityDocument.savedSearches.removeAll { $0.id == searchID }
+        guard before != analysisContinuityDocument.savedSearches.count else { return }
+        persistAnalysisContinuity(projectPath: projectPath)
+        refreshAnalysisContinuityProjection()
+        status = "Removed saved Triage filter."
     }
 
     func analysisAnnotatedHits(limit: Int = 180) -> [VGAnalysisEvidenceHit] {

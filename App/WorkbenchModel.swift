@@ -124,6 +124,7 @@ final class WorkbenchModel: ObservableObject {
     @Published var analysisReviewBaselines: [String: VGInvestigationReviewBaseline] = [:]
     @Published var analysisReviewEntries: [VGInvestigationReviewEntry] = []
     @Published var analysisFollowUps: [VGInvestigationFollowUp] = []
+    @Published var analysisSavedSearches: [VGAnalysisSavedSearch] = []
     @Published var analysisDelta: VGAnalysisDelta?
     @Published var analysisHistoryCursor = -1
     var analysisContinuityDocument = VGAnalysisContinuityDocument.empty
