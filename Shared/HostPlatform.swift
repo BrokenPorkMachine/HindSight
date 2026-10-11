@@ -34,6 +34,24 @@ enum VGHostPlatform {
     /// VectorEmu is a software emulator and is intentionally cross-host.
     static var supportsVectorEmu: Bool { architecture != .unknown }
 
+    /// Keep architecture support separate from runtime authorization. The
+    /// latter is only knowable when the host service attempts the operation.
+    static var nativeDebuggerStatus: String {
+        supportsArm64NativeDebugger
+            ? "supported by this process; macOS debugging permission is not probed until attach"
+            : "unsupported: requires an arm64 process on Apple Silicon"
+    }
+
+    static var hypervisorStatus: String {
+        supportsAppleSiliconHypervisor
+            ? "supported by this process; Hypervisor.framework entitlement/runtime availability is not probed until start"
+            : "unsupported: requires an arm64 process on Apple Silicon"
+    }
+
+    static var vectorEmuStatus: String {
+        supportsVectorEmu ? "available: software emulation" : "unavailable: host architecture is unknown"
+    }
+
     static var displayName: String {
         switch architecture {
         case .arm64: return "Apple Silicon (arm64)"
@@ -43,6 +61,6 @@ enum VGHostPlatform {
     }
 
     static func unavailableReason(for feature: String) -> String {
-        "\(feature) is unavailable in the \(architecture.rawValue) HindSight process. Static ARM64 analysis, projects, evidence, scripting, plugins, firmware tooling, and VectorEmu remain available. Run the arm64 slice on Apple Silicon to use this host-dependent feature."
+        "\(feature) is unavailable in the \(architecture.rawValue) HindSight process because this host-dependent path requires an arm64 process on Apple Silicon. Static ARM64 analysis, projects, evidence, scripting, plugins, firmware tooling, and VectorEmu remain available."
     }
 }

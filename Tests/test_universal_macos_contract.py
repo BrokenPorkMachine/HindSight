@@ -42,6 +42,18 @@ def test_apple_silicon_features_are_gated_on_intel():
     assert 'supportsAppleSiliconHypervisor' in hv
     assert '#if !defined(__APPLE__) || !defined(__arm64__)' in native_debug
 
+def test_host_diagnostics_explain_capability_and_runtime_boundaries():
+    host = read('Shared/HostPlatform.swift')
+    model = read('App/WorkbenchModel.swift')
+    ui = read('App/ContentView.swift')
+    assert 'nativeDebuggerStatus' in host
+    assert 'hypervisorStatus' in host
+    assert 'debugging permission is not probed until attach' in host
+    assert 'entitlement/runtime availability is not probed until start' in host
+    assert 'arm64_native_debugger_status=' in model
+    assert 'apple_silicon_hypervisor_status=' in model
+    assert 'unavailable on this host' in ui
+
 def test_typecheck_and_release_gates_cover_both_architectures():
     for script in ('scripts/test-app-typecheck.sh', 'scripts/test-coordinator-typecheck.sh'):
         text = read(script)

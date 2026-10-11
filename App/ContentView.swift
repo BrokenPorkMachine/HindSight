@@ -2232,9 +2232,13 @@ struct ContentView: View {
 
     @ViewBuilder private func hostUnavailableWorkspace(_ title: String, feature: String) -> some View {
         ContentUnavailableView {
-            Label("\(title) unavailable on Intel", systemImage: "cpu")
+            Label("\(title) unavailable on this host", systemImage: "cpu")
         } description: {
-            Text(VGHostPlatform.unavailableReason(for: feature))
+            VStack(alignment: .leading, spacing: 6) {
+                Text(VGHostPlatform.unavailableReason(for: feature))
+                Text("Host capability: \(feature == "Native ARM64 debugging" ? VGHostPlatform.nativeDebuggerStatus : VGHostPlatform.hypervisorStatus)")
+                    .font(.caption)
+            }
         } actions: {
             Button("Open VectorEmu") { model.workspace = "VectorEmu Lab" }
             Button("Open Navigator") { model.workspace = "Navigator" }

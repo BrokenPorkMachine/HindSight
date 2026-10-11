@@ -42,7 +42,7 @@ Acceptance: every new inference is provenance-labelled, bounded, and covered by 
 - [ ] Improve static-to-runtime pivots and breakpoint context.
 - [x] Distinguish module/slide address correlation from validated static-function correlation in runtime explanations.
 - [x] Add bounded `.vgcase` runtime trace capture/replay and restore the saved timeline into Trace Explorer without debugger attachment.
-- [ ] Add clearer host capability, permission, and entitlement diagnostics.
+- [x] Add clearer host capability, permission, and entitlement diagnostics, including explicit architecture gates and honest deferred runtime-probe status.
 - [ ] Expand Intel and Apple Silicon qualification coverage.
 
 Acceptance: an analyst can connect a static finding to a reproducible runtime observation and include both in a handoff.
@@ -72,4 +72,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels, explicit runtime correlation strength, and `.vgcase` runtime trace replay are complete. Next loop: prioritize runtime capability diagnostics or deeper non-ARM64 lifting.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels, explicit runtime correlation strength, `.vgcase` runtime trace replay, and host capability/permission/entitlement diagnostics are complete. Next loop: prioritize deeper non-ARM64 lifting or workspace-level help and unsupported-capability explanations.
