@@ -323,6 +323,18 @@ enum VGAdaptivePane: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum VGAdaptiveLayoutMode: String, CaseIterable {
+    case wide
+    case medium
+    case compact
+
+    static func resolve(width: CGFloat, wideBreakpoint: CGFloat, compactBreakpoint: CGFloat) -> Self {
+        if width >= wideBreakpoint { return .wide }
+        if width >= compactBreakpoint { return .medium }
+        return .compact
+    }
+}
+
 /// A responsive three-pane workbench primitive.
 ///
 /// Wide windows keep the classic navigator / canvas / inspector arrangement.
@@ -385,12 +397,12 @@ struct VGAdaptiveThreePane<Leading: View, Center: View, Trailing: View>: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let width = proxy.size.width
-            if width >= wideBreakpoint {
+            switch VGAdaptiveLayoutMode.resolve(width: proxy.size.width, wideBreakpoint: wideBreakpoint, compactBreakpoint: compactBreakpoint) {
+            case .wide:
                 wideLayout
-            } else if width >= compactBreakpoint {
+            case .medium:
                 mediumLayout
-            } else {
+            case .compact:
                 compactLayout
             }
         }

@@ -21,6 +21,21 @@ class UIDensityContracts(unittest.TestCase):
         ]:
             self.assertIn(token, chrome)
 
+    def test_three_pane_layout_has_testable_wide_medium_compact_modes(self):
+        chrome = self.text("App/WorkbenchChrome.swift")
+        for token in [
+            "enum VGAdaptiveLayoutMode",
+            "case wide",
+            "case medium",
+            "case compact",
+            "static func resolve(width: CGFloat",
+            "switch VGAdaptiveLayoutMode.resolve",
+            "wideLayout",
+            "mediumLayout",
+            "compactLayout",
+        ]:
+            self.assertIn(token, chrome)
+
     def test_targets_surface_has_no_legacy_fixed_table(self):
         content = self.text("App/ContentView.swift")
         start = content.index("@ViewBuilder private func targetsWorkspace()")

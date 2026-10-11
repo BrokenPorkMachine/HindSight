@@ -2893,7 +2893,7 @@ struct ContentView: View {
             }
         }
         .padding(24)
-        .frame(width: 620)
+        .frame(minWidth: 520, idealWidth: 620, maxWidth: 700)
     }
 
     @ViewBuilder private func quickStartGuideStep(
