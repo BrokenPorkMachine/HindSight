@@ -154,6 +154,12 @@ enum VGRuntimeCorrelationEngine {
             )
         }
         let function = functions.first(where: { $0.contains(preferred) })
+        let explanation: String
+        if let function {
+            explanation = "Runtime PC translated with the uniquely matched loaded image and its observed dyld slide, then matched to validated static function range \(function.name)."
+        } else {
+            explanation = "Runtime PC translated with the uniquely matched loaded image and its observed dyld slide, but no validated static function range contains the resulting address; address correlation only."
+        }
         return VGRuntimeCorrelation(
             sampleID: sample.id,
             runtimePC: sample.pc,
@@ -162,7 +168,7 @@ enum VGRuntimeCorrelationEngine {
             slide: module.slide,
             functionName: function?.name,
             confidence: "correlated",
-            explanation: "Runtime PC translated with the uniquely matched loaded image and its observed dyld slide."
+            explanation: explanation
         )
     }
 

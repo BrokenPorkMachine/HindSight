@@ -21,6 +21,7 @@ struct RuntimeCorrelationContract {
         precondition(corr.preferredPC == 0x100001024)
         precondition(corr.functionName == "sub_100001000")
         precondition(corr.confidence == "correlated")
+        precondition(corr.explanation.contains("validated static function range"))
 
         let heat = VGRuntimeCorrelationEngine.heat(samples: [first, second, second], binaryPath: "/tmp/Sample", modulesText: modules)
         precondition(heat[0x100001024] == 2)

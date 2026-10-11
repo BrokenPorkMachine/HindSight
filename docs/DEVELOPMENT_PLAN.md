@@ -40,6 +40,7 @@ Acceptance: every new inference is provenance-labelled, bounded, and covered by 
 ### Phase 3 — Runtime investigation
 
 - [ ] Improve static-to-runtime pivots and breakpoint context.
+- [x] Distinguish module/slide address correlation from validated static-function correlation in runtime explanations.
 - [ ] Add persistent trace capture/replay and runtime snapshot browsing.
 - [ ] Add clearer host capability, permission, and entitlement diagnostics.
 - [ ] Expand Intel and Apple Silicon qualification coverage.
@@ -71,4 +72,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, and bounded non-ARM64 semantic labels are complete. Next loop: prioritize deeper non-ARM64 lifting or begin Phase 3 runtime pivots if no safe static slice remains.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels, and explicit runtime correlation strength are complete. Next loop: prioritize persistent runtime trace capture/replay or deeper non-ARM64 lifting.
