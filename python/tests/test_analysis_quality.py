@@ -50,6 +50,12 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn("provenance=relative-pointer+mapped-cstring", body)
         self.assertIn("confidence=validated-record", body)
 
+    def test_swift_field_records_bound_variable_claims(self):
+        source = WORKER.read_text()
+        body = source[source.index("fn swift_field_records"):source.index("fn predecessor_value_flow")]
+        self.assertIn("Validated Swift field variables", body)
+        self.assertIn("storage layout, runtime offsets, and source-level declarations remain unresolved", body)
+
     def test_non_arm_semantic_hints_are_bounded_and_not_decompilation(self):
         source = (ROOT / "rust/crates/worker/src/binary.rs").read_text()
         body = source[source.index("fn semantic_hint"):source.index("pub fn analyze")]
