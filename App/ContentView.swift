@@ -231,7 +231,7 @@ struct ContentView: View {
                     Button("Next", action: model.nextPage).disabled(model.busy || !model.projectServiceReady || !hasNextPage)
                     Button("Verify", action: model.verifyPage).disabled(model.busy || !model.projectServiceReady)
                     Spacer()
-                    if let page = model.currentPage { Text("\(page.word_count) words • start \(page.start_word)").font(.caption).foregroundStyle(.secondary) }
+                    if let page = model.currentPage { Text("\(page.word_count) \(page.unitBytes == 1 ? "bytes" : page.unitBytes == 2 ? "halfwords" : "words") • start \(page.start_word)").font(.caption).foregroundStyle(.secondary) }
                 }
                 HStack {
                     TextField("Virtual address (hex)", text: $model.addressText).frame(maxWidth: 260)

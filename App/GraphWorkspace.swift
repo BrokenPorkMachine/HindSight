@@ -137,7 +137,7 @@ struct VGGraphWorkspace: View {
                                 HStack(spacing: 5) {
                                     Text(function.startText)
                                     Text("•")
-                                    Text("\(function.byteCount) B")
+                                    Text("\(function.extentLabel)")
                                 }
                                 .font(.system(size: 9, design: .monospaced))
                                 .foregroundStyle(.secondary)

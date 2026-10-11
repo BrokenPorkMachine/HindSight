@@ -30,6 +30,17 @@ VA (unslid)        File offset       Word      Instruction
         precondition(call.isControlFlow)
         precondition(call.annotation == "call -> _helper")
         precondition(call.normalizedAddress == "0000000100001004")
+        let multiarch = """
+0x0000000000001000 0x0000000000000100 55 pushq %rbp
+0x0000000000001001 0x0000000000000101 4889e5 movq %rsp, %rbp
+0x0000000000001004 0x0000000000000104 e800000000 callq 0x1009 ; call target=0x1009
+0x0000000000001009 0x0000000000000109 c3 retq
+0x0000000000002000 0x0000000000000200 80b5 push {r7, lr}
+"""
+        let multiRows = VGDisassemblyParser.parse(multiarch).filter { $0.kind == .instruction }
+        precondition(multiRows.count == 5)
+        precondition(multiRows[2].isCall && multiRows[2].isControlFlow)
+        precondition(multiRows[3].isControlFlow && multiRows[4].word == "80b5")
         print("Disassembly presentation contract passed.")
     }
 }

@@ -127,7 +127,7 @@ struct VGBinaryWorkspace: View {
                     Text(function.name)
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .lineLimit(1)
-                    Text("\(function.byteCount) B")
+                    Text("\(function.extentLabel)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {
@@ -198,7 +198,7 @@ struct VGBinaryWorkspace: View {
                                     HStack(spacing: 5) {
                                         Text(function.startText)
                                         Text("•")
-                                        Text("\(function.byteCount) B")
+                                        Text("\(function.extentLabel)")
                                     }
                                     .font(.system(size: 9, design: .monospaced))
                                     .foregroundStyle(.secondary)

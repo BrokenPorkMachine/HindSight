@@ -22,6 +22,22 @@ import Foundation
         var last = valid; last["start_word"] = "512"; last["word_count"] = 88
         let final = try decode(last)
         precondition(final.matches(id: id, digest: digest, start: 512))
+        var variable = valid; variable["unit_bytes"] = 1; variable["word_count"] = 255; variable["section_offset"] = "129"
+        let variablePage = try decode(variable)
+        precondition(variablePage.matches(id: id, digest: digest, start: 256))
+        precondition(variablePage.forRequest(id).unit_bytes == 1)
+        for unit in [-1, 0, 3, 8] {
+            variable["unit_bytes"] = unit
+            let changed = try decode(variable)
+            precondition(!changed.matches(id: id, digest: digest, start: 256))
+        }
+        var invalidCount = valid; invalidCount["word_count"] = 255
+        let changedCount = try decode(invalidCount)
+        precondition(!changedCount.matches(id: id, digest: digest, start: 256))
+        let input = BinaryImportOptions(format: "sepos", architecture: "thumb", load_address: "0x1000", file_offset: "0x94000")
+        precondition(input.validated?.arguments == ["sepos", "thumb", "4096", "606208"])
+        precondition(input.validated?.cacheIdentity != BinaryImportOptions.automatic.cacheIdentity)
+        precondition(BinaryImportOptions(format: "bad").validated == nil)
         print("Swift page identity, extent, frame-content and final-page checks passed")
     }
 }

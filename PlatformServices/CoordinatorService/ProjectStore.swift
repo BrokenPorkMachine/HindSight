@@ -192,7 +192,7 @@ final class ProjectStore {
         let url = URL(fileURLWithPath: path).appendingPathComponent(name, isDirectory: true)
         return try validatedDirectory(url, createIfMissing: true, label: "Project \(name)")
     }
-    func capturedSource(id: String) throws -> (path: String, digest: String, size: String) {
+    func capturedSource(id: String) throws -> (path: String, digest: String, size: String, options: BinaryImportOptions?) {
         let statement = try prepare("SELECT header_json FROM records WHERE id=?")
         defer { sqlite3_finalize(statement) }
         try bind(id, 1, statement)
@@ -213,7 +213,9 @@ final class ProjectStore {
         guard UUID(uuidString: suffix) != nil else { throw WorkbenchError("Invalid captured object name.") }
         let directory = URL(fileURLWithPath: path).appendingPathComponent("objects", isDirectory: true)
         _ = try validatedDirectory(directory, createIfMissing: false, label: "Captured object storage")
-        return (directory.appendingPathComponent(String(components[1])).path, digest, String(size))
+        let options = result.import_options ?? .automatic
+        guard options.validated == options else { throw WorkbenchError("Invalid saved import mapping.") }
+        return (directory.appendingPathComponent(String(components[1])).path, digest, String(size), options)
     }
     private func analysisCacheURL(digest: String) throws -> URL {
         guard digest.count == 64, digest.allSatisfy({ "0123456789abcdef".contains($0) }) else {

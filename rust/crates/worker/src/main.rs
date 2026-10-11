@@ -1,4 +1,5 @@
 mod preview;
+mod binary;
 use std::{fs::File,io::{self,Read}};
 use reworkbench_protocol::{read_frame,write_frame,write_frame_with_limit,MAX_ANALYSIS_FRAME};
 fn quote(text:&str)->String{
@@ -16,10 +17,11 @@ fn inspect(path:&str,id:&str)->io::Result<String>{
  let after=file.metadata()?;
  if before.len()!=after.len()||before.modified().ok()!=after.modified().ok(){return Err(io::Error::new(io::ErrorKind::InvalidData,"Source changed during inspection"));}
  let kind=if count<4{"Unknown or raw bytes"}else{match &header[..4]{
+ [0xce,0xfa,0xed,0xfe]=>"Mach-O 32 little-endian",[0xfe,0xed,0xfa,0xce]=>"Mach-O 32 big-endian",
  [0xcf,0xfa,0xed,0xfe]=>"Mach-O 64 little-endian",[0xfe,0xed,0xfa,0xcf]=>"Mach-O 64 big-endian",
  [0xca,0xfe,0xba,0xbe]|[0xca,0xfe,0xba,0xbf]=>"Universal Mach-O candidate",[0x7f,b'E',b'L',b'F']=>"ELF candidate",_=>"Unknown or raw bytes"}};
- let cpu=if count>=12 && header[..4]==[0xcf,0xfa,0xed,0xfe]{Some(u32::from_le_bytes(header[4..8].try_into().unwrap()))}else{None};
- let arch=match cpu{Some(0x0100000c)=>"ARM64",Some(0x01000007)=>"x86-64",Some(_)=>"Other",None=>"Not determined"};
+ let cpu=if count>=12 && matches!(&header[..4],[0xcf,0xfa,0xed,0xfe]|[0xce,0xfa,0xed,0xfe]){Some(u32::from_le_bytes(header[4..8].try_into().unwrap()))}else if count>=12 && matches!(&header[..4],[0xfe,0xed,0xfa,0xcf]|[0xfe,0xed,0xfa,0xce]){Some(u32::from_be_bytes(header[4..8].try_into().unwrap()))}else{None};
+ let arch=match cpu{Some(0x0100000c)=>"ARM64",Some(0x01000007)=>"x86-64",Some(7)=>"i386",Some(12)=>"ARM32",Some(_)=>"Other",None=>"Not determined"};
  let hex=header[..count].iter().map(|b|format!("{b:02x}")).collect::<Vec<_>>().join(" ");
  Ok(format!("{{\"protocol\":1,\"request_id\":{},\"kind\":\"header_result\",\"file_kind\":{},\"architecture\":{},\"size\":{},\"header_hex\":{},\"captured\":false}}",quote(id),quote(kind),quote(arch),quote(&before.len().to_string()),quote(&hex)))
 }
@@ -49,6 +51,17 @@ fn capture(source:&str,destination:&str,id:&str)->io::Result<String>{
  response=response.replace("\"captured\":false}",&format!("\"captured\":true,\"source_sha256\":{},\"structure_status\":{},\"structure\":{},\"disassembly_status\":{},\"disassembly\":{}}}",quote(&digest),quote(status),quote(&report),quote(&disassembly_status),quote(&disassembly)));
  Ok(response)
 }
+fn capture_image(source:&str,destination:&str,id:&str,options:&binary::Options)->io::Result<String>{
+ // Reuse exclusive streaming capture and digest calculation; then inspect the
+ // persisted bytes using the selected layout, never the live source.
+ let legacy=capture(source,destination,id)?;
+ let mut file=File::open(destination)?;
+ let(kind,arch,status,structure,ds,disassembly)=binary::describe(&mut file,options)?;
+ let size=file.metadata()?.len();use std::io::{Seek,SeekFrom};file.seek(SeekFrom::Start(0))?;let mut header=[0u8;32];let count=file.read(&mut header)?;
+ let hex=header[..count].iter().map(|b|format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+ let marker="\"source_sha256\":\"";let at=legacy.find(marker).ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,"Capture digest absent"))?+marker.len();let digest=&legacy[at..at+64];
+ Ok(format!("{{\"protocol\":1,\"request_id\":{},\"kind\":\"header_result\",\"file_kind\":{},\"architecture\":{},\"size\":{},\"header_hex\":{},\"captured\":true,\"source_sha256\":{},\"structure_status\":{},\"structure\":{},\"disassembly_status\":{},\"disassembly\":{},\"import_options\":{}}}",quote(id),quote(&kind),quote(&arch),quote(&size.to_string()),quote(&hex),quote(digest),quote(&status),quote(&structure),quote(&ds),quote(&disassembly),options.json()))
+}
 fn run()->io::Result<()>{
  let args:Vec<String>=std::env::args().collect();
  if args.len()==2 && args[1]=="--self-test"{
@@ -59,9 +72,12 @@ fn run()->io::Result<()>{
   let mut input=io::stdin().lock();let mut output=io::stdout().lock();
   while let Some(frame)=read_frame(&mut input)?{write_frame(&mut output,&frame)?;}return Ok(());
  }
- let is_analysis=args.len()==6 && args[1]=="--analyze";
+ let is_analysis=(args.len()==6 && args[1]=="--analyze") || (args.len()==10 && args[1]=="--analyze-image");
  let result=if args.len()==5 && args[1]=="--capture-inspect"{capture(&args[2],&args[3],&args[4])}
  else if args.len()==7 && args[1]=="--page"{preview::request(&args[2],&args[3],&args[4],&args[5],&args[6])}
+ else if args.len()==9 && args[1]=="--capture-image"{binary::Options::parse(&args[5..]).and_then(|o|capture_image(&args[2],&args[3],&args[4],&o))}
+ else if args.len()==11 && args[1]=="--page-image"{binary::Options::parse(&args[7..]).and_then(|o|binary::request(&args[2],&args[3],&args[4],&args[5],&args[6],&o))}
+ else if args.len()==10 && args[1]=="--analyze-image"{binary::Options::parse(&args[6..]).and_then(|o|if binary::legacy_arm64(&args[2],&o){preview::analyze(&args[2],&args[3],&args[4],&args[5])}else{binary::analyze(&args[2],&args[3],&args[4],&args[5],&o)})}
  else if is_analysis{preview::analyze(&args[2],&args[3],&args[4],&args[5])}
  else if args.len()==4 && args[1]=="--inspect-header"{inspect(&args[2],&args[3])}
  else{return Err(io::Error::new(io::ErrorKind::InvalidInput,"Invalid worker arguments"));};

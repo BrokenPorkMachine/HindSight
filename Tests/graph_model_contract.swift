@@ -47,6 +47,10 @@ struct GraphModelContract {
         precondition(VGGraphParser.address(from: "pc=0x0000000100001018 stopped") == 0x100001018)
         precondition(VGGraphParser.address(from: "no address") == nil)
 
+        let candidates = VGGraphParser.functions("0x1000 name=_firmware_entry source=nlist section=1\n0x1020 name=sub_1020 source=prologue candidate")
+        precondition(candidates.count == 2 && candidates[0].name == "_firmware_entry")
+        precondition(candidates[0].end == candidates[0].start && candidates[0].contains(0x1000))
+        precondition(!candidates[0].contains(0x1001) && candidates[0].extentLabel == "Extent unknown")
         print("graph model contract passed")
     }
 }

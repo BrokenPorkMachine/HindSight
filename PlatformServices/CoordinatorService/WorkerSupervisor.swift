@@ -177,17 +177,17 @@ final class WorkerSupervisor {
     }
     deinit { if let governor { reworkbench_governor_free(governor) } }
 
-    func start(path: String, staging: String, id: String, completion: @escaping (Result<HeaderResult, Error>) -> Void) {
-        run(path: path, arguments: ["--capture-inspect", path, staging, id], id: id, operation: "capture") { result in
-            completion(result.flatMap { data in Result { try Self.captureResult(data, id: id) } })
+    func start(path: String, staging: String, id: String, options: BinaryImportOptions? = nil, completion: @escaping (Result<HeaderResult, Error>) -> Void) {
+        run(path: path, arguments: options.map { ["--capture-image", path, staging, id] + $0.arguments } ?? ["--capture-inspect", path, staging, id], id: id, operation: "capture") { result in
+            completion(result.flatMap { data in Result { try Self.captureResult(data, id: id, options: options) } })
         }
     }
-    func page(path: String, digest: String, size: String, start: UInt64, id: String,
+    func page(path: String, digest: String, size: String, start: UInt64, id: String, options: BinaryImportOptions? = nil,
               completion: @escaping (Result<InstructionPage, Error>) -> Void) {
-        run(path: path, arguments: ["--page", path, digest, size, String(start), id], id: id, operation: "page") { result in
+        run(path: path, arguments: options.map { ["--page-image", path, digest, size, String(start), id] + $0.arguments } ?? ["--page", path, digest, size, String(start), id], id: id, operation: "page") { result in
             completion(result.flatMap { data in Result {
                 guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      Set(object.keys) == Set(["protocol", "kind", "request_id", "source_sha256", "start_word", "total_words", "section_address", "section_offset", "word_count", "text"]) else {
+                      Set(object.keys) == Set(["protocol", "kind", "request_id", "source_sha256", "start_word", "total_words", "section_address", "section_offset", "word_count", "text"] + (options == nil ? [] : ["unit_bytes"])) else {
                     throw WorkbenchError("Unexpected page fields.")
                 }
                 let page = try JSONDecoder().decode(InstructionPage.self, from: data)
@@ -196,10 +196,10 @@ final class WorkerSupervisor {
             } })
         }
     }
-    func analyze(path: String, digest: String, size: String, id: String,
+    func analyze(path: String, digest: String, size: String, id: String, options: BinaryImportOptions? = nil,
                  completion: @escaping (Result<(AnalysisReport, WorkerEvidenceBundle?), Error>) -> Void) {
         let evidenceBox = EvidenceBundleCapture()
-        run(path: path, arguments: ["--analyze", path, digest, size, id], id: id, operation: "analysis",
+        run(path: path, arguments: options.map { ["--analyze-image", path, digest, size, id] + $0.arguments } ?? ["--analyze", path, digest, size, id], id: id, operation: "analysis",
             maxFrameBytes: WorkbenchProtocolLimits.analysisWorkerFrameBytes, deadlineSeconds: 240,
             admissionBytes: 512 * 1_048_576,
             evidenceSink: { evidenceBox.bundle = $0 }) { [weak self] result in
@@ -220,13 +220,13 @@ final class WorkerSupervisor {
             }
         }
     }
-    private static func captureResult(_ data: Data, id: String) throws -> HeaderResult {
+    private static func captureResult(_ data: Data, id: String, options: BinaryImportOptions?) throws -> HeaderResult {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw WorkbenchError("Invalid capture JSON.") }
                 let expected: Set<String> = ["protocol", "request_id", "kind", "file_kind", "architecture", "size", "header_hex", "captured", "source_sha256", "structure_status", "structure", "disassembly_status", "disassembly"]
-                guard Set(object.keys) == expected else { throw WorkbenchError("Unexpected worker fields.") }
+                guard Set(object.keys) == expected.union(options == nil ? [] : ["import_options"]) else { throw WorkbenchError("Unexpected worker fields.") }
                 let decoded = try JSONDecoder().decode(HeaderResult.self, from: data)
                 guard decoded.`protocol` == 1, decoded.request_id == id, decoded.kind == "header_result",
-                      decoded.captured, UInt64(decoded.size) != nil, decoded.header_hex.utf8.count <= 95,
+                      decoded.captured, decoded.import_options == options, UInt64(decoded.size) != nil, decoded.header_hex.utf8.count <= 95,
                       let digest = decoded.source_sha256, digest.count == 64,
                       digest.allSatisfy({ "0123456789abcdef".contains($0) }),
                       ["checked", "unsupported", "rejected"].contains(decoded.structure_status ?? ""),

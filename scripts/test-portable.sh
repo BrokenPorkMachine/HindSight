@@ -14,6 +14,7 @@ export CARGO_TARGET_DIR="$ROOT/build/rust"
 "$CARGO" clippy --manifest-path "$ROOT/rust/Cargo.toml" --locked --offline --all-targets -- -D warnings
 "$CARGO" build --manifest-path "$ROOT/rust/Cargo.toml" --locked --offline --jobs 2 -p reworkbench-worker
 python3 "$ROOT/scripts/test-worker.py" "$CARGO_TARGET_DIR/debug/reworker"
+python3 "$ROOT/scripts/test-binary-formats.py" "$CARGO_TARGET_DIR/debug/reworker"
 
 # Compile the built-in VectorEmu workspace as a first-class release gate.
 # v0.2.6 shipped four unresolved `hex::` call sites because only the main

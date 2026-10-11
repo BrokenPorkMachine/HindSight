@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Bounded, aging-priority worker pool for plugin and firmware operations.
 /// The coordinator queue only admits work; execution and resource waits happen off it.
@@ -158,12 +159,21 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         }
     }
     func inspectHeader(_ path: String, requestID: String, withReply reply: @escaping (String) -> Void) {
+        captureBinary(path, options: nil, requestID: requestID, reply: reply)
+    }
+    func importBinary(_ path: String, optionsJSON: String, requestID: String, withReply reply: @escaping (String) -> Void) {
+        guard optionsJSON.utf8.count < 1024,
+              let decoded = try? JSONDecoder().decode(BinaryImportOptions.self, from: Data(optionsJSON.utf8)),
+              let options = decoded.validated else { reply(ServiceReply.failure("Invalid binary import options.")); return }
+        captureBinary(path, options: options, requestID: requestID, reply: reply)
+    }
+    private func captureBinary(_ path: String, options: BinaryImportOptions?, requestID: String, reply: @escaping (String) -> Void) {
         queue.async { [self] in
             guard let current = store else { reply(ServiceReply.failure("Create or open a project first.")); return }
             let staging: URL
             do { staging = try current.prepareCapture() }
             catch { reply(ServiceReply.failure(error.localizedDescription)); return }
-            supervisor.start(path: path, staging: staging.path, id: requestID) { [self] result in
+            supervisor.start(path: path, staging: staging.path, id: requestID, options: options) { [self] result in
                 defer { try? FileManager.default.removeItem(at: staging) }
                 do {
                     guard store === current else { throw WorkbenchError("Project changed while worker ran.") }
@@ -181,7 +191,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                 }
                 let source = try current.capturedSource(id: recordID)
                 let before = try VerifiedPageCache.stamp(source.path)
-                let key = try VerifiedPageCache.key(path: source.path, digest: source.digest, size: source.size, start: start, stamp: before)
+                let key = try VerifiedPageCache.key(path: source.path, digest: source.digest, size: source.size, start: start, stamp: before, configuration: source.options?.cacheIdentity ?? "")
                 if forceVerify { pageCache.clear() }
                 if let cached = pageCache.get(key) {
                     let page = cached.forRequest(requestID)
@@ -193,7 +203,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     }
                     pageCache.clear()
                 }
-                supervisor.page(path: source.path, digest: source.digest, size: source.size, start: start, id: requestID) { [self] result in
+                supervisor.page(path: source.path, digest: source.digest, size: source.size, start: start, id: requestID, options: source.options) { [self] result in
                     do {
                         guard store === current else { throw WorkbenchError("Project changed during page request.") }
                         let page = try result.get()
@@ -214,6 +224,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     throw WorkbenchError("Invalid analysis request or no open project.")
                 }
                 let source = try current.capturedSource(id: recordID)
+                let engineIdentity = source.options.map { "multiarch-v1:" + SHA256.hash(data: Data($0.cacheIdentity.utf8)).map { String(format: "%02x", $0) }.joined().prefix(48) } ?? (analysisCacheEngineVersion + "-patterns1")
                 let before = try VerifiedPageCache.stamp(source.path)
                 supervisor.recordStatus(id: requestID, operation: "analysis", phase: .checkingCache,
                                         detail: "Checking project-local analysis cache against source and engine identity.",
@@ -222,8 +233,8 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                 let cached: (report: AnalysisReport, evidence: WorkerEvidenceBundle?, legacy: Bool)?
                 do {
                     cached = try current.cachedAnalysis(
-                        digest: source.digest, requestID: requestID, engineVersion: analysisCacheEngineVersion,
-                        compatibleLegacyProductVersions: compatibleLegacyAnalysisCacheVersions
+                        digest: source.digest, requestID: requestID, engineVersion: engineIdentity,
+                        compatibleLegacyProductVersions: []
                     )
                 } catch {
                     cached = nil
@@ -239,7 +250,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     if cached.legacy {
                         do {
                             try current.storeAnalysisCache(cached.report, evidence: cached.evidence, digest: source.digest,
-                                                           engineVersion: analysisCacheEngineVersion,
+                                                           engineVersion: engineIdentity,
                                                            producerVersion: analysisCacheProducerVersion)
                         } catch {
                             message += " Cache migration was not persisted."
@@ -252,7 +263,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                 supervisor.recordStatus(id: requestID, operation: "analysis", phase: .admitted,
                                         detail: cacheWarning ?? "No compatible cached result; launching bounded worker analysis.",
                                         progressPercent: 1, progressStage: "cache-miss")
-                supervisor.analyze(path: source.path, digest: source.digest, size: source.size, id: requestID) { [self] result in
+                supervisor.analyze(path: source.path, digest: source.digest, size: source.size, id: requestID, options: source.options) { [self] result in
                     do {
                         guard store === current else { throw WorkbenchError("Project changed during analysis.") }
                         let workerResult = try result.get()
@@ -264,7 +275,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                         var message = report.truncated ? "Analysis completed within bounded scan limits." : "Analysis completed."
                         do {
                             try current.storeAnalysisCache(report, evidence: evidence, digest: source.digest,
-                                                           engineVersion: analysisCacheEngineVersion,
+                                                           engineVersion: engineIdentity,
                                                            producerVersion: analysisCacheProducerVersion)
                         } catch {
                             message += " Project analysis cache was not updated."

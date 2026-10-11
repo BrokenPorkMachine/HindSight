@@ -14,8 +14,10 @@ struct VGFunctionRecord: Identifiable, Hashable {
     var id: UInt64 { start }
     var startText: String { String(format: "0x%016llx", start) }
 
+    var extentLabel: String { end > start && byteCount > 0 ? "\(byteCount) B" : "Extent unknown" }
+
     func contains(_ address: UInt64) -> Bool {
-        address >= start && address < end
+        end == start ? address == start : address >= start && address < end
     }
 }
 
@@ -162,6 +164,12 @@ enum VGGraphParser {
     static func functions(_ text: String) -> [VGFunctionRecord] {
         text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { raw in
             let parts = raw.split(whereSeparator: { $0.isWhitespace })
+            if let startToken = parts.first, let start = hex(String(startToken)),
+               let range = raw.range(of: " name=") {
+                let tail = String(raw[range.upperBound...])
+                let name = tail.components(separatedBy: " source=").first ?? "<candidate>"
+                return VGFunctionRecord(start: start, end: start, byteCount: 0, name: name)
+            }
             guard parts.count >= 4,
                   let start = hex(String(parts[0])),
                   let end = hex(String(parts[1])),

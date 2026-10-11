@@ -25,11 +25,12 @@ struct VGDisassemblyRow: Identifiable, Hashable {
         let op = mnemonic.lowercased()
         return op == "b" || op == "bl" || op == "br" || op == "blr" || op == "ret"
             || op.hasPrefix("b.") || op.hasPrefix("cb") || op.hasPrefix("tb")
+            || op.hasPrefix("j") || op.hasPrefix("call") || op.hasPrefix("ret") || op == "bx" || op == "blx" || op.hasPrefix("loop")
     }
 
     var isCall: Bool {
         let op = mnemonic.lowercased()
-        return op == "bl" || op == "blr"
+        return op == "bl" || op == "blr" || op == "blx" || op.hasPrefix("call")
     }
 }
 
@@ -66,7 +67,7 @@ enum VGDisassemblyParser {
                 continue
             }
 
-            if fields.count >= 4, isHex(fields[0], width: 16...18), isHex(fields[1], width: 16...18), isHex(fields[2], width: 8...8) {
+            if fields.count >= 4, isHex(fields[0], width: 16...18), isHex(fields[1], width: 16...18), isHex(fields[2], width: 2...30), fields[2].count % 2 == 0 {
                 let instruction = fields.dropFirst(3).joined(separator: " ")
                 let decoded = splitInstruction(instruction)
                 rows.append(.init(id: index, kind: .instruction, address: fields[0], fileOffset: fields[1], word: fields[2], mnemonic: decoded.0, operands: decoded.1, annotation: decoded.2, raw: raw))

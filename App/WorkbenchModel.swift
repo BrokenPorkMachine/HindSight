@@ -21,12 +21,14 @@ final class WorkbenchModel: ObservableObject {
     @Published var selectedID: String? {
         didSet {
             if oldValue != selectedID {
-                instructionPage = nil; analysisReport = nil; pageRecordID = nil; analysisRecordID = nil; evidenceIndexTask?.cancel(); analysisEvidenceIndex = nil; evidenceIndexRecordID = nil; analysisEvidenceIndexing = false; analysisEvidenceStatus = "Evidence index unavailable."; navigationGeneration = UUID(); resetWorkspaceHistory(); analysisHistoryCursor = -1; refreshAnalysisContinuityProjection()
+                instructionPage = nil; pageStarts.removeAll(); traversingPreviousPage = false; analysisReport = nil; pageRecordID = nil; analysisRecordID = nil; evidenceIndexTask?.cancel(); analysisEvidenceIndex = nil; evidenceIndexRecordID = nil; analysisEvidenceIndexing = false; analysisEvidenceStatus = "Evidence index unavailable."; navigationGeneration = UUID(); resetWorkspaceHistory(); analysisHistoryCursor = -1; refreshAnalysisContinuityProjection()
                 if !suppressLedgerRecording, let selected { recordLedger(kind: .recordSelected, provenance: .observed, detail: "Selected artifact \(selected.name).") }
                 persistLaunchSessionIfPossible()
             }
         }
     }
+    private var pageStarts: [UInt64] = []
+    private var traversingPreviousPage = false
     @Published var instructionPage: InstructionPage?
     @Published var analysisReport: AnalysisReport?
     @Published private(set) var analysisEvidenceIndex: VGAnalysisEvidenceIndex?
@@ -669,8 +671,35 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard project != nil else { status = "Create or open a project before importing a binary."; return }
         let panel = NSOpenPanel(); panel.title = "Import binary"; panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        let alert = NSAlert()
+        alert.messageText = "Import \(url.lastPathComponent)"
+        alert.informativeText = "Mach-O uses validated header addresses. Raw firmware needs an explicit architecture and load address. For composite SEPI, choose an image offset; Auto selects the first validated embedded Mach-O."
+        alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
+        let format = NSPopUpButton(frame: .zero, pullsDown: false)
+        let formats = ["auto", "macho", "sepos", "securerom", "iboot", "raw"]
+        format.addItems(withTitles: ["Auto / composite", "Mach-O", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary"])
+        let architecture = NSPopUpButton(frame: .zero, pullsDown: false)
+        let architectures = ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
+        architecture.addItems(withTitles: ["From header (ARM32 defaults to Thumb-2)", "AArch64", "Intel 32-bit", "Intel 64-bit", "ARM32", "Thumb-2"])
+        let address = NSTextField(string: "0x0")
+        let offset = NSTextField(string: "0x0")
+        let stack = NSStackView(views: [NSTextField(labelWithString: "Image format"), format,
+            NSTextField(labelWithString: "Architecture / instruction mode"), architecture,
+            NSTextField(labelWithString: "Raw load address (hex or decimal; 0 = file-relative)"), address,
+            NSTextField(labelWithString: "Image offset in file (hex or decimal)"), offset])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 460, height: 235)
+        for view in [format, architecture, address, offset] { view.widthAnchor.constraint(equalToConstant: 460).isActive = true }
+        alert.accessoryView = stack
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let input = BinaryImportOptions(format: formats[format.indexOfSelectedItem], architecture: architectures[architecture.indexOfSelectedItem], load_address: address.stringValue.lowercased(), file_offset: offset.stringValue.lowercased())
+        guard let options = input.validated, let encoded = try? JSONEncoder().encode(options),
+              let optionsJSON = String(data: encoded, encoding: .utf8) else { status = "Invalid import mapping. Enter valid hexadecimal or decimal addresses."; return }
+        if ["securerom", "iboot", "raw"].contains(options.format), options.architecture == "auto" {
+            status = "Choose the raw firmware architecture before importing."; return
+        }
         let id = UUID().uuidString; activeRequest = id; busy = true; analysisJobStatus = nil; status = "Capturing and inspecting source…"
-        client.request(timeout: 150, operation: { $0.inspectHeader(url.path, requestID: id, withReply: $1) }) { [weak self] result in
+        client.request(timeout: 150, operation: { $0.importBinary(url.path, optionsJSON: optionsJSON, requestID: id, withReply: $1) }) { [weak self] result in
             guard let self else { return }; self.busy = false; self.activeRequest = nil
             if self.apply(result) { self.selectedID = self.project?.records.first?.id }
         }
@@ -683,6 +712,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         client.request(timeout: 150, operation: { $0.instructionPage(record.id, startWord: String(start), forceVerify: forceVerify, requestID: id, withReply: $1) }) { [weak self] result in
             guard let self, self.activeRequest == id else { return }
             self.busy = false; self.activeRequest = nil
+            defer { self.traversingPreviousPage = false }
             guard self.navigationGeneration == generation, self.selectedID == record.id, self.project?.path == projectPath else {
                 self.status = "Discarded a page for an earlier selection."; return
             }
@@ -690,6 +720,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 let reply = try JSONDecoder().decode(PageReply.self, from: Data(try result.get().utf8))
                 guard reply.ok, let page = reply.page else { self.status = reply.message; return }
                 guard page.matches(id: id, digest: digest, start: start) else { self.status = "Page identity or bounds mismatch."; return }
+                if !self.traversingPreviousPage, let old = self.currentPage, let oldStart = UInt64(old.start_word), oldStart != start {
+                    self.pageStarts.append(oldStart); if self.pageStarts.count > 256 { self.pageStarts.removeFirst() }
+                }
+                self.traversingPreviousPage = false
                 self.instructionPage = page; self.pageRecordID = record.id
                 self.status = reply.message.isEmpty ? "Instruction page loaded." : reply.message
             } catch { self.status = error.localizedDescription }
@@ -917,7 +951,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
     func previousPage() {
         guard let page = currentPage, let start = UInt64(page.start_word) else { return }
-        loadPage(start: start >= 256 ? start - 256 : 0)
+        if page.unit_bytes != nil, page.unitBytes < 4 {
+            let previous = pageStarts.popLast() ?? 0
+            traversingPreviousPage = true
+            loadPage(start: previous)
+        } else { loadPage(start: start >= 256 ? start - 256 : 0) }
     }
     func nextPage() {
         guard let page = currentPage, let start = UInt64(page.start_word), let total = UInt64(page.total_words),
@@ -928,9 +966,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard let page = currentPage, let base = UInt64(page.section_address), let total = UInt64(page.total_words) else { return }
         var value = addressText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if value.hasPrefix("0x") { value.removeFirst(2) }
-        guard let address = UInt64(value, radix: 16), address >= base, (address - base) % 4 == 0,
-              (address - base) / 4 < total else { status = "Enter an aligned hexadecimal VA inside the selected code section."; return }
-        loadPage(start: (address - base) / 4)
+        let unit = page.unitBytes
+        guard unit > 0, let address = UInt64(value, radix: 16), address >= base, (address - base) % unit == 0,
+              (address - base) / unit < total else { status = "Enter an aligned hexadecimal VA inside the selected code section."; return }
+        loadPage(start: (address - base) / unit)
     }
     func cancel() {
         guard let id = activeRequest else { return }; status = "Cancellation requested…"

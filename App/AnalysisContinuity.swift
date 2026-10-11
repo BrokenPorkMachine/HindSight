@@ -408,12 +408,12 @@ enum VGAnalysisContinuityStore {
         try data.write(to: target, options: .atomic)
     }
 
-    static func snapshot(recordID: String, sourceSHA256: String, report: AnalysisReport) -> VGAnalysisSnapshot {
+    static func snapshot(recordID: String, sourceSHA256: String, report: AnalysisReport, engineIdentity: String = engine) -> VGAnalysisSnapshot {
         let channels = VGAnalysisNavigation.sources(report).prefix(96).map { source -> VGAnalysisChannelFingerprint in
             let lines = source.text.split(separator: "\n", omittingEmptySubsequences: true).count
             return .init(name: source.name, lineCount: lines, fingerprint: vgContinuityFingerprint(source.text))
         }
-        return .init(recordID: recordID, sourceSHA256: sourceSHA256, engine: engine, capturedAt: Date(), channels: channels)
+        return .init(recordID: recordID, sourceSHA256: sourceSHA256, engine: engineIdentity, capturedAt: Date(), channels: channels)
     }
 
     static func delta(previous: VGAnalysisSnapshot?, current: VGAnalysisSnapshot) -> VGAnalysisDelta {
@@ -946,12 +946,13 @@ extension WorkbenchModel {
 
     func recordAnalysisSnapshot(recordID: String, sourceSHA256: String, report: AnalysisReport) {
         guard let projectPath = project?.path else { return }
+        let engineIdentity = project?.records.first { $0.id == recordID }?.result.import_options?.cacheIdentity ?? (VGAnalysisContinuityStore.engine + "-patterns1")
         // Fingerprinting all bounded report channels can still touch several MiB.
         // Keep that deterministic CPU work off the SwiftUI main actor, then publish
         // the small snapshot/delta back into continuity state.
         Task { [weak self] in
             let current = await Task.detached(priority: .utility) {
-                VGAnalysisContinuityStore.snapshot(recordID: recordID, sourceSHA256: sourceSHA256, report: report)
+                VGAnalysisContinuityStore.snapshot(recordID: recordID, sourceSHA256: sourceSHA256, report: report, engineIdentity: engineIdentity)
             }.value
             guard let self, self.project?.path == projectPath else { return }
             let previous = self.analysisContinuityDocument.snapshots[recordID]

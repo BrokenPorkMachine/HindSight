@@ -13,8 +13,8 @@ final class VerifiedPageCache {
         guard result == 0 else { throw NSError(domain: "VectorGlass", code: 3, userInfo: [NSLocalizedDescriptionKey: "Captured file metadata is unavailable or the object is not a regular file."]) }
         return String(cString: output)
     }
-    static func key(path: String, digest: String, size: String, start: UInt64, stamp: String) throws -> Data {
-        try JSONEncoder().encode(["page-cache-v2-a64-integer", path, digest, size, String(start), stamp])
+    static func key(path: String, digest: String, size: String, start: UInt64, stamp: String, configuration: String = "") throws -> Data {
+        try JSONEncoder().encode(["page-cache-v2-a64-integer", path, digest, size, String(start), stamp] + (configuration.isEmpty ? [] : [configuration]))
     }
     func get(_ key: Data) -> InstructionPage? {
         guard let handle else { return nil }

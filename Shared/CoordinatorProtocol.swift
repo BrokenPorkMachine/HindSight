@@ -3,6 +3,7 @@ import Foundation
     func capabilities(withReply reply: @escaping (String) -> Void)
     func openProject(_ path: String, create: Bool, withReply reply: @escaping (String) -> Void)
     func inspectHeader(_ path: String, requestID: String, withReply reply: @escaping (String) -> Void)
+    func importBinary(_ path: String, optionsJSON: String, requestID: String, withReply reply: @escaping (String) -> Void)
     func instructionPage(_ recordID: String, startWord: String, forceVerify: Bool, requestID: String, withReply reply: @escaping (String) -> Void)
     func analyzeRecord(_ recordID: String, requestID: String, withReply reply: @escaping (String) -> Void)
     func cancelInspection(_ requestID: String, withReply reply: @escaping (Bool) -> Void)

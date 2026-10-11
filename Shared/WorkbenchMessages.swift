@@ -1,4 +1,27 @@
 import Foundation
+/// Persisted import interpretation, included in page and analysis cache identity.
+struct BinaryImportOptions: Codable, Equatable {
+    var format: String = "auto"
+    var architecture: String = "auto"
+    var load_address: String = "0"
+    var file_offset: String = "0"
+    static let automatic = BinaryImportOptions()
+    private static func number(_ text: String) -> UInt64? {
+        if text.hasPrefix("0x") { return UInt64(text.dropFirst(2), radix: 16) }
+        return UInt64(text)
+    }
+    var validated: BinaryImportOptions? {
+        guard ["auto", "macho", "sepos", "securerom", "iboot", "raw"].contains(format),
+              ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"].contains(architecture),
+              let address = Self.number(load_address), let offset = Self.number(file_offset),
+              offset < 8_589_934_592 else { return nil }
+        return BinaryImportOptions(format: format, architecture: architecture,
+                                   load_address: String(address), file_offset: String(offset))
+    }
+    var arguments: [String] { [format, architecture, load_address, file_offset] }
+    var cacheIdentity: String { "multiarch-v1:" + arguments.joined(separator: ":") }
+}
+
 struct HeaderResult: Codable {
     let `protocol`: Int
     let request_id: String
@@ -14,6 +37,7 @@ struct HeaderResult: Codable {
     let structure: String?
     let disassembly_status: String?
     let disassembly: String?
+    var import_options: BinaryImportOptions? = nil
 }
 struct ProjectRecord: Codable, Identifiable {
     let id: String
@@ -51,19 +75,23 @@ struct InstructionPage: Codable {
     let section_offset: String
     let word_count: Int
     let text: String
+    var unit_bytes: Int? = nil
+    var unitBytes: UInt64 { UInt64(exactly: unit_bytes ?? 4) ?? 0 }
     func forRequest(_ id: String) -> InstructionPage {
         InstructionPage(protocol: `protocol`, kind: kind, request_id: id, source_sha256: source_sha256,
                         start_word: start_word, total_words: total_words, section_address: section_address,
-                        section_offset: section_offset, word_count: word_count, text: text)
+                        section_offset: section_offset, word_count: word_count, text: text, unit_bytes: unit_bytes)
     }
     func matches(id: String, digest: String, start: UInt64) -> Bool {
-        guard `protocol` == 1, kind == "page_result", request_id == id,
+        let unit = unitBytes
+        guard [1, 2, 4].contains(unit), `protocol` == 1, kind == "page_result", request_id == id,
               source_sha256 == digest, UInt64(start_word) == start,
-              let total = UInt64(total_words), total <= 2_147_483_648, start < total,
-              let address = UInt64(section_address), address % 4 == 0,
-              let offset = UInt64(section_offset), offset % 4 == 0,
-              total <= (UInt64.max - address) / 4, total <= (UInt64.max - offset) / 4,
-              word_count == Int(min(256, total - start)), text.utf8.count < 65536 else { return false }
+              let total = UInt64(total_words), total <= 8_589_934_592, start < total,
+              let address = UInt64(section_address), address % unit == 0,
+              let offset = UInt64(section_offset), offset % unit == 0,
+              total <= (UInt64.max - address) / unit, total <= (UInt64.max - offset) / unit,
+              word_count > 0, word_count <= Int(min(256, total - start)),
+              (unit_bytes != nil || word_count == Int(min(256, total - start))), text.utf8.count < 65536 else { return false }
         return true
     }
 }

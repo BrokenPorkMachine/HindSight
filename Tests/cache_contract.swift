@@ -15,6 +15,10 @@ import Foundation
         precondition(!cached.matches(id: nextID, digest: digest, start: 0))
         let changed = try VerifiedPageCache.key(path: "/object", digest: digest, size: "168", start: 0, stamp: "stamp2")
         precondition(cache.get(changed) == nil)
+        let remapped = try VerifiedPageCache.key(path: "/object", digest: digest, size: "168", start: 0, stamp: "stamp1", configuration: "multiarch-v1:sepos:thumb:0:606208")
+        let otherMode = try VerifiedPageCache.key(path: "/object", digest: digest, size: "168", start: 0, stamp: "stamp1", configuration: "multiarch-v1:sepos:arm:0:606208")
+        precondition(remapped != key && remapped != otherMode)
+        precondition(cache.get(remapped) == nil)
         cache.clear(); precondition(cache.get(key) == nil)
         print("Swift/C cache adapter, request rebinding and metadata-key isolation passed")
     }

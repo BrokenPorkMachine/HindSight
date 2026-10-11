@@ -265,7 +265,7 @@ struct VGBinaryDiffWorkspace: View {
                     return function.contains(address)
                 }
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("\(function.startText) • \(function.byteCount) bytes").font(.caption).foregroundStyle(.secondary)
+                    Text("\(function.startText) • \(function.extentLabel)").font(.caption).foregroundStyle(.secondary)
                     ScrollView([.vertical, .horizontal]) {
                         LazyVStack(alignment: .leading, spacing: 2) {
                             ForEach(rows.prefix(600)) { row in

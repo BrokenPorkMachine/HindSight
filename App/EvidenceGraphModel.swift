@@ -330,7 +330,7 @@ enum VGEvidenceGraphBuilder {
                 provenance: .analysis,
                 confidence: .derived,
                 title: function.name,
-                detail: "\(function.startText) · \(function.byteCount) bytes",
+                detail: "\(function.startText) · \(function.extentLabel)",
                 address: function.start
             ))
             appendEdge(rootID, id, .contains, .derived, "Function range is derived from the bounded static-analysis result.")
