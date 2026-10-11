@@ -139,6 +139,15 @@ struct VGGraphWorkspace: View {
                 Button { setZoom(zoom - 0.1) } label: { Image(systemName: "minus.magnifyingglass") }.buttonStyle(.borderless)
                 Text("\(Int(zoom * 100))%").font(.system(size: 10, weight: .medium, design: .monospaced)).frame(width: 42)
                 Button { setZoom(zoom + 0.1) } label: { Image(systemName: "plus.magnifyingglass") }.buttonStyle(.borderless)
+                Slider(
+                    value: Binding(
+                        get: { Double(zoom) },
+                        set: { setZoom(CGFloat($0)) }
+                    ),
+                    in: 0.35...1.8
+                )
+                .frame(width: 92)
+                .help("Graph zoom")
                 Button("Fit") {
                     setZoom(0.72)
                     mapOffset = .zero
@@ -245,6 +254,7 @@ struct VGGraphWorkspace: View {
                     )
                 }
                 .simultaneousGesture(mapPanGesture)
+                .scrollDisabled(true)
                 .background {
                     Canvas { context, size in
                         let step: CGFloat = 22
@@ -257,7 +267,7 @@ struct VGGraphWorkspace: View {
                     }
                 }
 
-                minimap
+                minimap(viewportSize: proxy.size)
                     .padding(12)
                     .shadow(radius: 8, y: 3)
             }
@@ -498,8 +508,19 @@ struct VGGraphWorkspace: View {
         }
     }
 
-    private var minimap: some View {
+    private func minimap(viewportSize: CGSize) -> some View {
         let scale = minimapScale
+        let zoomValue = max(zoom, 0.01)
+        let visibleX = max(0, min(layout.width, Double(-mapOffset.width / zoomValue)))
+        let visibleY = max(0, min(layout.height, Double(-mapOffset.height / zoomValue)))
+        let visibleWidth = min(layout.width, Double(viewportSize.width / zoomValue))
+        let visibleHeight = min(layout.height, Double(viewportSize.height / zoomValue))
+        let viewportRect = CGRect(
+            x: 6 + CGFloat(visibleX) * scale,
+            y: 6 + CGFloat(visibleY) * scale,
+            width: max(8, CGFloat(visibleWidth) * scale),
+            height: max(8, CGFloat(visibleHeight) * scale)
+        )
         return ZStack {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(.ultraThickMaterial)
@@ -523,6 +544,15 @@ struct VGGraphWorkspace: View {
                 }
             }
             .padding(6)
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(Color.accentColor.opacity(0.08))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .stroke(Color.accentColor.opacity(0.88), lineWidth: 1.5)
+                }
+                .frame(width: viewportRect.width, height: viewportRect.height)
+                .position(x: viewportRect.midX, y: viewportRect.midY)
+                .allowsHitTesting(false)
         }
         .frame(width: 190, height: 120)
         .overlay { RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1) }
