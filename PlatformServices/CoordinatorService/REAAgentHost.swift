@@ -137,6 +137,9 @@ final class REAAgentHost {
             }
             guard session["error"] == nil else { return response(session, method: "binary_session") }
             guard let targetPath, let tool else { return response(session, method: "binary_session") }
+            if let availability = Self.toolAvailability(in: session, tool: tool), !availability.available {
+                return failure("REA operation \(tool) is unavailable: \(availability.reason)")
+            }
 
             let openID = nextID; nextID += 1
             try write(Self.message(id: openID, method: "tools/call", params: [
@@ -197,6 +200,29 @@ final class REAAgentHost {
         ["jsonrpc": "2.0", "id": id, "method": method, "params": params]
     }
     private static func notification(method: String) -> [String: Any] { ["jsonrpc": "2.0", "method": method] }
+
+    private static func toolAvailability(in object: Any, tool: String) -> (available: Bool, reason: String)? {
+        if let dictionary = object as? [String: Any] {
+            if let catalog = dictionary["tool_availability"] as? [String: Any],
+               let entry = catalog[tool] as? [String: Any],
+               let available = entry["available"] as? Bool {
+                let reason = (entry["reason"] as? String) ?? "The provider did not report a remediation."
+                return (available, String(reason.prefix(512)))
+            }
+            for value in dictionary.values {
+                if let result = toolAvailability(in: value, tool: tool) { return result }
+                if let text = value as? String,
+                   let data = text.data(using: .utf8),
+                   let decoded = try? JSONSerialization.jsonObject(with: data),
+                   let result = toolAvailability(in: decoded, tool: tool) { return result }
+            }
+        } else if let array = object as? [Any] {
+            for value in array {
+                if let result = toolAvailability(in: value, tool: tool) { return result }
+            }
+        }
+        return nil
+    }
 
     private func response(_ object: [String: Any], method: String) -> String {
         let value: [String: Any] = ["ok": object["error"] == nil, "method": method, "response": object]

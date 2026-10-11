@@ -22,7 +22,7 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 - [x] Add a coordinator-owned stdio MCP probe with timeout cleanup and bounded I/O.
 - [x] Add initial provider discovery through REA's `binary_session` tool.
 - [x] Add explicit target/provider selection for bounded overview, procedure, and name operations.
-- [ ] Add capability-aware operation selection for discovered providers.
+- [x] Gate target operations on explicit `binary_session.tool_availability` results when supplied.
 - [x] Add a dedicated REA Agent workspace with explicit target/provider controls.
 - [x] Add explicit cancellation for active REA operations.
 - [x] Include bounded REA responses and SHA-256 identities in HindSight case exports.
