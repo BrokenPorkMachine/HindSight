@@ -41,7 +41,7 @@ Acceptance: every new inference is provenance-labelled, bounded, and covered by 
 
 - [ ] Improve static-to-runtime pivots and breakpoint context.
 - [x] Distinguish module/slide address correlation from validated static-function correlation in runtime explanations.
-- [ ] Add persistent trace capture/replay and runtime snapshot browsing.
+- [x] Add bounded `.vgcase` runtime trace capture/replay and restore the saved timeline into Trace Explorer without debugger attachment.
 - [ ] Add clearer host capability, permission, and entitlement diagnostics.
 - [ ] Expand Intel and Apple Silicon qualification coverage.
 
@@ -72,4 +72,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels, and explicit runtime correlation strength are complete. Next loop: prioritize persistent runtime trace capture/replay or deeper non-ARM64 lifting.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels, explicit runtime correlation strength, and `.vgcase` runtime trace replay are complete. Next loop: prioritize runtime capability diagnostics or deeper non-ARM64 lifting.

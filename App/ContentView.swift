@@ -1018,6 +1018,7 @@ struct ContentView: View {
                         onCaptureSnapshot: model.captureInvestigationSnapshot,
                         onRestoreSnapshot: model.restoreInvestigationSnapshot,
                         onExportCase: model.exportInvestigationCase,
+                        onImportCase: model.importInvestigationCase,
                         onExportMarkdown: model.exportInvestigationMarkdown,
                         onExportPDF: model.exportInvestigationPDF,
                         onExportJSON: model.exportInvestigationJSON

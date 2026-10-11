@@ -24,6 +24,19 @@ struct VGRuntimeSample: Identifiable, Hashable {
 
     var pcText: String { VGTargetUtilities.hex(pc) }
 
+    static func restore(_ event: VGCaseRuntimeEvent, previous: VGRuntimeSample?) -> VGRuntimeSample? {
+        guard let pc = VGTargetUtilities.parseHex(event.pc) else { return nil }
+        let deltas = event.registers.keys.sorted().compactMap { name -> VGRuntimeRegisterDelta? in
+            guard let after = event.registers[name], previous?.registers[name] != after else { return nil }
+            return VGRuntimeRegisterDelta(name: name, before: previous?.registers[name], after: after)
+        }
+        return VGRuntimeSample(id: event.sequence, timestamp: event.timestamp, event: event.event, reason: event.reason,
+                               threadID: event.threadID, stopped: event.stopped, pc: pc,
+                               sp: event.sp.flatMap(VGTargetUtilities.parseHex), fp: event.fp.flatMap(VGTargetUtilities.parseHex),
+                               lr: event.lr.flatMap(VGTargetUtilities.parseHex), registers: event.registers,
+                               changedRegisters: deltas, breakpoints: event.breakpoints.compactMap(VGTargetUtilities.parseHex))
+    }
+
     static func capture(
         sequence: Int,
         snapshot: DebugSnapshot,

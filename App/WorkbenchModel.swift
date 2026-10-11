@@ -1659,6 +1659,47 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         } catch { status = "Case encoding failed: \(error.localizedDescription)" }
     }
 
+    func importInvestigationCase() {
+        let panel = NSOpenPanel()
+        panel.title = "Import HindSight Case"
+        panel.allowedFileTypes = ["vgcase"]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            let bundle = try VGLedgerStore.decodeCase(data)
+            let restored = bundle.runtime.compactMap { event in
+                VGRuntimeSample.restore(event, previous: runtimeSamples.last)
+            }
+            guard restored.count == bundle.runtime.count else {
+                throw NSError(domain: "HindSightCase", code: 4, userInfo: [NSLocalizedDescriptionKey: "The case contains runtime events with invalid addresses."])
+            }
+            func decodeHex(_ value: String) -> [UInt8]? {
+                let chars = Array(value)
+                guard chars.count <= 8192, chars.count.isMultiple(of: 2) else { return nil }
+                return stride(from: 0, to: chars.count, by: 2).compactMap { index in
+                    UInt8(String(chars[index...index + 1]), radix: 16)
+                }.count == chars.count / 2 ? stride(from: 0, to: chars.count, by: 2).compactMap { index in UInt8(String(chars[index...index + 1]), radix: 16) } : nil
+            }
+            let memory = bundle.memory.compactMap { observation -> VGRuntimeMemoryObservation? in
+                guard let address = VGTargetUtilities.parseHex(observation.address), let bytes = decodeHex(observation.bytesHex) else { return nil }
+                return VGRuntimeMemoryObservation(id: observation.sequence, timestamp: observation.timestamp, address: address, bytes: bytes)
+            }
+            guard memory.count == bundle.memory.count else {
+                throw NSError(domain: "HindSightCase", code: 5, userInfo: [NSLocalizedDescriptionKey: "The case contains invalid memory-observation bytes."])
+            }
+            runtimeSamples = restored
+            runtimeMemoryObservations = memory
+            runtimeSequence = restored.map(\.id).max() ?? 0
+            runtimeMemorySequence = memory.map(\.id).max() ?? 0
+            if let artifact = bundle.artifacts.first, project?.records.contains(where: { $0.id == artifact.id }) == true { selectedID = artifact.id }
+            workspace = "Trace Explorer"
+            ledgerStatus = "Imported \(restored.count) runtime observations from \(url.lastPathComponent); debugger remains detached."
+            status = ledgerStatus
+        } catch { status = "Case import failed: \(error.localizedDescription)" }
+    }
+
     func exportInvestigationMarkdown() {
         guard let bundle = caseBundle() else { return }
         let data = Data(VGLedgerStore.markdown(bundle).utf8)

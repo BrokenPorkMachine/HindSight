@@ -20,6 +20,7 @@ struct VGInvestigationLedgerWorkspace: View {
     let onCaptureSnapshot: (String) -> Void
     let onRestoreSnapshot: (VGInvestigationSnapshot) -> Void
     let onExportCase: () -> Void
+    let onImportCase: () -> Void
     let onExportMarkdown: () -> Void
     let onExportPDF: () -> Void
     let onExportJSON: () -> Void
@@ -82,6 +83,7 @@ struct VGInvestigationLedgerWorkspace: View {
                     Button("Ledger JSON", action: onExportJSON)
                 }
                 .buttonStyle(.borderedProminent)
+                Button("Import Case…", action: onImportCase)
             }
         }
         .padding(.horizontal, 16)

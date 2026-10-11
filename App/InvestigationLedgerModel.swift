@@ -449,6 +449,27 @@ enum VGLedgerStore {
         return try encoder.encode(bundle)
     }
 
+    static func decodeCase(_ data: Data) throws -> VGCaseBundle {
+        guard data.count <= 32 * 1024 * 1024 else {
+            throw NSError(domain: "HindSightCase", code: 1, userInfo: [NSLocalizedDescriptionKey: "Case bundle exceeds the 32 MiB safety limit."])
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let bundle = try decoder.decode(VGCaseBundle.self, from: data)
+        guard bundle.format == "com.zensoftware.vectorglass.case", bundle.schema == 1,
+              bundle.runtime.count <= 256, bundle.memory.count <= 64, bundle.artifacts.count <= 256 else {
+            throw NSError(domain: "HindSightCase", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unsupported or oversized HindSight case bundle."])
+        }
+        guard bundle.runtime.allSatisfy({ event in
+            event.pc.utf8.count <= 32 && event.reason.utf8.count <= 4096 && event.event.utf8.count <= 128 &&
+            event.registers.count <= 256 && event.registers.keys.allSatisfy({ $0.utf8.count <= 128 }) &&
+            event.registers.values.allSatisfy({ $0.utf8.count <= 256 }) && event.breakpoints.count <= 256
+        }), bundle.memory.allSatisfy({ $0.address.utf8.count <= 32 && $0.bytesHex.utf8.count <= 8192 }) else {
+            throw NSError(domain: "HindSightCase", code: 3, userInfo: [NSLocalizedDescriptionKey: "Case runtime evidence exceeds a bounded field limit."])
+        }
+        return bundle
+    }
+
     static func pdf(_ bundle: VGCaseBundle) -> Data {
         func ascii(_ value: String) -> String {
             String(value.unicodeScalars.map { scalar in
