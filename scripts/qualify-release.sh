@@ -116,6 +116,7 @@ verified on the required host.
 - [ ] Real stripped, symbol-rich, data-in-code, and encrypted-metadata arm64 Mach-O inputs.
 - [ ] 0.4.1 schema-1 migration and 0.4.2 schema-2 cache reuse/invalidation.
 - [ ] Monotonic progress, cancellation, and clean worker diagnostics.
+- [ ] Real REA installation/provider qualification; deterministic MCP fixture is covered by the automated preflight.
 - [ ] Binary Diff, responsive layouts, Function Neighborhoods, and continuity/reconnect flows.
 - [ ] VectorEmu flows and Intel closed-out debugger/Hypervisor/SoC surfaces.
 - [ ] Apple-Silicon debugger, Hypervisor, and SoC execution paths.

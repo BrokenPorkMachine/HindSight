@@ -8,6 +8,8 @@ echo "HindSight release preflight"
 echo "host architecture: $(uname -m)"
 xcodebuild -version | sed -n '1,2p'
 rustc --version
+python3 "$ROOT/scripts/test-rea-bridge.py"
+echo "REA bridge fixture contract: passed"
 
 if [[ -n "${VECTORGLASS_SIGN_IDENTITY:-}" ]]; then
     identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"

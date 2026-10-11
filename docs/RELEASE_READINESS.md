@@ -19,6 +19,7 @@ HindSight 0.5.7 uses the stable product/release-channel identity in source. That
 - The 0.5.7 Evidence Core builds a maximum 50,000-record typed index off the SwiftUI render path; Search/Triage/Related Evidence must consume that index rather than reparsing report strings.
 - Resident full compatibility reports are bounded to an 8-entry LRU; the selected artifact owns at most one typed evidence index.
 - Launch-session persistence is coalesced with a 350 ms debounce.
+- The optional REA bridge has a deterministic MCP fixture contract covering handshake, capability gating, progress retention, and fail-closed unavailable-tool behavior; real provider qualification remains manual and local-first.
 
 ## Mandatory universal macOS release-host gate
 
@@ -79,16 +80,17 @@ Before distributing 0.5.7, complete the common matrix on both an Intel Mac and t
 12. Open Function Neighborhoods on the firmware-scale stress artifact that previously caused a hang; confirm first paint remains responsive, evidence expands only in bounded batches, Code/CFG pivots work, and memory stays bounded enough for the 8 GiB baseline.
 13. On a disposable project copy, substitute symbolic links for `objects`, `staging`, and `analysis-cache`, plus a staged capture/cache file. Each case must fail closed without writing through the link or special file.
 14. Inspect `HindSight`, `CoordinatorService`, `reworker`, and `vg-emu-server` with `lipo -archs`; every distributed executable must contain both `arm64` and `x86_64`.
+15. If REA is enabled for the distribution, run a local provider qualification against an approved target and confirm `binary_session` availability, progress, cancellation, bounded response retention, structured Evidence identity, and `.vgcase` restore. The automated deterministic fixture runs during release preflight.
 
 ### Intel-only qualification
 
-15. Confirm ARM64/ARM64e static analysis, projects, Binary Diff, evidence/review workflows, scripting/plugins, firmware tooling, and VectorEmu work natively in the x86_64 slice.
-16. Confirm Debugger, Hypervisor RE, and SoC Virtualization are visibly closed out with explicit Apple-Silicon requirements from every navigation route, including menus, sidebar/tool cards, restored workspaces, and no-artifact states. Direct Coordinator calls to those backends must fail closed.
+16. Confirm ARM64/ARM64e static analysis, projects, Binary Diff, evidence/review workflows, scripting/plugins, firmware tooling, and VectorEmu work natively in the x86_64 slice.
+17. Confirm Debugger, Hypervisor RE, and SoC Virtualization are visibly closed out with explicit Apple-Silicon requirements from every navigation route, including menus, sidebar/tool cards, restored workspaces, and no-artifact states. Direct Coordinator calls to those backends must fail closed.
 
 ### Apple-Silicon-only qualification
 
-17. Exercise authorized native debugger attach/launch/step/breakpoint/memory/module/backtrace against a local ARM64 target.
-18. Exercise Hypervisor/SoC execution create/destroy, RAM access, vCPU registers/run exits, reset, trace, breakpoints, and firmware-load paths.
+18. Exercise authorized native debugger attach/launch/step/breakpoint/memory/module/backtrace against a local ARM64 target.
+19. Exercise Hypervisor/SoC execution create/destroy, RAM access, vCPU registers/run exits, reset, trace, breakpoints, and firmware-load paths.
 
 Until that matrix is completed on both release hosts, treat the source archive as a release-candidate source package even though its internal channel is `stable`.
 
