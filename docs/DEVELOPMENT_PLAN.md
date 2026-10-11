@@ -62,7 +62,7 @@ Acceptance: a clean install is understandable, testable, supportable, and distri
 
 - [x] Add a visible Support & Readiness center with build identity, Coordinator health, host capability status, and diagnostics actions.
 - [x] Add structured operation/error taxonomy with recovery guidance and support-safe export.
-- [ ] Add case integrity manifests, verification, review decisions, and conflict-safe handoff workflows.
+- [ ] Complete review decisions and conflict-safe handoff workflows; case integrity manifests, bounded verification, and visible trust status are implemented.
 - [ ] Add local policy and extension-governance surfaces with fail-closed validation.
 - [ ] Add managed-defaults, signed-release-manifest, retention, and opt-in crash-diagnostics documentation.
 

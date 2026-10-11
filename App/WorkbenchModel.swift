@@ -171,6 +171,7 @@ final class WorkbenchModel: ObservableObject {
     @Published var runtimeMemoryObservations: [VGRuntimeMemoryObservation] = []
     @Published var investigationLedger: VGInvestigationLedger?
     @Published var ledgerStatus = "Ledger opens with the project."
+    @Published private(set) var caseIntegrityStatus = "No imported case integrity record."
     @Published var selectedLedgerEntryID = ""
     @Published var pythonSource = """
 # HindSight Python API v2
@@ -1888,7 +1889,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         )
     }
 
-    private func exportData(_ data: Data, suggestedName: String, title: String) {
+    private func exportData(_ data: Data, suggestedName: String, title: String, successMessage: String? = nil) {
         let panel = NSSavePanel()
         panel.title = title
         panel.nameFieldStringValue = suggestedName
@@ -1896,7 +1897,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         do {
             try data.write(to: url, options: .atomic)
             recordLedger(kind: .caseExported, provenance: .asserted, detail: "Exported \(url.lastPathComponent).")
-            status = "Exported \(url.lastPathComponent)."
+            status = successMessage ?? "Exported \(url.lastPathComponent)."
         } catch { status = "Export failed: \(error.localizedDescription)" }
     }
 
@@ -1906,7 +1907,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             let data = try VGLedgerStore.encodeCase(bundle)
             guard data.count <= 32 * 1024 * 1024 else { status = "Case bundle exceeds the 32 MiB export limit."; return }
             let base = bundle.ledger.projectName.replacingOccurrences(of: "/", with: "-")
-            exportData(data, suggestedName: "\(base).vgcase", title: "Export HindSight Case")
+            exportData(data, suggestedName: "\(base).vgcase", title: "Export HindSight Case",
+                       successMessage: "Exported \(base).vgcase with a SHA-256 case integrity manifest.")
         } catch { status = "Case encoding failed: \(error.localizedDescription)" }
     }
 
@@ -1949,7 +1951,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             runtimeMemorySequence = memory.map(\.id).max() ?? 0
             if let artifact = bundle.artifacts.first, project?.records.contains(where: { $0.id == artifact.id }) == true { selectedID = artifact.id }
             workspace = reaEvidence.isEmpty ? "Trace Explorer" : "REA Agent"
-            ledgerStatus = "Imported \(restored.count) runtime observations and \(reaEvidence.count) REA evidence record(s) from \(url.lastPathComponent); debugger remains detached."
+            caseIntegrityStatus = bundle.integrity == nil
+                ? "Imported legacy case without an integrity manifest; contents passed schema and bounds checks."
+                : "Imported case integrity verified with SHA-256 manifest."
+            ledgerStatus = "Imported \(restored.count) runtime observations and \(reaEvidence.count) REA evidence record(s) from \(url.lastPathComponent); \(caseIntegrityStatus) Debugger remains detached."
             status = ledgerStatus
         } catch { status = "Case import failed: \(error.localizedDescription)" }
     }

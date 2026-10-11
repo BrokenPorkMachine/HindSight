@@ -1083,7 +1083,7 @@ struct ContentView: View {
                 if let ledger = model.investigationLedger {
                     VGInvestigationLedgerWorkspace(
                         ledger: ledger,
-                        status: model.ledgerStatus,
+                        status: "\(model.ledgerStatus)\n\(model.caseIntegrityStatus)",
                         selectedEntryID: model.selectedLedgerEntryID,
                         onSelectEntry: { model.selectedLedgerEntryID = $0 },
                         onOpenContext: model.openLedgerContext,

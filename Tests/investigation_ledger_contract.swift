@@ -37,6 +37,7 @@ struct InvestigationLedgerContract {
         let data = try VGLedgerStore.encodeCase(bundle)
         let boundedCase = try VGLedgerStore.decodeCase(data)
         precondition(boundedCase.format == "com.zensoftware.vectorglass.case")
+        precondition(boundedCase.integrity?.algorithm == "SHA-256")
         let decoder = JSONDecoder(); decoder.dateDecodingStrategy = .iso8601
         let decoded = try decoder.decode(VGCaseBundle.self, from: data)
         precondition(decoded.ledger.caseID == "case-1")
