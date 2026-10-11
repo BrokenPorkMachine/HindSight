@@ -693,6 +693,21 @@ extension WorkbenchModel {
         return analysisContinuityDocument.collections.first(where: { $0.id == collectionID && $0.recordID == recordID })?.pinIDs.contains(pinID) == true
     }
 
+    func analysisAnnotation(for hit: VGAnalysisEvidenceHit) -> VGAnalysisAnnotation? {
+        guard let recordID = selectedID else { return nil }
+        let id = "\(recordID)|\(vgContinuityFingerprint(hit.text))"
+        return analysisContinuityDocument.annotations[id]
+    }
+
+    func analysisHitMatchesFilter(_ hit: VGAnalysisEvidenceHit, query: String) -> Bool {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return true }
+        guard let annotation = analysisAnnotation(for: hit) else { return false }
+        return annotation.note.localizedCaseInsensitiveContains(needle) ||
+            annotation.tags.contains { $0.localizedCaseInsensitiveContains(needle) } ||
+            annotation.confidence.rawValue.localizedCaseInsensitiveContains(needle)
+    }
+
     func toggleAnalysisCollectionMembership(_ hit: VGAnalysisEvidenceHit, collectionID: String) {
         guard let recordID = selectedID, let projectPath = project?.path,
               let collectionIndex = analysisContinuityDocument.collections.firstIndex(where: { $0.id == collectionID && $0.recordID == recordID }) else { return }

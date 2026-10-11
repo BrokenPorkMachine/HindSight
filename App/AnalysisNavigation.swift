@@ -342,6 +342,17 @@ struct VGAnalysisEvidenceHitCard: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .lineLimit(compact ? 4 : 7)
+            if let annotation = model.analysisAnnotation(for: hit) {
+                VGFlowLayout(horizontalSpacing: 5, verticalSpacing: 4) {
+                    VGTagPill(text: annotation.confidence.rawValue, systemImage: "checkmark.seal")
+                    ForEach(annotation.tags, id: \.self) { tag in
+                        VGTagPill(text: tag, systemImage: "tag")
+                    }
+                    if !annotation.note.isEmpty {
+                        VGTagPill(text: "annotated", systemImage: "note.text")
+                    }
+                }
+            }
             VGFlowLayout(horizontalSpacing: 6, verticalSpacing: 5) {
                 Button("Select") { model.selectAnalysisHit(hit) }
                 Button(model.isAnalysisHitPinned(hit) ? "Unpin" : "Pin") { model.toggleAnalysisPin(hit) }
@@ -387,12 +398,22 @@ struct VGAnalysisTriageView: View {
     @State private var renamingCollectionID: String?
     @State private var renamingCollectionName = ""
 
-    private var focusHits: [VGAnalysisEvidenceHit] { model.analysisFocusHits(filter: filter) }
+    private var focusHits: [VGAnalysisEvidenceHit] {
+        let indexed = model.analysisFocusHits(filter: filter)
+        guard !filter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return indexed }
+        let annotated = model.analysisFocusHits().filter { model.analysisHitMatchesFilter($0, query: filter) }
+        var seen = Set<String>()
+        return (indexed + annotated).filter { seen.insert($0.id).inserted }.prefix(180).map { $0 }
+    }
     private var pinnedHits: [VGAnalysisEvidenceHit] {
-        model.analysisPins.map(\.hit).filter { filter.isEmpty || $0.text.localizedCaseInsensitiveContains(filter) || $0.source.localizedCaseInsensitiveContains(filter) }
+        model.analysisPins.map(\.hit).filter {
+            filter.isEmpty || $0.text.localizedCaseInsensitiveContains(filter) || $0.source.localizedCaseInsensitiveContains(filter) || model.analysisHitMatchesFilter($0, query: filter)
+        }
     }
     private var recentVisits: [VGAnalysisVisit] {
-        model.analysisRecentVisits.filter { filter.isEmpty || $0.text.localizedCaseInsensitiveContains(filter) || $0.source.localizedCaseInsensitiveContains(filter) }
+        model.analysisRecentVisits.filter {
+            filter.isEmpty || $0.text.localizedCaseInsensitiveContains(filter) || $0.source.localizedCaseInsensitiveContains(filter) || model.analysisHitMatchesFilter($0.hit, query: filter)
+        }
     }
     private var filteredCollections: [VGInvestigationCollection] { model.filteredAnalysisCollections(query: collectionFilter) }
 
