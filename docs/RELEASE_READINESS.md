@@ -40,6 +40,27 @@ VECTORGLASS_NOTARIZE_PROFILE="notary-profile" \\
 
 This gate must complete Debug/Release builds, embedded worker/VectorEmu checks, code-sign verification, notarization, stapling, and stable bundle identity verification.
 
+For a single repeatable operator command that runs the non-secret preflight, invokes
+the candidate or stable gate, captures a timestamped transcript, and writes the
+remaining manual checklist, use:
+
+```bash
+./scripts/qualify-release.sh --candidate
+```
+
+After Developer ID and notarization credentials are configured, run the stable path:
+
+```bash
+VECTORGLASS_SIGN_IDENTITY="Developer ID Application: …" \
+VECTORGLASS_DEVELOPMENT_TEAM="TEAMID" \
+VECTORGLASS_NOTARIZE_PROFILE="notary-profile" \
+./scripts/qualify-release.sh --stable --open
+```
+
+Reports are written below `build/release-reports/<timestamp>-<mode>/`. The command
+does not claim the real-target or memory-pressure matrix passed; it creates a
+checklist for those host-specific steps.
+
 ## Manual distribution matrix
 
 Before distributing 0.5.7, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
