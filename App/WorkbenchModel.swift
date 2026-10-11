@@ -105,6 +105,12 @@ final class WorkbenchModel: ObservableObject {
             persistLaunchSessionIfPossible()
         }
     }
+    @Published var preferredLayoutPreset = "Explore" {
+        didSet {
+            guard VGWorkspaceCatalog.layouts.contains(preferredLayoutPreset) else { return }
+            UserDefaults.standard.set(preferredLayoutPreset, forKey: "HindSight.preferred-layout.v1")
+        }
+    }
     @Published var selectedTargetID = ""
     @Published var targetPivotInput = ""
     @Published var targetPivot: VGAddressPivot?
@@ -341,6 +347,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private var applyingLaunchSession = false
     private let client = CoordinatorClient()
     init() {
+        if let saved = UserDefaults.standard.string(forKey: "HindSight.preferred-layout.v1"), VGWorkspaceCatalog.layouts.contains(saved) {
+            preferredLayoutPreset = saved
+            layoutPreset = saved
+        }
         savedLaunchSession = Self.readSavedLaunchSession()
         savedLaunchSessionAvailable = savedLaunchSession != nil
         savedLaunchProjectName = savedLaunchSession.map { URL(fileURLWithPath: $0.projectPath, isDirectory: true).lastPathComponent } ?? ""

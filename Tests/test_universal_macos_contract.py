@@ -70,6 +70,15 @@ def test_recent_projects_are_bounded_and_reopenable():
     assert 'func openRecentProject' in model
     assert 'Section("Recent Projects")' in ui
 
+def test_preferences_persist_bounded_startup_and_guidance_choices():
+    model = read('App/WorkbenchModel.swift')
+    app = read('App/HindSightApp.swift')
+    assert 'HindSight.preferred-layout.v1' in model
+    assert 'preferredLayoutPreset' in model
+    assert 'Settings {' in app
+    assert 'Preferred layout' in app
+    assert 'Show mentor guidance' in app
+
 def test_typecheck_and_release_gates_cover_both_architectures():
     for script in ('scripts/test-app-typecheck.sh', 'scripts/test-coordinator-typecheck.sh'):
         text = read(script)

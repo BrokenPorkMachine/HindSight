@@ -10,6 +10,9 @@ struct HindSightApp: App {
                 .frame(minWidth: 900, minHeight: 680)
         }
         .defaultSize(width: 1480, height: 920)
+        Settings {
+            HindSightSettingsView(model: model)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Project…", action: model.newProject)
@@ -63,5 +66,33 @@ struct HindSightApp: App {
                     .keyboardShortcut("0", modifiers: .command)
             }
         }
+    }
+}
+
+private struct HindSightSettingsView: View {
+    @ObservedObject var model: WorkbenchModel
+
+    var body: some View {
+        Form {
+            Section("Startup") {
+                Picker("Preferred layout", selection: $model.preferredLayoutPreset) {
+                    ForEach(VGWorkspaceCatalog.layouts, id: \.self) { Text($0).tag($0) }
+                }
+                Button("Apply to current project") { model.layoutPreset = model.preferredLayoutPreset }
+                    .disabled(model.layoutPreset == model.preferredLayoutPreset)
+                Text("The last project view is restored when available; this preference is used as the default for a new session.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("Investigation") {
+                Toggle("Show mentor guidance", isOn: $model.mentorMode)
+                Text("Mentor mode adds short explanations around investigation controls without changing analysis results.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 460)
+        .padding()
     }
 }
