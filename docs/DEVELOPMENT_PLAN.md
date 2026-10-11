@@ -24,7 +24,7 @@ Acceptance: a new user can import an artifact, run analysis, find a result, anno
 ### Phase 2 — Analysis quality and depth
 
 - [x] Add bounded compact-unwind metadata ingestion; DWARF/dSYM sections remain explicitly inventory-only.
-- [ ] Improve type and variable recovery.
+- [x] Add bounded ARM64 stack-slot variable-location candidates from decoded stack-relative loads/stores; source names, lifetimes, layouts, and types remain unresolved.
 - [x] Label validated Swift type-descriptor names with relative-pointer provenance and confidence.
 - [x] Surface bounded Swift field-variable counts with explicit unresolved layout/declaration boundaries.
 - [x] Add bounded AArch64 call-argument/return-register provenance; source-level types and callee prototypes remain explicit unknowns.
@@ -73,4 +73,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bundled synthetic tutorial fixture and walkthrough, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, explicit runtime stop-event/reason context, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, startup-pressure diagnostics, and shared compact/medium/wide layout coverage are complete. Next loop: prioritize type/variable recovery, deeper non-ARM64 lifting, or release/memory/crash gates.
+The Phase 1 usability slices, bundled synthetic tutorial fixture and walkthrough, bounded ARM64 stack-slot variable-location candidates, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, explicit runtime stop-event/reason context, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, startup-pressure diagnostics, and shared compact/medium/wide layout coverage are complete. Next loop: prioritize deeper type recovery, non-ARM64 lifting, or release/memory/crash gates.

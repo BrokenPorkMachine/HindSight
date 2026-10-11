@@ -834,6 +834,29 @@ fn function_neighborhood_report(starts:&[u64],calls:&[(u64,u64,u64)],tails:&[(u6
  for f in selected{if out.len()>58_000{break}let ins=incoming.get(&f).map_or(&[][..],|v|v.as_slice());let outs=outgoing.get(&f).map_or(&[][..],|v|v.as_slice());let name=names.get(&f).copied().unwrap_or("<discovered>");let total_in=incoming_count.get(&f).copied().unwrap_or(0);let total_out=outgoing_count.get(&f).copied().unwrap_or(0);out.push_str(&format!("function {f:#018x} {name}  incoming={total_in} outgoing={total_out}\n"));for &(site,peer,kind) in ins{let pn=names.get(&peer).copied().unwrap_or("<discovered>");out.push_str(&format!("  <- {kind:<16} site={site:#018x} from={peer:#018x} {pn}\n"));}if total_in>ins.len(){out.push_str(&format!("  <- … {} additional incoming edges omitted\n",total_in-ins.len()));}for &(site,peer,kind) in outs{let pn=names.get(&peer).copied().unwrap_or("<external-or-discovered>");out.push_str(&format!("  -> {kind:<16} site={site:#018x} to={peer:#018x} {pn}\n"));}if total_out>outs.len(){out.push_str(&format!("  -> … {} additional outgoing edges omitted\n",total_out-outs.len()));}out.push('\n');}
  if out.lines().count()<=2{out.push_str("No direct function neighborhood edges were recovered in the bounded code scan.\n");}out
 }
+/// Recover only decoded instructions whose textual operands explicitly use
+/// the stack pointer and an immediate offset. These are variable-location
+/// candidates, not source variables: names, lifetimes, layouts, and types stay
+/// unresolved until matching debug information is available.
+fn stack_slot_candidates(ir:&str)->String{
+ let mut out=String::from("Bounded stack-slot candidates (decoded stack-relative operands; names, lifetimes, layouts, and types remain unresolved)\n");
+ let mut count=0usize;
+ for line in ir.lines().take(20_000){
+  let mut fields=line.split_whitespace();
+  let Some(address)=fields.next() else{continue};
+  let Some(kind)=fields.next() else{continue};
+  if kind!="op"{continue}
+  let assembly=fields.collect::<Vec<_>>().join(" ");
+  let mnemonic=assembly.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+  if !matches!(mnemonic.as_str(),"ldr"|"ldrb"|"ldrh"|"ldrsw"|"ldp"|"str"|"strb"|"strh"|"stp")||!assembly.contains("sp")||!assembly.contains('#'){continue}
+  if out.len()>58_000{break}
+  out.push_str(&format!("  {address} {assembly}  classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown\n"));
+  count+=1;
+ }
+ if count==0{out.push_str("No decoded stack-relative load/store candidates were recovered.\n");}
+ else{out.push_str(&format!("Candidates recovered: {count}. Source variable identity and type recovery remain unresolved.\n"));}
+ out
+}
 fn analysis_quality_report(map_bytes:u64,scan_bytes:u64,encrypted:bool,truncated:bool,instructions:usize,decoded:usize,data_words:usize,functions:usize,blocks:usize,calls:usize,tails:usize,relocations:usize,data_refs:&str,dominators:&str)->String{
  let decoder_pct=if instructions==0{0.0}else{decoded as f64*100.0/instructions as f64};let scan_pct=if map_bytes==0{0.0}else{scan_bytes as f64*100.0/map_bytes as f64};let refs=data_refs.lines().filter(|l|l.contains("provenance=")).count();let skipped=dominators.lines().filter(|l|l.contains("dominator detail omitted")).count();
  let code_status=if encrypted{"metadata-only: Mach-O declares code encrypted"}else if truncated{"bounded: executable mapping exceeds scan budget"}else{"complete within admitted executable mapping"};let dom_status=if skipped==0{"complete for admitted functions under per-function budget"}else{"partially budgeted; see Dominators for exact functions"};
@@ -885,6 +908,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
   if let Some((target,k,split))=branch_target(w,pc){if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&pc+4<scan_end{leaders.push(pc+4);edges.push((pc,pc+4,"fallthrough"));}}
   else if is_terminal(w)&&pc+4<scan_end{leaders.push(pc+4);}
  }
+ let stack_slots=stack_slot_candidates(&ir);if dataflow.len().saturating_add(stack_slots.len())<60_000{dataflow.push('\n');dataflow.push_str(&stack_slots);}
  analysis_progress(44,"decode","Instruction scan completed; constructing bounded control-flow topology.");
  leaders.retain(|x|*x>=map.address&&*x<scan_end&&(*x-map.address)%4==0);leaders.sort_unstable();leaders.dedup();let block_count=leaders.len();let cfg_limit=leaders.len().min(4000);let mut cfg_edges=vec![Vec::<(u64,u64,&str)>::new();cfg_limit];for &(from,to,k) in &edges{if let Some(block)=block_index(&leaders,from){if block<cfg_limit&&cfg_edges[block].len()<16{cfg_edges[block].push((from,to,k));}}}let mut cfg=String::new();for n in 0..cfg_limit{let start=leaders[n];let end=leaders.get(n+1).copied().unwrap_or(scan_end);cfg.push_str(&format!("block B{n:04} {start:#018x}..{end:#018x}\n"));for &(from,to,k) in &cfg_edges[n]{cfg.push_str(&format!("    {k:<11} {from:#018x} -> {to:#018x}\n"));}if cfg.len()>60_000{break}}
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");

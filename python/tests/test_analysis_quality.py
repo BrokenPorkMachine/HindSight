@@ -56,6 +56,13 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn("Validated Swift field variables", body)
         self.assertIn("storage layout, runtime offsets, and source-level declarations remain unresolved", body)
 
+    def test_stack_slot_candidates_bound_variable_recovery(self):
+        source = (ROOT / "rust/crates/worker/src/preview.rs").read_text()
+        body = source[source.index("fn stack_slot_candidates"):source.index("fn analysis_quality_report")]
+        self.assertIn("classification=stack-slot-candidate", body)
+        self.assertIn("provenance=decoded-stack-relative-address", body)
+        self.assertIn("type=unknown", body)
+
     def test_non_arm_semantic_hints_are_bounded_and_not_decompilation(self):
         source = (ROOT / "rust/crates/worker/src/binary.rs").read_text()
         body = source[source.index("fn semantic_hint"):source.index("pub fn analyze")]
