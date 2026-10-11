@@ -26,6 +26,7 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 - [x] Add a dedicated REA Agent workspace with explicit target/provider controls.
 - [x] Add explicit cancellation for active REA operations.
 - [x] Include bounded REA responses and SHA-256 identities in HindSight case exports.
+- [x] Expose retained REA records as provenance nodes in the Evidence Graph.
 - [ ] Add streamed progress history and retained evidence to the REA Agent workspace.
 - [ ] Import REA evidence into cases and the evidence graph with compatibility checks.
 - [ ] Add contract tests using deterministic MCP fixtures and release qualification coverage.

@@ -342,6 +342,7 @@ struct VGEvidenceGraphWorkspace: View {
         case .function: return "function"
         case .address: return "number"
         case .staticEvidence: return "checkmark.seal"
+        case .reaEvidence: return "sparkles.rectangle.stack"
         case .correlationEvidence: return "point.3.filled.connected.trianglepath.dotted"
         case .runtimeObservation: return "ladybug"
         case .memoryObservation: return "memorychip"

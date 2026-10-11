@@ -1138,7 +1138,8 @@ struct ContentView: View {
                                     address: hypothesis.linkedAddresses.first.flatMap(VGTargetUtilities.parseHex)
                                 )
                             },
-                            selectedAddress: VGTargetUtilities.parseHex(model.addressText)
+                            selectedAddress: VGTargetUtilities.parseHex(model.addressText),
+                            reaEvidence: model.reaEvidence
                         ),
                         onSelectAddress: { value in
                             model.addressText = value

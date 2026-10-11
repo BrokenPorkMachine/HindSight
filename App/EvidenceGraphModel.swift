@@ -31,6 +31,7 @@ struct VGEvidenceNode: Identifiable, Hashable {
         case function
         case address
         case staticEvidence
+        case reaEvidence
         case correlationEvidence
         case runtimeObservation
         case memoryObservation
@@ -43,6 +44,7 @@ struct VGEvidenceNode: Identifiable, Hashable {
             case .function: return "Function"
             case .address: return "Address"
             case .staticEvidence: return "Static evidence"
+            case .reaEvidence: return "REA evidence"
             case .correlationEvidence: return "Correlation evidence"
             case .runtimeObservation: return "Runtime observation"
             case .memoryObservation: return "Memory observation"
@@ -163,13 +165,14 @@ struct VGEvidenceGraph: Hashable {
 
         let laneOrder: [VGEvidenceNode.Kind] = [
             .investigation, .function, .address, .staticEvidence, .correlationEvidence,
-            .runtimeObservation, .memoryObservation, .analystNote, .analystHypothesis
+            .reaEvidence, .runtimeObservation, .memoryObservation, .analystNote, .analystHypothesis
         ]
         let laneX: [VGEvidenceNode.Kind: Double] = [
             .investigation: 150,
             .function: 440,
             .address: 730,
             .staticEvidence: 730,
+            .reaEvidence: 880,
             .correlationEvidence: 830,
             .runtimeObservation: 1080,
             .memoryObservation: 1360,
@@ -277,7 +280,8 @@ enum VGEvidenceGraphBuilder {
         memory: [VGEvidenceMemoryFact],
         note: String,
         assertions: [VGEvidenceAnalystAssertion] = [],
-        selectedAddress: UInt64?
+        selectedAddress: UInt64?,
+        reaEvidence: [VGREAAgentEvidence] = []
     ) -> VGEvidenceGraph {
         let rootID = "investigation"
         let functions = Array(VGGraphParser.functions(functionsText).prefix(96))
@@ -358,6 +362,20 @@ enum VGEvidenceGraphBuilder {
             ))
             let target = ensureAddressNode(address, detail: clip(line))
             appendEdge(id, target, .supports, .derived, "Static provenance record supports the correlated address or function node.")
+        }
+
+        for evidence in reaEvidence.suffix(32) {
+            let id = "rea:\(evidence.id)"
+            appendNode(VGEvidenceNode(
+                id: id,
+                kind: .reaEvidence,
+                provenance: .analysis,
+                confidence: .observed,
+                title: "REA \(evidence.operation)",
+                detail: "\(URL(fileURLWithPath: evidence.targetPath).lastPathComponent) · \(evidence.provider) · SHA-256 \(evidence.responseSHA256)",
+                address: nil
+            ))
+            appendEdge(rootID, id, .contains, .observed, "REA response retained with explicit target, provider, and SHA-256 provenance.")
         }
 
         var runtimeNodeIDs: [(VGEvidenceRuntimeFact, String)] = []
