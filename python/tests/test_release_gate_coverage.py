@@ -51,6 +51,12 @@ class ReleaseGateCoverageTests(unittest.TestCase):
         trace_block = validator.split("vectorglass-trace-explorer-", 1)[1].split("vectorglass-evidence-graph-", 1)[0]
         self.assertIn("App/InvestigationLedgerModel.swift", trace_block)
 
+    def test_bridge_sources_are_ready_for_single_source_and_test_module_lints(self):
+        build_script = (ROOT / "rust/crates/bridge/build.rs").read_text()
+        bridge_source = (ROOT / "rust/crates/bridge/src/lib.rs").read_text()
+        self.assertIn('let source="cache";', build_script)
+        self.assertGreater(bridge_source.rfind("#[cfg(test)]"), bridge_source.rfind("pub unsafe extern"))
+
 
 if __name__ == "__main__":
     unittest.main()

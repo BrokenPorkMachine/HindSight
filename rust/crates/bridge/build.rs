@@ -10,7 +10,7 @@ fn main(){
  if apple{assert!(!apple_arch.is_empty(),"unsupported Apple target: {target}");}
  let deployment=env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_|"14.0".into());
  let sdkroot=env::var("SDKROOT").ok();
- for source in ["cache"]{
+ let source="cache";
   let mut compiler=Command::new(env::var("CC").unwrap_or_else(|_|"cc".into()));
   compiler.args(["-std=c17","-O2","-Wall","-Wextra","-Werror","-c"]).arg(root.join(format!("{source}.c"))).arg("-o").arg(out.join(format!("{source}.o")));
   if apple{
@@ -20,7 +20,6 @@ fn main(){
   run(&mut compiler);
   println!("cargo:rerun-if-changed={}",root.join(format!("{source}.c")).display());
   println!("cargo:rerun-if-changed={}",root.join(format!("{source}.h")).display());
- }
  run(Command::new(env::var("AR").unwrap_or_else(|_|"ar".into())).arg("crs").arg(out.join("libre_cache.a")).arg(out.join("cache.o")));
  println!("cargo:rustc-link-search=native={}",out.display());println!("cargo:rustc-link-lib=static=re_cache");
  println!("cargo:rerun-if-env-changed=CC");println!("cargo:rerun-if-env-changed=AR");

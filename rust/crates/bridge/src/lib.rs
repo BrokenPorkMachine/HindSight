@@ -26,23 +26,6 @@ pub unsafe extern "C" fn reworkbench_checked_address_add(base: u64, offset: u64,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test] fn overflow_does_not_modify_output() {
-        let mut output = 42;
-        assert!(!unsafe { reworkbench_checked_address_add(u64::MAX, 1, &mut output) });
-        assert_eq!(output, 42);
-    }
-    #[test] fn null_output_is_rejected() {
-        assert!(!unsafe { reworkbench_checked_address_add(1, 2, std::ptr::null_mut()) });
-    }
-    #[test] fn bridge_string_is_valid_c_utf8() {
-        let text = unsafe { std::ffi::CStr::from_ptr(reworkbench_capabilities_json()) };
-        assert!(text.to_str().unwrap().contains("\"analysis\":true"));
-    }
-}
-
 use reworkbench_scheduler::{Governor, LeaseId};
 use std::ffi::c_void;
 #[no_mangle]
@@ -111,4 +94,21 @@ pub unsafe extern "C" fn reworkbench_cache_get(cache: *mut c_void,key: *const u8
 #[no_mangle]
 pub unsafe extern "C" fn reworkbench_file_stamp(path: *const c_char,out: *mut c_char,capacity: usize) -> i32 {
     unsafe { re_file_stamp(path,out,capacity) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn overflow_does_not_modify_output() {
+        let mut output = 42;
+        assert!(!unsafe { reworkbench_checked_address_add(u64::MAX, 1, &mut output) });
+        assert_eq!(output, 42);
+    }
+    #[test] fn null_output_is_rejected() {
+        assert!(!unsafe { reworkbench_checked_address_add(1, 2, std::ptr::null_mut()) });
+    }
+    #[test] fn bridge_string_is_valid_c_utf8() {
+        let text = unsafe { std::ffi::CStr::from_ptr(reworkbench_capabilities_json()) };
+        assert!(text.to_str().unwrap().contains("\"analysis\":true"));
+    }
 }
