@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum VGLedgerProvenance: String, Codable, CaseIterable, Hashable {
@@ -312,6 +313,15 @@ struct VGCaseMemoryObservation: Codable, Hashable {
     let bytesHex: String
 }
 
+struct VGCaseIntegrityManifest: Codable, Hashable {
+    let algorithm: String
+    let payloadSHA256: String
+    let artifactCount: Int
+    let ledgerEntryCount: Int
+    let runtimeEventCount: Int
+    let memoryObservationCount: Int
+}
+
 struct VGCaseBundle: Codable, Hashable {
     let format: String
     let schema: Int
@@ -323,6 +333,9 @@ struct VGCaseBundle: Codable, Hashable {
     let evidence: VGCaseEvidenceSnapshot?
     let runtime: [VGCaseRuntimeEvent]
     let memory: [VGCaseMemoryObservation]
+    /// Optional for backward compatibility with schema-1 bundles exported before
+    /// integrity manifests were introduced.
+    let integrity: VGCaseIntegrityManifest?
 }
 
 struct VGLedgerLoadResult {
@@ -446,7 +459,42 @@ enum VGLedgerStore {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(bundle)
+        let payload = VGCaseBundle(
+            format: bundle.format,
+            schema: bundle.schema,
+            product: bundle.product,
+            productVersion: bundle.productVersion,
+            exportedAt: bundle.exportedAt,
+            ledger: bundle.ledger,
+            artifacts: bundle.artifacts,
+            evidence: bundle.evidence,
+            runtime: bundle.runtime,
+            memory: bundle.memory,
+            integrity: nil
+        )
+        let payloadData = try encoder.encode(payload)
+        let manifest = VGCaseIntegrityManifest(
+            algorithm: "SHA-256",
+            payloadSHA256: SHA256.hash(data: payloadData).map { String(format: "%02x", $0) }.joined(),
+            artifactCount: payload.artifacts.count,
+            ledgerEntryCount: payload.ledger.entries.count,
+            runtimeEventCount: payload.runtime.count,
+            memoryObservationCount: payload.memory.count
+        )
+        let complete = VGCaseBundle(
+            format: payload.format,
+            schema: payload.schema,
+            product: payload.product,
+            productVersion: payload.productVersion,
+            exportedAt: payload.exportedAt,
+            ledger: payload.ledger,
+            artifacts: payload.artifacts,
+            evidence: payload.evidence,
+            runtime: payload.runtime,
+            memory: payload.memory,
+            integrity: manifest
+        )
+        return try encoder.encode(complete)
     }
 
     static func decodeCase(_ data: Data) throws -> VGCaseBundle {
@@ -466,6 +514,34 @@ enum VGLedgerStore {
             event.registers.values.allSatisfy({ $0.utf8.count <= 256 }) && event.breakpoints.count <= 256
         }), bundle.memory.allSatisfy({ $0.address.utf8.count <= 32 && $0.bytesHex.utf8.count <= 8192 }) else {
             throw NSError(domain: "HindSightCase", code: 3, userInfo: [NSLocalizedDescriptionKey: "Case runtime evidence exceeds a bounded field limit."])
+        }
+        if let manifest = bundle.integrity {
+            let payload = VGCaseBundle(
+                format: bundle.format,
+                schema: bundle.schema,
+                product: bundle.product,
+                productVersion: bundle.productVersion,
+                exportedAt: bundle.exportedAt,
+                ledger: bundle.ledger,
+                artifacts: bundle.artifacts,
+                evidence: bundle.evidence,
+                runtime: bundle.runtime,
+                memory: bundle.memory,
+                integrity: nil
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let payloadData = try encoder.encode(payload)
+            let digest = SHA256.hash(data: payloadData).map { String(format: "%02x", $0) }.joined()
+            guard manifest.algorithm == "SHA-256",
+                  manifest.payloadSHA256 == digest,
+                  manifest.artifactCount == bundle.artifacts.count,
+                  manifest.ledgerEntryCount == bundle.ledger.entries.count,
+                  manifest.runtimeEventCount == bundle.runtime.count,
+                  manifest.memoryObservationCount == bundle.memory.count else {
+                throw NSError(domain: "HindSightCase", code: 6, userInfo: [NSLocalizedDescriptionKey: "Case integrity manifest does not match the exported evidence payload."])
+            }
         }
         return bundle
     }

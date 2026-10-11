@@ -27,7 +27,7 @@ management, or shared collaboration without an enterprise service boundary.
 - [ ] Add structured operation/error taxonomy with recovery guidance.
 - [x] Add support-safe diagnostics export with explicit user-selected destination.
 - [ ] Add full support-bundle export with redaction preview and explicit consent.
-- [ ] Add case integrity manifest and verification status to every export.
+- [x] Add a backward-compatible SHA-256 case integrity manifest and verify it on import.
 - [ ] Add startup, memory-pressure, crash, and worker-health history to support
   diagnostics without collecting target-file contents.
 

@@ -1689,7 +1689,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             artifacts: artifacts,
             evidence: evidence,
             runtime: runtime,
-            memory: memory
+            memory: memory,
+            integrity: nil
         )
     }
 
