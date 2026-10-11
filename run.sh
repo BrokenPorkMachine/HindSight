@@ -8,7 +8,7 @@ CONFIGURATION="${CONFIGURATION:-Debug}"
 # environments. Keep the build script's default unchanged, but make the
 # user-facing build-and-run entry point work there unless explicitly opted out.
 HINDSIGHT_SWIFT_DISABLE_SANDBOX="${HINDSIGHT_SWIFT_DISABLE_SANDBOX:-1}" \
-    "$ROOT/build.sh" "$@"
+    "$ROOT/build.sh" ENABLE_DEBUG_DYLIB=NO "$@"
 
 APP="$ROOT/build/DerivedData/Build/Products/$CONFIGURATION/HindSight.app"
 [[ -d "$APP" ]] || {
