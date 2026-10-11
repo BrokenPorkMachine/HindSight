@@ -40,7 +40,7 @@ Acceptance: every new inference is provenance-labelled, bounded, and covered by 
 
 ### Phase 3 — Runtime investigation
 
-- [ ] Improve static-to-runtime pivots and breakpoint context.
+- [x] Add explicit stop-event and stop-reason context to static-to-runtime pivots; richer breakpoint-condition context remains open.
 - [x] Distinguish module/slide address correlation from validated static-function correlation in runtime explanations.
 - [x] Add bounded `.vgcase` runtime trace capture/replay and restore the saved timeline into Trace Explorer without debugger attachment.
 - [x] Add clearer host capability, permission, and entitlement diagnostics, including explicit architecture gates and honest deferred runtime-probe status.
@@ -73,4 +73,4 @@ For every loop:
 
 ## Today's workload
 
-The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, and startup-pressure diagnostics are complete. Next loop: prioritize type/variable recovery, deeper non-ARM64 lifting, or release/memory/crash gates.
+The Phase 1 usability slices, bounded IMG4/IM4P container inventory, compact-unwind record ingestion, executable-target pointer-run validation, metadata-guided mixed ARM/Thumb decoding, bounded AArch64 call-register provenance, Swift type-descriptor provenance labels, Swift field-variable boundaries, bounded non-ARM64 semantic labels with direct/indirect and conditional-control distinctions, bounded structural pseudocode sketches, explicit runtime correlation strength, explicit runtime stop-event/reason context, `.vgcase` runtime trace replay, host capability/permission/entitlement diagnostics, workspace-level help/unsupported-capability explanations, bounded recent-project management, persisted startup/layout preferences, architecture-focused qualification tests, and startup-pressure diagnostics are complete. Next loop: prioritize type/variable recovery, deeper non-ARM64 lifting, or release/memory/crash gates.

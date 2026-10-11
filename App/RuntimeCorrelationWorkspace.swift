@@ -118,6 +118,7 @@ struct VGRuntimeCorrelationWorkspace: View {
             VGHorizontalOverflowBar {
                 HStack(spacing: 8) {
                     runtimePill("RUN", value: sample.pcText, icon: "bolt.fill")
+                    runtimePill("STOP", value: sample.event, icon: sample.stopped ? "pause.circle.fill" : "play.circle")
                     Image(systemName: "arrow.right").font(.caption).foregroundStyle(.tertiary)
                     runtimePill("STATIC", value: correlation.preferredText, icon: correlation.preferredPC == nil ? "questionmark" : "doc.text")
                     if let name = correlation.functionName { runtimePill("FUNCTION", value: name, icon: "function") }
@@ -126,6 +127,12 @@ struct VGRuntimeCorrelationWorkspace: View {
                         .font(.system(size: 9, weight: .bold, design: .rounded))
                         .padding(.horizontal, 7).padding(.vertical, 4)
                         .background(Capsule().fill(correlation.preferredPC == nil ? Color.secondary.opacity(0.12) : Color.accentColor.opacity(0.14)))
+                    if !sample.reason.isEmpty {
+                        Text(sample.reason)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 7)
             }
@@ -177,6 +184,9 @@ struct VGRuntimeCorrelationWorkspace: View {
                                         Text("Δ\(sample.changedRegisters.count)").font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
                                     }
                                     Text(sample.pcText).font(.system(size: 10, weight: .medium, design: .monospaced))
+                                    if !sample.reason.isEmpty {
+                                        Text(sample.reason).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1)
+                                    }
                                     Text(corr.functionName ?? corr.preferredText)
                                         .font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
                                 }
