@@ -63,6 +63,13 @@ class ReleaseGateCoverageTests(unittest.TestCase):
         self.assertIn('if ((${#release_build_args[@]})); then', gate)
         self.assertIn('"\\"analysis\\":true"', smoke)
 
+    def test_release_preflight_is_non_secret_and_checks_universal_bundle(self):
+        preflight = (ROOT / "scripts/release-preflight.sh").read_text()
+        self.assertIn("security find-identity", preflight)
+        self.assertNotIn("notarytool submit", preflight)
+        self.assertIn("lipo -archs", preflight)
+        self.assertIn("manual Intel/Apple-Silicon qualification matrix", preflight)
+
 
 if __name__ == "__main__":
     unittest.main()

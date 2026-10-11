@@ -22,6 +22,13 @@ HindSight 0.5.7 uses the stable product/release-channel identity in source. That
 
 ## Mandatory universal macOS release-host gate
 
+Before supplying credentials, run the non-secret preflight to identify missing
+toolchain, keychain, notarization-profile, or universal-bundle prerequisites:
+
+```bash
+./scripts/release-preflight.sh
+```
+
 Run:
 
 ```bash
