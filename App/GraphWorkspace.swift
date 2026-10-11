@@ -52,9 +52,10 @@ struct VGGraphWorkspace: View {
         self.debugPC = debugPC
         self.onSelectAddress = onSelectAddress
 
-        let parsedGraph = VGGraphParser.cfg(cfgText)
+        let parsedFunctions = VGGraphParser.functions(functionsText)
+        let parsedGraph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
         _graph = State(initialValue: parsedGraph)
-        _functions = State(initialValue: VGGraphParser.functions(functionsText))
+        _functions = State(initialValue: parsedFunctions)
         _layout = State(initialValue: parsedGraph.layout(limit: 240))
     }
 
@@ -97,12 +98,17 @@ struct VGGraphWorkspace: View {
         .background(Color.primary.opacity(0.012))
         .onAppear { synchronizeSelection() }
         .onChange(of: cfgText) { _, newValue in
-            graph = VGGraphParser.cfg(newValue)
+            let parsedFunctions = VGGraphParser.functions(functionsText)
+            functions = parsedFunctions
+            graph = VGGraphParser.cfg(newValue, functionStarts: Set(parsedFunctions.map(\.start)))
             layout = graph.layout(limit: 240)
             synchronizeSelection()
         }
         .onChange(of: functionsText) { _, newValue in
-            functions = VGGraphParser.functions(newValue)
+            let parsedFunctions = VGGraphParser.functions(newValue)
+            functions = parsedFunctions
+            graph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
+            layout = graph.layout(limit: 240)
             synchronizeSelection()
         }
         .onChange(of: selectedAddress) { _, _ in synchronizeSelection() }

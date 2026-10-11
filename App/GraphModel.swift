@@ -179,7 +179,7 @@ enum VGGraphParser {
         }
     }
 
-    static func cfg(_ text: String) -> VGCFGGraph {
+    static func cfg(_ text: String, functionStarts: Set<UInt64> = []) -> VGCFGGraph {
         struct PendingBlock {
             let id: String
             let start: UInt64
@@ -223,6 +223,12 @@ enum VGGraphParser {
         finish(current, into: &pending)
 
         let startToID = Dictionary(uniqueKeysWithValues: pending.map { ($0.start, $0.id) })
+
+        func blockID(containing address: UInt64) -> String? {
+            if let exact = startToID[address] { return exact }
+            return pending.first { $0.start <= address && address < $0.end }?.id
+        }
+
         var blocks: [VGCFGBlock] = []
         var allEdges: [VGCFGEdge] = []
         for item in pending {
@@ -232,11 +238,33 @@ enum VGGraphParser {
                     targetAddress: raw.2,
                     kind: raw.0,
                     sourceBlockID: item.id,
-                    targetBlockID: startToID[raw.2]
+                    targetBlockID: blockID(containing: raw.2)
                 )
             }
             blocks.append(VGCFGBlock(id: item.id, start: item.start, end: item.end, edges: blockEdges))
             allEdges.append(contentsOf: blockEdges)
+        }
+
+        // The Rust analyzer intentionally records only decoded control-flow
+        // edges. A normal sequential transfer between two adjacent leaders is
+        // still real CFG structure, so restore it here unless the next leader
+        // starts a known function or the block already has a terminating edge.
+        for index in blocks.indices.dropLast() {
+            let current = blocks[index]
+            let next = blocks[index + 1]
+            guard current.end == next.start,
+                  !functionStarts.contains(next.start),
+                  !current.edges.contains(where: { !$0.isCall }) else { continue }
+
+            let edge = VGCFGEdge(
+                sourceAddress: current.end > current.start ? current.end - 4 : current.start,
+                targetAddress: next.start,
+                kind: "fallthrough",
+                sourceBlockID: current.id,
+                targetBlockID: next.id
+            )
+            blocks[index] = VGCFGBlock(id: current.id, start: current.start, end: current.end, edges: current.edges + [edge])
+            allEdges.append(edge)
         }
         return VGCFGGraph(blocks: blocks, edges: allEdges)
     }
