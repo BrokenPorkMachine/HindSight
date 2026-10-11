@@ -79,7 +79,8 @@ Acceptance: an enterprise operator can deploy, diagnose, govern, and hand off a 
 - [x] Add bounded streamed progress history and retained evidence handles.
 - [x] Gate REA operations on explicit provider capability reports when supplied.
 - [ ] Import REA evidence into HindSight cases and the evidence graph with compatibility checks.
-- [ ] Add deterministic MCP fixtures and release qualification coverage for the bridge.
+- [x] Add deterministic MCP fixtures for handshake, capability gating, and progress retention.
+- [ ] Add release qualification coverage for the bridge.
 
 Acceptance: an analyst can explicitly select a local target and REA operation, inspect bounded provider output, and retain the resulting evidence in a HindSight case without losing provenance or silently expanding scope.
 

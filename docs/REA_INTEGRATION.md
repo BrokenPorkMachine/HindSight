@@ -30,6 +30,7 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 - [x] Restore retained REA records when importing a `.vgcase`.
 - [x] Add bounded streamed progress history and retained evidence to the REA Agent workspace.
 - [ ] Import REA evidence into cases and the evidence graph with compatibility checks.
-- [ ] Add contract tests using deterministic MCP fixtures and release qualification coverage.
+- [x] Add a deterministic MCP fixture contract for handshake, capability gating, and progress retention.
+- [ ] Add release qualification coverage for the bridge.
 
 The first bridge implementation should pin a tested `rea-agents` version instead of using an unbounded `latest` dependency. Users can install REA with the upstream setup flow, then select the executable/package in HindSight.
