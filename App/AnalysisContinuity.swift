@@ -266,6 +266,33 @@ struct VGInvestigationReviewEntry: Codable, Identifiable, Hashable {
     }
 }
 
+enum VGInvestigationHandoffReadiness: String, Hashable {
+    case ready = "Ready for handoff"
+    case followUpRequired = "Follow-up required"
+    case reviewRequired = "Review required"
+    case conflict = "Review conflict"
+
+    var icon: String {
+        switch self {
+        case .ready: return "checkmark.seal.fill"
+        case .followUpRequired: return "checklist"
+        case .reviewRequired: return "exclamationmark.circle"
+        case .conflict: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    static func evaluate(state: VGInvestigationReviewState,
+                         hasBaseline: Bool,
+                         baselineMatchesRecord: Bool,
+                         baselineMatchesSource: Bool,
+                         hasDrift: Bool,
+                         openFollowUps: Int) -> Self {
+        guard hasBaseline, baselineMatchesRecord, baselineMatchesSource, !hasDrift else { return .conflict }
+        guard state == .approved || state == .rejected else { return .reviewRequired }
+        return openFollowUps > 0 ? .followUpRequired : .ready
+    }
+}
+
 
 
 enum VGInvestigationFollowUpState: String, Codable, CaseIterable, Hashable {
@@ -1005,6 +1032,25 @@ extension WorkbenchModel {
         return "\(state.rawValue) · \(open) open follow-ups · \(completed) completed · \(journal) journal entries"
     }
 
+    func analysisCollectionHandoffReadiness(_ collectionID: String) -> VGInvestigationHandoffReadiness? {
+        guard let collection = analysisCollections.first(where: { $0.id == collectionID }) else { return nil }
+        let baseline = analysisReviewBaselines[collectionID]
+        let source = selected?.result.source_sha256
+        let baselineMatchesRecord = baseline.map { $0.recordID == selectedID } ?? false
+        let baselineMatchesSource = baseline.map { $0.sourceSHA256 == source } ?? false
+        let drift = analysisCollectionReviewDrift(collection, currentPinIDs: currentAnalysisPinIDs())
+        let hasDrift = drift?.hasMembershipDrift == true || drift?.hasPresenceDrift == true
+        let openFollowUps = analysisFollowUps(for: collectionID, includeCompleted: false).count
+        return .evaluate(
+            state: latestAnalysisReviewState(for: collectionID),
+            hasBaseline: baseline != nil,
+            baselineMatchesRecord: baselineMatchesRecord,
+            baselineMatchesSource: baselineMatchesSource,
+            hasDrift: hasDrift,
+            openFollowUps: openFollowUps
+        )
+    }
+
     func analysisCollectionHandoff(_ collectionID: String) -> String? {
         guard let collection = analysisCollections.first(where: { $0.id == collectionID }) else { return nil }
         let currentPinIDs = currentAnalysisPinIDs()
@@ -1013,6 +1059,7 @@ extension WorkbenchModel {
         let entries = analysisReviewEntries(for: collectionID)
         let followUps = analysisFollowUps(for: collectionID)
         let hits = analysisCollectionHits(collection)
+        let readiness = analysisCollectionHandoffReadiness(collectionID) ?? .reviewRequired
         var lines: [String] = [
             "# HindSight Investigation Handoff",
             "",
@@ -1023,6 +1070,7 @@ extension WorkbenchModel {
             "Review summary: \(analysisCollectionReviewSummary(collectionID))",
             "Collection health: \(health.label)",
             "Review drift: \(drift?.label ?? "no review baseline")",
+            "Handoff readiness: \(readiness.rawValue)",
             "Generated: \(Date().formatted(date: .abbreviated, time: .shortened))",
             "",
             "## Preserved Evidence"

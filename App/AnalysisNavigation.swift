@@ -831,6 +831,9 @@ struct VGCollectionReviewView: View {
 
                     VGFlowLayout {
                         VGTagPill(text: model.latestAnalysisReviewState(for: collection.id).rawValue, systemImage: model.latestAnalysisReviewState(for: collection.id).icon)
+                        if let readiness = model.analysisCollectionHandoffReadiness(collection.id) {
+                            VGTagPill(text: readiness.rawValue, systemImage: readiness.icon)
+                        }
                         VGTagPill(text: health.label, systemImage: "heart.text.square")
                         if let drift { VGTagPill(text: drift.label, systemImage: "arrow.triangle.2.circlepath") }
                         VGTagPill(text: "\(entries.count) journal entries", systemImage: "list.bullet.rectangle")
