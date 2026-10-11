@@ -1846,6 +1846,7 @@ struct ContentView: View {
                             .buttonStyle(.bordered)
                     }.padding(.bottom,4)
                     investigationPath(record)
+                    handoffSummary(record)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], spacing: 10) {
                         VGMetricTile(title: "Functions", value: String(model.currentAnalysis?.function_count ?? 0), detail: model.currentAnalysis == nil ? "Run analysis" : "bounded discoveries", icon: "function")
                         VGMetricTile(title: "Basic Blocks", value: String(model.currentAnalysis?.basic_block_count ?? 0), detail: model.currentAnalysis?.truncated == true ? "bounded scan" : "control-flow units", icon: "point.3.connected.trianglepath.dotted")
@@ -2953,6 +2954,34 @@ struct ContentView: View {
                         enabled: hasReviewContext
                     )
                 }
+            }
+            .padding(8)
+        }
+    }
+
+    @ViewBuilder private func handoffSummary(_ record: ProjectRecord) -> some View {
+        let openFollowUps = model.analysisFollowUps.filter { $0.state == .open }.count
+        GroupBox("Handoff readiness") {
+            VStack(alignment: .leading, spacing: 10) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 8)], spacing: 8) {
+                    VGMetricTile(title: "Pinned", value: "\(model.analysisPins.count)", detail: "preserved findings", icon: "pin")
+                    VGMetricTile(title: "Annotated", value: "\(model.analysisAnnotationCount)", detail: "analyst context", icon: "note.text")
+                    VGMetricTile(title: "Open tasks", value: "\(openFollowUps)", detail: "follow-ups", icon: "checklist")
+                }
+                Text(openFollowUps == 0 ? "No open follow-ups are recorded. Review the preserved evidence, then export the handoff when the conclusion is ready." : "Resolve or explain the open follow-ups before treating this investigation as ready for handoff.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                VGFlowLayout {
+                    Button("Review annotations") { model.workspace = "Analysis Triage" }
+                    Button("Open Ledger") { model.workspace = "Investigation Ledger" }
+                    Button("Open Notes") { model.workspace = "Notes" }
+                }
+                .buttonStyle(.borderless)
+                Text("Artifact: \(record.name) · SHA-256: \(record.result.source_sha256 ?? "unavailable")")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
             }
             .padding(8)
         }

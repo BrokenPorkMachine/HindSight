@@ -17,7 +17,7 @@ The app already has a broad macOS workbench covering project/artifact management
 - [x] Add evidence annotations with notes, tags, confidence, persistence, handoff export, and Annotated Triage mode.
 - [x] Add saved searches and reusable triage filters.
 - [x] Make annotations available from every evidence card without requiring the inspector.
-- [ ] Add an analyst-facing “annotated handoff” summary to the main Overview.
+- [x] Add an analyst-facing “annotated handoff” summary to the main Overview.
 
 Acceptance: a new user can import an artifact, run analysis, find a result, annotate it, retrieve it later, and export a handoff without searching through advanced workspaces.
 
@@ -67,4 +67,4 @@ For every loop:
 
 ## Today's workload
 
-Saved searches are complete. Next: make annotation editing available directly from evidence cards, then add the Overview handoff summary if validation remains clean. Keep each slice project-local, bounded, and compatible with existing continuity documents.
+The Phase 1 usability slices are complete through saved searches, inline annotation editing, and the Overview handoff summary. Next loop: begin Phase 2 with a bounded analysis-depth improvement, starting with the most useful metadata path available in the current worker.
