@@ -415,6 +415,11 @@ struct VGAnalysisTriageView: View {
             filter.isEmpty || $0.text.localizedCaseInsensitiveContains(filter) || $0.source.localizedCaseInsensitiveContains(filter) || model.analysisHitMatchesFilter($0.hit, query: filter)
         }
     }
+    private var annotatedHits: [VGAnalysisEvidenceHit] {
+        model.analysisAnnotatedHits().filter {
+            filter.isEmpty || $0.text.localizedCaseInsensitiveContains(filter) || $0.source.localizedCaseInsensitiveContains(filter) || model.analysisHitMatchesFilter($0, query: filter)
+        }
+    }
     private var filteredCollections: [VGInvestigationCollection] { model.filteredAnalysisCollections(query: collectionFilter) }
 
     var body: some View {
@@ -434,6 +439,7 @@ struct VGAnalysisTriageView: View {
                     VGTagPill(text: "analysis not loaded", systemImage: "tray")
                 }
                 VGTagPill(text: "\(model.analysisPins.count) pinned", systemImage: "pin")
+                VGTagPill(text: "\(model.analysisAnnotationCount) annotated", systemImage: "note.text")
                 VGTagPill(text: "\(model.analysisRecentVisits.count) recent", systemImage: "clock.arrow.circlepath")
                 VGTagPill(text: "\(model.analysisCollections.count) collections", systemImage: "folder")
             }
@@ -442,6 +448,7 @@ struct VGAnalysisTriageView: View {
                 Picker("Triage view", selection: $mode) {
                     Text("Focus").tag("Focus")
                     Text("Pinned").tag("Pinned")
+                    Text("Annotated").tag("Annotated")
                     Text("Recent").tag("Recent")
                     Text("Collections").tag("Collections")
                     Text("Review").tag("Review")
@@ -453,6 +460,7 @@ struct VGAnalysisTriageView: View {
                 Picker("Triage view", selection: $mode) {
                     Text("Focus").tag("Focus")
                     Text("Pinned").tag("Pinned")
+                    Text("Annotated").tag("Annotated")
                     Text("Recent").tag("Recent")
                     Text("Collections").tag("Collections")
                     Text("Review").tag("Review")
@@ -465,7 +473,7 @@ struct VGAnalysisTriageView: View {
             if mode != "Changes" && mode != "Collections" && mode != "Review" {
                 HStack(spacing: 8) {
                     Image(systemName: "line.3.horizontal.decrease.circle").foregroundStyle(.secondary)
-                    TextField(mode == "Focus" ? "Filter the focus queue…" : "Filter preserved evidence…", text: $filter)
+                    TextField(mode == "Focus" ? "Filter the focus queue…" : mode == "Annotated" ? "Filter annotations…" : "Filter preserved evidence…", text: $filter)
                         .textFieldStyle(.roundedBorder)
                     if !filter.isEmpty { Button("Clear") { filter = "" } }
                     if mode == "Recent", !model.analysisRecentVisits.isEmpty {
@@ -487,6 +495,12 @@ struct VGAnalysisTriageView: View {
                         ContentUnavailableView("No pinned evidence", systemImage: "pin", description: Text("Pin evidence from Triage, Search, or Related Evidence to preserve it with the project."))
                     } else {
                         ScrollView { LazyVStack(alignment: .leading, spacing: 8) { ForEach(pinnedHits) { VGAnalysisEvidenceHitCard(model: model, hit: $0) } } }
+                    }
+                case "Annotated":
+                    if annotatedHits.isEmpty {
+                        ContentUnavailableView("No annotated evidence", systemImage: "note.text", description: Text("Select an evidence row and add an analyst annotation from the Inspector to collect it here."))
+                    } else {
+                        ScrollView { LazyVStack(alignment: .leading, spacing: 8) { ForEach(annotatedHits) { VGAnalysisEvidenceHitCard(model: model, hit: $0) } } }
                     }
                 case "Recent":
                     if recentVisits.isEmpty {

@@ -708,6 +708,19 @@ extension WorkbenchModel {
             annotation.confidence.rawValue.localizedCaseInsensitiveContains(needle)
     }
 
+    func analysisAnnotatedHits(limit: Int = 180) -> [VGAnalysisEvidenceHit] {
+        guard let index = currentEvidenceIndex else { return [] }
+        return index.corpus(limit: 25_000)
+            .filter { analysisAnnotation(for: $0) != nil }
+            .prefix(max(1, limit))
+            .map { $0 }
+    }
+
+    var analysisAnnotationCount: Int {
+        guard let recordID = selectedID else { return 0 }
+        return analysisContinuityDocument.annotations.values.filter { $0.recordID == recordID }.count
+    }
+
     func toggleAnalysisCollectionMembership(_ hit: VGAnalysisEvidenceHit, collectionID: String) {
         guard let recordID = selectedID, let projectPath = project?.path,
               let collectionIndex = analysisContinuityDocument.collections.firstIndex(where: { $0.id == collectionID && $0.recordID == recordID }) else { return }
