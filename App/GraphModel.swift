@@ -128,7 +128,9 @@ struct VGCFGGraph {
         let nodeWidth = 290.0
         let nodeHeight = 126.0
         let horizontalGap = 54.0
-        let functionGap = functionStarts.isEmpty ? 0.0 : 118.0
+        // Keep blocks within a function readable while giving adjacent function
+        // lanes a clearly visible separation. The canvas grows to make room.
+        let functionGap = functionStarts.count > 1 ? 260.0 : 0.0
         let verticalGap = 76.0
         let margin = 70.0
         let maxRowCount = max(1, rowsByLevel.values.map(\.count).max() ?? 1)
