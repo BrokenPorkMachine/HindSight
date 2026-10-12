@@ -13,7 +13,7 @@ HindSight Research Tool imports captured, immutable bytes. Import configuration 
 | Universal FAT32/FAT64, either table byte order | Checked slice extents/alignment, overlap rejection, CPU/header agreement; select requested architecture or prefer AArch64, then x86_64, i386, ARM32 | Structural backend for the selected slice |
 | Plaintext SecureROM/iBoot/raw firmware | Explicit architecture, file offset and raw load address | Linear instruction decode, direct-transfer and frame/return candidates, bounded raw string scan; headerless bytes have no verified code/data partition |
 | Big-endian thin Mach-O with a supported CPU | Header/section/symbol/string/pointer metadata | Instruction decode and relocation-bitfield interpretation unavailable; never decoded with little-endian semantics |
-| IMG3/IMG4/IM4P and IPSW/ZIP marker-bearing input | Bounded container/codec inventory; signed/encrypted envelopes remain opaque | On macOS, bounded plaintext candidates are decoded with Compression.framework (LZFSE/LZ4/LZMA/zlib); legacy `complzss` is recognized through the guarded LZSS path. A decoded payload is analyzed while the original artifact SHA-256 remains authoritative. |
+| IMG3/IMG4/IM4P and IPSW/ZIP marker-bearing input | Bounded container/codec inventory; stored IPSW local entries can be selected as payload candidates; signed/encrypted envelopes remain opaque | On macOS, bounded plaintext candidates are decoded with Compression.framework (LZFSE/LZ4/LZMA/zlib); legacy `complzss` is recognized through the guarded LZSS path. ZIP deflate/encrypted entries remain inventory-only. A decoded payload is analyzed while the original artifact SHA-256 remains authoritative. |
 
 The loader accepts supported file types with a validated file-backed instruction section, including relocatable objects. Object addresses/relocations remain structural metadata; relocation application is not implied. Instruction paging and CFG currently use one primary executable section (`__text` when present); metadata/table/string walkers inspect other mapped sections.
 
@@ -52,7 +52,7 @@ Mach-O structure definitions follow Apple's [loader header](https://github.com/a
 
 ## Remaining commercial-disassembler gaps
 
-This change supplies bounded Apple-container/codec ingestion and conservative stripped-kernel name candidates; it does not establish parity with mature commercial products. Intel/ARM32 semantic lifting, SSA and high-level decompilation; automatic mixed ARM/Thumb transitions; unwind/DWARF-driven boundary recovery; validated indirect-dispatch reconstruction; interactive multi-section selection; complete Unicode decoding; ZIP entries requiring archive-level extraction; and authenticated IMG4 signature/decryption remain outstanding. Existing ARM64 semantic/runtime features continue on their established path, with their documented bounds.
+This change supplies bounded Apple-container/codec ingestion and conservative stripped-kernel name candidates; it does not establish parity with mature commercial products. Intel/ARM32 semantic lifting, SSA and high-level decompilation; automatic mixed ARM/Thumb transitions; unwind/DWARF-driven boundary recovery; validated indirect-dispatch reconstruction; interactive multi-section selection; complete Unicode decoding; ZIP deflate/encrypted entry extraction; and authenticated IMG4 signature/decryption remain outstanding. Existing ARM64 semantic/runtime features continue on their established path, with their documented bounds.
 
 ## Validation
 

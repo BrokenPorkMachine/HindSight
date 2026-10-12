@@ -956,6 +956,11 @@ fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, Str
             &mut out,
             &format!("IPSW/ZIP local-header offsets: {:?}\n", zip),
         );
+        let inventory = compression::zip_inventory(&bytes);
+        if !inventory.is_empty() {
+            push(&mut out, "IPSW/ZIP bounded local-entry inventory:\n");
+            push(&mut out, &inventory);
+        }
     }
     if let Some((scheme, decoded)) = compression::decode_payload(&bytes) {
         push(
@@ -1036,8 +1041,17 @@ impl Drop for TemporaryPayload {
 
 fn decoded_payload(source: &mut File) -> io::Result<(File, TemporaryPayload)> {
     let size = source.metadata()?.len();
-    let bytes = read(source, 0, size.min(16 * 1024 * 1024) as usize)?;
-    let has_marker = [b"IMG3".as_slice(), b"IMG4", b"IM4P", b"bvx2", b"bvxn", b"complzss"]
+    let bytes = read(source, 0, size.min(64 * 1024 * 1024) as usize)?;
+    let has_marker = [
+        b"IMG3".as_slice(),
+        b"IMG4",
+        b"IM4P",
+        b"bvx2",
+        b"bvxn",
+        b"bvx-",
+        b"complzss",
+        b"PK\x03\x04",
+    ]
         .iter()
         .any(|marker| bytes.windows(marker.len()).any(|window| window == *marker));
     if !has_marker {
@@ -1421,7 +1435,6 @@ fn kernel_name_like(value: &str) -> bool {
         return false;
     }
     value.starts_with("ZN")
-        || value.starts_with('Z')
         || value.starts_with("Apple")
         || value.starts_with("IO")
         || value.starts_with("com.apple.")

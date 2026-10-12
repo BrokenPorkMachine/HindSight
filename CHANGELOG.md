@@ -10,6 +10,7 @@
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses
 
 - Add bounded Apple firmware container/codec detection and macOS Compression.framework decoding for LZFSE, LZ4, LZMA, and zlib, plus guarded legacy `complzss`/LZSS handling.
+- Add bounded IPSW ZIP local-entry inventory and stored-entry payload candidates; deflate/encrypted entries remain explicit inventory-only evidence.
 - Add heuristic XNU/SEP kernel function-name candidates from nearby strings with explicit provenance.
 
 # 0.5.8 — Pressure-Aware Launch and Enterprise Operations

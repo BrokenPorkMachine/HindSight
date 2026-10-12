@@ -6,6 +6,8 @@
 //! small `complzss` path covers the legacy kernelcache/IMG3 LZSS wrapper.
 
 const MAX_OUTPUT: usize = 512 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 256;
+const MAX_ZIP_NAME: usize = 256;
 
 #[cfg(target_os = "macos")]
 extern "C" {
@@ -143,6 +145,72 @@ fn lzss(input: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+fn zip_entries(input: &[u8]) -> Vec<&[u8]> {
+    let mut entries = Vec::new();
+    let mut at = 0usize;
+    while at + 30 <= input.len() && entries.len() < MAX_ZIP_ENTRIES {
+        if &input[at..at + 4] != b"PK\x03\x04" {
+            break;
+        }
+        let flags = u16::from_le_bytes([input[at + 6], input[at + 7]]);
+        let method = u16::from_le_bytes([input[at + 8], input[at + 9]]);
+        let compressed = u32::from_le_bytes(input[at + 18..at + 22].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes([input[at + 26], input[at + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([input[at + 28], input[at + 29]]) as usize;
+        if name_len == 0 || name_len > MAX_ZIP_NAME || flags & 0x08 != 0 {
+            break;
+        }
+        let start = at.saturating_add(30 + name_len + extra_len);
+        let end = start.saturating_add(compressed);
+        if end > input.len() {
+            break;
+        }
+        if method == 0 {
+            entries.push(&input[start..end]);
+        }
+        at = end;
+    }
+    entries
+}
+
+pub fn zip_inventory(input: &[u8]) -> String {
+    let mut out = String::new();
+    let mut at = 0usize;
+    let mut count = 0usize;
+    while at + 30 <= input.len() && count < MAX_ZIP_ENTRIES {
+        if &input[at..at + 4] != b"PK\x03\x04" {
+            break;
+        }
+        let flags = u16::from_le_bytes([input[at + 6], input[at + 7]]);
+        let method = u16::from_le_bytes([input[at + 8], input[at + 9]]);
+        let compressed = u32::from_le_bytes(input[at + 18..at + 22].try_into().unwrap());
+        let uncompressed = u32::from_le_bytes(input[at + 22..at + 26].try_into().unwrap());
+        let name_len = u16::from_le_bytes([input[at + 26], input[at + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([input[at + 28], input[at + 29]]) as usize;
+        if name_len == 0 || name_len > MAX_ZIP_NAME || flags & 0x08 != 0 {
+            break;
+        }
+        let name_start = at + 30;
+        let name_end = name_start + name_len;
+        let data_start = name_end + extra_len;
+        let end = data_start.saturating_add(compressed as usize);
+        if end > input.len() {
+            break;
+        }
+        let name = String::from_utf8_lossy(&input[name_start..name_end]);
+        out.push_str(&format!(
+            "entry={name:?} method={method} compressed={compressed:#x} uncompressed={uncompressed:#x} stored={}\n",
+            method == 0
+        ));
+        count += 1;
+        at = end;
+    }
+    if count == MAX_ZIP_ENTRIES {
+        out.push_str("ZIP entry inventory capped at 256 entries.\n");
+    }
+    out
+}
+
 /// Decode a bounded Apple payload and return the first result that contains a
 /// Mach-O header. The returned scheme is evidence, not an assertion that an
 /// encrypted or signed container was validly authenticated.
@@ -167,6 +235,7 @@ pub fn decode_payload(input: &[u8]) -> Option<(&'static str, Vec<u8>)> {
             }
         }
     }
+    bodies.extend(zip_entries(input));
 
     let algorithms = [
         ("LZFSE", 0x801),
@@ -217,6 +286,20 @@ mod tests {
         assert_eq!(marker_name(b"bvx2xxxx"), "bvx2/LZFSE");
         assert_eq!(marker_name(b"complzss"), "complzss/LZSS");
         assert_eq!(marker_name(b"IMG4"), "IMG4");
+    }
+
+    #[test]
+    fn stored_zip_entries_are_bounded_and_visible() {
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&(4u32).to_le_bytes());
+        zip.extend_from_slice(&(4u32).to_le_bytes());
+        zip.extend_from_slice(&(5u16).to_le_bytes());
+        zip.extend_from_slice(&(0u16).to_le_bytes());
+        zip.extend_from_slice(b"x.binTEST");
+        assert_eq!(zip_entries(&zip), vec![b"TEST".as_slice()]);
+        assert!(zip_inventory(&zip).contains("entry=\"x.bin\""));
     }
 
     #[test]
