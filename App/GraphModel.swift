@@ -71,7 +71,7 @@ struct VGCFGGraph {
         blocks.first { $0.start == address }
     }
 
-    func layout(limit: Int = 240, functionStarts: Set<UInt64> = []) -> VGCFGLayout {
+    func layout(limit: Int = 240, functionStarts: Set<UInt64> = [], availableWidth: Double? = nil, availableHeight: Double? = nil) -> VGCFGLayout {
         let visible = Array(blocks.prefix(max(1, limit)))
         guard !visible.isEmpty else {
             return VGCFGLayout(positions: [:], width: 640, height: 420, visibleBlockIDs: [])
@@ -145,9 +145,14 @@ struct VGCFGGraph {
             return Double(row.count) * nodeWidth + Double(max(0, row.count - 1)) * horizontalGap + functionBreaks
         }
         let canvasWidth = max(760.0, margin * 2 + (rowsByLevel.values.map(rowWidth).max() ?? (Double(maxRowCount) * nodeWidth)))
+        let targetWidth = max(canvasWidth, availableWidth ?? 0)
+        let rowExpansion = max(0, targetWidth - canvasWidth) / Double(max(1, maxRowCount - 1))
         var positions: [String: VGGraphPoint] = [:]
         var currentY = margin + nodeHeight / 2
         var previousFunctions: Set<UInt64> = []
+        let levelCount = rowsByLevel.count
+        let intrinsicHeight = margin * 2 + Double(levelCount) * nodeHeight + Double(max(0, levelCount - 1)) * verticalGap
+        let rowExpansionY = max(0, (availableHeight ?? intrinsicHeight) - intrinsicHeight) / Double(max(1, levelCount - 1))
 
         for graphLevel in rowsByLevel.keys.sorted() {
             let row = rowsByLevel[graphLevel] ?? []
@@ -155,8 +160,8 @@ struct VGCFGGraph {
             if !previousFunctions.isEmpty && !rowFunctions.isEmpty && previousFunctions.isDisjoint(with: rowFunctions) {
                 currentY += functionGap
             }
-            let width = rowWidth(row)
-            let startX = (canvasWidth - width) / 2 + nodeWidth / 2
+            let width = rowWidth(row) + Double(max(0, row.count - 1)) * rowExpansion
+            let startX = (targetWidth - width) / 2 + nodeWidth / 2
             var x = startX
             for (index, block) in row.enumerated() {
                 positions[block.id] = VGGraphPoint(
@@ -164,16 +169,16 @@ struct VGCFGGraph {
                     y: currentY
                 )
                 if index + 1 < row.count {
-                    let nextGap = horizontalGap + (functionFor(block.start) != functionFor(row[index + 1].start) ? functionGap : 0)
+                    let nextGap = horizontalGap + rowExpansion + (functionFor(block.start) != functionFor(row[index + 1].start) ? functionGap : 0)
                     x += nodeWidth + nextGap
                 }
             }
-            currentY += nodeHeight + verticalGap
+            currentY += nodeHeight + verticalGap + rowExpansionY
             previousFunctions = rowFunctions
         }
 
         let canvasHeight = max(520.0, currentY - verticalGap + margin + nodeHeight / 2)
-        return VGCFGLayout(positions: positions, width: canvasWidth, height: canvasHeight, visibleBlockIDs: visibleIDs)
+        return VGCFGLayout(positions: positions, width: targetWidth, height: max(canvasHeight, availableHeight ?? 0), visibleBlockIDs: visibleIDs)
     }
 }
 

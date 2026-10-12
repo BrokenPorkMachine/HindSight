@@ -68,6 +68,15 @@ struct VGGraphWorkspace: View {
     private var selectedAddressValue: UInt64? { VGGraphParser.address(from: selectedAddress) }
     private var debugPCValue: UInt64? { debugPC.flatMap { VGGraphParser.address(from: $0) } }
 
+    private func relayout(for viewport: CGSize) {
+        layout = graph.layout(
+            limit: 240,
+            functionStarts: Set(functions.map(\.start)),
+            availableWidth: Double(viewport.width / max(zoom, 0.01)),
+            availableHeight: Double(viewport.height / max(zoom, 0.01))
+        )
+    }
+
     private var selectedBlock: VGCFGBlock? {
         if !selectedBlockID.isEmpty, let exact = graph.blocks.first(where: { $0.id == selectedBlockID }) { return exact }
         if let address = selectedAddressValue { return graph.block(containing: address) }
@@ -286,6 +295,9 @@ struct VGGraphWorkspace: View {
                         .frame(width: proxy.size.width, height: proxy.size.height)
                 }
             }
+            .onAppear { relayout(for: proxy.size) }
+            .onChange(of: proxy.size) { _, newSize in relayout(for: newSize) }
+            .onChange(of: zoom) { _, _ in relayout(for: proxy.size) }
         }
         .frame(minWidth: 480, minHeight: 520)
     }
