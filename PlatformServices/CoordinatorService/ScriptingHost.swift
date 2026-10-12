@@ -25,6 +25,21 @@ final class ScriptingHost {
     ]
     private let fm = FileManager.default
 
+    private func establishProcessGroup(for process: Process) -> Bool {
+        let pid = process.processIdentifier
+        return pid > 0 && setpgid(pid, pid) == 0
+    }
+
+    private func terminateProcessTree(_ process: Process, grouped: Bool, termination: DispatchSemaphore) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        if grouped { _ = kill(-pid, SIGTERM) } else { process.terminate() }
+        _ = termination.wait(timeout: DispatchTime.now() + DispatchTimeInterval.seconds(1))
+        if process.isRunning {
+            if grouped { _ = kill(-pid, SIGKILL) } else { _ = kill(pid, SIGKILL) }
+        }
+    }
+
     private func extensionPolicyMode() -> String {
         switch UserDefaults.standard.string(forKey: Self.extensionPolicyDefaultsKey) {
         case "disabled": return "disabled"
@@ -182,18 +197,14 @@ except BaseException:
         stderr.fileHandleForReading.readabilityHandler={ h in output.appendStderr(h.availableData, limit: Self.maxOutputBytes) }
         let sem=DispatchSemaphore(value:0); p.terminationHandler={_ in sem.signal()}
         do { try p.run() } catch { return encodeRun(ok:false,stderr:"",message:"Python 3 could not be launched: \(error.localizedDescription).",duration:0) }
+        let grouped = establishProcessGroup(for: p)
         stdin.fileHandleForWriting.write(input); try? stdin.fileHandleForWriting.close()
         let timeout = max(250, min(timeoutMS, 30_000))
         let deadline = DispatchTime.now() + DispatchTimeInterval.milliseconds(timeout)
         let timedOut = sem.wait(timeout: deadline) == .timedOut
         if timedOut {
-            p.terminate()
-            let terminationDeadline = DispatchTime.now() + DispatchTimeInterval.seconds(1)
-            _ = sem.wait(timeout: terminationDeadline)
-            if p.isRunning {
-                _ = kill(p.processIdentifier, SIGKILL)
-                _ = sem.wait(timeout: DispatchTime.now() + DispatchTimeInterval.seconds(1))
-            }
+            terminateProcessTree(p, grouped: grouped, termination: sem)
+            _ = sem.wait(timeout: DispatchTime.now() + DispatchTimeInterval.seconds(1))
         }
         stdout.fileHandleForReading.readabilityHandler=nil; stderr.fileHandleForReading.readabilityHandler=nil
         output.appendStdout(stdout.fileHandleForReading.readDataToEndOfFile(), limit: Self.maxOutputBytes)

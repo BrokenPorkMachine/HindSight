@@ -139,11 +139,12 @@ enum VGWorkspaceCatalog {
             ])
 
         add(.automation,
-            ["Python Console", "Plugins", "Automation SDK", "REA Agent", "Extensions Platform", "Extension Manager"],
-            sidebar: ["Python Console", "REA Agent", "Extensions Platform", "Extension Manager"],
+            ["Terminal", "Python Console", "Plugins", "Automation SDK", "REA Agent", "Extensions Platform", "Extension Manager"],
+            sidebar: ["Terminal", "Python Console", "REA Agent", "Extensions Platform", "Extension Manager"],
             subtitle: "Automate repeatable work and extend the workbench safely.",
             icon: "terminal",
             overrides: [
+                "Terminal": ("Terminal", "terminal.fill"),
                 "Python Console": ("Python Console", "terminal"),
                 "REA Agent": ("REA Agent", "sparkles.rectangle.stack"),
                 "Extensions Platform": ("Extensions", "puzzlepiece.extension"),

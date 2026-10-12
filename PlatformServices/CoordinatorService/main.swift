@@ -135,6 +135,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let virtualizationHost = VirtualizationHost()
     private let firmwareRuntimeHost = FirmwareRuntimeHost()
     private let reaAgentHost = REAAgentHost()
+    private let terminalHost = TerminalHost()
     private let firmwareLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.firmware", qos: .utility, maxConcurrent: 1, maxPending: 16, reservationBytes: 192 * 1_048_576)
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
     private let reaLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.rea", qos: .utility, maxConcurrent: 1, maxPending: 4, reservationBytes: 128 * 1_048_576)
@@ -415,7 +416,29 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
     }
-    func disconnect() { queue.async { [self] in supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); reaLane.cancelQueued(); debugServer.shutdown(); pageCache.clear(); store = nil } }
+    func disconnect() { queue.async { [self] in supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); reaLane.cancelQueued(); debugServer.shutdown(); terminalHost.stop(); pageCache.clear(); store = nil } }
+
+    func terminalStart(_ workingDirectory: String, withReply reply: @escaping (String) -> Void) {
+        reply(terminalHost.start(workingDirectory: workingDirectory))
+    }
+    func terminalWrite(_ input: String, withReply reply: @escaping (String) -> Void) {
+        reply(terminalHost.write(input))
+    }
+    func terminalRead(withReply reply: @escaping (String) -> Void) {
+        reply(terminalHost.read())
+    }
+    func terminalResize(_ columns: Int, rows: Int, withReply reply: @escaping (String) -> Void) {
+        reply(terminalHost.resize(columns: columns, rows: rows))
+    }
+    func terminalInterrupt(withReply reply: @escaping (String) -> Void) {
+        reply(terminalHost.interrupt())
+    }
+    func terminalEOF(withReply reply: @escaping (String) -> Void) {
+        reply(terminalHost.eof())
+    }
+    func terminalStop(withReply reply: @escaping (String) -> Void) {
+        terminalHost.stop(); reply(TerminalReply.encode(TerminalReply(ok: true, message: "Terminal stopped.")))
+    }
 }
 final class ServiceDelegate: NSObject, NSXPCListenerDelegate {
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection connection: NSXPCConnection) -> Bool {

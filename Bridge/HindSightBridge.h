@@ -28,6 +28,7 @@ const uint8_t *reworkbench_cache_get(VectorGlassPageCache *cache,const uint8_t *
 int32_t reworkbench_file_stamp(const char *path,char *out,size_t capacity);
 #include "../native/debug/debug_server.h"
 #include "../native/virtualization/hv_vm.h"
+#include "../native/terminal/terminal_pty.h"
 #include "../native/macho/decode.h"
 
 #ifdef __cplusplus

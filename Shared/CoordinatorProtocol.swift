@@ -34,5 +34,12 @@ import Foundation
     func reaCancel(_ requestID: String, withReply reply: @escaping (Bool) -> Void)
     func reaProgress(_ requestID: String, withReply reply: @escaping (String) -> Void)
     func saveNote(_ recordID: String, expectedRevision: Int, text: String, withReply reply: @escaping (String) -> Void)
+    func terminalStart(_ workingDirectory: String, withReply reply: @escaping (String) -> Void)
+    func terminalWrite(_ input: String, withReply reply: @escaping (String) -> Void)
+    func terminalRead(withReply reply: @escaping (String) -> Void)
+    func terminalResize(_ columns: Int, rows: Int, withReply reply: @escaping (String) -> Void)
+    func terminalInterrupt(withReply reply: @escaping (String) -> Void)
+    func terminalEOF(withReply reply: @escaping (String) -> Void)
+    func terminalStop(withReply reply: @escaping (String) -> Void)
 }
 enum ServiceIdentity { static let coordinator = "ca.zensoftware.VectorGlass.CoordinatorService" }

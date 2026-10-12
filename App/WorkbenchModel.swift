@@ -209,6 +209,13 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var virtualizationRELength = 256
     @Published var virtualizationREPattern = "d4200000"
     @Published var virtualizationImagePath = ""
+    @Published var virtualizationFirmwareGPA = "0x0"
+    @Published var terminalOutput = ""
+    @Published var terminalDisplayOutput = ""
+    @Published var terminalInput = ""
+    @Published var terminalWorkingDirectory = ""
+    @Published var terminalStatus = "Terminal is not running."
+    @Published var terminalRunning = false
     @Published var dyldCachePath = ""
     @Published var dyldCache: DyldCacheSummary?
     @Published var dyldFilter = ""
@@ -251,11 +258,20 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var vectorEmuRaw = ""
     @Published var iphemeralExecutable = ""
     @Published var iphemeralROM = ""
+    @Published var iphemeralBootSource = ""
     @Published var iphemeralSoC = "t8020"
+    @Published var iphemeralMode = "ipsw"
+    @Published var iphemeralPort = 37921
+    @Published var iphemeralSteps: UInt64 = 0
     @Published var iphemeralRunning = false
     @Published var iphemeralOutput = ""
     private var debugPollTimer: Timer?
     private var reaProgressTimer: Timer?
+    private var terminalPollTimer: Timer?
+    private var terminalPollInFlight = false
+    private let terminalDisplayStream = TerminalDisplay.Stream()
+    private var terminalCommandHistory: [String] = []
+    private var terminalHistoryIndex: Int?
     private var analysisMonitorTask: Task<Void, Never>?
     private var evidenceIndexTask: Task<Void, Never>?
     private var evidenceIndexRecordID: String?
@@ -390,6 +406,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             self.analysisMonitorTask?.cancel()
             self.analysisMonitorTask = nil
             self.stopDebugPolling()
+            self.stopTerminalPolling()
+            self.terminalRunning = false
             self.debugAttached = false
             self.status = self.project == nil
                 ? "Coordinator disconnected. Reconnect to continue."
@@ -1373,6 +1391,144 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         debugPollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in Task { @MainActor in self?.pollDebugEvent() } }
     }
     private func stopDebugPolling() { debugPollTimer?.invalidate(); debugPollTimer = nil; debugPollInFlight = false }
+
+    func startTerminal() {
+        if terminalWorkingDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            terminalWorkingDirectory = project?.path ?? FileManager.default.homeDirectoryForCurrentUser.path
+        }
+        client.request(timeout: 8, maxReplyBytes: 64 * 1024, operation: { coordinator, reply in
+            coordinator.terminalStart(self.terminalWorkingDirectory, withReply: reply)
+        }) { [weak self] result in
+            guard let self else { return }
+            do {
+                let reply = try JSONDecoder().decode(TerminalReply.self, from: Data(try result.get().utf8))
+                self.terminalStatus = reply.message
+                self.terminalRunning = reply.running
+                if reply.ok { self.clearTerminalOutput(); self.startTerminalPolling() }
+            } catch { self.terminalStatus = error.localizedDescription }
+        }
+    }
+
+    func stopTerminal() {
+        stopTerminalPolling()
+        client.request(timeout: 5, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.terminalStop(withReply: $1) }) { [weak self] result in
+            guard let self else { return }
+            self.terminalRunning = false
+            if let text = try? result.get(), let data = text.data(using: .utf8), let reply = try? JSONDecoder().decode(TerminalReply.self, from: data) {
+                self.terminalStatus = reply.message
+            } else { self.terminalStatus = "Terminal stopped." }
+        }
+    }
+
+    func sendTerminalInput() {
+        let input = terminalInput
+        guard terminalRunning, !input.isEmpty else { return }
+        terminalInput = ""
+        terminalCommandHistory.removeAll { $0 == input }
+        terminalCommandHistory.append(input)
+        if terminalCommandHistory.count > 100 { terminalCommandHistory.removeFirst(terminalCommandHistory.count - 100) }
+        terminalHistoryIndex = nil
+        client.request(timeout: 5, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.terminalWrite(input + "\n", withReply: $1) }) { [weak self] result in
+            if case .failure(let error) = result { self?.terminalStatus = error.localizedDescription }
+        }
+    }
+
+    func terminalHistoryUp() {
+        guard !terminalCommandHistory.isEmpty else { return }
+        let next = max((terminalHistoryIndex ?? terminalCommandHistory.count) - 1, 0)
+        terminalHistoryIndex = next
+        terminalInput = terminalCommandHistory[next]
+    }
+
+    func terminalHistoryDown() {
+        guard let index = terminalHistoryIndex else { return }
+        let next = index + 1
+        if next >= terminalCommandHistory.count { terminalHistoryIndex = nil; terminalInput = "" }
+        else { terminalHistoryIndex = next; terminalInput = terminalCommandHistory[next] }
+    }
+
+    func sendContextToTerminal(_ context: String) {
+        workspace = "Terminal"
+        terminalInput = context
+        guard terminalRunning else { terminalStatus = "Start the terminal, then send the prepared context."; return }
+    }
+
+    func clearTerminalOutput() {
+        terminalOutput = ""
+        terminalDisplayOutput = ""
+        terminalDisplayStream.reset()
+    }
+
+    func terminalInterrupt() {
+        client.request(timeout: 5, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.terminalInterrupt(withReply: $1) }) { [weak self] result in
+            if case .failure(let error) = result { self?.terminalStatus = error.localizedDescription }
+        }
+    }
+
+    func terminalEOF() {
+        client.request(timeout: 5, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.terminalEOF(withReply: $1) }) { [weak self] result in
+            if case .failure(let error) = result { self?.terminalStatus = error.localizedDescription }
+        }
+    }
+
+    func resizeTerminal(columns: Int, rows: Int) {
+        guard terminalRunning else { return }
+        client.request(timeout: 5, maxReplyBytes: 64 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.terminalResize(columns, rows: rows, withReply: $1) }) { [weak self] result in
+            if case .failure(let error) = result { self?.terminalStatus = error.localizedDescription }
+        }
+    }
+
+    func runOpenCodePrompt(_ instruction: String, context: String) {
+        let boundedContext = String(context.prefix(24_000))
+        let prompt = "\(instruction)\n\nHindSight context:\n\(boundedContext)"
+        terminalInput = "opencode run --format json \(shellQuote(prompt))"
+        workspace = "Terminal"
+        guard terminalRunning else { terminalStatus = "Start the terminal, then send the prepared OpenCode prompt."; return }
+        sendTerminalInput()
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func startTerminalPolling() {
+        stopTerminalPolling()
+        terminalPollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pollTerminal() }
+        }
+        pollTerminal()
+    }
+
+    private func stopTerminalPolling() {
+        terminalPollTimer?.invalidate(); terminalPollTimer = nil; terminalPollInFlight = false
+    }
+
+    private func pollTerminal() {
+        guard terminalRunning, !terminalPollInFlight else { return }
+        terminalPollInFlight = true
+        client.request(timeout: 3, maxReplyBytes: 128 * 1024, invalidateConnectionOnTimeout: false,
+                       operation: { $0.terminalRead(withReply: $1) }) { [weak self] result in
+            guard let self else { return }
+            self.terminalPollInFlight = false
+            guard case .success(let text) = result, let data = text.data(using: .utf8), let reply = try? JSONDecoder().decode(TerminalReply.self, from: data) else { return }
+            if let output = reply.output {
+                self.terminalOutput = Self.boundedTail(self.terminalOutput + output, limit: 500_000)
+                self.terminalDisplayOutput.append(self.terminalDisplayStream.append(output))
+                self.terminalDisplayOutput = Self.boundedTail(self.terminalDisplayOutput, limit: 500_000)
+            }
+            self.terminalRunning = reply.running
+            if !reply.message.isEmpty { self.terminalStatus = reply.message }
+            if !reply.running { self.stopTerminalPolling() }
+        }
+    }
+    private static func boundedTail(_ value: String, limit: Int) -> String {
+        value.count > limit ? String(value.suffix(limit)) : value
+    }
     private func pollDebugEvent() {
         guard debugAttached, !debugPollInFlight else { return }; debugPollInFlight = true
         client.request(timeout: 3, operation: { $0.debugPollEvent(withReply: $1) }) { [weak self] result in
@@ -1415,8 +1571,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             do { let state = try JSONDecoder().decode(VirtualizationState.self, from: Data(try result.get().utf8)); self.virtualizationState = state; self.virtualizationStatus = state.message } catch { self.virtualizationStatus = error.localizedDescription }
         }
     }
-    func virtualizationRE(_ command: String, value: String? = nil, path: String? = nil, length: Int? = nil) {
-        let request = VirtualizationRERequest(command: command, address: virtualizationREAddress, length: length ?? virtualizationRELength, value: value, path: path, mode: nil)
+    func virtualizationRE(_ command: String, value: String? = nil, path: String? = nil, length: Int? = nil, address: String? = nil) {
+        let request = VirtualizationRERequest(command: command, address: address ?? virtualizationREAddress, length: length ?? virtualizationRELength, value: value, path: path, mode: nil)
         guard let data = try? JSONEncoder().encode(request) else { virtualizationStatus = "Unable to encode virtualization RE request."; return }
         let json = String(decoding: data, as: UTF8.self)
         client.request(timeout: command == "run_once" ? 15 : 8, operation: { $0.virtualizationRE(json, withReply: $1) }) { [weak self] result in
@@ -1438,7 +1594,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
     func loadVirtualizationImage() {
         guard !virtualizationImagePath.isEmpty else { virtualizationStatus = "Choose an image first."; return }
-        virtualizationRE("load_image", path: virtualizationImagePath)
+        virtualizationRE("load_image", path: virtualizationImagePath, address: virtualizationFirmwareGPA)
     }
     func firmwareRuntime(_ request: FirmwareRuntimeRequest, timeout: UInt64 = 30, completion: ((FirmwareRuntimeReply)->Void)? = nil) {
         guard let d = try? JSONEncoder().encode(request) else { firmwareStatus = "Unable to encode firmware request."; return }
@@ -1508,9 +1664,19 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     func vectorEmuRefreshContext() { vectorEmuDebug("registers"); vectorEmuDebug("disassemble") }
     func chooseIPhemeralExecutable() { let p=NSOpenPanel(); p.title="Choose iphem-cli"; p.canChooseDirectories=false; guard p.runModal() == .OK,let u=p.url else{return}; iphemeralExecutable=u.path }
     func chooseIPhemeralROM() { let p=NSOpenPanel(); p.title="Choose ROM / firmware image"; p.canChooseDirectories=false; guard p.runModal() == .OK,let u=p.url else{return}; iphemeralROM=u.path }
+    func chooseIPhemeralBootSource() { let p=NSOpenPanel(); p.title="Choose IPSW or extracted firmware directory"; p.canChooseDirectories=true; p.canChooseFiles=true; p.allowsMultipleSelection=false; guard p.runModal() == .OK,let u=p.url else{return}; iphemeralBootSource=u.path }
     func iphemeralStatusCheck() { firmwareRuntime(.init(command:"iphemeral_status",executable:iphemeralExecutable)) }
-    func startIPhemeral() { firmwareRuntime(.init(command:"iphemeral_start",soc:iphemeralSoC,executable:iphemeralExecutable,rom:iphemeralROM),timeout:15) }
+    func startIPhemeral() {
+        firmwareRuntime(.init(command:"iphemeral_start",path:iphemeralBootSource.isEmpty ? nil : iphemeralBootSource,soc:iphemeralSoC,executable:iphemeralExecutable,rom:iphemeralROM,port:iphemeralPort,steps:iphemeralSteps == 0 ? nil : iphemeralSteps,mode:iphemeralMode),timeout:15)
+    }
     func stopIPhemeral() { firmwareRuntime(.init(command:"iphemeral_stop")) }
+    func iphemeralDebug(_ command: String) {
+        let request = FirmwareRuntimeRequest(command:"iphemeral_debug", port:iphemeralPort, debugCommand:command, address:virtualizationREAddress, count:virtualizationRELength, steps:iphemeralSteps == 0 ? 10000 : iphemeralSteps)
+        firmwareRuntime(request, timeout: command == "run" ? 12 : 4) { [weak self] reply in
+            guard let self else { return }
+            self.iphemeralOutput = reply.text ?? reply.emulatorJSON ?? reply.message
+        }
+    }
     var filteredDyldImages:[DyldCacheImageRecord] { let q=dyldFilter.lowercased().trimmingCharacters(in:.whitespacesAndNewlines); guard let imgs=dyldCache?.images else{return[]}; return q.isEmpty ? Array(imgs.prefix(5000)) : Array(imgs.filter{$0.path.lowercased().contains(q)}.prefix(5000)) }
     var selectedFirmwareDevice: FirmwareDeviceRecord? { firmwareDevices.first{$0.identifier==firmwareDeviceID} }
     func useSelectedDeviceForEmulator() { if let d=selectedFirmwareDevice,let p=d.platform { iphemeralSoC=p }; workspace="Full-System iPhemeral" }

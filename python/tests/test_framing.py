@@ -1,6 +1,13 @@
 import io
+import pathlib
 import struct
+import sys
 import unittest
+
+# Keep direct unittest discovery from the repository root self-contained. The
+# SDK is intentionally source-layout based and does not require installation.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 from reworkbench_sdk.framing import read_frame, write_frame, MAX_FRAME
 
 class FramingTests(unittest.TestCase):

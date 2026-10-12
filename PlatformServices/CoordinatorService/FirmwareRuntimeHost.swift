@@ -27,13 +27,31 @@ final class FirmwareRuntimeHost {
         }
     }
     private var vectorEmu: Process?
+    private var vectorEmuGrouped = false
     private let vectorEmuOutput = BoundedOutputBuffer(capacity: 512 * 1024)
     private var vectorEmuPort = 37920
     private var iphemeral: Process?
+    private var iphemeralGrouped = false
     private let iphemeralOutput = BoundedOutputBuffer(capacity: 512 * 1024)
+    private var iphemeralPort = 37921
     private let maxReplyText = 512 * 1024
 
     deinit { stopVectorEmu(); stopIPhemeral() }
+
+    private func establishProcessGroup(for process: Process) -> Bool {
+        let pid = process.processIdentifier
+        return pid > 0 && setpgid(pid, pid) == 0
+    }
+
+    private func terminateProcess(_ process: Process, grouped: Bool, wait: DispatchSemaphore? = nil) {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        if grouped { _ = kill(-pid, SIGTERM) } else { process.terminate() }
+        if let wait { _ = wait.wait(timeout: .now() + 1) }
+        if process.isRunning {
+            if grouped { _ = kill(-pid, SIGKILL) } else { _ = kill(pid, SIGKILL) }
+        }
+    }
 
     func command(_ json: String) -> String {
         guard let data = json.data(using: .utf8), let r = try? JSONDecoder().decode(FirmwareRuntimeRequest.self, from: data) else {
@@ -52,7 +70,8 @@ final class FirmwareRuntimeHost {
         case "vectoremu_stop": stopVectorEmu(); return encode(.init(ok:true,message:"VectorEmu stopped.",running:false,emulatorOutput:boundedVectorEmuOutput()))
         case "vectoremu_debug": return vectorEmuDebug(r)
         case "iphemeral_status": return iphemeralStatus(executable:r.executable)
-        case "iphemeral_start": return startIPhemeral(executable:r.executable, soc:r.soc, rom:r.rom)
+        case "iphemeral_start": return startIPhemeral(executable:r.executable, soc:r.soc, rom:r.rom, mode:r.mode, path:r.path, port:r.port, steps:r.steps)
+        case "iphemeral_debug": return iphemeralDebug(r)
         case "iphemeral_stop": stopIPhemeral(); return encode(.init(ok:true,message:"iPhemeral software-emulation process stopped.",running:false,emulatorOutput:boundedOutput()))
         default: return encode(.init(ok:false, message:"Unsupported firmware/runtime command: \(r.command)"))
         }
@@ -271,6 +290,7 @@ final class FirmwareRuntimeHost {
         }
         do {
             try p.run()
+            vectorEmuGrouped = establishProcessGroup(for: p)
             vectorEmu = p
             return encode(.init(ok:true, message:"VectorEmu started on 127.0.0.1:\(selectedPort). Attach when the listener is ready.", running:true, emulatorOutput:boundedVectorEmuOutput()))
         } catch {
@@ -284,9 +304,10 @@ final class FirmwareRuntimeHost {
             if let payload = try? JSONSerialization.data(withJSONObject:["id":Int(Date().timeIntervalSince1970 * 1000),"command":"shutdown"], options:[]),
                let _ = try? vectorEmuRoundTrip(payload, port:vectorEmuPort, timeout:1.0) { }
             process.interrupt()
-            DispatchQueue.global().asyncAfter(deadline:.now()+1) { if process.isRunning { process.terminate() } }
+            terminateProcess(process, grouped: vectorEmuGrouped)
         }
         vectorEmu = nil
+        vectorEmuGrouped = false
     }
 
     private func vectorEmuDebug(_ request: FirmwareRuntimeRequest) -> String {
@@ -383,21 +404,68 @@ final class FirmwareRuntimeHost {
     // MARK: iPhemeral adapter
     private func iphemeralStatus(executable:String?) -> String {
         let path=resolveIPhemeral(executable)
-        guard let path else { return encode(.init(ok:false,message:"iPhemeral CLI was not found. Choose iphem-cli in the Software Emulation workspace.",running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
-        do { let version=try runTool(path,["--version"],timeout:5,max:64*1024); return encode(.init(ok:true,message:"iPhemeral adapter ready: \(path)",text:version,running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
-        catch { return encode(.init(ok:true,message:"iPhemeral executable found at \(path); --version was not supported (\(error.localizedDescription)).",running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
+        guard let path else { return encode(.init(ok:false,message:"iPhemeral CLI was not found. Choose iphem-cli in the Full-System iPhemeral workspace.",running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
+        do {
+            let help=try runTool(path,["--help"],timeout:5,max:128*1024)
+            let version=help.split(separator:"\n").first(where:{$0.localizedCaseInsensitiveContains("IPHEMERAL") || $0.localizedCaseInsensitiveContains("iphem-cli")}) ?? Substring(URL(fileURLWithPath:path).lastPathComponent)
+            return encode(.init(ok:true,message:"iPhemeral 1.9-compatible CLI ready: \(path)",text:String(version)+"\n\n"+help,running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput()))
+        } catch { return encode(.init(ok:false,message:"iPhemeral probe failed: \(error.localizedDescription)",running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
     }
-    private func startIPhemeral(executable:String?, soc:String?, rom:String?) -> String {
+    private func startIPhemeral(executable:String?, soc:String?, rom:String?, mode:String?, path:String?, port:Int?, steps:UInt64?) -> String {
         guard iphemeral?.isRunning != true else { return encode(.init(ok:false,message:"iPhemeral is already running.",running:true,emulatorOutput:boundedOutput())) }
-        guard let exe=resolveIPhemeral(executable), let soc, validToken(soc), let rom, rom.hasPrefix("/"), FileManager.default.fileExists(atPath:rom) else { return encode(.init(ok:false,message:"Choose iphem-cli, a SoC identifier, and a local ROM/image.",running:false)) }
-        let p=Process(); p.executableURL=URL(fileURLWithPath:exe); p.arguments=["--soc",soc,"--rom",rom]
+        guard let exe=resolveIPhemeral(executable), let soc, validToken(soc) else { return encode(.init(ok:false,message:"Choose iphem-cli and a supported SoC.",running:false)) }
+        let selectedMode = mode ?? "raw"
+        let selectedPort = port ?? 37921
+        guard (1024...65535).contains(selectedPort) else { return encode(.init(ok:false,message:"iPhemeral debugger port must be between 1024 and 65535.",running:false)) }
+        if soc.lowercased() != "t8020", selectedMode != "raw" {
+            let hasReadableROM = rom.map { $0.hasPrefix("/") && FileManager.default.isReadableFile(atPath: $0) } ?? false
+            if !hasReadableROM {
+                return encode(.init(ok:false,message:"iPhemeral requires a matching SecureROM/iBoot image for SoC \(soc) in this boot mode.",running:false))
+            }
+        }
+        var arguments=["--soc",soc]
+        switch selectedMode {
+        case "raw":
+            guard let rom, rom.hasPrefix("/"), FileManager.default.isReadableFile(atPath:rom) else { return encode(.init(ok:false,message:"Raw mode requires a readable SecureROM/iBoot image.",running:false)) }
+            arguments += ["--rom",rom]
+        case "ipsw", "system_boot", "dfu_restore", "springboard", "ipsw_install":
+            guard let path, path.hasPrefix("/"), FileManager.default.fileExists(atPath:path) else { return encode(.init(ok:false,message:"This iPhemeral mode requires a local IPSW or firmware path.",running:false)) }
+            let flag: String
+            switch selectedMode {
+            case "ipsw": flag = "--ipsw"
+            case "system_boot": flag = "--system-boot"
+            case "dfu_restore": flag = "--dfu-restore"
+            case "springboard": flag = "--springboard"
+            case "ipsw_install": flag = "--ipsw-install"
+            default: return encode(.init(ok:false,message:"Unsupported iPhemeral boot mode: \(selectedMode).",running:false))
+            }
+            arguments += [flag,path]
+            if let rom, rom.hasPrefix("/"), FileManager.default.isReadableFile(atPath:rom) { arguments += ["--rom",rom] }
+        default: return encode(.init(ok:false,message:"Unsupported iPhemeral boot mode: \(selectedMode).",running:false))
+        }
+        arguments += ["--debug-server",String(selectedPort),"--log-uart"]
+        if let steps, steps > 0 { arguments += ["--steps",String(min(steps,1_000_000_000))] }
+        let p=Process(); p.executableURL=URL(fileURLWithPath:exe); p.arguments=arguments
         let pipe=Pipe(); p.standardOutput=pipe; p.standardError=pipe; iphemeralOutput.reset()
+        iphemeralPort=selectedPort
         pipe.fileHandleForReading.readabilityHandler={ [weak self] h in guard let self else { return }; let d=h.availableData; if d.isEmpty { return }; self.appendEmulatorOutput(d) }
         p.terminationHandler={ _ in pipe.fileHandleForReading.readabilityHandler=nil }
-        do { try p.run(); iphemeral=p; return encode(.init(ok:true,message:"Started iPhemeral software emulation backend for \(soc).",running:true,emulatorOutput:boundedOutput())) }
+        do { try p.run(); iphemeralGrouped = establishProcessGroup(for: p); iphemeral=p; return encode(.init(ok:true,message:"Started iPhemeral \(selectedMode) backend for \(soc); live RE server on 127.0.0.1:\(selectedPort).",running:true,emulatorOutput:boundedOutput())) }
         catch { return encode(.init(ok:false,message:"iPhemeral launch failed: \(error.localizedDescription)",running:false,emulatorOutput:boundedOutput())) }
     }
-    private func stopIPhemeral() { if let p=iphemeral, p.isRunning { p.interrupt(); DispatchQueue.global().asyncAfter(deadline:.now()+1) { if p.isRunning { p.terminate() } } }; iphemeral=nil }
+    private func iphemeralDebug(_ request:FirmwareRuntimeRequest) -> String {
+        let command=request.debugCommand ?? "status"
+        let allowed:Set<String>=["hello","status","attach","detach","pause","run","step","reset","shutdown","registers","cpu_state","regions","read_memory","disassemble","breakpoint_add","breakpoint_remove","breakpoints","trace","watch_write","header","convert"]
+        guard allowed.contains(command) else { return encode(.init(ok:false,message:"iPhemeral RE command is not exposed by this UI: \(command)",running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
+        guard iphemeral?.isRunning == true else { return encode(.init(ok:false,message:"Start iPhemeral before using its live RE server.",running:false,emulatorOutput:boundedOutput())) }
+        var object:[String:Any] = ["id":Int(Date().timeIntervalSince1970*1000),"command":command]
+        if let address=request.address,!address.isEmpty { object["address"]=address }
+        if let count=request.count { object[command == "read_memory" ? "length":"count"]=max(1,min(count,65536)) }
+        if let steps=request.steps { object["steps"]=min(steps,1_000_000_000) }
+        do { let payload=try JSONSerialization.data(withJSONObject:object); let raw=try vectorEmuRoundTrip(payload,port:request.port ?? iphemeralPort,timeout:command == "run" ? 8 : 3); return encode(.init(ok:true,message:"iPhemeral RE \(command) completed.",text:prettyJSON(raw),running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput(),emulatorJSON:String(decoding:raw,as:UTF8.self))) }
+        catch { return encode(.init(ok:false,message:"iPhemeral RE \(command): \(error.localizedDescription)",running:iphemeral?.isRunning ?? false,emulatorOutput:boundedOutput())) }
+    }
+    private func stopIPhemeral() { if let p=iphemeral, p.isRunning { p.interrupt(); terminateProcess(p, grouped: iphemeralGrouped) }; iphemeral=nil; iphemeralGrouped=false }
     private func resolveIPhemeral(_ requested:String?) -> String? {
         let fm=FileManager.default; var candidates:[String]=[]; if let r=requested,!r.isEmpty { candidates.append(r) }; if let e=ProcessInfo.processInfo.environment["IPHEM_CLI"] { candidates.append(e) }
         candidates += ["/opt/homebrew/bin/iphem-cli","/usr/local/bin/iphem-cli",NSHomeDirectory()+"/bin/iphem-cli",NSHomeDirectory()+"/Applications/iphem-cli"]
@@ -521,13 +589,10 @@ final class FirmwareRuntimeHost {
             pipe.fileHandleForReading.readabilityHandler = nil
             throw error
         }
+        let grouped = establishProcessGroup(for: process)
 
         if finished.wait(timeout: .now() + timeout) != .success {
-            if process.isRunning { process.terminate() }
-            if finished.wait(timeout: .now() + 1) != .success, process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                _ = finished.wait(timeout: .now() + 1)
-            }
+            terminateProcess(process, grouped: grouped, wait: finished)
             pipe.fileHandleForReading.readabilityHandler = nil
             throw HostError("Tool timed out.")
         }

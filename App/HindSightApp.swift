@@ -62,6 +62,7 @@ struct HindSightApp: App {
                 Button("VectorEmu") { model.workspace = "VectorEmu Lab" }
                     .keyboardShortcut("5", modifiers: .command)
                 Button("REA Agent") { model.workspace = "REA Agent" }
+                Button("Terminal") { model.workspace = "Terminal" }
                 Divider()
                 Button("Notes") { model.workspace = "Notes" }
                     .keyboardShortcut("0", modifiers: .command)

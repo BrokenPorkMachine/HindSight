@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 private final class REAOutputReader {
     private let handle: FileHandle
@@ -46,7 +47,11 @@ private final class REAOutputReader {
 final class REAAgentHost {
     private let maxLineBytes = 4 * 1024 * 1024
     private let processLock = NSLock()
-    private var processes: [String: Process] = [:]
+    private struct ManagedProcess {
+        let process: Process
+        let grouped: Bool
+    }
+    private var processes: [String: ManagedProcess] = [:]
     private var progressHistory: [String: [String]] = [:]
 
     func probe(requestJSON: String) -> String {
@@ -80,11 +85,26 @@ final class REAAgentHost {
 
     func cancel(requestID: String) -> Bool {
         processLock.lock()
-        let process = processes[requestID]
+        let managed = processes[requestID]
         processLock.unlock()
-        guard let process, process.isRunning else { return false }
-        process.terminate()
+        guard let managed, managed.process.isRunning else { return false }
+        terminate(managed, wait: nil)
         return true
+    }
+
+    private func establishProcessGroup(for process: Process) -> Bool {
+        let pid = process.processIdentifier
+        return pid > 0 && setpgid(pid, pid) == 0
+    }
+
+    private func terminate(_ managed: ManagedProcess, wait: DispatchSemaphore?) {
+        guard managed.process.isRunning else { return }
+        let pid = managed.process.processIdentifier
+        if managed.grouped { _ = kill(-pid, SIGTERM) } else { managed.process.terminate() }
+        if let wait { _ = wait.wait(timeout: .now() + 1) }
+        if managed.process.isRunning {
+            if managed.grouped { _ = kill(-pid, SIGKILL) } else { _ = kill(pid, SIGKILL) }
+        }
     }
 
     private func run(executable: String, arguments: [String], targetPath: String?, providerID: String,
@@ -98,9 +118,10 @@ final class REAAgentHost {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         do { try process.run() } catch { return failure("REA launch failed: \(error.localizedDescription)") }
+        let managed = ManagedProcess(process: process, grouped: establishProcessGroup(for: process))
         if let requestID {
             processLock.lock()
-            processes[requestID] = process
+            processes[requestID] = managed
             progressHistory[requestID] = ["Launching local REA MCP server."]
             if progressHistory.count > 16, let oldest = progressHistory.keys.first, oldest != requestID {
                 progressHistory.removeValue(forKey: oldest)
@@ -111,7 +132,7 @@ final class REAAgentHost {
         defer {
             if let requestID { processLock.lock(); processes.removeValue(forKey: requestID); processLock.unlock() }
             input.fileHandleForWriting.closeFile()
-            if process.isRunning { process.terminate() }
+            terminate(managed, wait: nil)
         }
 
         let deadline = Date().addingTimeInterval(Double(timeoutMS) / 1000)

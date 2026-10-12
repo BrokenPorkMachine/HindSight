@@ -35,6 +35,7 @@
     "PlatformServices/CoordinatorService/ProjectStore.swift",
     "PlatformServices/CoordinatorService/REAAgentHost.swift",
     "PlatformServices/CoordinatorService/ScriptingHost.swift",
+    "PlatformServices/CoordinatorService/TerminalHost.swift",
     "PlatformServices/CoordinatorService/VerifiedPageCache.swift",
     "PlatformServices/CoordinatorService/VirtualizationHost.swift",
     "PlatformServices/CoordinatorService/WorkerSupervisor.swift",
@@ -48,12 +49,15 @@
     "Shared/REAAgentMessages.swift",
     "Shared/ScriptingMessages.swift",
     "Shared/TargetModel.swift",
+    "Shared/TerminalMessages.swift",
     "Shared/VirtualizationMessages.swift",
     "Shared/WorkbenchMessages.swift",
     "native/debug/debug_server.c",
     "native/debug/debug_server.h",
     "native/macho/decode.c",
     "native/macho/decode.h",
+    "native/terminal/terminal_pty.c",
+    "native/terminal/terminal_pty.h",
     "native/virtualization/hv_vm.c",
     "native/virtualization/hv_vm.h"
   ],
@@ -91,6 +95,7 @@
       "Shared/DebugMessages.swift",
       "Shared/ScriptingMessages.swift",
       "Shared/VirtualizationMessages.swift",
+      "Shared/TerminalMessages.swift",
       "Shared/FirmwareRuntimeMessages.swift",
       "Shared/TargetModel.swift",
       "Shared/HostPlatform.swift"
@@ -107,17 +112,20 @@
       "Shared/DebugMessages.swift",
       "Shared/ScriptingMessages.swift",
       "Shared/VirtualizationMessages.swift",
+      "Shared/TerminalMessages.swift",
       "PlatformServices/CoordinatorService/DebugServer.swift",
       "PlatformServices/CoordinatorService/ScriptingHost.swift",
       "PlatformServices/CoordinatorService/VirtualizationHost.swift",
+      "PlatformServices/CoordinatorService/TerminalHost.swift",
       "PlatformServices/CoordinatorService/FirmwareRuntimeHost.swift",
       "Shared/FirmwareRuntimeMessages.swift",
       "Shared/HostPlatform.swift",
       "native/debug/debug_server.c",
       "native/macho/decode.c",
-      "native/virtualization/hv_vm.c"
+      "native/virtualization/hv_vm.c",
+      "native/terminal/terminal_pty.c"
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "3df9557b1b2e4f3a764258a8a96d73108c311412f8203ad5add28d8ec87f57fb"
+  "project_sha256": "ab8fedac68e34e2d3451dfdc8134953a3c8ac595dff599cbaaac18f2c2f2ed24"
 }

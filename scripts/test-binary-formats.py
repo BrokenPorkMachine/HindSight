@@ -152,7 +152,9 @@ with tempfile.TemporaryDirectory() as directory:
     container=invoke('capture',path,options=('auto','auto','0','0'),destination=root/'firmware.capture')
     assert container['file_kind']=='IMG4 firmware container',container
     assert 'IMG4 marker offsets' in container['structure'] and 'IM4P payload marker offsets' in container['structure'],container
-    assert 'bvx2 compression marker offsets' in container['structure'] and 'DER-like sequence prefix' in container['structure'],container
+    assert ('bvx2 compression marker offsets' in container['structure']
+            and 'DER-like prefix' in container['structure']
+            and 'ASN.1 structure was not accepted' in container['structure']),container
     assert container['disassembly_status']=='unavailable' and 'plaintext payload' in container['disassembly'],container
     assert invoke('page',path,options=('auto','auto','0','0'))['kind']=='error'
     # Valid universal FAT32/FAT64, plus overlapping slices rejected before selection.

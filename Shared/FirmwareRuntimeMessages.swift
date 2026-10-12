@@ -74,6 +74,7 @@ struct FirmwareRuntimeRequest: Codable {
     var count: Int? = nil
     var steps: UInt64? = nil
     var source: String? = nil
+    var mode: String? = nil
 }
 
 struct FirmwareRuntimeReply: Codable {

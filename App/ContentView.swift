@@ -84,6 +84,11 @@ private struct VGBoundedEvidenceList: View {
                     .padding(.vertical, 2)
                     .contextMenu {
                         Button("Select Evidence") { model.selectEvidence(line) }
+                        Button("Send Evidence to Terminal") { model.sendContextToTerminal(line) }
+                        Divider()
+                        Button("OpenCode: Explain") { model.runOpenCodePrompt("Explain this evidence conservatively and separate observations from hypotheses.", context: line) }
+                        Button("OpenCode: Find implications") { model.runOpenCodePrompt("Identify useful reverse-engineering implications and follow-up checks for this evidence.", context: line) }
+                        Button("OpenCode: Draft note") { model.runOpenCodePrompt("Draft a concise analyst note grounded only in this evidence.", context: line) }
                         if let address = model.analysisEvidenceAddress(line) {
                             Button("Open 0x\(String(address, radix: 16)) in Disassembly") {
                                 model.selectEvidence(line)
@@ -1995,6 +2000,21 @@ struct ContentView: View {
                         Button("Stop") { model.virtualizationCommand("stop") }.disabled(model.virtualizationState?.running != true)
                         Button("Status") { model.virtualizationCommand("status") }
                     }
+                    GroupBox("Guest firmware / ROM") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Select a legally obtained image, start the VM, then load it into guest RAM at the specified GPA.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            VGFlowLayout {
+                                Button("Choose Image…", action: model.chooseVirtualizationImage)
+                                TextField("Guest GPA (hex)", text: $model.virtualizationFirmwareGPA)
+                                    .frame(minWidth: 150, idealWidth: 190, maxWidth: 240)
+                                Button("Load into VM", action: model.loadVirtualizationImage)
+                                    .disabled(model.virtualizationImagePath.isEmpty || model.virtualizationState?.running != true)
+                            }
+                            Text(model.virtualizationImagePath.isEmpty ? "No firmware image selected." : model.virtualizationImagePath)
+                                .font(.caption).textSelection(.enabled)
+                        }.padding(8)
+                    }
                     Text(model.virtualizationStatus).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }.padding(8)
             }
@@ -2183,19 +2203,43 @@ struct ContentView: View {
                 }.padding(8) }
             } else if tool == "Full-System iPhemeral" {
                 GroupBox("Full-System iPhemeral • advanced external backend") { VStack(alignment:.leading,spacing:10) {
-                    Text("Optional handoff to the full iPhemeral executable for experiments that require its larger boot/device model. HindSight does not bundle that backend, its firmware corpus, restore paths, or key material.").font(.caption).foregroundStyle(.secondary)
+                    Text("External iPhemeral 1.9-compatible full-system backend. It supports real-firmware boot, IPSW/DFU restore research, SpringBoard experiments, UART capture, and a loopback iphem-re/2 debugger. HindSight does not bundle firmware, restore credentials, device secrets, or key material.").font(.caption).foregroundStyle(.secondary)
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 8) { TextField("iphem-cli",text:$model.iphemeralExecutable); Button("Choose…",action:model.chooseIPhemeralExecutable); Button("Probe",action:model.iphemeralStatusCheck) }
                         VStack(alignment: .leading, spacing: 8) { TextField("iphem-cli",text:$model.iphemeralExecutable); VGFlowLayout { Button("Choose…",action:model.chooseIPhemeralExecutable); Button("Probe",action:model.iphemeralStatusCheck) } }
                     }
                     VStack(alignment: .leading, spacing: 8) {
-                        TextField("SoC/platform (e.g. t8020)",text:$model.iphemeralSoC)
-                        TextField("ROM / firmware image",text:$model.iphemeralROM)
-                        Button("Choose ROM…",action:model.chooseIPhemeralROM)
+                        Picker("Boot mode", selection:$model.iphemeralMode) {
+                            Text("Raw SecureROM / firmware").tag("raw")
+                            Text("IPSW boot assessment").tag("ipsw")
+                            Text("System boot (directory or IPSW)").tag("system_boot")
+                            Text("DFU restore").tag("dfu_restore")
+                            Text("SpringBoard runloop").tag("springboard")
+                            Text("IPSW install").tag("ipsw_install")
+                        }
+                        TextField("SoC (t8010, t8015, t8020, t8027, t8030, t8101, s8000, a8, a7)",text:$model.iphemeralSoC)
+                        if model.iphemeralMode == "raw" {
+                            TextField("SecureROM / iBoot image",text:$model.iphemeralROM)
+                            Button("Choose ROM…",action:model.chooseIPhemeralROM)
+                        } else {
+                            TextField("IPSW / firmware source",text:$model.iphemeralBootSource)
+                            Button("Choose IPSW / firmware…",action:model.chooseIPhemeralBootSource)
+                            TextField("Optional matching ROM",text:$model.iphemeralROM)
+                            Button("Choose ROM…",action:model.chooseIPhemeralROM)
+                        }
+                        HStack {
+                            Stepper("RE port \(model.iphemeralPort)",value:$model.iphemeralPort,in:1024...65535)
+                            Stepper("Steps",value:$model.iphemeralSteps,in:0...1_000_000_000,step:1000)
+                            Text(model.iphemeralSteps == 0 ? "unbounded" : String(model.iphemeralSteps)).font(.caption)
+                        }
                     }
                     VGFlowLayout {
                         Button("Start",action:model.startIPhemeral).disabled(model.iphemeralRunning)
                         Button("Stop",action:model.stopIPhemeral).disabled(!model.iphemeralRunning)
+                        Button("Attach") { model.iphemeralDebug("attach") }.disabled(!model.iphemeralRunning)
+                        Button("Registers") { model.iphemeralDebug("registers") }.disabled(!model.iphemeralRunning)
+                        Button("Pause") { model.iphemeralDebug("pause") }.disabled(!model.iphemeralRunning)
+                        Button("Run") { model.iphemeralDebug("run") }.disabled(!model.iphemeralRunning)
                         Text(model.iphemeralRunning ? "running" : "stopped").foregroundStyle(model.iphemeralRunning ? .green : .secondary)
                     }
                     monospaced(model.iphemeralOutput.isEmpty ? model.firmwareStatus : model.iphemeralOutput).frame(minHeight:260)
@@ -3206,6 +3250,8 @@ struct ContentView: View {
                 }
             } else if model.workspace == "Python Console" {
                 ScrollView { pythonWorkspace().padding(22) }
+            } else if model.workspace == "Terminal" {
+                terminalWorkspace().padding(22)
             } else if model.workspace == "Plugins" {
                 ScrollView { pluginsWorkspace().padding(22) }
             } else if model.workspace == "Automation SDK" {
@@ -3232,6 +3278,66 @@ struct ContentView: View {
                 emptyInvestigation()
             }
         })
+    }
+
+    @ViewBuilder private func terminalWorkspace() -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            GroupBox("Terminal") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Interactive local shell hosted by the Coordinator. OpenCode, debuggers, build tools, and ordinary shell commands can run here.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        TextField("Working directory", text: $model.terminalWorkingDirectory)
+                        Button("Start", action: model.startTerminal).disabled(model.terminalRunning)
+                        Button("Stop", action: model.stopTerminal).disabled(!model.terminalRunning)
+                        Button("OpenCode") { model.terminalInput = "opencode"; model.sendTerminalInput() }
+                            .disabled(!model.terminalRunning)
+                        Button("Interrupt", action: model.terminalInterrupt).disabled(!model.terminalRunning)
+                        Button("EOF", action: model.terminalEOF).disabled(!model.terminalRunning)
+                        Button("Clear", action: model.clearTerminalOutput)
+                    }
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            Text(model.terminalDisplayOutput.isEmpty ? "Terminal output will appear here." : model.terminalDisplayOutput)
+                                .font(.system(.body, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(10)
+                                .id("terminal-output")
+                        }
+                        .frame(minHeight: 420, maxHeight: .infinity)
+                        .background(Color.black.opacity(0.9), in: RoundedRectangle(cornerRadius: 6))
+                        .foregroundStyle(.green)
+                        .onChange(of: model.terminalDisplayOutput) { _, _ in proxy.scrollTo("terminal-output", anchor: .bottom) }
+                        .background {
+                            GeometryReader { geometry in
+                                Color.clear
+                                    .onAppear { model.resizeTerminal(columns: Int(geometry.size.width / 8), rows: Int(geometry.size.height / 18)) }
+                                    .onChange(of: geometry.size) { _, size in
+                                        model.resizeTerminal(columns: Int(size.width / 8), rows: Int(size.height / 18))
+                                    }
+                            }
+                        }
+                    }
+                    HStack {
+                        TextField("Command", text: $model.terminalInput)
+                            .font(.system(.body, design: .monospaced))
+                            .onSubmit(model.sendTerminalInput)
+                        Button("↑", action: model.terminalHistoryUp)
+                            .help("Previous terminal command")
+                            .disabled(!model.terminalRunning)
+                        Button("↓", action: model.terminalHistoryDown)
+                            .help("Next terminal command")
+                            .disabled(!model.terminalRunning)
+                        Button("Send", action: model.sendTerminalInput).disabled(!model.terminalRunning || model.terminalInput.isEmpty)
+                    }
+                    Text(model.terminalStatus).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }.padding(8)
+            }
+        }
+        .onAppear {
+            if model.terminalWorkingDirectory.isEmpty { model.terminalWorkingDirectory = model.project?.path ?? FileManager.default.homeDirectoryForCurrentUser.path }
+        }
     }
 
     @ViewBuilder private func statusBar() -> some View {
