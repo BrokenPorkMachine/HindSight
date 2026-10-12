@@ -9,7 +9,7 @@ resolve_rustup
 # Xcode can inject stale Rust wrapper/flag settings into script phases. Keep
 # Cargo's proc-macro compiler environment deterministic and aligned with the
 # pinned rustup toolchain used by the workspace.
-unset RUSTC_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+unset RUSTC_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
 if [[ -n "${RUSTUP:-}" ]]; then
   export RUSTC="$($RUSTUP which rustc)"
   export CARGO="$($RUSTUP which cargo)"
