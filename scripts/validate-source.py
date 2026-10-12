@@ -294,7 +294,7 @@ if topology_ui['targets']['HindSight']:
 # deterministic layout, minimap, synchronized semantics, and debugger PC highlighting.
 graph_model=(R/'App/GraphModel.swift').read_text()
 graph_ui=(R/'App/GraphWorkspace.swift').read_text()
-for token in ['struct VGCFGGraph','struct VGCFGBlock','struct VGCFGEdge','enum VGGraphParser','func layout(limit: Int = 240)']:
+for token in ['struct VGCFGGraph','struct VGCFGBlock','struct VGCFGEdge','enum VGGraphParser','func layout(limit: Int = 240, functionStarts: Set<UInt64> = [], availableWidth: Double? = nil, availableHeight: Double? = nil)']:
     assert token in graph_model, token
 for token in ['struct VGGraphWorkspace','Canvas { context','MagnificationGesture','minimap','functionNavigator','semanticPane','debugPC','VGAdaptiveThreePane(']:
     assert token in graph_ui, token

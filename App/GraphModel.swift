@@ -189,12 +189,18 @@ struct VGCFGGraph {
                     members.append(neighbor)
                 }
             }
-            members.sort { byID[$0]!.start < byID[$1]!.start }
+            members.sort {
+                let left = byID[$0]?.start ?? 0
+                let right = byID[$1]?.start ?? 0
+                return left == right ? $0 < $1 : left < right
+            }
             var incoming = Dictionary(uniqueKeysWithValues: members.map { ($0, 0) })
             for id in members {
                 for target in successors[id, default: []] { incoming[target, default: 0] += 1 }
             }
-            let roots = members.filter { incoming[$0] == 0 || functionStarts.contains(byID[$0]!.start) }
+            let roots = members.filter { id in
+                incoming[id] == 0 || byID[id].map { functionStarts.contains($0.start) } == true
+            }
             var queue = (roots.isEmpty ? [members[0]] : roots).map { ($0, 0) }
             var levels: [String: Int] = [:]
             cursor = 0
@@ -215,7 +221,7 @@ struct VGCFGGraph {
                 visitQueue()
             }
             var rows: [Int: [String]] = [:]
-            for id in members { rows[levels[id]!, default: []].append(id) }
+            for id in members { rows[levels[id] ?? 0, default: []].append(id) }
             let columns = rows.values.map(\.count).max() ?? 1
             let width = Double(columns) * nodeWidth + Double(columns - 1) * horizontalGap
             let height = Double(rows.count) * nodeHeight + Double(rows.count - 1) * verticalGap
