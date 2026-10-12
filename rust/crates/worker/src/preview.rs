@@ -189,6 +189,18 @@ fn printable_strings(file:&mut File,size:u64)->io::Result<String>{
  Ok(out)
 }
 
+fn object_detections(_file:&mut File,window:&[u8],size:u64,strings:&str,dyld_imports:&str)->io::Result<String>{
+ let secs=sections(window);let mut out=String::new();let mut cstrings=0usize;let mut cdata=0usize;let mut cf=0usize;let mut foundation=0usize;
+ for sec in &secs{
+  if sec.sect=="__cstring"||sec.sect=="__cfstring"{if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}out.push_str(&format!("0x{:016x} section={} classification=c-string confidence=section-backed size={} bytes\n",sec.addr,sec.sect,sec.size));cstrings+=1;
+  }else if ["__const","__data","__data_const","__bss","__common"].contains(&sec.sect.as_str()){out.push_str(&format!("0x{:016x} section={} classification=c-data-object confidence=section-backed size={} bytes\n",sec.addr,sec.sect,sec.size));cdata+=1;}
+  if out.len()>50_000{break}
+ }
+ let classify=|name:&str|->Option<&'static str>{let n=name.trim_matches('_').to_ascii_lowercase();if n.contains("cfstring")||n.contains("cfdata")||n.contains("cfarray")||n.contains("cfdictionary")||n.contains("cfset")||n.contains("cfurl")||n.contains("cfuuid")||n.contains("cfrunloop")||n.contains("cfnotification")||n.contains("cfallocator"){Some("CoreFoundation object")}else if n.contains("nsstring")||n.contains("nsdata")||n.contains("nsarray")||n.contains("nsdictionary")||n.contains("nsset")||n.contains("nsurl")||n.contains("nsnumber")||n.contains("nsdate")||n.contains("nsvalue")||n.contains("nserror")||n.contains("nsobject"){Some("Foundation object")}else{None}};
+ for line in dyld_imports.lines().chain(strings.lines()){let lower=line.to_ascii_lowercase();let Some(kind)=classify(&lower) else{continue};let confidence=if line.contains("symbol=")||line.contains("import"){"symbol-backed"}else{"string-backed heuristic"};out.push_str(&format!("{} classification={} confidence={}\n",line,kind,confidence));if kind=="CoreFoundation object"{cf+=1}else{foundation+=1}if out.len()>60_000{break}}
+ out.push_str(&format!("\nDetection totals: C strings={} C data sections={} CoreFoundation={} Foundation={}\nObject identity is not inferred from arbitrary bytes; C-string/data records are section-backed and Apple object records require matching runtime names or imports.\n",cstrings,cdata,cf,foundation));Ok(out)
+}
+
 fn parse_text_relocations(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<(u64,String,u32,bool,u32,Option<u64>)>>{
  if window.len()<32||&window[..4]!=[0xcf,0xfa,0xed,0xfe]{return Ok(vec![])}
  let ncmd=le32(&window[16..20]);let mut at=32usize;let mut text_addr=0u64;let mut reloff=0u64;let mut nreloc=0usize;let mut symtab=None;
@@ -937,7 +949,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
  let selector_xrefs=selector_call_xrefs(&relocations,&calls,&symbols);
  analysis_progress(92,"evidence","Formatting xrefs, call evidence, relocations, selectors, and bounded strings.");
- let strings=printable_strings(&mut file,size)?;
+ let strings=printable_strings(&mut file,size)?;let object_detections=object_detections(&mut file,&window,size,&strings,&dyld_imports)?;let mut runtime_records=runtime_records;runtime_records.push_str("\n\nC / Apple object detections\n===========================\n");runtime_records.push_str(&object_detections);
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;
  for (source,workspace,kind,text,priority) in [
   ("Analysis Insights","Analysis Insights","Synthesis",analysis_insights.as_str(),100u16),
@@ -954,6 +966,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
   ("Indirect Calls","Indirect Calls","Control Flow",indirect_calls.as_str(),72),
   ("Jump Tables","Jump Tables","Control Flow",jump_tables.as_str(),66),
   ("Strings","Strings","Data",strings.as_str(),44),
+  ("Object Detections","Object Detections","Data",object_detections.as_str(),70),
   ("Runtime Records","Runtime Records","Runtime",runtime_records.as_str(),58),
   ("Swift Types","Swift Types","Semantic",swift_types.as_str(),58),
   ("ObjC Classes","ObjC Classes","Semantic",objc_classes.as_str(),60),

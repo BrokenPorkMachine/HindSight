@@ -1407,6 +1407,11 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
         limited |= (n as u64) < s.size;
         remaining -= n;
         let b = read(file, s.offset, n)?;
+        if s.name == "__cstring" || s.name == "__cfstring" {
+            push(&mut out, &format!("0x{:016x} classification=c-string confidence=section-backed section={} size={} bytes\n", s.address, s.name, s.size));
+        } else if ["__const", "__data", "__data_const", "__bss", "__common"].contains(&s.name.as_str()) {
+            push(&mut out, &format!("0x{:016x} classification=c-data-object confidence=section-backed section={} size={} bytes\n", s.address, s.name, s.size));
+        }
         let mut at = 0;
         while at < b.len() {
             let start = at;
@@ -1415,14 +1420,21 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
             }
             if at - start >= 4 {
                 let text = name(&b[start..at.min(start + 512)]);
+                let lower = text.to_ascii_lowercase();
+                let object_kind = if lower.contains("cfstring") || lower.contains("cfdata") || lower.contains("cfarray") || lower.contains("cfdictionary") || lower.contains("cfurl") || lower.contains("cfuuid") {
+                    Some("CoreFoundation object")
+                } else if lower.contains("nsstring") || lower.contains("nsdata") || lower.contains("nsarray") || lower.contains("nsdictionary") || lower.contains("nsset") || lower.contains("nsurl") || lower.contains("nsnumber") || lower.contains("nsdate") || lower.contains("nserror") || lower.contains("nsobject") {
+                    Some("Foundation object")
+                } else { None };
                 push(
                     &mut out,
                     &format!(
-                        "0x{:016x} file={:#x} ASCII {:?} section={}\n",
+                        "0x{:016x} file={:#x} ASCII {:?} section={}{}\n",
                         s.address + start as u64,
                         s.offset + start as u64,
                         text,
-                        s.name
+                        s.name,
+                        object_kind.map(|kind| format!(" classification={} confidence=string-backed heuristic", kind)).unwrap_or_default()
                     ),
                 );
             }
