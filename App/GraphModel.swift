@@ -1,4 +1,79 @@
 import Foundation
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+
+struct VGCanvasViewport {
+    let contentSize: CGSize
+    let viewportSize: CGSize
+    let zoom: CGFloat
+    var pan: CGSize = .zero
+
+    var origin: CGSize {
+        CGSize(width: (viewportSize.width - contentSize.width * zoom) / 2 + pan.width,
+               height: max(0, (viewportSize.height - contentSize.height * zoom) / 2) + pan.height)
+    }
+
+    var visibleRect: CGRect {
+        let scale = max(zoom, 0.01)
+        return CGRect(
+            x: max(0, -origin.width / scale), y: max(0, -origin.height / scale),
+            width: min(contentSize.width, viewportSize.width / scale),
+            height: min(contentSize.height, viewportSize.height / scale)
+        )
+    }
+
+    func clampedPan(_ candidate: CGSize) -> CGSize {
+        let overflowX = max(0, contentSize.width * zoom - viewportSize.width)
+        let overflowY = max(0, contentSize.height * zoom - viewportSize.height)
+        return CGSize(
+            width: min(overflowX / 2, max(-overflowX / 2, candidate.width)),
+            height: min(0, max(-overflowY, candidate.height))
+        )
+    }
+
+    func pan(centering point: CGPoint) -> CGSize {
+        clampedPan(CGSize(
+            width: (contentSize.width / 2 - point.x) * zoom,
+            height: viewportSize.height / 2 - point.y * zoom
+        ))
+    }
+
+    func fittedZoom(widthOnly: Bool, maximum: CGFloat) -> CGFloat {
+        let widthScale = viewportSize.width / max(contentSize.width, 1)
+        let heightScale = viewportSize.height / max(contentSize.height, 1)
+        return max(0.1, min(maximum, widthScale, widthOnly ? maximum : heightScale))
+    }
+}
+
+struct VGMinimapProjection {
+    let contentSize: CGSize
+    let mapSize: CGSize
+    var padding: CGFloat = 6
+
+    var scale: CGFloat {
+        min(max(1, mapSize.width - padding * 2) / max(contentSize.width, 1),
+            max(1, mapSize.height - padding * 2) / max(contentSize.height, 1))
+    }
+
+    var origin: CGPoint {
+        CGPoint(x: (mapSize.width - contentSize.width * scale) / 2,
+                y: (mapSize.height - contentSize.height * scale) / 2)
+    }
+
+    func project(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: origin.x + point.x * scale, y: origin.y + point.y * scale)
+    }
+
+    func project(_ rect: CGRect) -> CGRect {
+        CGRect(origin: project(rect.origin), size: CGSize(width: rect.width * scale, height: rect.height * scale))
+    }
+
+    func unproject(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: min(contentSize.width, max(0, (point.x - origin.x) / scale)),
+                y: min(contentSize.height, max(0, (point.y - origin.y) / scale)))
+    }
+}
 
 struct VGGraphPoint: Hashable {
     let x: Double
@@ -79,106 +154,117 @@ struct VGCFGGraph {
 
         let visibleIDs = Set(visible.map(\.id))
         let byID = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, $0) })
-        var incoming: [String: Int] = Dictionary(uniqueKeysWithValues: visible.map { ($0.id, 0) })
         var successors: [String: [String]] = [:]
+        var neighbors: [String: [String]] = [:]
 
         for edge in edges where !edge.isCall {
             guard visibleIDs.contains(edge.sourceBlockID), let target = edge.targetBlockID, visibleIDs.contains(target) else { continue }
             successors[edge.sourceBlockID, default: []].append(target)
-            incoming[target, default: 0] += 1
+            neighbors[edge.sourceBlockID, default: []].append(target)
+            neighbors[target, default: []].append(edge.sourceBlockID)
         }
-
-        let orderedRoots = visible.filter { incoming[$0.id, default: 0] == 0 }
-        var queue: [(String, Int)] = orderedRoots.map { ($0.id, 0) }
-        if queue.isEmpty, let first = visible.first { queue = [(first.id, 0)] }
-
-        var level: [String: Int] = [:]
-        var cursor = 0
-        while cursor < queue.count {
-            let (id, depth) = queue[cursor]
-            cursor += 1
-            if let current = level[id], current <= depth { continue }
-            level[id] = depth
-            guard depth < 96 else { continue }
-            for target in successors[id, default: []] where byID[target] != nil {
-                if target == id { continue }
-                let candidate = depth + 1
-                if let existing = level[target] {
-                    if candidate < existing { queue.append((target, candidate)) }
-                } else {
-                    queue.append((target, candidate))
-                }
-            }
-        }
-
-        var nextDisconnectedLevel = (level.values.max() ?? -1) + 1
-        for block in visible where level[block.id] == nil {
-            level[block.id] = nextDisconnectedLevel
-            nextDisconnectedLevel += 1
-        }
-
-        var rowsByLevel: [Int: [VGCFGBlock]] = [:]
-        for block in visible {
-            rowsByLevel[level[block.id, default: 0], default: []].append(block)
-        }
-        for key in rowsByLevel.keys {
-            rowsByLevel[key]?.sort { $0.start < $1.start }
-        }
-
         let nodeWidth = 290.0
         let nodeHeight = 126.0
         let horizontalGap = 54.0
-        // Keep blocks within a function readable while giving adjacent function
-        // lanes a clearly visible separation. The canvas grows to make room.
-        let functionGap = functionStarts.count > 1 ? 260.0 : 0.0
         let verticalGap = 76.0
         let margin = 70.0
-        let maxRowCount = max(1, rowsByLevel.values.map(\.count).max() ?? 1)
-        let functionFor: (UInt64) -> UInt64 = { address in
-            functionStarts.filter { $0 <= address }.max() ?? 0
+        struct ComponentLayout {
+            let positions: [String: VGGraphPoint]
+            let width: Double
+            let height: Double
         }
-        let rowWidth: ([VGCFGBlock]) -> Double = { row in
-            guard !row.isEmpty else { return 0 }
-            let functionBreaks = zip(row, row.dropFirst()).reduce(0) { total, pair in
-                total + (functionFor(pair.0.start) != functionFor(pair.1.start) ? functionGap : 0)
-            }
-            return Double(row.count) * nodeWidth + Double(max(0, row.count - 1)) * horizontalGap + functionBreaks
-        }
-        let canvasWidth = max(760.0, margin * 2 + (rowsByLevel.values.map(rowWidth).max() ?? (Double(maxRowCount) * nodeWidth)))
-        let targetWidth = max(canvasWidth, availableWidth ?? 0)
-        let rowExpansion = max(0, targetWidth - canvasWidth) / Double(max(1, maxRowCount - 1))
-        var positions: [String: VGGraphPoint] = [:]
-        var currentY = margin + nodeHeight / 2
-        var previousFunctions: Set<UInt64> = []
-        let levelCount = rowsByLevel.count
-        let intrinsicHeight = margin * 2 + Double(levelCount) * nodeHeight + Double(max(0, levelCount - 1)) * verticalGap
-        let rowExpansionY = max(0, (availableHeight ?? intrinsicHeight) - intrinsicHeight) / Double(max(1, levelCount - 1))
 
-        for graphLevel in rowsByLevel.keys.sorted() {
-            let row = rowsByLevel[graphLevel] ?? []
-            let rowFunctions = Set(row.map { functionFor($0.start) }.filter { $0 != 0 })
-            if !previousFunctions.isEmpty && !rowFunctions.isEmpty && previousFunctions.isDisjoint(with: rowFunctions) {
-                currentY += functionGap
-            }
-            let width = rowWidth(row) + Double(max(0, row.count - 1)) * rowExpansion
-            let startX = (targetWidth - width) / 2 + nodeWidth / 2
-            var x = startX
-            for (index, block) in row.enumerated() {
-                positions[block.id] = VGGraphPoint(
-                    x: x,
-                    y: currentY
-                )
-                if index + 1 < row.count {
-                    let nextGap = horizontalGap + rowExpansion + (functionFor(block.start) != functionFor(row[index + 1].start) ? functionGap : 0)
-                    x += nodeWidth + nextGap
+        // Keep connected branches in their own layers. Only independent graphs
+        // may wrap; wrapping a branch layer destroys its visible fork/join shape.
+        var remaining = visibleIDs
+        var components: [ComponentLayout] = []
+        for seed in visible where remaining.contains(seed.id) {
+            var members: [String] = [seed.id]
+            remaining.remove(seed.id)
+            var cursor = 0
+            while cursor < members.count {
+                let id = members[cursor]
+                cursor += 1
+                for neighbor in neighbors[id, default: []] where remaining.remove(neighbor) != nil {
+                    members.append(neighbor)
                 }
             }
-            currentY += nodeHeight + verticalGap + rowExpansionY
-            previousFunctions = rowFunctions
+            members.sort { byID[$0]!.start < byID[$1]!.start }
+            var incoming = Dictionary(uniqueKeysWithValues: members.map { ($0, 0) })
+            for id in members {
+                for target in successors[id, default: []] { incoming[target, default: 0] += 1 }
+            }
+            let roots = members.filter { incoming[$0] == 0 || functionStarts.contains(byID[$0]!.start) }
+            var queue = (roots.isEmpty ? [members[0]] : roots).map { ($0, 0) }
+            var levels: [String: Int] = [:]
+            cursor = 0
+            func visitQueue() {
+                while cursor < queue.count {
+                    let (id, depth) = queue[cursor]
+                    cursor += 1
+                    guard levels[id] == nil else { continue }
+                    levels[id] = depth
+                    for target in successors[id, default: []] where levels[target] == nil {
+                        queue.append((target, depth + 1))
+                    }
+                }
+            }
+            visitQueue()
+            for id in members where levels[id] == nil {
+                queue.append((id, 0))
+                visitQueue()
+            }
+            var rows: [Int: [String]] = [:]
+            for id in members { rows[levels[id]!, default: []].append(id) }
+            let columns = rows.values.map(\.count).max() ?? 1
+            let width = Double(columns) * nodeWidth + Double(columns - 1) * horizontalGap
+            let height = Double(rows.count) * nodeHeight + Double(rows.count - 1) * verticalGap
+            var points: [String: VGGraphPoint] = [:]
+            for (depth, row) in rows {
+                let rowWidth = Double(row.count) * nodeWidth + Double(row.count - 1) * horizontalGap
+                for (column, id) in row.enumerated() {
+                    points[id] = VGGraphPoint(
+                        x: (width - rowWidth) / 2 + nodeWidth / 2 + Double(column) * (nodeWidth + horizontalGap),
+                        y: nodeHeight / 2 + Double(depth) * (nodeHeight + verticalGap)
+                    )
+                }
+            }
+            components.append(ComponentLayout(positions: points, width: width, height: height))
         }
 
-        let canvasHeight = max(520.0, currentY - verticalGap + margin + nodeHeight / 2)
-        return VGCFGLayout(positions: positions, width: targetWidth, height: max(canvasHeight, availableHeight ?? 0), visibleBlockIDs: visibleIDs)
+        let componentGap = 64.0
+        let minimumContentWidth = components.count > 1 ? nodeWidth * 2 + componentGap : nodeWidth
+        let targetWidth = max(760, availableWidth ?? 1100, margin * 2 + minimumContentWidth, margin * 2 + (components.map(\.width).max() ?? 0))
+        var shelves: [[ComponentLayout]] = []
+        var shelf: [ComponentLayout] = []
+        var shelfWidth = 0.0
+        for component in components {
+            let addedWidth = component.width + (shelf.isEmpty ? 0 : componentGap)
+            if !shelf.isEmpty && shelfWidth + addedWidth > targetWidth - margin * 2 {
+                shelves.append(shelf)
+                shelf = []
+                shelfWidth = 0
+            }
+            shelfWidth += component.width + (shelf.isEmpty ? 0 : componentGap)
+            shelf.append(component)
+        }
+        if !shelf.isEmpty { shelves.append(shelf) }
+        let contentHeight = shelves.reduce(0.0) { $0 + ($1.map(\.height).max() ?? 0) } + Double(max(0, shelves.count - 1)) * 96
+        let targetHeight = max(520, availableHeight ?? 0, contentHeight + margin * 2)
+        var y = max(margin, (targetHeight - contentHeight) / 2)
+        var positions: [String: VGGraphPoint] = [:]
+        for shelf in shelves {
+            let width = shelf.reduce(0.0) { $0 + $1.width } + Double(shelf.count - 1) * componentGap
+            var x = (targetWidth - width) / 2
+            for component in shelf {
+                for (id, point) in component.positions {
+                    positions[id] = VGGraphPoint(x: x + point.x, y: y + point.y)
+                }
+                x += component.width + componentGap
+            }
+            y += (shelf.map(\.height).max() ?? 0) + 96
+        }
+        return VGCFGLayout(positions: positions, width: targetWidth, height: targetHeight, visibleBlockIDs: visibleIDs)
     }
 }
 

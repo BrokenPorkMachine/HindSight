@@ -3,6 +3,29 @@ import Foundation
 @main
 struct GraphModelContract {
     static func main() {
+        let viewport = VGCanvasViewport(contentSize: CGSize(width: 1000, height: 1200), viewportSize: CGSize(width: 400, height: 600), zoom: 1)
+        precondition(viewport.origin.width == -300)
+        precondition(viewport.visibleRect == CGRect(x: 300, y: 0, width: 400, height: 600))
+        precondition(viewport.clampedPan(CGSize(width: 999, height: -999)) == CGSize(width: 300, height: -600))
+        precondition(viewport.pan(centering: CGPoint(x: 0, y: 0)) == CGSize(width: 300, height: 0))
+        precondition(viewport.pan(centering: CGPoint(x: 1000, y: 1200)) == CGSize(width: -300, height: -600))
+        precondition(viewport.fittedZoom(widthOnly: false, maximum: 1) == 0.4)
+        let smallViewport = VGCanvasViewport(contentSize: CGSize(width: 200, height: 100), viewportSize: CGSize(width: 400, height: 600), zoom: 1)
+        precondition(smallViewport.origin.width == 100)
+        precondition(smallViewport.clampedPan(CGSize(width: 50, height: -50)) == .zero)
+        for contentSize in [CGSize(width: 1000, height: 4000), CGSize(width: 4000, height: 1000)] {
+            let minimap = VGMinimapProjection(contentSize: contentSize, mapSize: CGSize(width: 200, height: 120))
+            let graphCenter = CGPoint(x: contentSize.width / 2, y: contentSize.height / 2)
+            let mapCenter = minimap.project(graphCenter)
+            precondition(abs(mapCenter.x - 100) < 0.000001 && abs(mapCenter.y - 60) < 0.000001,
+                         "tall and wide minimaps must center the graph in both axes")
+            let restored = minimap.unproject(mapCenter)
+            precondition(abs(restored.x - graphCenter.x) < 0.000001 && abs(restored.y - graphCenter.y) < 0.000001,
+                         "minimap navigation must account for the centered origin")
+            precondition(minimap.unproject(.zero) == .zero)
+            let projectedBounds = minimap.project(CGRect(origin: .zero, size: contentSize))
+            precondition(abs(projectedBounds.midX - 100) < 0.000001 && abs(projectedBounds.midY - 60) < 0.000001)
+        }
         let cfg = """
         block B0000 0x0000000100001000..0x0000000100001008
             b.cond      0x0000000100001004 -> 0x0000000100001010
@@ -35,6 +58,12 @@ struct GraphModelContract {
         } else {
             preconditionFailure("missing deterministic positions")
         }
+        let narrow = graph.layout(availableWidth: 480, availableHeight: 700)
+        let leftBranch = narrow.positions["B0001"]!
+        let rightBranch = narrow.positions["B0002"]!
+        precondition(leftBranch.y == rightBranch.y, "narrow viewports must preserve branch siblings on one layer")
+        precondition(rightBranch.x - leftBranch.x >= 290, "branch nodes must remain separate")
+        precondition(narrow.positions["B0000"]!.x == narrow.width / 2, "entry must be centered above its branches")
 
         let funcs = VGGraphParser.functions("""
         0x0000000100001000  0x0000000100001020        32 bytes  _main
@@ -54,6 +83,15 @@ struct GraphModelContract {
 
         let paddedCandidates = VGGraphParser.functions("  0x1030    name=_padded_entry source=nlist")
         precondition(paddedCandidates.count == 1 && paddedCandidates[0].name == "_padded_entry")
+        let entryBlocks = (0..<24).map { index in
+            VGCFGBlock(id: "entry\(index)", start: UInt64(index * 16), end: UInt64(index * 16 + 8), edges: [])
+        }
+        let entries = VGCFGGraph(blocks: entryBlocks, edges: [])
+        let wrapped = entries.layout(availableWidth: 1000, availableHeight: 700)
+        precondition(wrapped.width <= 1000, "entry blocks must not form an unbounded horizontal strip")
+        precondition(Set(wrapped.positions.values.map(\.y)).count == 12)
+        precondition(wrapped.positions.values.allSatisfy { $0.x >= 145 && $0.x + 145 <= wrapped.width })
+        precondition(wrapped.positions["entry2"]!.y > wrapped.positions["entry0"]!.y)
         print("graph model contract passed")
     }
 }

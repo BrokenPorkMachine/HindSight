@@ -173,8 +173,8 @@ struct VGEvidenceGraph: Hashable {
             .function: 440,
             .address: 730,
             .staticEvidence: 730,
-            .reaEvidence: 880,
-            .correlationEvidence: 830,
+            .reaEvidence: 730,
+            .correlationEvidence: 730,
             .runtimeObservation: 1080,
             .memoryObservation: 1360,
             .analystNote: 730,
@@ -194,34 +194,20 @@ struct VGEvidenceGraph: Hashable {
         let rowGap = 92.0
         var positions: [String: VGEvidenceGraphPoint] = [:]
         var maxRows = 1
+        var rowsByLane: [Double: Int] = [:]
         for kind in laneOrder {
             let items = grouped[kind] ?? []
-            maxRows = max(maxRows, items.count)
             let x = laneX[kind] ?? 730
+            let startRow = rowsByLane[x, default: 0]
             for (index, node) in items.enumerated() {
-                var y = top + Double(index) * rowGap
-                let analystBase = max(1, (grouped[.staticEvidence] ?? []).count + (grouped[.address] ?? []).count)
-                if kind == .analystNote {
-                    y = top + Double(analystBase) * rowGap + Double(index) * rowGap
-                } else if kind == .analystHypothesis {
-                    y = top + Double(analystBase + (grouped[.analystNote] ?? []).count) * rowGap + Double(index) * rowGap
-                }
+                let y = top + Double(startRow + index) * rowGap
                 positions[node.id] = VGEvidenceGraphPoint(x: x, y: y)
             }
-        }
-
-        let staticCount = (grouped[.staticEvidence] ?? []).count
-        let addressCount = (grouped[.address] ?? []).count
-        let analystCount = (grouped[.analystNote] ?? []).count + (grouped[.analystHypothesis] ?? []).count
-        let analystStartRow = max(1, staticCount + addressCount)
-        let analystBottom: Double
-        if analystCount > 0 {
-            analystBottom = top + Double(analystStartRow + analystCount - 1) * rowGap
-        } else {
-            analystBottom = 0
+            rowsByLane[x] = startRow + items.count
+            maxRows = max(maxRows, startRow + items.count)
         }
         let regularBottom = top + Double(maxRows) * rowGap + 90
-        let height = max(620, max(regularBottom, analystBottom + 120))
+        let height = max(620, regularBottom)
         return VGEvidenceGraphLayout(
             positions: positions,
             width: 1500,

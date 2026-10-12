@@ -31,6 +31,7 @@ struct VGGraphWorkspace: View {
     @State private var graph: VGCFGGraph
     @State private var functions: [VGFunctionRecord]
     @State private var layout: VGCFGLayout
+    @State private var graphViewportSize: CGSize = .zero
     @State private var mapOffset: CGSize = .zero
     @State private var mapOffsetAnchor: CGSize = .zero
 
@@ -69,12 +70,15 @@ struct VGGraphWorkspace: View {
     private var debugPCValue: UInt64? { debugPC.flatMap { VGGraphParser.address(from: $0) } }
 
     private func relayout(for viewport: CGSize) {
+        guard viewport.width > 1, viewport.height > 1 else { return }
+        graphViewportSize = viewport
         layout = graph.layout(
             limit: 240,
             functionStarts: Set(functions.map(\.start)),
-            availableWidth: Double(viewport.width / max(zoom, 0.01)),
-            availableHeight: Double(viewport.height / max(zoom, 0.01))
+            availableWidth: Double(viewport.width / 0.85),
+            availableHeight: Double(viewport.height / 0.85)
         )
+        fitGraph(widthOnly: true)
     }
 
     private var selectedBlock: VGCFGBlock? {
@@ -115,19 +119,33 @@ struct VGGraphWorkspace: View {
         .onChange(of: cfgText) { _, newValue in
             let parsedFunctions = VGGraphParser.functions(functionsText)
             functions = parsedFunctions
-            graph = VGGraphParser.cfg(newValue, functionStarts: Set(parsedFunctions.map(\.start)))
-            layout = graph.layout(limit: 240, functionStarts: Set(parsedFunctions.map(\.start)))
+            let parsedGraph = VGGraphParser.cfg(newValue, functionStarts: Set(parsedFunctions.map(\.start)))
+            graph = parsedGraph
+            layout = parsedGraph.layout(
+                limit: 240,
+                functionStarts: Set(parsedFunctions.map(\.start)),
+                availableWidth: graphViewportSize.width > 1 ? Double(graphViewportSize.width / 0.85) : nil,
+                availableHeight: graphViewportSize.height > 1 ? Double(graphViewportSize.height / 0.85) : nil
+            )
             mapOffset = .zero
             mapOffsetAnchor = .zero
+            fitGraph(widthOnly: true)
             synchronizeSelection()
         }
         .onChange(of: functionsText) { _, newValue in
             let parsedFunctions = VGGraphParser.functions(newValue)
             functions = parsedFunctions
-            graph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
-            layout = graph.layout(limit: 240, functionStarts: Set(parsedFunctions.map(\.start)))
+            let parsedGraph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
+            graph = parsedGraph
+            layout = parsedGraph.layout(
+                limit: 240,
+                functionStarts: Set(parsedFunctions.map(\.start)),
+                availableWidth: graphViewportSize.width > 1 ? Double(graphViewportSize.width / 0.85) : nil,
+                availableHeight: graphViewportSize.height > 1 ? Double(graphViewportSize.height / 0.85) : nil
+            )
             mapOffset = .zero
             mapOffsetAnchor = .zero
+            fitGraph(widthOnly: true)
             synchronizeSelection()
         }
         .onChange(of: selectedAddress) { _, _ in synchronizeSelection() }
@@ -156,15 +174,11 @@ struct VGGraphWorkspace: View {
                         get: { Double(zoom) },
                         set: { setZoom(CGFloat($0)) }
                     ),
-                    in: 0.35...1.8
+                    in: 0.1...1.8
                 )
                 .frame(width: 92)
                 .help("Graph zoom")
-                Button("Fit") {
-                    setZoom(0.72)
-                    mapOffset = .zero
-                    mapOffsetAnchor = .zero
-                }
+                Button("Fit") { fitGraph(widthOnly: false) }
                 .controlSize(.small)
             }
         }
@@ -249,7 +263,7 @@ struct VGGraphWorkspace: View {
     private var graphCanvas: some View {
         GeometryReader { proxy in
             ZStack(alignment: .bottomTrailing) {
-                ScrollView([.horizontal, .vertical]) {
+                VGCanvasSurface(viewport: canvasViewport(proxy.size)) {
                     ZStack(alignment: .topLeading) {
                         edgeCanvas
                         ForEach(graph.blocks.filter { layout.visibleBlockIDs.contains($0.id) }) { block in
@@ -259,20 +273,15 @@ struct VGGraphWorkspace: View {
                             }
                         }
                     }
-                    .frame(width: CGFloat(layout.width), height: CGFloat(layout.height), alignment: .topLeading)
-                    .scaleEffect(zoom, anchor: .topLeading)
-                    .frame(width: CGFloat(layout.width) * zoom, height: CGFloat(layout.height) * zoom, alignment: .topLeading)
-                    .offset(mapOffset)
-                    .gesture(
-                        MagnificationGesture()
-                            .onChanged { value in
-                                zoom = clampZoom(zoomAnchor * value)
-                            }
-                            .onEnded { _ in zoomAnchor = zoom }
-                    )
                 }
+                .gesture(
+                    MagnificationGesture()
+                        .onChanged { value in
+                            zoom = clampZoom(zoomAnchor * value)
+                        }
+                        .onEnded { _ in zoomAnchor = zoom }
+                )
                 .simultaneousGesture(mapPanGesture)
-                .scrollDisabled(true)
                 .background {
                     Canvas { context, size in
                         let step: CGFloat = 22
@@ -297,9 +306,11 @@ struct VGGraphWorkspace: View {
             }
             .onAppear { relayout(for: proxy.size) }
             .onChange(of: proxy.size) { _, newSize in relayout(for: newSize) }
-            .onChange(of: zoom) { _, _ in relayout(for: proxy.size) }
+            .onChange(of: zoom) { _, _ in
+                mapOffset = clampedMapOffset(mapOffset, viewportSize: proxy.size)
+                mapOffsetAnchor = mapOffset
+            }
         }
-        .frame(minWidth: 480, minHeight: 520)
     }
 
     private var edgeCanvas: some View {
@@ -530,18 +541,9 @@ struct VGGraphWorkspace: View {
     }
 
     private func minimap(viewportSize: CGSize) -> some View {
-        let scale = minimapScale
-        let zoomValue = max(zoom, 0.01)
-        let visibleX = max(0, min(layout.width, Double(-mapOffset.width / zoomValue)))
-        let visibleY = max(0, min(layout.height, Double(-mapOffset.height / zoomValue)))
-        let visibleWidth = min(layout.width, Double(viewportSize.width / zoomValue))
-        let visibleHeight = min(layout.height, Double(viewportSize.height / zoomValue))
-        let viewportRect = CGRect(
-            x: 6 + CGFloat(visibleX) * scale,
-            y: 6 + CGFloat(visibleY) * scale,
-            width: max(8, CGFloat(visibleWidth) * scale),
-            height: max(8, CGFloat(visibleHeight) * scale)
-        )
+        let projection = minimapProjection
+        let visible = canvasViewport(viewportSize).visibleRect
+        let viewportRect = projection.project(visible)
         return ZStack {
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(.ultraThickMaterial)
@@ -552,26 +554,26 @@ struct VGGraphWorkspace: View {
                           let target = layout.positions[targetID],
                           layout.visibleBlockIDs.contains(edge.sourceBlockID), layout.visibleBlockIDs.contains(targetID) else { continue }
                     var path = Path()
-                    path.move(to: CGPoint(x: CGFloat(source.x) * scale, y: CGFloat(source.y) * scale))
-                    path.addLine(to: CGPoint(x: CGFloat(target.x) * scale, y: CGFloat(target.y) * scale))
+                    path.move(to: projection.project(CGPoint(x: source.x, y: source.y)))
+                    path.addLine(to: projection.project(CGPoint(x: target.x, y: target.y)))
                     context.stroke(path, with: .color(Color.secondary.opacity(0.20)), lineWidth: 0.5)
                 }
                 for block in graph.blocks where layout.visibleBlockIDs.contains(block.id) {
                     guard let point = layout.positions[block.id] else { continue }
                     let selected = selectedBlock?.id == block.id
                     let executing = debugPCValue.map(block.contains) ?? false
-                    let rect = CGRect(x: CGFloat(point.x) * scale - 2.4, y: CGFloat(point.y) * scale - 1.7, width: 4.8, height: 3.4)
+                    let projected = projection.project(CGPoint(x: point.x, y: point.y))
+                    let rect = CGRect(x: projected.x - 2.4, y: projected.y - 1.7, width: 4.8, height: 3.4)
                     context.fill(Path(ellipseIn: rect), with: .color(executing ? Color.red : selected ? Color.accentColor : Color.primary.opacity(0.38)))
                 }
             }
-            .padding(6)
             RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(Color.accentColor.opacity(0.08))
                 .overlay {
                     RoundedRectangle(cornerRadius: 3, style: .continuous)
                         .stroke(Color.accentColor.opacity(0.88), lineWidth: 1.5)
                 }
-                .frame(width: viewportRect.width, height: viewportRect.height)
+                .frame(width: max(8, viewportRect.width), height: max(8, viewportRect.height))
                 .position(x: viewportRect.midX, y: viewportRect.midY)
                 .allowsHitTesting(false)
         }
@@ -584,10 +586,8 @@ struct VGGraphWorkspace: View {
         )
     }
 
-    private var minimapScale: CGFloat {
-        let widthScale = 176 / max(CGFloat(layout.width), 1)
-        let heightScale = 106 / max(CGFloat(layout.height), 1)
-        return min(widthScale, heightScale)
+    private var minimapProjection: VGMinimapProjection {
+        VGMinimapProjection(contentSize: CGSize(width: layout.width, height: layout.height), mapSize: CGSize(width: 190, height: 120))
     }
 
     private func edgeBadge(_ edge: VGCFGEdge) -> String {
@@ -608,27 +608,27 @@ struct VGGraphWorkspace: View {
     }
 
     private func clampZoom(_ value: CGFloat) -> CGFloat {
-        min(max(value, 0.35), 1.8)
+        min(max(value, 0.1), 1.8)
     }
 
     private func jumpToMinimap(_ location: CGPoint, viewportSize: CGSize) {
-        let scale = minimapScale
-        let graphX = max(0, min(layout.width, Double((location.x - 6) / max(scale, 0.001))))
-        let graphY = max(0, min(layout.height, Double((location.y - 6) / max(scale, 0.001))))
-        let visibleWidth = min(layout.width, Double(viewportSize.width / max(zoom, 0.01)))
-        let visibleHeight = min(layout.height, Double(viewportSize.height / max(zoom, 0.01)))
-        let targetOffset = CGSize(
-            width: CGFloat(-(graphX - visibleWidth / 2) * Double(zoom)),
-            height: CGFloat(-(graphY - visibleHeight / 2) * Double(zoom))
-        )
-        mapOffset = clampedMapOffset(targetOffset, viewportSize: viewportSize)
+        mapOffset = canvasViewport(viewportSize).pan(centering: minimapProjection.unproject(location))
         mapOffsetAnchor = mapOffset
     }
 
     private func clampedMapOffset(_ offset: CGSize, viewportSize: CGSize) -> CGSize {
-        let maxX = max(0, CGFloat(layout.width) * zoom - viewportSize.width)
-        let maxY = max(0, CGFloat(layout.height) * zoom - viewportSize.height)
-        return CGSize(width: min(0, max(-maxX, offset.width)), height: min(0, max(-maxY, offset.height)))
+        canvasViewport(viewportSize).clampedPan(offset)
+    }
+
+    private func canvasViewport(_ size: CGSize) -> VGCanvasViewport {
+        VGCanvasViewport(contentSize: CGSize(width: layout.width, height: layout.height), viewportSize: size, zoom: zoom, pan: mapOffset)
+    }
+
+    private func fitGraph(widthOnly: Bool) {
+        guard graphViewportSize.width > 1, graphViewportSize.height > 1 else { return }
+        setZoom(canvasViewport(graphViewportSize).fittedZoom(widthOnly: widthOnly, maximum: widthOnly ? 0.85 : 1))
+        mapOffset = .zero
+        mapOffsetAnchor = .zero
     }
 
     private func setZoom(_ value: CGFloat) {
@@ -639,10 +639,10 @@ struct VGGraphWorkspace: View {
     private var mapPanGesture: some Gesture {
         DragGesture(minimumDistance: 4)
             .onChanged { value in
-                mapOffset = CGSize(
+                mapOffset = clampedMapOffset(CGSize(
                     width: mapOffsetAnchor.width + value.translation.width,
                     height: mapOffsetAnchor.height + value.translation.height
-                )
+                ), viewportSize: graphViewportSize)
             }
             .onEnded { _ in mapOffsetAnchor = mapOffset }
     }

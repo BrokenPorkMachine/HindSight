@@ -1,5 +1,28 @@
 import SwiftUI
 
+struct VGCanvasSurface<Content: View>: View {
+    let viewport: VGCanvasViewport
+    let content: Content
+
+    init(viewport: VGCanvasViewport, @ViewBuilder content: () -> Content) {
+        self.viewport = viewport
+        self.content = content()
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            content
+                .frame(width: viewport.contentSize.width, height: viewport.contentSize.height, alignment: .topLeading)
+                .scaleEffect(viewport.zoom, anchor: .topLeading)
+                .frame(width: viewport.contentSize.width * viewport.zoom, height: viewport.contentSize.height * viewport.zoom, alignment: .topLeading)
+                .offset(viewport.origin)
+        }
+        .frame(width: viewport.viewportSize.width, height: viewport.viewportSize.height, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .clipped()
+    }
+}
+
 struct VGPanelGroupBoxStyle: GroupBoxStyle {
     func makeBody(configuration: Configuration) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -397,14 +420,17 @@ struct VGAdaptiveThreePane<Leading: View, Center: View, Trailing: View>: View {
 
     var body: some View {
         GeometryReader { proxy in
-            switch VGAdaptiveLayoutMode.resolve(width: proxy.size.width, wideBreakpoint: wideBreakpoint, compactBreakpoint: compactBreakpoint) {
-            case .wide:
-                wideLayout
-            case .medium:
-                mediumLayout
-            case .compact:
-                compactLayout
+            Group {
+                switch VGAdaptiveLayoutMode.resolve(width: proxy.size.width, wideBreakpoint: wideBreakpoint, compactBreakpoint: compactBreakpoint) {
+                case .wide:
+                    wideLayout
+                case .medium:
+                    mediumLayout
+                case .compact:
+                    compactLayout
+                }
             }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
     }
 
@@ -525,17 +551,20 @@ struct VGAdaptiveTwoPane<Primary: View, Secondary: View>: View {
 
     var body: some View {
         GeometryReader { proxy in
-            if proxy.size.width >= breakpoint {
-                HSplitView {
-                    primary.frame(minWidth: 280)
-                    secondary.frame(minWidth: 280)
-                }
-            } else {
-                VSplitView {
-                    primary.frame(minHeight: 160)
-                    secondary.frame(minHeight: 160)
+            Group {
+                if proxy.size.width >= breakpoint {
+                    HSplitView {
+                        primary.frame(minWidth: 280)
+                        secondary.frame(minWidth: 280)
+                    }
+                } else {
+                    VSplitView {
+                        primary.frame(minHeight: 160)
+                        secondary.frame(minHeight: 160)
+                    }
                 }
             }
+            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
         }
     }
 }

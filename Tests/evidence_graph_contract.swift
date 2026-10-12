@@ -52,6 +52,13 @@ struct EvidenceGraphContract {
         let layout = graph.layout()
         precondition(layout.positions.count == graph.nodes.count)
         precondition(layout.width >= 1200 && layout.height >= 620)
+        let points = Array(layout.positions.values)
+        for index in points.indices {
+            for other in points.indices where other > index {
+                precondition(abs(points[index].x - points[other].x) >= 218 || abs(points[index].y - points[other].y) >= 72,
+                             "evidence cards sharing a lane must not overlap")
+            }
+        }
         print("evidence graph contract passed: \(graph.nodes.count) nodes, \(graph.edges.count) edges")
     }
 }
