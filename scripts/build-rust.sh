@@ -14,7 +14,8 @@ export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 export CC="$(/usr/bin/xcrun --sdk macosx -f clang)"
 export AR="$(/usr/bin/xcrun --sdk macosx -f ar)"
 
-if [[ -n "${CONFIGURATION_TEMP_DIR:-}" ]]; then work_root="$CONFIGURATION_TEMP_DIR/HindSightRust"
+if [[ -n "${HINDSIGHT_CARGO_TARGET_DIR:-}" ]]; then work_root="$HINDSIGHT_CARGO_TARGET_DIR"
+elif [[ -n "${CONFIGURATION_TEMP_DIR:-}" ]]; then work_root="$CONFIGURATION_TEMP_DIR/HindSightRust"
 elif [[ -n "${DERIVED_FILE_DIR:-}" ]]; then work_root="$DERIVED_FILE_DIR/HindSightRust"
 else work_root="$ROOT/build"; fi
 export CARGO_TARGET_DIR="$work_root/target"
