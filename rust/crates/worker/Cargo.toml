@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 reworkbench-protocol = { path = "../protocol" }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+lzvn = "0.1.1"

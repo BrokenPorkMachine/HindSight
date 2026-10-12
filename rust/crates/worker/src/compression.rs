@@ -145,7 +145,7 @@ fn lzss(input: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn zip_entries(input: &[u8]) -> Vec<&[u8]> {
+fn zip_entries(input: &[u8]) -> Vec<(u16, &[u8])> {
     let mut entries = Vec::new();
     let mut at = 0usize;
     while at + 30 <= input.len() && entries.len() < MAX_ZIP_ENTRIES {
@@ -166,11 +166,34 @@ fn zip_entries(input: &[u8]) -> Vec<&[u8]> {
             break;
         }
         if method == 0 {
-            entries.push(&input[start..end]);
+            entries.push((method, &input[start..end]));
         }
         at = end;
     }
     entries
+}
+
+fn deflate_decode(input: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = flate2::read::DeflateDecoder::new(input);
+    let mut output = Vec::new();
+    let mut limited = (&mut decoder).take((MAX_OUTPUT + 1) as u64);
+    limited.read_to_end(&mut output).ok()?;
+    (output.len() <= MAX_OUTPUT).then_some(output)
+}
+
+fn zip_payloads(input: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    zip_entries(input)
+        .into_iter()
+        .filter_map(|(method, bytes)| {
+            let payload = match method {
+                0 => Some(bytes.to_vec()),
+                8 => deflate_decode(bytes),
+                _ => None,
+            }?;
+            Some((method, payload))
+        })
+        .collect()
 }
 
 pub fn zip_inventory(input: &[u8]) -> String {
@@ -214,7 +237,7 @@ pub fn zip_inventory(input: &[u8]) -> String {
 /// Decode a bounded Apple payload and return the first result that contains a
 /// Mach-O header. The returned scheme is evidence, not an assertion that an
 /// encrypted or signed container was validly authenticated.
-pub fn decode_payload(input: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+fn decode_payload_inner(input: &[u8], depth: usize) -> Option<(&'static str, Vec<u8>)> {
     if input.len() > 8 * 1024 * 1024 * 1024 {
         return None;
     }
@@ -235,7 +258,19 @@ pub fn decode_payload(input: &[u8]) -> Option<(&'static str, Vec<u8>)> {
             }
         }
     }
-    bodies.extend(zip_entries(input));
+    for (_, entry) in zip_entries(input) {
+        bodies.push(entry);
+    }
+
+    if let Some(offset) = input.windows(4).position(|window| window == b"bvxn") {
+        if let Ok(decoded) = lzvn::decode_bvxn(&input[offset..]) {
+            if decoded.len() <= MAX_OUTPUT {
+                if let Some(macho) = macho_offset(&decoded) {
+                    return Some(("bvxn-LZVN", decoded[macho..].to_vec()));
+                }
+            }
+        }
+    }
 
     let algorithms = [
         ("LZFSE", 0x801),
@@ -254,7 +289,24 @@ pub fn decode_payload(input: &[u8]) -> Option<(&'static str, Vec<u8>)> {
         }
     }
     let lzss_input = input.strip_prefix(b"complzss").unwrap_or(input);
-    lzss(lzss_input).map(|decoded| ("complzss-LZSS", decoded))
+    if let Some(decoded) = lzss(lzss_input) {
+        return Some(("complzss-LZSS", decoded));
+    }
+    if depth < 2 {
+        for (method, payload) in zip_payloads(input) {
+            if let Some(offset) = macho_offset(&payload) {
+                return Some((if method == 0 { "IPSW-stored" } else { "IPSW-deflate" }, payload[offset..].to_vec()));
+            }
+            if let Some((scheme, decoded)) = decode_payload_inner(&payload, depth + 1) {
+                return Some((scheme, decoded));
+            }
+        }
+    }
+    None
+}
+
+pub fn decode_payload(input: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    decode_payload_inner(input, 0)
 }
 
 pub fn marker_name(input: &[u8]) -> &'static str {
@@ -298,8 +350,27 @@ mod tests {
         zip.extend_from_slice(&(5u16).to_le_bytes());
         zip.extend_from_slice(&(0u16).to_le_bytes());
         zip.extend_from_slice(b"x.binTEST");
-        assert_eq!(zip_entries(&zip), vec![b"TEST".as_slice()]);
+        assert_eq!(zip_entries(&zip), vec![(0, b"TEST".as_slice())]);
         assert!(zip_inventory(&zip).contains("entry=\"x.bin\""));
+    }
+
+    #[test]
+    fn raw_deflate_round_trips_with_output_budget() {
+        use std::io::Write;
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"Apple firmware payload").unwrap();
+        let encoded = encoder.finish().unwrap();
+        assert_eq!(deflate_decode(&encoded).as_deref(), Some(b"Apple firmware payload".as_slice()));
+    }
+
+    #[test]
+    fn bvxn_lzvn_decodes_a_macho_candidate() {
+        let mut plaintext = vec![0xcf, 0xfa, 0xed, 0xfe];
+        plaintext.extend_from_slice(b"kernel");
+        let encoded = lzvn::encode_bvxn(&plaintext).unwrap();
+        let (scheme, decoded) = decode_payload(&encoded).unwrap();
+        assert_eq!(scheme, "bvxn-LZVN");
+        assert_eq!(decoded, plaintext);
     }
 
     #[test]

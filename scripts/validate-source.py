@@ -861,11 +861,14 @@ for script in (R/'scripts').glob('*.sh'):
     subprocess.run(['bash','-n',str(script)],check=True)
     assert os.access(script,os.X_OK),script
 manifest=tomllib.loads((R/'rust/Cargo.toml').read_text())
+approved_external_dependencies={'flate2','lzvn'}
 for member in manifest['workspace']['members']:
     config=tomllib.loads((R/'rust'/member/'Cargo.toml').read_text())
-    for dep in config.get('dependencies',{}).values():
-        assert 'path' in dep,'Scaffold must have only local dependencies'
-        assert (R/'rust'/member/dep['path']/'Cargo.toml').is_file()
+    for name, dep in config.get('dependencies',{}).items():
+        if 'path' in dep:
+            assert (R/'rust'/member/dep['path']/'Cargo.toml').is_file()
+        else:
+            assert name in approved_external_dependencies, f'Unapproved external dependency: {name}'
 env=dict(os.environ,PYTHONPATH=str(R/'python'),PYTHONDONTWRITEBYTECODE='1')
 subprocess.run([sys.executable,'-m','unittest','discover','-s',str(R/'python/tests'),'-v'],env=env,check=True)
 # Portable Swift validation when a Swift compiler is available. Parsing catches syntax

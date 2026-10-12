@@ -11,6 +11,8 @@
 
 - Add bounded Apple firmware container/codec detection and macOS Compression.framework decoding for LZFSE, LZ4, LZMA, and zlib, plus guarded legacy `complzss`/LZSS handling.
 - Add bounded IPSW ZIP local-entry inventory and stored-entry payload candidates; deflate/encrypted entries remain explicit inventory-only evidence.
+- Add bounded raw-deflate decoding for IPSW local entries, including recursive handoff to nested IM4P/compressed payload candidates.
+- Add safe bounded `bvxn`/LZVN decoding with a known-good Mach-O candidate test.
 - Add heuristic XNU/SEP kernel function-name candidates from nearby strings with explicit provenance.
 
 # 0.5.8 — Pressure-Aware Launch and Enterprise Operations
