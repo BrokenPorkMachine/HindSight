@@ -144,27 +144,33 @@ struct VGCFGGraph {
         }
         let canvasWidth = max(760.0, margin * 2 + (rowsByLevel.values.map(rowWidth).max() ?? (Double(maxRowCount) * nodeWidth)))
         var positions: [String: VGGraphPoint] = [:]
+        var currentY = margin + nodeHeight / 2
+        var previousFunctions: Set<UInt64> = []
 
         for graphLevel in rowsByLevel.keys.sorted() {
             let row = rowsByLevel[graphLevel] ?? []
+            let rowFunctions = Set(row.map { functionFor($0.start) }.filter { $0 != 0 })
+            if !previousFunctions.isEmpty && !rowFunctions.isEmpty && previousFunctions.isDisjoint(with: rowFunctions) {
+                currentY += functionGap
+            }
             let width = rowWidth(row)
             let startX = (canvasWidth - width) / 2 + nodeWidth / 2
-            let y = margin + nodeHeight / 2 + Double(graphLevel) * (nodeHeight + verticalGap)
             var x = startX
             for (index, block) in row.enumerated() {
                 positions[block.id] = VGGraphPoint(
                     x: x,
-                    y: y
+                    y: currentY
                 )
                 if index + 1 < row.count {
                     let nextGap = horizontalGap + (functionFor(block.start) != functionFor(row[index + 1].start) ? functionGap : 0)
                     x += nodeWidth + nextGap
                 }
             }
+            currentY += nodeHeight + verticalGap
+            previousFunctions = rowFunctions
         }
 
-        let maxLevel = rowsByLevel.keys.max() ?? 0
-        let canvasHeight = max(520.0, margin * 2 + Double(maxLevel + 1) * nodeHeight + Double(maxLevel) * verticalGap)
+        let canvasHeight = max(520.0, currentY - verticalGap + margin + nodeHeight / 2)
         return VGCFGLayout(positions: positions, width: canvasWidth, height: canvasHeight, visibleBlockIDs: visibleIDs)
     }
 }
