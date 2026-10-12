@@ -165,7 +165,7 @@ fn zip_entries(input: &[u8]) -> Vec<(u16, &[u8])> {
         if end > input.len() {
             break;
         }
-        if matches!(method, 0 | 8) {
+        if matches!(method, 0 | 8) && flags & 1 == 0 {
             entries.push((method, &input[start..end]));
         }
         at = end;
@@ -180,6 +180,56 @@ fn deflate_decode(input: &[u8]) -> Option<Vec<u8>> {
     let mut limited = (&mut decoder).take((MAX_OUTPUT + 1) as u64);
     limited.read_to_end(&mut output).ok()?;
     (output.len() <= MAX_OUTPUT).then_some(output)
+}
+
+fn zipcrypto_crc32(mut crc: u32, byte: u8) -> u32 {
+    crc ^= byte as u32;
+    for _ in 0..8 {
+        crc = if crc & 1 != 0 {
+            (crc >> 1) ^ 0xedb8_8320
+        } else {
+            crc >> 1
+        };
+    }
+    crc
+}
+
+fn zipcrypto_update(keys: &mut [u32; 3], byte: u8) {
+    keys[0] = zipcrypto_crc32(keys[0], byte);
+    keys[1] = keys[1]
+        .wrapping_add(keys[0] & 0xff)
+        .wrapping_mul(134_775_813)
+        .wrapping_add(1);
+    keys[2] = zipcrypto_crc32(keys[2], (keys[1] >> 24) as u8);
+}
+
+fn zipcrypto_decrypt(input: &[u8], password: &[u8], check: u8) -> Option<Vec<u8>> {
+    if password.is_empty() || input.len() < 12 {
+        return None;
+    }
+    let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
+    for &byte in password {
+        zipcrypto_update(&mut keys, byte);
+    }
+    let mut plain = Vec::with_capacity(input.len() - 12);
+    for (index, &encrypted) in input.iter().enumerate() {
+        let temp = ((keys[2] | 2).wrapping_mul((keys[2] | 2) ^ 1) >> 8) as u8;
+        let byte = encrypted ^ temp;
+        zipcrypto_update(&mut keys, byte);
+        if index == 11 {
+            if byte != check {
+                return None;
+            }
+        } else if index >= 12 {
+            plain.push(byte);
+        }
+    }
+    Some(plain)
+}
+
+fn zip_password() -> Option<Vec<u8>> {
+    std::env::var_os("HINDSIGHT_ZIP_PASSWORD")
+        .map(|value| value.to_string_lossy().as_bytes().to_vec())
 }
 
 fn zip_payloads(input: &[u8]) -> Vec<(u16, Vec<u8>)> {
@@ -225,7 +275,7 @@ fn zip_payloads(input: &[u8]) -> Vec<(u16, Vec<u8>)> {
         let comment_len = u16::from_le_bytes([input[at + 32], input[at + 33]]) as usize;
         let local_offset = u32::from_le_bytes(input[at + 42..at + 46].try_into().unwrap()) as usize;
         let next = at.saturating_add(46 + name_len + extra_len + comment_len);
-        if next > directory_end || name_len == 0 || name_len > MAX_ZIP_NAME || flags & 1 != 0 {
+        if next > directory_end || name_len == 0 || name_len > MAX_ZIP_NAME {
             break;
         }
         if local_offset + 30 > input.len() || &input[local_offset..local_offset + 4] != b"PK\x03\x04" {
@@ -240,7 +290,29 @@ fn zip_payloads(input: &[u8]) -> Vec<(u16, Vec<u8>)> {
             continue;
         }
         let data = &input[data_start..data_end];
-        let decoded = if method == 0 { Some(data.to_vec()) } else { deflate_decode(data) };
+        let data = if flags & 1 != 0 {
+            let Some(password) = zip_password() else {
+                at = next;
+                continue;
+            };
+            let check = if flags & 8 != 0 {
+                input[local_offset + 11]
+            } else {
+                input[local_offset + 17]
+            };
+            let Some(data) = zipcrypto_decrypt(data, &password, check) else {
+                at = next;
+                continue;
+            };
+            data
+        } else {
+            data.to_vec()
+        };
+        let decoded = if method == 0 {
+            Some(data)
+        } else {
+            deflate_decode(&data)
+        };
         if let Some(decoded) = decoded {
             payloads.push((method, decoded));
         }
@@ -476,6 +548,67 @@ mod tests {
         zip.extend_from_slice(&(directory_offset as u32).to_le_bytes());
         zip.extend_from_slice(&[0; 2]);
         assert_eq!(zip_payloads(&zip), vec![(0, payload.to_vec())]);
+    }
+
+    #[test]
+    fn zipcrypto_entries_require_and_accept_the_explicit_password() {
+        let password = b"secret";
+        let name = b"kernelcache";
+        let payload = b"TEST";
+        let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
+        for &byte in password {
+            zipcrypto_update(&mut keys, byte);
+        }
+        let mut encrypted = Vec::new();
+        for byte in 0..11u8 {
+            let temp = ((keys[2] | 2).wrapping_mul((keys[2] | 2) ^ 1) >> 8) as u8;
+            encrypted.push(byte ^ temp);
+            zipcrypto_update(&mut keys, byte);
+        }
+        let temp = ((keys[2] | 2).wrapping_mul((keys[2] | 2) ^ 1) >> 8) as u8;
+        encrypted.push(temp); // CRC high byte is zero in this fixture.
+        zipcrypto_update(&mut keys, 0);
+        for &byte in payload {
+            let temp = ((keys[2] | 2).wrapping_mul((keys[2] | 2) ^ 1) >> 8) as u8;
+            encrypted.push(byte ^ temp);
+            zipcrypto_update(&mut keys, byte);
+        }
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&[20, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(encrypted.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(&encrypted);
+        let directory_offset = zip.len();
+        zip.extend_from_slice(b"PK\x01\x02");
+        zip.extend_from_slice(&[20, 0, 20, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(encrypted.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(name);
+        let directory_size = zip.len() - directory_offset;
+        zip.extend_from_slice(b"PK\x05\x06");
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(1u16).to_le_bytes());
+        zip.extend_from_slice(&(1u16).to_le_bytes());
+        zip.extend_from_slice(&(directory_size as u32).to_le_bytes());
+        zip.extend_from_slice(&(directory_offset as u32).to_le_bytes());
+        zip.extend_from_slice(&[0; 2]);
+        std::env::set_var("HINDSIGHT_ZIP_PASSWORD", "secret");
+        assert_eq!(zip_payloads(&zip), vec![(0, payload.to_vec())]);
+        std::env::remove_var("HINDSIGHT_ZIP_PASSWORD");
+        assert!(zip_payloads(&zip).is_empty());
     }
 
     #[test]

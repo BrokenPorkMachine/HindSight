@@ -75,6 +75,10 @@ python3 scripts/qualify-firmware-fixtures.py \
 The gate verifies bounded capture, source SHA-256 preservation, container structure,
 and worker status for every fixture. It does not promote an unsigned or encrypted
 artifact to authenticated plaintext without the required Apple credentials.
+For legacy ZipCrypto fixtures only, provide `HINDSIGHT_ZIP_PASSWORD` in the worker
+environment; passwords are never written to the report. AES-encrypted ZIP fixtures
+remain a deliberate failure until a vetted AES implementation and key-handling
+contract are supplied.
 
 ## Manual distribution matrix
 
