@@ -62,6 +62,20 @@ Reports are written below `build/release-reports/<timestamp>-<mode>/`. The comma
 does not claim the real-target or memory-pressure matrix passed; it creates a
 checklist for those host-specific steps.
 
+For supplied IPSW/IMG3/IMG4/SEP fixtures, run the worker-backed container gate and
+retain its JSON report with the release evidence:
+
+```bash
+python3 scripts/qualify-firmware-fixtures.py \
+  /absolute/path/to/reworker \
+  /absolute/path/to/firmware-fixtures \
+  --report build/release-reports/firmware-qualification.json
+```
+
+The gate verifies bounded capture, source SHA-256 preservation, container structure,
+and worker status for every fixture. It does not promote an unsigned or encrypted
+artifact to authenticated plaintext without the required Apple credentials.
+
 ## Manual distribution matrix
 
 Before distributing 0.5.9, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
