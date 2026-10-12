@@ -199,6 +199,9 @@ struct VGEvidenceGraphWorkspace: View {
                     }
                 }
             }
+            // Keep the graph viewport centered when an adaptive pane gives it
+            // more room than the current evidence graph needs.
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .gesture(
                 MagnificationGesture()
                     .onChanged { value in zoom = min(1.5, max(0.1, zoomAnchor * value)) }

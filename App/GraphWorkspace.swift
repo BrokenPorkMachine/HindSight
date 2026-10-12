@@ -274,6 +274,11 @@ struct VGGraphWorkspace: View {
                         }
                     }
                 }
+                // HSplitView can preserve the canvas's intrinsic leading origin
+                // when the graph is narrower than the available center pane.
+                // Make the viewport itself occupy and center within the pane;
+                // VGCanvasSurface still handles graph-level zoom and panning.
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 .gesture(
                     MagnificationGesture()
                         .onChanged { value in
