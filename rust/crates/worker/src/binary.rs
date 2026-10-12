@@ -1558,6 +1558,70 @@ fn function_name_guesses(
     }
     Ok(output)
 }
+
+/// Apply an analyst-supplied address/name catalog without pretending it is an
+/// Apple-provided database. The file is opt-in through HINDSIGHT_SYMBOL_DB so
+/// private XNU/SEP catalogs never become a hidden or network-fetched input.
+fn external_symbol_database(
+    image: &Image,
+    functions: &mut BTreeMap<u64, (String, String)>,
+) -> io::Result<usize> {
+    let Some(path) = std::env::var_os("HINDSIGHT_SYMBOL_DB") else {
+        return Ok(0);
+    };
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() || path.to_string_lossy().len() > 16 * 1024 {
+        return Err(bad("HINDSIGHT_SYMBOL_DB must be an absolute path"));
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let mut applied = 0usize;
+    for line in contents.lines().take(200_000) {
+        if line.len() > 512 || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let Some((address, name)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Some(address) = address
+            .strip_prefix("0x")
+            .or_else(|| address.strip_prefix("0X"))
+        else {
+            continue;
+        };
+        let Ok(mut address) = u64::from_str_radix(address, 16) else {
+            continue;
+        };
+        if image.cpu == 12 {
+            address &= !1;
+        }
+        let Some(section) = image
+            .sections
+            .iter()
+            .find(|section| section.executable && section.contains(address))
+        else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty()
+            || name.len() > 256
+            || name.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            continue;
+        }
+        let entry = functions.entry(address).or_insert_with(|| {
+            (format!("sub_{address:x}"), "external-catalog-fallback".into())
+        });
+        if entry.1 != "export-trie" && !entry.1.starts_with("nlist") {
+            *entry = (
+                name.to_owned(),
+                format!("external-symbol-db section={}", section.name),
+            );
+            applied += 1;
+        }
+    }
+    Ok(applied)
+}
+
 fn relocations(file: &mut File, i: &Image, symbols: &[Symbol]) -> io::Result<String> {
     if i.be {
         return Ok("Big-endian relocation bitfields are not decoded by this backend.".into());
@@ -2185,6 +2249,15 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     let (export_text, export_names) = exports(&mut file, &image)?;
     for (a, name) in export_names {
         functions.entry(a).or_insert((name, "export-trie".into()));
+    }
+    let external_symbols = external_symbol_database(&image, &mut functions)?;
+    if external_symbols != 0 {
+        push(
+            &mut metadata,
+            &format!(
+                "Applied {external_symbols} validated names from HINDSIGHT_SYMBOL_DB; nlist/export names retained as higher-confidence evidence.\n"
+            ),
+        );
     }
     let (strings, strings_limited) = strings(&mut file, &image)?;
     let (pointers, tables, tables_limited) = pointer_tables(&mut file, &image)?;

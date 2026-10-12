@@ -1,0 +1,33 @@
+# External XNU/SEP symbol catalogs
+
+HindSight accepts an analyst-supplied symbol catalog through the opt-in
+`HINDSIGHT_SYMBOL_DB` environment variable. This is the supported way to use
+private XNU or SEP symbols without embedding proprietary databases in the
+application.
+
+The file is UTF-8 text with one record per line:
+
+```text
+0xfffffff007004000 _start
+0xfffffff007004120 kernel_task
+```
+
+Rules:
+
+- addresses must be hexadecimal with a `0x` prefix;
+- names are bounded to 256 bytes and comments begin with `#`;
+- only addresses inside validated executable sections are accepted;
+- ARM32 Thumb address bit 0 is normalized;
+- nlist and export-trie names always outrank catalog names;
+- accepted names carry `source=external-symbol-db` provenance;
+- the file is capped at 200,000 records and is never downloaded automatically.
+
+Example:
+
+```bash
+HINDSIGHT_SYMBOL_DB=/absolute/path/xnu-symbols.txt \
+  ./build/worker/reworker --analyze-image ...
+```
+
+This provides authoritative naming when the analyst supplies an authoritative
+catalog. It does not manufacture a complete Apple private XNU/SEP database.

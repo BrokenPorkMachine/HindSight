@@ -40,6 +40,7 @@ For a raw SecureROM/iBoot file, choose the architecture and its known load addre
 - Supported architecture direct-call/branch targets and bounded basic-block structure. Unknown instructions and data-in-code are barriers. Supported PC/literal/RIP-relative references are resolved through mapped sections; printable data targets become string-reference evidence.
 - Intel frame setup/leave/return patterns, ARM/Thumb stack push/pop returns, AArch64 frame pair saves/restores and pointer-authentication frame hints. These are candidate boundaries; optimized leaf functions need not have frame patterns.
 - Apple/XNU/SEP name candidates from bounded kernel strings near discovered starts. C++-mangled, `Apple*`, `IO*`, `mach_*`, `vm_*`, `bsd_*`, panic/assert and related names retain `source=nearby-kernel-string`; they are heuristic navigation labels and never outrank nlist, export-trie or `LC_FUNCTION_STARTS` evidence.
+- Optional analyst-supplied XNU/SEP address catalogs through `HINDSIGHT_SYMBOL_DB`; validated executable-section addresses receive `source=external-symbol-db`, while nlist and export-trie names retain precedence. See `docs/SYMBOL_DATABASE_FORMAT.md`.
 
 Exact nlist names take precedence over synthesized `sub_<address>` names. Direct-call targets, frame patterns and section starts retain candidate labels. Function extents, indirect transfers and pointer-table use are not invented from naming or byte-pattern evidence.
 
