@@ -9,9 +9,13 @@ resolve_rustup
 # Xcode can inject stale Rust wrapper/flag settings into script phases. Keep
 # Cargo's proc-macro compiler environment deterministic and aligned with the
 # pinned rustup toolchain used by the workspace.
-unset RUSTC_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
+unset RUSTC RUSTC_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH
+# Xcode 27's ld can emit a proc-macro dylib whose LINKEDIT string table is not
+# loadable when Rust supplies the default compact layout. Reserving ordinary
+# Mach-O install-name padding keeps LINKEDIT aligned and is supported by both
+# the current and older deployment linkers.
 if [[ -n "${RUSTUP:-}" ]]; then
-  export RUSTC="$($RUSTUP which rustc)"
+  export RUSTUP_TOOLCHAIN="$($RUSTUP show active-toolchain | /usr/bin/awk '{print $1}')"
   export CARGO="$($RUSTUP which cargo)"
 fi
 
@@ -20,8 +24,10 @@ configuration="${CONFIGURATION:-Debug}"
 rew_phase_banner "Build Rust bridge + worker"
 resolve_macos_sdk
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
-export CC="$(/usr/bin/xcrun --sdk macosx -f clang)"
-export AR="$(/usr/bin/xcrun --sdk macosx -f ar)"
+export RUSTFLAGS="-C link-arg=-Wl,-headerpad_max_install_names"
+macos_clang="$(/usr/bin/xcrun --sdk macosx -f clang)"
+macos_ar="$(/usr/bin/xcrun --sdk macosx -f ar)"
+unset CC AR
 
 if [[ -n "${HINDSIGHT_CARGO_TARGET_DIR:-}" ]]; then work_root="$HINDSIGHT_CARGO_TARGET_DIR"
 elif [[ -n "${CONFIGURATION_TEMP_DIR:-}" ]]; then work_root="$CONFIGURATION_TEMP_DIR/HindSightRust"
@@ -49,13 +55,21 @@ if [[ ${#arches[@]} -eq 0 ]]; then
 fi
 [[ ${#arches[@]} -gt 0 ]] || rew_die "no supported macOS architectures resolved from ARCHS/CURRENT_ARCH"
 
-if [[ "$configuration" == "Release" ]]; then profile=release; release_flag=1; else profile=debug; release_flag=0; fi
+if [[ "$configuration" == "Release" ]]; then
+  profile=release
+  release_flag=1
+else
+  profile=debug
+  release_flag=0
+fi
 bridge_parts=(); worker_parts=()
 for arch in "${arches[@]}"; do
   case "$arch" in arm64) target="aarch64-apple-darwin" ;; x86_64) target="x86_64-apple-darwin" ;; *) rew_die "unsupported architecture '$arch'" ;; esac
   target_env="$(/bin/echo "$target" | /usr/bin/tr '[:lower:]-' '[:upper:]_')"
   linker_key="CARGO_TARGET_${target_env}_LINKER"
-  export "${linker_key}=$CC"
+  cc_key="CC_${target//-/_}"
+  ar_key="AR_${target//-/_}"
+  export "${linker_key}=$macos_clang" "${cc_key}=$macos_clang" "${ar_key}=$macos_ar"
   if [[ -n "$RUSTUP" ]] && ! "$RUSTUP" target list --installed | /usr/bin/grep -qx "$target"; then
     rew_die "Rust target '$target' is not installed. Run: $RUSTUP target add $target"
   fi

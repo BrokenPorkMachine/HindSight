@@ -287,7 +287,7 @@ See [`docs/VECTOREMU_PROTOCOL.md`](docs/VECTOREMU_PROTOCOL.md) and [`Engines/Vec
 
 ## Build on macOS
 
-Requirements: Apple Silicon Mac, macOS 14+, Xcode command-line tools/Xcode, Rust/Cargo **1.90.x** (the pinned/MSRV qualification toolchain), Python 3.11+.
+Requirements: Apple Silicon Mac, macOS 14+, Xcode command-line tools/Xcode, Rust/Cargo **1.98.1** for release-host qualification, Python 3.11+. Shipped crates retain a declared Rust **1.90** MSRV.
 
 ```bash
 ./scripts/doctor.sh

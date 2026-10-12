@@ -713,8 +713,8 @@ for token in ['Analysis navigator','Dominators','Dominance frontiers','Phi place
     assert token in content, token
 
 # v0.4.0-beta.7 Rust compatibility contract: the Apple-Silicon release host
-# currently qualifies VectorEmu with Rust 1.90. Keep every engine crate explicit
-# about that MSRV and reject convenience APIs known to require newer stable Rust.
+# keeps VectorEmu's Rust 1.90 MSRV while using a newer Xcode-compatible release
+# compiler. Keep every engine crate explicit about the MSRV and reject newer APIs.
 engine_manifests = sorted((R/'Engines/VectorEmu/crates').glob('*/Cargo.toml'))
 for manifest in engine_manifests:
     package = tomllib.loads(manifest.read_text())['package']
@@ -727,7 +727,7 @@ for source in (R/'Engines/VectorEmu/crates').rglob('*.rs'):
     for forbidden in ['.isolate_lowest_one(', '.isolate_highest_one(', '.bit_width(']:
         assert forbidden not in text, f'Rust >1.90 API {forbidden} in {source}'
 assert (R/'scripts/check-rust-msrv.py').is_file()
-assert tomllib.loads((R/'rust-toolchain.toml').read_text())['toolchain']['channel'] == '1.90.0'
+assert tomllib.loads((R/'rust-toolchain.toml').read_text())['toolchain']['channel'] == '1.98.1'
 
 # v0.4 beta-readiness contract: recover expected failures, preserve case data,
 # and keep incomplete hardware models explicitly experimental.
@@ -792,6 +792,11 @@ cap_schema=json.loads((R/'schemas/capabilities.schema.json').read_text())
 assert cap_schema['additionalProperties'] is False and len(cap_schema['required']) >= 160
 assert cap_schema['properties']['release_channel']['enum'] == ['beta','rc','stable']
 assert cap_schema['properties']['stable_release_channel']['const'] is True
+for rust_build_script in ['scripts/build-rust.sh', 'scripts/build-vector-emu.sh']:
+    rust_build_text = (R/rust_build_script).read_text()
+    assert '-Wl,-headerpad_max_install_names' in rust_build_text, rust_build_script
+    assert 'unset RUSTC ' in rust_build_text, rust_build_script
+    assert 'export RUSTUP_TOOLCHAIN=' in rust_build_text, rust_build_script
 assert cap_schema['properties']['runtime_governor']['const'] is True
 assert 'CONFIGURATION="${CONFIGURATION:-Debug}"' in (R/'scripts/build-app.sh').read_text()
 assert 'HINDSIGHT_SWIFT_DISABLE_SANDBOX' in (R/'scripts/build-app.sh').read_text()

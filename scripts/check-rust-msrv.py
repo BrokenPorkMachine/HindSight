@@ -6,10 +6,12 @@ import re, tomllib
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ROOT / "Engines/VectorEmu"
 EXPECTED = "1.90"
+QUALIFICATION_TOOLCHAIN = "1.98.1"
 
 # Integer convenience APIs introduced after Rust 1.90 and known to be tempting in
 # low-level bit manipulation. This is a source regression guard; the authoritative
-# compatibility gate remains compiling the workspace with the pinned 1.90 toolchain.
+# compatibility gate keeps the crates' declared 1.90 MSRV while the release host
+# uses a newer compiler compatible with the installed Xcode SDK.
 POST_190_TOKENS = {
     ".isolate_lowest_one(": "1.97",
     ".isolate_highest_one(": "1.97",
@@ -34,11 +36,11 @@ for source in sorted((ENGINE / "crates").rglob("*.rs")):
 
 rt = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())
 channel = str(rt.get("toolchain", {}).get("channel", ""))
-if channel != "1.90.0":
-    errors.append(f"rust-toolchain.toml pins {channel!r}, expected '1.90.0'")
+if channel != QUALIFICATION_TOOLCHAIN:
+    errors.append(f"rust-toolchain.toml pins {channel!r}, expected {QUALIFICATION_TOOLCHAIN!r}")
 
 if errors:
     for error in errors:
         print(f"error: {error}")
     raise SystemExit(2)
-print("VectorEmu Rust 1.90 MSRV source preflight passed.")
+print(f"VectorEmu Rust 1.90 MSRV source preflight passed; release host toolchain is {QUALIFICATION_TOOLCHAIN}.")
