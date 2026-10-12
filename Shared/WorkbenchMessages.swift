@@ -52,6 +52,9 @@ struct ServiceReply: Codable {
     let ok: Bool
     let message: String
     let project: ProjectSnapshot?
+    static func success(_ message: String) -> String {
+        encode(Self(ok: true, message: message, project: nil))
+    }
     static func success(_ project: ProjectSnapshot, _ message: String = "") -> String {
         encode(Self(ok: true, message: message, project: project))
     }

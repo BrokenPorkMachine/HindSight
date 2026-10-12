@@ -9,6 +9,8 @@ struct VGEvidenceGraphWorkspace: View {
     @State private var selectedNodeID: String?
     @State private var zoom: CGFloat = 0.88
     @State private var zoomAnchor: CGFloat = 0.88
+    @State private var mapOffset: CGSize = .zero
+    @State private var mapOffsetAnchor: CGSize = .zero
     @State private var includeAnalysis = true
     @State private var includeDebugger = true
     @State private var includeCorrelation = true
@@ -72,7 +74,12 @@ struct VGEvidenceGraphWorkspace: View {
                 Button { zoom = max(0.5, zoom - 0.1); zoomAnchor = zoom } label: { Image(systemName: "minus.magnifyingglass") }.help("Zoom out")
                 Text("\(Int(zoom * 100))%").font(.system(size: 10, design: .monospaced)).frame(width: 42)
                 Button { zoom = min(1.5, zoom + 0.1); zoomAnchor = zoom } label: { Image(systemName: "plus.magnifyingglass") }.help("Zoom in")
-                Button("Fit") { zoom = 0.78; zoomAnchor = zoom }
+                Button("Fit") {
+                    zoom = 0.78
+                    zoomAnchor = zoom
+                    mapOffset = .zero
+                    mapOffsetAnchor = .zero
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -190,14 +197,17 @@ struct VGEvidenceGraphWorkspace: View {
                 .frame(width: CGFloat(layout.width), height: CGFloat(layout.height))
                 .scaleEffect(zoom, anchor: .topLeading)
                 .frame(width: CGFloat(layout.width) * zoom, height: CGFloat(layout.height) * zoom, alignment: .topLeading)
+                .offset(mapOffset)
                 .contentShape(Rectangle())
                 .gesture(
                     MagnificationGesture()
                         .onChanged { value in zoom = min(1.5, max(0.5, zoomAnchor * value)) }
                         .onEnded { _ in zoomAnchor = zoom }
                 )
+                .simultaneousGesture(mapPanGesture)
             }
-            .overlay(alignment: .bottomTrailing) { miniMap(maxWidth: min(220, proxy.size.width * 0.32)) }
+            .scrollDisabled(true)
+            .overlay(alignment: .bottomTrailing) { miniMap(viewportSize: proxy.size, maxWidth: min(220, proxy.size.width * 0.32)) }
             .background(Color(nsColor: .textBackgroundColor).opacity(0.55))
         }
     }
@@ -242,28 +252,84 @@ struct VGEvidenceGraphWorkspace: View {
         }
     }
 
-    private func miniMap(maxWidth: CGFloat) -> some View {
-        let scale: CGFloat = maxWidth / max(1, CGFloat(layout.width))
-        let height = CGFloat(layout.height) * scale
+    private func miniMap(viewportSize: CGSize, maxWidth: CGFloat) -> some View {
+        let scale = minimapScale(maxWidth: maxWidth)
+        let height = CGFloat(layout.height) * scale + 12
+        let zoomValue = max(zoom, 0.01)
+        let visibleX = max(0, min(layout.width, Double(-mapOffset.width / zoomValue)))
+        let visibleY = max(0, min(layout.height, Double(-mapOffset.height / zoomValue)))
+        let visibleWidth = min(layout.width, Double(viewportSize.width / zoomValue))
+        let visibleHeight = min(layout.height, Double(viewportSize.height / zoomValue))
+        let viewportRect = CGRect(
+            x: 6 + CGFloat(visibleX) * scale,
+            y: 6 + CGFloat(visibleY) * scale,
+            width: max(8, CGFloat(visibleWidth) * scale),
+            height: max(8, CGFloat(visibleHeight) * scale)
+        )
         return Canvas { context, _ in
             for edge in filtered.edges {
                 guard let a = layout.positions[edge.sourceID], let b = layout.positions[edge.targetID] else { continue }
                 var p = Path()
-                p.move(to: CGPoint(x: CGFloat(a.x) * scale, y: CGFloat(a.y) * scale))
-                p.addLine(to: CGPoint(x: CGFloat(b.x) * scale, y: CGFloat(b.y) * scale))
+                p.move(to: CGPoint(x: 6 + CGFloat(a.x) * scale, y: 6 + CGFloat(a.y) * scale))
+                p.addLine(to: CGPoint(x: 6 + CGFloat(b.x) * scale, y: 6 + CGFloat(b.y) * scale))
                 context.stroke(p, with: .color(.secondary.opacity(0.22)), lineWidth: 0.5)
             }
             for node in filtered.nodes.prefix(180) {
                 guard let p = layout.positions[node.id] else { continue }
-                let rect = CGRect(x: CGFloat(p.x) * scale - 2, y: CGFloat(p.y) * scale - 2, width: 4, height: 4)
+                let rect = CGRect(x: 6 + CGFloat(p.x) * scale - 2, y: 6 + CGFloat(p.y) * scale - 2, width: 4, height: 4)
                 context.fill(Path(ellipseIn: rect), with: .color(confidenceColor(node.confidence).opacity(0.8)))
             }
         }
         .frame(width: maxWidth, height: min(150, height))
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .fill(Color.accentColor.opacity(0.08))
+                .overlay { RoundedRectangle(cornerRadius: 3, style: .continuous).stroke(Color.accentColor.opacity(0.88), lineWidth: 1.5) }
+                .frame(width: viewportRect.width, height: viewportRect.height)
+                .position(x: viewportRect.midX, y: viewportRect.midY)
+                .allowsHitTesting(false)
+        }
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
         .padding(12)
-        .allowsHitTesting(false)
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in jumpToMinimap(value.location, viewportSize: viewportSize, maxWidth: maxWidth) }
+        )
+    }
+
+    private func minimapScale(maxWidth: CGFloat) -> CGFloat {
+        min((maxWidth - 12) / max(CGFloat(layout.width), 1), 138 / max(CGFloat(layout.height), 1))
+    }
+
+    private func jumpToMinimap(_ location: CGPoint, viewportSize: CGSize, maxWidth: CGFloat) {
+        let scale = minimapScale(maxWidth: maxWidth)
+        let graphX = max(0, min(layout.width, Double((location.x - 6) / max(scale, 0.001))))
+        let graphY = max(0, min(layout.height, Double((location.y - 6) / max(scale, 0.001))))
+        let visibleWidth = min(layout.width, Double(viewportSize.width / max(zoom, 0.01)))
+        let visibleHeight = min(layout.height, Double(viewportSize.height / max(zoom, 0.01)))
+        let target = CGSize(
+            width: CGFloat(-(graphX - visibleWidth / 2) * Double(zoom)),
+            height: CGFloat(-(graphY - visibleHeight / 2) * Double(zoom))
+        )
+        mapOffset = clampedMapOffset(target, viewportSize: viewportSize)
+        mapOffsetAnchor = mapOffset
+    }
+
+    private func clampedMapOffset(_ offset: CGSize, viewportSize: CGSize) -> CGSize {
+        let maxX = max(0, CGFloat(layout.width) * zoom - viewportSize.width)
+        let maxY = max(0, CGFloat(layout.height) * zoom - viewportSize.height)
+        return CGSize(width: min(0, max(-maxX, offset.width)), height: min(0, max(-maxY, offset.height)))
+    }
+
+    private var mapPanGesture: some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { value in
+                mapOffset = CGSize(width: mapOffsetAnchor.width + value.translation.width,
+                                   height: mapOffsetAnchor.height + value.translation.height)
+            }
+            .onEnded { _ in mapOffsetAnchor = mapOffset }
     }
 
     private var inspector: some View {

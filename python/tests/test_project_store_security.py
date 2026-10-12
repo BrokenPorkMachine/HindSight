@@ -22,6 +22,13 @@ class ProjectStoreSecurityContract(unittest.TestCase):
         self.assertIn("Analysis cache destination must be a regular file, not a symbolic link or special file.", SOURCE)
         self.assertIn("existing.isRegularFile == true, existing.isSymbolicLink != true", SOURCE)
 
+    def test_analysis_cache_clear_is_bounded_and_does_not_create_storage(self):
+        self.assertIn("func clearAnalysisCache() throws -> Int", SOURCE)
+        self.assertIn('appendingPathComponent("analysis-cache", isDirectory: true)', SOURCE)
+        self.assertIn("guard fm.fileExists(atPath: cacheDirectory.path) else { return 0 }", SOURCE)
+        self.assertIn('for url in entries where url.pathExtension == "json"', SOURCE)
+        self.assertIn("guard entries.count <= 4096", SOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

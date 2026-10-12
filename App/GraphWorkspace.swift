@@ -10,6 +10,7 @@ private enum VGSemanticPaneMode: String, CaseIterable, Identifiable {
 }
 
 struct VGGraphWorkspace: View {
+    let imageName: String
     let cfgText: String
     let functionsText: String
     let disassemblyText: String
@@ -37,6 +38,7 @@ struct VGGraphWorkspace: View {
     private let nodeHeight: CGFloat = 126
 
     init(
+        imageName: String = "",
         cfgText: String,
         functionsText: String,
         disassemblyText: String,
@@ -46,6 +48,7 @@ struct VGGraphWorkspace: View {
         debugPC: String?,
         onSelectAddress: @escaping (String) -> Void
     ) {
+        self.imageName = imageName
         self.cfgText = cfgText
         self.functionsText = functionsText
         self.disassemblyText = disassemblyText
@@ -191,7 +194,13 @@ struct VGGraphWorkspace: View {
                             selectAddress(function.start)
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(function.name)
+                                if !imageName.isEmpty {
+                                    Text(imageName)
+                                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Text(function.name.isEmpty ? "<unnamed function>" : function.name)
                                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                                     .lineLimit(1)
                                 HStack(spacing: 5) {
@@ -556,7 +565,11 @@ struct VGGraphWorkspace: View {
         }
         .frame(width: 190, height: 120)
         .overlay { RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(Color.primary.opacity(0.10), lineWidth: 1) }
-        .allowsHitTesting(false)
+        .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in jumpToMinimap(value.location, viewportSize: viewportSize) }
+        )
     }
 
     private var minimapScale: CGFloat {
@@ -584,6 +597,26 @@ struct VGGraphWorkspace: View {
 
     private func clampZoom(_ value: CGFloat) -> CGFloat {
         min(max(value, 0.35), 1.8)
+    }
+
+    private func jumpToMinimap(_ location: CGPoint, viewportSize: CGSize) {
+        let scale = minimapScale
+        let graphX = max(0, min(layout.width, Double((location.x - 6) / max(scale, 0.001))))
+        let graphY = max(0, min(layout.height, Double((location.y - 6) / max(scale, 0.001))))
+        let visibleWidth = min(layout.width, Double(viewportSize.width / max(zoom, 0.01)))
+        let visibleHeight = min(layout.height, Double(viewportSize.height / max(zoom, 0.01)))
+        let targetOffset = CGSize(
+            width: CGFloat(-(graphX - visibleWidth / 2) * Double(zoom)),
+            height: CGFloat(-(graphY - visibleHeight / 2) * Double(zoom))
+        )
+        mapOffset = clampedMapOffset(targetOffset, viewportSize: viewportSize)
+        mapOffsetAnchor = mapOffset
+    }
+
+    private func clampedMapOffset(_ offset: CGSize, viewportSize: CGSize) -> CGSize {
+        let maxX = max(0, CGFloat(layout.width) * zoom - viewportSize.width)
+        let maxY = max(0, CGFloat(layout.height) * zoom - viewportSize.height)
+        return CGSize(width: min(0, max(-maxX, offset.width)), height: min(0, max(-maxY, offset.height)))
     }
 
     private func setZoom(_ value: CGFloat) {

@@ -1,8 +1,8 @@
-# HindSight 0.5.9 Status
+# HindSight 0.5.10 Status
 
 ## Current milestone: stable universal-macOS analysis/review baseline
 
-HindSight 0.5.9 is the current stable source identity (`stable`, protocol ABI 1, bundle build `5900`). The evidence engine is `arm64-analysis-v15-schema71` with the exact 71-field `AnalysisReport`, analysis-cache envelope schema 3 (with schema-2 backward reads), project SQLite schema 1, and analysis-continuity schema 5.
+HindSight 0.5.10 is the current stable source identity (`stable`, protocol ABI 1, bundle build `5910`). The evidence engine is `arm64-analysis-v15-schema71` with the exact 71-field `AnalysisReport`, analysis-cache envelope schema 3 (with schema-2 backward reads), project SQLite schema 1, and analysis-continuity schema 5.
 
 The 0.4.9 feature line added bounded analyst Follow-Up Queue workflow over the existing collection/review system. Older analysis caches are reused only when their source and engine identities match the current engine; the 0.5.3→0.5.7 engine bump intentionally invalidated prior analysis results so the scalability budgets and hang fixes are not bypassed by cache reuse.
 
@@ -29,7 +29,7 @@ The 0.4.9 feature line added bounded analyst Follow-Up Queue workflow over the e
 
 ## Stable-source invariants
 
-- Product/service/worker version `0.5.9`, release channel `stable`, bundle build `5900`, protocol ABI 1.
+- Product/service/worker version `0.5.10`, release channel `stable`, bundle build `5910`, protocol ABI 1.
 - Final analysis transport is the exact 71-field report contract.
 - Analysis progress is operational telemetry, not evidence and not an ETA.
 - Coordinator transport health and project-session readiness remain separate states.

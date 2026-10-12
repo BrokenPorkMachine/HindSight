@@ -163,11 +163,13 @@ enum VGGraphParser {
 
     static func functions(_ text: String) -> [VGFunctionRecord] {
         text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { raw in
-            let parts = raw.split(whereSeparator: { $0.isWhitespace })
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = line.split(whereSeparator: { $0.isWhitespace })
             if let startToken = parts.first, let start = hex(String(startToken)),
-               let range = raw.range(of: " name=") {
-                let tail = String(raw[range.upperBound...])
-                let name = tail.components(separatedBy: " source=").first ?? "<candidate>"
+               let nameRange = line.range(of: #"\bname="#, options: .regularExpression) {
+                let tail = line[nameRange.upperBound...]
+                let name = tail.components(separatedBy: " source=").first?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ?? "<candidate>"
                 return VGFunctionRecord(start: start, end: start, byteCount: 0, name: name)
             }
             guard parts.count >= 4,

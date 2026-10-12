@@ -1079,6 +1079,34 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             }
         }
     }
+    func clearAnalysisCache() {
+        guard !busy, projectServiceReady, project != nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Clear analysis cache?"
+        alert.informativeText = "This removes cached analysis results from the current project. Captured binaries, notes, and investigation evidence are preserved."
+        alert.addButton(withTitle: "Clear Cache")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        status = "Clearing analysis cache…"
+        client.request(timeout: 15, invalidateConnectionOnTimeout: false,
+                       operation: { $0.clearAnalysisCache(withReply: $1) }) { [weak self] result in
+            guard let self else { return }
+            do {
+                let reply = try JSONDecoder().decode(ServiceReply.self, from: Data(try result.get().utf8))
+                guard reply.ok else { self.status = reply.message; return }
+                self.analysisReportsByRecordID.removeAll()
+                self.analysisReportLRU.removeAll()
+                self.analysisReport = nil
+                self.analysisRecordID = nil
+                self.analysisEvidenceIndex = nil
+                self.evidenceIndexRecordID = nil
+                self.status = reply.message
+            } catch {
+                self.status = error.localizedDescription
+            }
+        }
+    }
     func prepareBinaryDiff() {
         guard !busy, projectServiceReady, let project else { return }
         guard !diffBaselineID.isEmpty, !diffCandidateID.isEmpty, diffBaselineID != diffCandidateID else {

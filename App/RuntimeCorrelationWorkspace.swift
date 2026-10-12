@@ -121,7 +121,10 @@ struct VGRuntimeCorrelationWorkspace: View {
                     runtimePill("STOP", value: sample.event, icon: sample.stopped ? "pause.circle.fill" : "play.circle")
                     Image(systemName: "arrow.right").font(.caption).foregroundStyle(.tertiary)
                     runtimePill("STATIC", value: correlation.preferredText, icon: correlation.preferredPC == nil ? "questionmark" : "doc.text")
-                    if let name = correlation.functionName { runtimePill("FUNCTION", value: name, icon: "function") }
+                    runtimePill("FUNCTION", value: correlation.functionName ?? "unresolved", icon: "function")
+                    if let modulePath = correlation.modulePath {
+                        runtimePill("IMAGE", value: URL(fileURLWithPath: modulePath).lastPathComponent, icon: "shippingbox")
+                    }
                     if let slide = correlation.slide { runtimePill("SLIDE", value: String(format: "%+lld", slide), icon: "arrow.left.and.right") }
                     Text(correlation.confidence.uppercased())
                         .font(.system(size: 9, weight: .bold, design: .rounded))
@@ -187,7 +190,13 @@ struct VGRuntimeCorrelationWorkspace: View {
                                     if !sample.reason.isEmpty {
                                         Text(sample.reason).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary).lineLimit(1)
                                     }
-                                    Text(corr.functionName ?? corr.preferredText)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(corr.functionName ?? "Unresolved function")
+                                        if let modulePath = corr.modulePath {
+                                            Text(URL(fileURLWithPath: modulePath).lastPathComponent)
+                                                .foregroundStyle(.tertiary)
+                                        }
+                                    }
                                         .font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
                                 }
                                 .padding(.horizontal, 8).padding(.vertical, 7)

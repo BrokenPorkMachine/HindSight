@@ -141,7 +141,7 @@ final class REAAgentHost {
             let initializeID = nextID; nextID += 1
             try write(Self.message(id: initializeID, method: "initialize", params: [
                 "protocolVersion": "2025-06-18", "capabilities": [String: Any](),
-                "clientInfo": ["name": "HindSight", "version": "0.5.9"]
+                "clientInfo": ["name": "HindSight", "version": "0.5.10"]
             ]), to: input)
             guard let initialize = try readResponse(id: initializeID, from: reader, until: deadline, requestID: requestID) else {
                 return failure("REA initialize timed out or returned no response.")

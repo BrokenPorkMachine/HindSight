@@ -16,9 +16,9 @@ struct EvidenceGraphContract {
         0x0000000000002000 symbol=func_worker source=LC_FUNCTION_STARTS
         """
         let runtime = [
-            VGEvidenceRuntimeFact(id: 1, timestamp: 10.0, runtimePC: 0x5000, preferredPC: 0x1004, functionName: "func_main", reason: "breakpoint", confidence: "unique-module+slide"),
-            VGEvidenceRuntimeFact(id: 2, timestamp: 11.0, runtimePC: 0x6000, preferredPC: 0x2000, functionName: "func_worker", reason: "step", confidence: "unique-module+slide"),
-            VGEvidenceRuntimeFact(id: 3, timestamp: 12.0, runtimePC: 0x7000, preferredPC: nil, functionName: nil, reason: "ambiguous image", confidence: "unresolved")
+            VGEvidenceRuntimeFact(id: 1, timestamp: 10.0, runtimePC: 0x5000, preferredPC: 0x1004, functionName: "func_main", imageName: "Demo", reason: "breakpoint", confidence: "unique-module+slide"),
+            VGEvidenceRuntimeFact(id: 2, timestamp: 11.0, runtimePC: 0x6000, preferredPC: 0x2000, functionName: "func_worker", imageName: "Demo", reason: "step", confidence: "unique-module+slide"),
+            VGEvidenceRuntimeFact(id: 3, timestamp: 12.0, runtimePC: 0x7000, preferredPC: nil, functionName: nil, imageName: nil, reason: "ambiguous image", confidence: "unresolved")
         ]
         let memory = [
             VGEvidenceMemoryFact(id: 1, timestamp: 11.2, address: 0x9000, preview: "41 42 43 44")

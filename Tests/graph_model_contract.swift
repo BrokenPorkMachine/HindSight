@@ -51,6 +51,9 @@ struct GraphModelContract {
         precondition(candidates.count == 2 && candidates[0].name == "_firmware_entry")
         precondition(candidates[0].end == candidates[0].start && candidates[0].contains(0x1000))
         precondition(!candidates[0].contains(0x1001) && candidates[0].extentLabel == "Extent unknown")
+
+        let paddedCandidates = VGGraphParser.functions("  0x1030    name=_padded_entry source=nlist")
+        precondition(paddedCandidates.count == 1 && paddedCandidates[0].name == "_padded_entry")
         print("graph model contract passed")
     }
 }

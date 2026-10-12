@@ -1,10 +1,10 @@
-# HindSight 0.5.9 — Release readiness
+# HindSight 0.5.10 — Release readiness
 
-HindSight 0.5.9 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
+HindSight 0.5.10 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
 
 ## Source invariants already enforced
 
-- Product/service/worker identity is exactly `0.5.9`; release channel is `stable`; bundle build is `5900`.
+- Product/service/worker identity is exactly `0.5.10`; release channel is `stable`; bundle build is `5910`.
 - App and Coordinator require the same version, release channel, ABI, and required capabilities before project actions are enabled.
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
@@ -82,7 +82,7 @@ contract are supplied.
 
 ## Manual distribution matrix
 
-Before distributing 0.5.9, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
+Before distributing 0.5.10, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
 
 1. Re-run the large firmware image that exposed the beta.12 pressure failure; record peak RSS and confirm bounded dominator behavior.
 2. Analyze several real arm64 Mach-O inputs: stripped, symbol-rich, data-in-code, and encrypted-metadata cases.

@@ -221,6 +221,8 @@ struct ContentView: View {
         HStack(spacing: 10) {
             Button(model.currentAnalysis == nil ? "Analyze binary" : "Analyze again", action: model.analyzeSelected)
                 .disabled(model.busy || !model.projectServiceReady || !record.result.captured)
+            Button("Clear cache…", action: model.clearAnalysisCache)
+                .disabled(model.busy || !model.projectServiceReady)
             if let report = model.currentAnalysis {
                 Label("\(report.function_count) functions", systemImage: "function")
                 Label("\(report.basic_block_count) blocks", systemImage: "point.3.connected.trianglepath.dotted")
@@ -1130,6 +1132,7 @@ struct ContentView: View {
                             runtimePC: sample.pc,
                             preferredPC: correlation.preferredPC,
                             functionName: correlation.functionName,
+                            imageName: correlation.modulePath.map { URL(fileURLWithPath: $0).lastPathComponent },
                             reason: sample.reason,
                             confidence: correlation.confidence
                         )
@@ -1160,7 +1163,8 @@ struct ContentView: View {
                                 )
                             },
                             selectedAddress: VGTargetUtilities.parseHex(model.addressText),
-                            reaEvidence: model.reaEvidence
+                            reaEvidence: model.reaEvidence,
+                            imageName: URL(fileURLWithPath: record.path).lastPathComponent
                         ),
                         onSelectAddress: { value in
                             model.addressText = value
@@ -1338,6 +1342,7 @@ struct ContentView: View {
             case "CFG":
                 if let analysis = model.currentAnalysis {
                     VGGraphWorkspace(
+                        imageName: URL(fileURLWithPath: record.path).lastPathComponent,
                         cfgText: analysis.cfg,
                         functionsText: analysis.functions,
                         disassemblyText: analysis.annotated_disassembly,

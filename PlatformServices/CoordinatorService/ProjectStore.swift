@@ -321,6 +321,27 @@ final class ProjectStore {
         }
     }
 
+    func clearAnalysisCache() throws -> Int {
+        let cacheDirectory = URL(fileURLWithPath: path).appendingPathComponent("analysis-cache", isDirectory: true)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: cacheDirectory.path) else { return 0 }
+        _ = try validatedDirectory(cacheDirectory, createIfMissing: false, label: "Project analysis cache")
+        let entries = try fm.contentsOfDirectory(at: cacheDirectory,
+                                                  includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                                                  options: [.skipsHiddenFiles])
+        guard entries.count <= 4096 else { throw WorkbenchError("Project analysis cache contains too many entries to clear safely.") }
+        var removed = 0
+        for url in entries where url.pathExtension == "json" {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw WorkbenchError("Project analysis cache contains an unsafe entry.")
+            }
+            try fm.removeItem(at: url)
+            removed += 1
+        }
+        return removed
+    }
+
     func prepareCapture() throws -> URL {
         try objectDirectory("staging").appendingPathComponent(UUID().uuidString + ".partial")
     }

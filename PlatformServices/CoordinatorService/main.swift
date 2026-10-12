@@ -140,7 +140,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
     private let reaLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.rea", qos: .utility, maxConcurrent: 1, maxPending: 4, reservationBytes: 128 * 1_048_576)
     private let analysisCacheEngineVersion = "arm64-analysis-v15-schema71"
-    private let analysisCacheProducerVersion = "0.5.9"
+    private let analysisCacheProducerVersion = "0.5.10"
     private let compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]
     func capabilities(withReply reply: @escaping (String) -> Void) {
         guard let value = reworkbench_capabilities_json() else { reply("Bridge unavailable"); return }
@@ -305,6 +305,16 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                 reply(InspectionStatusReply.encode(error: "No active or recent inspection matches this request.")); return
             }
             reply(InspectionStatusReply.encode(status: status))
+        }
+    }
+    func clearAnalysisCache(withReply reply: @escaping (String) -> Void) {
+        queue.async { [self] in
+            do {
+                guard let current = store else { throw WorkbenchError("Create or open a project first.") }
+                guard !supervisor.isBusy else { throw WorkbenchError("Cancel the active inspection before clearing the analysis cache.") }
+                let removed = try current.clearAnalysisCache()
+                reply(ServiceReply.success("Cleared \(removed) cached analysis result\(removed == 1 ? "" : "s")."))
+            } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
     }
     func debugAttach(_ pid: Int32, withReply reply: @escaping (String) -> Void) {

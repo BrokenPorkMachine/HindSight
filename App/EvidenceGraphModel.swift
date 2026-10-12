@@ -6,6 +6,7 @@ struct VGEvidenceRuntimeFact: Identifiable, Hashable {
     let runtimePC: UInt64
     let preferredPC: UInt64?
     let functionName: String?
+    let imageName: String?
     let reason: String
     let confidence: String
 }
@@ -281,7 +282,8 @@ enum VGEvidenceGraphBuilder {
         note: String,
         assertions: [VGEvidenceAnalystAssertion] = [],
         selectedAddress: UInt64?,
-        reaEvidence: [VGREAAgentEvidence] = []
+        reaEvidence: [VGREAAgentEvidence] = [],
+        imageName: String? = nil
     ) -> VGEvidenceGraph {
         let rootID = "investigation"
         let functions = Array(VGGraphParser.functions(functionsText).prefix(96))
@@ -328,13 +330,14 @@ enum VGEvidenceGraphBuilder {
 
         for function in functions {
             let id = functionNodeID(function)
+            let imageDetail = imageName.map { "\($0) · " } ?? ""
             appendNode(VGEvidenceNode(
                 id: id,
                 kind: .function,
                 provenance: .analysis,
                 confidence: .derived,
                 title: function.name,
-                detail: "\(function.startText) · \(function.extentLabel)",
+                detail: "\(imageDetail)\(function.startText) · \(function.extentLabel)",
                 address: function.start
             ))
             appendEdge(rootID, id, .contains, .derived, "Function range is derived from the bounded static-analysis result.")
@@ -381,26 +384,36 @@ enum VGEvidenceGraphBuilder {
         var runtimeNodeIDs: [(VGEvidenceRuntimeFact, String)] = []
         for fact in runtime.sorted(by: { $0.timestamp < $1.timestamp }).suffix(64) {
             let id = "runtime:\(fact.id)"
+            let runtimeDetail = [
+                fact.imageName,
+                String(format: "runtime 0x%016llx", fact.runtimePC),
+                fact.reason.isEmpty ? nil : fact.reason
+            ]
+            .compactMap { $0 }
+            .joined(separator: " · ")
             appendNode(VGEvidenceNode(
                 id: id,
                 kind: .runtimeObservation,
                 provenance: .debugger,
                 confidence: .observed,
-                title: String(format: "runtime 0x%016llx", fact.runtimePC),
-                detail: fact.reason.isEmpty ? "Debugger stop/snapshot observation" : fact.reason,
+                title: fact.functionName ?? "Runtime observation",
+                detail: runtimeDetail,
                 address: nil
             ))
             appendEdge(rootID, id, .contains, .observed, "Debugger observation is retained as runtime evidence independently of static correlation.")
 
             let correlationID = "correlation:\(fact.id)"
             if let preferred = fact.preferredPC {
+                let correlationDetail = [fact.imageName, fact.confidence.isEmpty ? nil : fact.confidence]
+                    .compactMap { $0 }
+                    .joined(separator: " · ")
                 appendNode(VGEvidenceNode(
                     id: correlationID,
                     kind: .correlationEvidence,
                     provenance: .correlation,
                     confidence: .correlated,
                     title: fact.functionName ?? "Runtime ↔ static mapping",
-                    detail: fact.confidence.isEmpty ? "Evidence-backed runtime/static mapping" : fact.confidence,
+                    detail: correlationDetail.isEmpty ? "Evidence-backed runtime/static mapping" : correlationDetail,
                     address: preferred
                 ))
                 appendEdge(id, correlationID, .supports, .correlated, "This correlation record maps an observed runtime endpoint to static evidence; it is separate from the observation itself.")
