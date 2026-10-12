@@ -71,7 +71,7 @@ struct VGCFGGraph {
         blocks.first { $0.start == address }
     }
 
-    func layout(limit: Int = 240) -> VGCFGLayout {
+    func layout(limit: Int = 240, functionStarts: Set<UInt64> = []) -> VGCFGLayout {
         let visible = Array(blocks.prefix(max(1, limit)))
         guard !visible.isEmpty else {
             return VGCFGLayout(positions: [:], width: 640, height: 420, visibleBlockIDs: [])
@@ -128,22 +128,38 @@ struct VGCFGGraph {
         let nodeWidth = 290.0
         let nodeHeight = 126.0
         let horizontalGap = 54.0
+        let functionGap = functionStarts.isEmpty ? 0.0 : 118.0
         let verticalGap = 76.0
         let margin = 70.0
         let maxRowCount = max(1, rowsByLevel.values.map(\.count).max() ?? 1)
-        let canvasWidth = max(760.0, margin * 2 + Double(maxRowCount) * nodeWidth + Double(maxRowCount - 1) * horizontalGap)
+        let functionFor: (UInt64) -> UInt64 = { address in
+            functionStarts.filter { $0 <= address }.max() ?? 0
+        }
+        let rowWidth: ([VGCFGBlock]) -> Double = { row in
+            guard !row.isEmpty else { return 0 }
+            let functionBreaks = zip(row, row.dropFirst()).reduce(0) { total, pair in
+                total + (functionFor(pair.0.start) != functionFor(pair.1.start) ? functionGap : 0)
+            }
+            return Double(row.count) * nodeWidth + Double(max(0, row.count - 1)) * horizontalGap + functionBreaks
+        }
+        let canvasWidth = max(760.0, margin * 2 + (rowsByLevel.values.map(rowWidth).max() ?? (Double(maxRowCount) * nodeWidth)))
         var positions: [String: VGGraphPoint] = [:]
 
         for graphLevel in rowsByLevel.keys.sorted() {
             let row = rowsByLevel[graphLevel] ?? []
-            let rowWidth = Double(row.count) * nodeWidth + Double(max(0, row.count - 1)) * horizontalGap
-            let startX = (canvasWidth - rowWidth) / 2 + nodeWidth / 2
+            let width = rowWidth(row)
+            let startX = (canvasWidth - width) / 2 + nodeWidth / 2
             let y = margin + nodeHeight / 2 + Double(graphLevel) * (nodeHeight + verticalGap)
+            var x = startX
             for (index, block) in row.enumerated() {
                 positions[block.id] = VGGraphPoint(
-                    x: startX + Double(index) * (nodeWidth + horizontalGap),
+                    x: x,
                     y: y
                 )
+                if index + 1 < row.count {
+                    let nextGap = horizontalGap + (functionFor(block.start) != functionFor(row[index + 1].start) ? functionGap : 0)
+                    x += nodeWidth + nextGap
+                }
             }
         }
 

@@ -62,7 +62,7 @@ struct VGGraphWorkspace: View {
         let parsedGraph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
         _graph = State(initialValue: parsedGraph)
         _functions = State(initialValue: parsedFunctions)
-        _layout = State(initialValue: parsedGraph.layout(limit: 240))
+        _layout = State(initialValue: parsedGraph.layout(limit: 240, functionStarts: Set(parsedFunctions.map(\.start))))
     }
 
     private var selectedAddressValue: UInt64? { VGGraphParser.address(from: selectedAddress) }
@@ -107,7 +107,7 @@ struct VGGraphWorkspace: View {
             let parsedFunctions = VGGraphParser.functions(functionsText)
             functions = parsedFunctions
             graph = VGGraphParser.cfg(newValue, functionStarts: Set(parsedFunctions.map(\.start)))
-            layout = graph.layout(limit: 240)
+            layout = graph.layout(limit: 240, functionStarts: Set(parsedFunctions.map(\.start)))
             mapOffset = .zero
             mapOffsetAnchor = .zero
             synchronizeSelection()
@@ -116,7 +116,7 @@ struct VGGraphWorkspace: View {
             let parsedFunctions = VGGraphParser.functions(newValue)
             functions = parsedFunctions
             graph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
-            layout = graph.layout(limit: 240)
+            layout = graph.layout(limit: 240, functionStarts: Set(parsedFunctions.map(\.start)))
             mapOffset = .zero
             mapOffsetAnchor = .zero
             synchronizeSelection()
