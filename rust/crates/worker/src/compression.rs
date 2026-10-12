@@ -183,7 +183,7 @@ fn deflate_decode(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn zip_payloads(input: &[u8]) -> Vec<(u16, Vec<u8>)> {
-    zip_entries(input)
+    let mut payloads = zip_entries(input)
         .into_iter()
         .filter_map(|(method, bytes)| {
             let payload = match method {
@@ -193,7 +193,60 @@ fn zip_payloads(input: &[u8]) -> Vec<(u16, Vec<u8>)> {
             }?;
             Some((method, payload))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !payloads.is_empty() {
+        return payloads;
+    }
+    // Data-descriptor archives leave sizes in the local header as zero.  The
+    // central directory is authoritative for the extent, so use it when the
+    // local-header walk cannot safely advance.
+    let Some(eocd) = input.windows(4).rposition(|window| window == b"PK\x05\x06") else {
+        return payloads;
+    };
+    if eocd + 22 > input.len() {
+        return payloads;
+    }
+    let directory_size = u32::from_le_bytes(input[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let directory_offset = u32::from_le_bytes(input[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let directory_end = directory_offset.saturating_add(directory_size);
+    if directory_end > input.len() {
+        return payloads;
+    }
+    let mut at = directory_offset;
+    while at + 46 <= directory_end && payloads.len() < MAX_ZIP_ENTRIES {
+        if &input[at..at + 4] != b"PK\x01\x02" {
+            break;
+        }
+        let flags = u16::from_le_bytes([input[at + 8], input[at + 9]]);
+        let method = u16::from_le_bytes([input[at + 10], input[at + 11]]);
+        let compressed = u32::from_le_bytes(input[at + 20..at + 24].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes([input[at + 28], input[at + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([input[at + 30], input[at + 31]]) as usize;
+        let comment_len = u16::from_le_bytes([input[at + 32], input[at + 33]]) as usize;
+        let local_offset = u32::from_le_bytes(input[at + 42..at + 46].try_into().unwrap()) as usize;
+        let next = at.saturating_add(46 + name_len + extra_len + comment_len);
+        if next > directory_end || name_len == 0 || name_len > MAX_ZIP_NAME || flags & 1 != 0 {
+            break;
+        }
+        if local_offset + 30 > input.len() || &input[local_offset..local_offset + 4] != b"PK\x03\x04" {
+            break;
+        }
+        let local_name = u16::from_le_bytes([input[local_offset + 26], input[local_offset + 27]]) as usize;
+        let local_extra = u16::from_le_bytes([input[local_offset + 28], input[local_offset + 29]]) as usize;
+        let data_start = local_offset.saturating_add(30 + local_name + local_extra);
+        let data_end = data_start.saturating_add(compressed);
+        if data_end > input.len() || !matches!(method, 0 | 8) {
+            at = next;
+            continue;
+        }
+        let data = &input[data_start..data_end];
+        let decoded = if method == 0 { Some(data.to_vec()) } else { deflate_decode(data) };
+        if let Some(decoded) = decoded {
+            payloads.push((method, decoded));
+        }
+        at = next;
+    }
+    payloads
 }
 
 pub fn zip_inventory(input: &[u8]) -> String {

@@ -877,9 +877,64 @@ pub fn describe(
     ))
 }
 
-/// Inventory recognizable firmware-container markers without interpreting or
-/// unpacking their payload. This keeps capture useful for triage while making
-/// the boundary explicit: offsets are observations, not validated ASN.1 fields.
+fn img4_asn1_inventory(bytes: &[u8]) -> Option<String> {
+    fn walk(bytes: &[u8], mut at: usize, end: usize, depth: usize, nodes: &mut usize, out: &mut String) -> bool {
+        while at < end && *nodes < 512 {
+            if at + 2 > end { return false; }
+            let tag_start = at;
+            let tag = bytes[at];
+            at += 1;
+            if tag & 0x1f == 0x1f {
+                let mut continuation = 0;
+                loop {
+                    if at >= end || continuation == 5 { return false; }
+                    let byte = bytes[at];
+                    at += 1;
+                    continuation += 1;
+                    if byte & 0x80 == 0 { break; }
+                }
+            }
+            let length_byte = bytes[at];
+            at += 1;
+            let length = if length_byte & 0x80 == 0 {
+                length_byte as usize
+            } else {
+                let count = (length_byte & 0x7f) as usize;
+                if count == 0 || count > 4 || at + count > end { return false; }
+                let mut value = 0usize;
+                for byte in &bytes[at..at + count] {
+                    value = value.checked_shl(8).and_then(|v| v.checked_add(*byte as usize)).unwrap_or(usize::MAX);
+                }
+                at += count;
+                value
+            };
+            let value_end = at.saturating_add(length);
+            if value_end > end { return false; }
+            *nodes += 1;
+            out.push_str(&format!("tag=0x{tag:02x} offset={tag_start:#x} length={length:#x}\n"));
+            if tag & 0x20 != 0 && depth < 8 && length != 0 && !walk(bytes, at, value_end, depth + 1, nodes, out) {
+                return false;
+            }
+            at = value_end;
+            if depth == 0 { return true; }
+        }
+        at == end || *nodes == 512
+    }
+
+    if bytes.first().copied() != Some(0x30) { return None; }
+    let mut out = String::from("Bounded DER/ASN.1 TLV inventory (IMG4 candidate):\n");
+    let mut nodes = 0;
+    if walk(bytes, 0, bytes.len().min(4 * 1024 * 1024), 0, &mut nodes, &mut out) {
+        out.push_str(&format!("ASN.1 nodes={nodes}; depth cap=8; node cap=512.\n"));
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Inventory recognizable firmware-container markers and bounded structure.
+/// Cryptographic authentication and Apple-specific schema interpretation stay
+/// separate from this syntax-level parser.
 fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, String)>> {
     const BUDGET: usize = 4 * 1024 * 1024;
     let size = file.metadata()?.len();
@@ -980,8 +1035,10 @@ fn inspect_firmware_container(file: &mut File) -> io::Result<Option<(String, Str
             ),
         );
     }
-    if bytes.first() == Some(&0x30) {
-        push(&mut out, "DER-like sequence prefix observed at file offset 0; complete ASN.1 structure is not decoded.\n");
+    if let Some(asn1) = img4_asn1_inventory(&bytes) {
+        push(&mut out, &asn1);
+    } else if bytes.first() == Some(&0x30) {
+        push(&mut out, "Malformed or truncated DER-like prefix; ASN.1 structure was not accepted.\n");
     }
     push(&mut out, &format!(
         "File size={size:#x}; scan budget={BUDGET:#x}. Payload boundaries, encryption and compression validity are not established.\n"

@@ -13,7 +13,7 @@ HindSight Research Tool imports captured, immutable bytes. Import configuration 
 | Universal FAT32/FAT64, either table byte order | Checked slice extents/alignment, overlap rejection, CPU/header agreement; select requested architecture or prefer AArch64, then x86_64, i386, ARM32 | Structural backend for the selected slice |
 | Plaintext SecureROM/iBoot/raw firmware | Explicit architecture, file offset and raw load address | Linear instruction decode, direct-transfer and frame/return candidates, bounded raw string scan; headerless bytes have no verified code/data partition |
 | Big-endian thin Mach-O with a supported CPU | Header/section/symbol/string/pointer metadata | Instruction decode and relocation-bitfield interpretation unavailable; never decoded with little-endian semantics |
-| IMG3/IMG4/IM4P and IPSW/ZIP marker-bearing input | Bounded container/codec inventory; stored and deflated IPSW local entries can be selected as payload candidates; signed/encrypted envelopes remain opaque | On macOS, bounded plaintext candidates are decoded with Compression.framework (LZFSE/LZ4/LZMA/zlib); `bvxn`/LZVN and legacy `complzss`/LZSS are decoded through bounded Rust paths. ZIP encrypted entries, data-descriptor entries, and authenticated IMG4 envelopes remain inventory-only. A decoded payload is analyzed while the original artifact SHA-256 remains authoritative. |
+| IMG3/IMG4/IM4P and IPSW/ZIP marker-bearing input | Bounded container/codec inventory; stored and deflated IPSW entries are selected from local headers or the central directory, including data-descriptor archives; signed/encrypted envelopes remain opaque | On macOS, bounded plaintext candidates are decoded with Compression.framework (LZFSE/LZ4/LZMA/zlib); `bvxn`/LZVN and legacy `complzss`/LZSS are decoded through bounded Rust paths. ZIP encryption and authenticated IMG4 envelopes remain unavailable without credentials/keys. A decoded payload is analyzed while the original artifact SHA-256 remains authoritative. |
 
 The loader accepts supported file types with a validated file-backed instruction section, including relocatable objects. Object addresses/relocations remain structural metadata; relocation application is not implied. Instruction paging and CFG currently use one primary executable section (`__text` when present); metadata/table/string walkers inspect other mapped sections.
 
@@ -30,6 +30,7 @@ For a raw SecureROM/iBoot file, choose the architecture and its known load addre
 ## Implemented table and function evidence
 
 - Mach-O headers, load-command framing, segment/section bounds, nonoverlapping mappings, encrypted-code state and selected linkedit extents.
+- Bounded DER/ASN.1 TLV parsing for IMG4 candidates: definite lengths, high-tag numbers, constructed nesting, depth/node caps, and malformed/truncated rejection. This establishes syntax and offsets, not Apple's authenticated IMG4 schema or signature validity.
 - `LC_SYMTAB` 32/64-bit nlist names with type, section and descriptor provenance; malformed name/section indices are errors.
 - `LC_FUNCTION_STARTS` checked ULEB128 walks; `LC_MAIN` and supported architecture thread-state entry addresses.
 - Export-trie names and mapped executable exports, with cycle/depth/node/size bounds; reexports remain name/ordinal records.
@@ -52,7 +53,7 @@ Mach-O structure definitions follow Apple's [loader header](https://github.com/a
 
 ## Remaining commercial-disassembler gaps
 
-This change supplies bounded Apple-container/codec ingestion and conservative stripped-kernel name candidates; it does not establish parity with mature commercial products. Intel/ARM32 semantic lifting, SSA and high-level decompilation; automatic mixed ARM/Thumb transitions; unwind/DWARF-driven boundary recovery; validated indirect-dispatch reconstruction; interactive multi-section selection; complete Unicode decoding; ZIP encrypted/data-descriptor entry extraction; and authenticated IMG4 signature/decryption remain outstanding. Existing ARM64 semantic/runtime features continue on their established path, with their documented bounds.
+This change supplies bounded Apple-container/codec ingestion and conservative stripped-kernel name candidates; it does not establish parity with mature commercial products. Intel/ARM32 semantic lifting, SSA and high-level decompilation; automatic mixed ARM/Thumb transitions; unwind/DWARF-driven boundary recovery; validated indirect-dispatch reconstruction; interactive multi-section selection; complete Unicode decoding; ZIP encryption; Apple-specific IMG4 schema interpretation; authenticated IMG4 signature/decryption; and complete private XNU/SEP symbol databases remain outstanding. Existing ARM64 semantic/runtime features continue on their established path, with their documented bounds.
 
 ## Validation
 
