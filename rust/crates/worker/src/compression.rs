@@ -438,6 +438,47 @@ mod tests {
     }
 
     #[test]
+    fn data_descriptor_zip_entries_use_the_central_directory() {
+        let name = b"kernelcache";
+        let payload = b"TEST";
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&[20, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&[0; 12]); // CRC and sizes are deferred.
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&(0u16).to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(payload);
+        zip.extend_from_slice(b"PK\x07\x08");
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let directory_offset = zip.len();
+        zip.extend_from_slice(b"PK\x01\x02");
+        zip.extend_from_slice(&[20, 0, 20, 0, 8, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 2]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(name);
+        let directory_size = zip.len() - directory_offset;
+        zip.extend_from_slice(b"PK\x05\x06");
+        zip.extend_from_slice(&[0; 4]);
+        zip.extend_from_slice(&(1u16).to_le_bytes());
+        zip.extend_from_slice(&(1u16).to_le_bytes());
+        zip.extend_from_slice(&(directory_size as u32).to_le_bytes());
+        zip.extend_from_slice(&(directory_offset as u32).to_le_bytes());
+        zip.extend_from_slice(&[0; 2]);
+        assert_eq!(zip_payloads(&zip), vec![(0, payload.to_vec())]);
+    }
+
+    #[test]
     fn bvxn_lzvn_decodes_a_macho_candidate() {
         let mut plaintext = vec![0xcf, 0xfa, 0xed, 0xfe];
         plaintext.extend_from_slice(b"kernel");

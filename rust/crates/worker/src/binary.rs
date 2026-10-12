@@ -2804,6 +2804,14 @@ mod tests {
         assert_eq!(uleb(&[0x81, 0x01], &mut 0).unwrap(), 129);
     }
     #[test]
+    fn img4_der_inventory_is_bounded_and_rejects_truncation() {
+        let valid = [0x30, 0x07, 0x30, 0x05, 0x02, 0x01, 0x01, 0x05, 0x00];
+        let inventory = img4_asn1_inventory(&valid).unwrap();
+        assert!(inventory.contains("tag=0x30 offset=0x0 length=0x7"));
+        assert!(inventory.contains("ASN.1 nodes=4"));
+        assert!(img4_asn1_inventory(&[0x30, 0x82, 0x00, 0x10, 0x00]).is_none());
+    }
+    #[test]
     fn architecture_patterns_are_candidates() {
         assert!(prologue(Arch::X64, &[0x55, 0x48, 0x89, 0xe5], "pushq %rbp"));
         assert!(!prologue(
