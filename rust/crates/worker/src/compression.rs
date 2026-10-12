@@ -165,7 +165,7 @@ fn zip_entries(input: &[u8]) -> Vec<(u16, &[u8])> {
         if end > input.len() {
             break;
         }
-        if method == 0 {
+        if matches!(method, 0 | 8) {
             entries.push((method, &input[start..end]));
         }
         at = end;
@@ -361,6 +361,27 @@ mod tests {
         encoder.write_all(b"Apple firmware payload").unwrap();
         let encoded = encoder.finish().unwrap();
         assert_eq!(deflate_decode(&encoded).as_deref(), Some(b"Apple firmware payload".as_slice()));
+    }
+
+    #[test]
+    fn deflated_zip_entries_are_extracted() {
+        use std::io::Write;
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"firmware Mach-O candidate").unwrap();
+        let encoded = encoder.finish().unwrap();
+        let name = b"kernelcache";
+        let mut zip = Vec::new();
+        zip.extend_from_slice(b"PK\x03\x04");
+        zip.extend_from_slice(&[20, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        zip.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        zip.extend_from_slice(&(25u32).to_le_bytes());
+        zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        zip.extend_from_slice(&(0u16).to_le_bytes());
+        zip.extend_from_slice(name);
+        zip.extend_from_slice(&encoded);
+        assert_eq!(zip_entries(&zip).len(), 1);
+        assert_eq!(zip_payloads(&zip)[0].1, b"firmware Mach-O candidate");
+        assert!(zip_inventory(&zip).contains("method=8"));
     }
 
     #[test]
