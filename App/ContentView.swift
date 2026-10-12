@@ -1582,12 +1582,12 @@ struct ContentView: View {
                     }.padding(8)
                 }
             case "Call Values":
-                GroupBox("Call argument provenance") {
+                GroupBox("Arguments, parameters, and casts") {
                     VStack(alignment: .leading, spacing: 10) {
                         analysisToolbar(record)
-                        Text("Tracks the nearest modeled definitions of x0–x7 before direct calls. These are provenance facts, not guessed runtime values.")
+                        Text("Detects incoming x0–x7 parameter candidates, nearby outgoing call arguments, operand-width value shapes, and architecturally explicit integer extensions. Source-level types and prototypes remain unresolved.")
                             .font(.caption).foregroundStyle(.secondary)
-                        monospaced(model.currentAnalysis?.call_values ?? "Run Analyze binary to derive call argument provenance.")
+                        monospaced(model.currentAnalysis?.call_values ?? "Run Analyze binary to detect argument, parameter, and explicit-cast evidence.")
                     }.padding(8)
                 }
 

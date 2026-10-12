@@ -404,7 +404,7 @@ struct VGAnalysisContinuityDocument: Codable {
 }
 
 enum VGAnalysisContinuityStore {
-    static let engine = "arm64-analysis-v15-schema71"
+    static let engine = "arm64-analysis-v16-schema71"
     static let maximumBytes = 1 * 1024 * 1024
     static let maximumPins = 128
     static let maximumRecent = 96

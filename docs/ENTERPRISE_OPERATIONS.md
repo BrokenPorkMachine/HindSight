@@ -31,7 +31,7 @@ Stable distribution requires a detached release manifest next to the notarized a
   "artifacts": [{"name": "HindSight-0.5.8.dmg", "sha256": "…", "bytes": 0}],
   "minimum_macos": "14.0",
   "required_architectures": ["arm64", "x86_64"],
-  "analysis_engine": "arm64-analysis-v15-schema71",
+  "analysis_engine": "arm64-analysis-v16-schema71",
   "protocol_abi": 1,
   "signature": {"algorithm": "Ed25519", "key_id": "…", "value_base64": "…"}
 }

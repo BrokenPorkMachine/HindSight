@@ -76,6 +76,7 @@ enum VGAnalysisNavigation {
             .init(name: "Functions", workspace: "Functions", kind: .function, text: report.functions, focusPriority: 62, focusLimit: 24),
             .init(name: "Xrefs", workspace: "Xrefs", kind: .controlFlow, text: report.xrefs, focusPriority: 64, focusLimit: 28),
             .init(name: "Calls", workspace: "Call Graph", kind: .controlFlow, text: report.call_graph, focusPriority: 64, focusLimit: 28),
+            .init(name: "Arguments & Types", workspace: "Call Values", kind: .semantic, text: report.call_values, focusPriority: 68, focusLimit: 32),
             .init(name: "Strings", workspace: "Strings", kind: .data, text: report.strings, focusPriority: 56, focusLimit: 24),
             .init(name: "Relocations", workspace: "Relocations", kind: .linkage, text: report.relocations, focusPriority: 58, focusLimit: 24),
             .init(name: "Jump Tables", workspace: "Jump Tables", kind: .controlFlow, text: report.jump_tables, focusPriority: 58, focusLimit: 24),

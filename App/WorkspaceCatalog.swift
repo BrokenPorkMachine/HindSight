@@ -82,7 +82,7 @@ enum VGWorkspaceCatalog {
 
         add(.staticAnalysis,
             ["Binary Workspace", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Annotated Code", "Functions", "Function Intelligence", "Function Neighborhoods", "Tail-Call Candidates", "CFG", "Dominators", "Dominance Frontiers", "Phi Nodes", "IR", "SSA", "SSA Rename", "Strings", "Xrefs", "Data References", "Relocations", "Jump Tables", "Call Graph", "Data Flow", "Metadata", "Runtime Records", "Runtime Graph", "ObjC Classes", "Swift Types", "Swift Contexts", "Selector Xrefs", "Call Values", "Chained Fixups", "Chained Starts", "ObjC Protocols", "Swift Fields", "Swift Field Records", "Inter-block Values", "Predecessor Values", "Chained Pointers", "Multi-Start Chains", "ARM64e Pointers", "Swift Ownership", "Propagated Values", "Indirect Calls", "Dyld Imports", "Dyld Linking", "Soft Linking", "Symbolication", "Symbol Resolver", "Apple Symbolication", "Dylib Ordinals", "Resolved Imports", "ARM64e Bind Symbols", "Authenticated Targets", "Indirect Symbols", "Pointer Slots", "Exports", "Symbol Provenance", "Linkage Records", "Symbol Callers", "GOT/Auth-GOT", "Import/Export Collisions"],
-            sidebar: ["Binary Workspace", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Functions", "Function Neighborhoods", "CFG", "Strings", "Xrefs", "Runtime Graph", "Symbol Resolver", "Symbol Provenance"],
+            sidebar: ["Binary Workspace", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Functions", "Function Neighborhoods", "Call Values", "CFG", "Strings", "Xrefs", "Runtime Graph", "Symbol Resolver", "Symbol Provenance"],
             subtitle: "Understand code, control flow, data, symbols, and Apple runtime evidence.",
             icon: "doc.text.magnifyingglass",
             overrides: [
@@ -98,6 +98,7 @@ enum VGWorkspaceCatalog {
                 "Function Intelligence": ("Function Intelligence", "chart.bar.xaxis"),
                 "Function Neighborhoods": ("Function Neighborhoods", "point.3.connected.trianglepath.dotted"),
                 "Tail-Call Candidates": ("Tail-Call Candidates", "arrowshape.turn.up.right"),
+                "Call Values": ("Arguments & Types", "function"),
                 "CFG": ("Flow Graph", "point.3.connected.trianglepath.dotted"),
                 "Strings": ("Strings", "text.quote"),
                 "Xrefs": ("Cross References", "arrow.triangle.branch"),

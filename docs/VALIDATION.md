@@ -38,7 +38,7 @@ These checks complement the project-root/database symlink rejection and the nati
 
 - Product/service/worker identity is `0.5.10`, release channel `stable`, bundle build `5910`, protocol ABI 1.
 - Swift/Rust agree on the exact 71-field `AnalysisReport`.
-- Cache envelope schema 2 binds source SHA-256 and `arm64-analysis-v15-schema71`; only the explicit validated 0.4.1 legacy cache path is admitted.
+- Cache envelopes bind source SHA-256 and `arm64-analysis-v16-schema71`; only explicitly validated legacy cache paths are admitted.
 - Staged worker progress remains bounded, monotonic pipeline telemetry and is filtered from ordinary diagnostics.
 - Large-CFG dominators remain per-function/budgeted; Function Intelligence distinguishes internal/external calls; tail-call candidates remain exact-entry candidates.
 - Continuity schema 5 remains bounded to 1 MiB and preserves pins, recent pivots, collections, review baselines/journal, and follow-ups without reclassifying workflow state as evidence.

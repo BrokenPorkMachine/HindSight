@@ -250,7 +250,7 @@ fn platform_metadata(window:&[u8])->String{
  out.push_str(&format!("\nObjective-C metadata sections: {objc}\nSwift reflection sections: {swift}\nSection presence is factual; class/type reconstruction remains conservative until pointer/relative-offset records are individually validated.\n"));out
 }
 fn block_index(leaders:&[u64], address:u64)->Option<usize>{let i=leaders.partition_point(|&x|x<=address);if i==0{None}else{Some(i-1)}}
-fn modeled_def_reg(w:u32)->Option<usize>{let rd=(w&31) as usize;if rd==31{return None}if (w&0x1f800000)==0x11000000||(w&0x1f200000)==0x0b000000||(w&0x1f000000)==0x0a000000||(w&0x1f800000)==0x12800000||(w&0x1f000000)==0x10000000||((w&0x3f000000)==0x39000000&&((w>>22)&3)!=0){Some(rd)}else{None}}
+fn modeled_def_reg(w:u32)->Option<usize>{let rd=(w&31) as usize;if rd==31{return None}if (w&0x1f800000)==0x11000000||(w&0x1f200000)==0x0b000000||(w&0x1f000000)==0x0a000000||(w&0x1f800000)==0x12800000||(w&0x1f000000)==0x10000000||(w&0x1f800000)==0x13000000||((w&0x3f000000)==0x39000000&&((w>>22)&3)!=0){Some(rd)}else{None}}
 fn structural_analysis(leaders:&[u64], starts:&[u64], edges:&[(u64,u64,&str)], code:&[u8], base:u64, end:u64)->(String,String,String){
  use std::collections::{BTreeMap,BTreeSet};
  const MAX_STRUCTURAL_BLOCKS:usize=20_000;
@@ -461,8 +461,72 @@ fn phi_operand_trace(leaders:&[u64],starts:&[u64],edges:&[(u64,u64,&str)],code:&
  let mut out=String::new();for b in 0..n{if pred[b].len()<2{continue}for r in 0..31{let mut ops=Vec::new();for &pb in &pred[b]{if let Some(pc)=local[pb][r]{ops.push(format!("x{r}@B{pb:04}[def {pc:#018x}]"));}}if ops.len()>=2{out.push_str(&format!("B{b:04} {:#018x}  x{r}.phi <- {}\n",leaders[b],ops.join(", ")));if out.len()>60_000{return out}}}}if out.is_empty(){out.push_str("No phi site had two or more validated modeled predecessor definitions.\n");}out
 }
 
-fn call_argument_provenance(calls:&[(u64,u64,u64)],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
- let mut out=String::from("AArch64 PCS signature evidence: x0-x7 are argument/return registers; only nearby modeled definitions are observed below. No source-level types or callee prototypes are inferred.\n");for &(func,site,target) in calls.iter().take(5000){let lo=site.saturating_sub(base) as usize;let start=lo.saturating_sub(16*4);let mut defs=[None;8];if lo<=code.len(){for (i,ch) in code[start..lo.min(code.len())].chunks_exact(4).enumerate(){if let Some(r)=modeled_def_reg(le32(ch)){if r<8{defs[r]=Some(base+start as u64+i as u64*4);}}}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|pc|format!("x{r}<-{pc:#x}"))).collect::<Vec<_>>();out.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee}  args=[{}] return-register=x0\n",args.join(", ")));if out.len()>60_000{return out}}if out.lines().count()==1{out.push_str("No direct calls were available for bounded argument provenance.\n");}out
+fn explicit_integer_cast(w:u32)->Option<(usize,usize,&'static str,&'static str)> {
+ // UBFM/SBFM aliases with immr=0 encode the architectural UXTB/UXTH/UXTW
+ // and SXTB/SXTH/SXTW operations. Requiring N==sf excludes reserved forms.
+ if (w&0x1f800000)!=0x13000000||((w>>16)&0x3f)!=0{return None}
+ let sf=(w>>31)&1;let n=(w>>22)&1;if n!=sf{return None}
+ let opc=(w>>29)&3;let imms=(w>>10)&0x3f;let rd=(w&31) as usize;let rn=((w>>5)&31) as usize;
+ let (operation,result)=match (opc,imms,sf){
+  (0,7,0)=>("sign-extend-i8-to-i32","signed-i32"),(0,15,0)=>("sign-extend-i16-to-i32","signed-i32"),
+  (0,7,1)=>("sign-extend-i8-to-i64","signed-i64"),(0,15,1)=>("sign-extend-i16-to-i64","signed-i64"),(0,31,1)=>("sign-extend-i32-to-i64","signed-i64"),
+  (2,7,0)=>("zero-extend-u8-to-u32","unsigned-u32"),(2,15,0)=>("zero-extend-u16-to-u32","unsigned-u32"),
+  (2,7,1)=>("zero-extend-u8-to-u64","unsigned-u64"),(2,15,1)=>("zero-extend-u16-to-u64","unsigned-u64"),(2,31,1)=>("zero-extend-u32-to-u64","unsigned-u64"),
+  _=>return None,
+ };
+ Some((rd,rn,operation,result))
+}
+
+fn definition_value_shape(w:u32)->&'static str{
+ if let Some((_,_,_,shape))=explicit_integer_cast(w){return shape}
+ if (w&0x1f000000)==0x10000000{return "pointer-width-address-candidate"}
+ if (w&0x1f800000)==0x12800000{return if w>>31!=0{"integer-u64"}else{"integer-u32-zero-extended"}}
+ if (w&0x1f800000)==0x11000000||(w&0x1f200000)==0x0b000000||(w&0x1f000000)==0x0a000000{return if w>>31!=0{"u64-or-pointer-width"}else{"integer-u32-zero-extended"}}
+ if (w&0x3f000000)==0x39000000&&((w>>22)&3)!=0{return match w>>30{0=>"loaded-8-bit-value",1=>"loaded-16-bit-value",2=>"loaded-32-bit-value",_=>"loaded-64-bit-or-pointer-width"}}
+ "unknown"
+}
+
+fn modeled_argument_uses(w:u32)->u8{
+ let mut uses=0u8;let mut add=|r:u32|{if r<8{uses|=1u8<<r}};let rn=(w>>5)&31;let rm=(w>>16)&31;let rt=w&31;
+ if (w&0x1f800000)==0x11000000{add(rn)}
+ else if (w&0x1f200000)==0x0b000000||(w&0x1f000000)==0x0a000000{add(rn);add(rm)}
+ else if (w&0x1f800000)==0x13000000{add(rn)}
+ else if (w&0x3b000000)==0x39000000{add(rn);if ((w>>22)&3)==0{add(rt)}}
+ else if (w&0x3a000000)==0x28000000{add(rn);if ((w>>22)&1)==0{add(rt);add((w>>10)&31)}}
+ else if (w&0x7e000000)==0x34000000||(w&0x7e000000)==0x36000000{add(rt)}
+ else if (w&0xfffffc1f)==0xd61f0000||(w&0xfffffc1f)==0xd63f0000||(w&0xfffffc1f)==0xd65f0000{add(rn)}
+ uses
+}
+
+fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
+ let mut out=String::new();let code_end=base.saturating_add(code.len() as u64);let mut found=0usize;
+ for (index,&entry) in starts.iter().take(2000).enumerate(){
+  if entry<base||entry>=code_end{continue}
+  let end=starts.get(index+1).copied().unwrap_or(code_end).min(code_end).min(entry.saturating_add(128));
+  let lo=(entry-base) as usize;let hi=(end-base) as usize;let mut defined=0u8;let mut live_in=0u8;
+  for chunk in code[lo..hi].chunks_exact(4){let w=le32(chunk);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){break}live_in|=modeled_argument_uses(w)&!defined;if let Some(r)=modeled_def_reg(w){if r<8{defined|=1u8<<r}}}
+  if live_in==0{continue}
+  let registers=(0..8).filter(|r|live_in&(1u8<<r)!=0).map(|r|format!("x{r}")).collect::<Vec<_>>();
+  let highest=8-live_in.leading_zeros() as usize;let name=symbol_name_at(symbols,entry).unwrap_or("<discovered>");
+  out.push_str(&format!("function {entry:#018x} {name} parameter-registers=[{}] highest-abi-position={highest} classification=incoming-parameter-candidate provenance=entry-block-use-before-modeled-definition\n",registers.join(", ")));
+  found+=1;if out.len()>18_000{break}
+ }
+ if found==0{out.push_str("No entry-block uses of x0-x7 before a modeled definition were recovered.\n")}
+ out
+}
+
+fn explicit_cast_evidence(code:&[u8],base:u64)->String{
+ let mut out=String::new();let mut found=0usize;
+ for (index,chunk) in code.chunks_exact(4).enumerate(){let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{continue};let pc=base+index as u64*4;out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}}
+ if found==0{out.push_str("No explicit UXTB/UXTH/UXTW/SXTB/SXTH/SXTW encodings were recovered.\n")}
+ out
+}
+
+fn call_argument_provenance(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
+ let mut arguments=String::new();
+ for &(func,site,target) in calls.iter().take(2000){let lo=site.saturating_sub(base) as usize;let function_start=func.saturating_sub(base) as usize;let start=lo.saturating_sub(16*4).max(function_start.min(lo));let mut defs:[Option<(u64,u32)>;8]=[None;8];if lo<=code.len(){for (i,ch) in code[start..lo.min(code.len())].chunks_exact(4).enumerate(){let w=le32(ch);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];continue}if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some((base+start as u64+i as u64*4,w));}}}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|(pc,w)|format!("x{r}<-{pc:#x} shape={}",definition_value_shape(w)))).collect::<Vec<_>>();arguments.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee} observed-argument-register-definitions={} args=[{}] return-register=x0\n",args.len(),args.join(", ")));if arguments.len()>18_000{break}}
+ if arguments.is_empty(){arguments.push_str("No direct calls were available for bounded argument provenance.\n")}
+ format!("AArch64 PCS signature evidence: x0-x7 are integer/pointer argument and result registers. Incoming parameter candidates are entry-block uses before a modeled definition; outgoing arguments are nearby modeled definitions; cast rows require exact extension encodings. Value shapes do not distinguish pointers from same-width integers. No source-level types or callee prototypes are inferred.\n\nIncoming parameter candidates\n=============================\n{}\nOutgoing call arguments\n=======================\n{}\nExplicit integer casts\n======================\n{}",function_parameter_candidates(starts,code,base,symbols),arguments,explicit_cast_evidence(code,base))
 }
 
 fn annotated_disassembly(code:&[u8],base:u64,symbols:&[(u64,String)],relocations:&[(u64,String,u32,bool,u32,Option<u64>)])->String{
@@ -981,7 +1045,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");
  let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end);
  analysis_progress(61,"structure","Bounded dominator, phi, and SSA structure completed.");
- let objc_classes=objc_class_graph(&mut file,&window,size)?;let swift_contexts=swift_context_graph(&mut file,&window,size)?;let call_values=call_argument_provenance(&calls,&code,map.address,&symbols);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
+ let objc_classes=objc_class_graph(&mut file,&window,size)?;let swift_contexts=swift_context_graph(&mut file,&window,size)?;let call_values=call_argument_provenance(&calls,&starts,&code,map.address,&symbols);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
  analysis_progress(69,"runtime","Objective-C, Swift, chained-fixup, and annotated-code evidence completed.");
  let interblock_values=interblock_value_flow(&calls,&code,map.address,&leaders,&symbols);let predecessor_values=predecessor_value_flow(&code,map.address,&leaders,&edges,scan_end);let propagated_values=iterative_value_flow(&code,map.address,&leaders,&edges,scan_end);let indirect_calls=indirect_call_resolution(&code,map.address,&leaders,&relocations,&symbols);
  analysis_progress(75,"value-flow","Bounded inter-block value flow and indirect-call evidence completed.");
@@ -1005,6 +1069,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
   ("CFG","CFG","Control Flow",cfg.as_str(),76),
   ("Xrefs","Xrefs","Control Flow",xrefs.as_str(),72),
   ("Call Graph","Call Graph","Control Flow",call_graph.as_str(),78),
+  ("Arguments & Types","Call Values","Semantic",call_values.as_str(),80),
   ("Data References","Data References","Data",data_references.as_str(),88),
   ("Tail-Call Candidates","Tail-Call Candidates","Control Flow",tail_call_candidates.as_str(),70),
   ("Relocations","Relocations","Linkage",relocation_xrefs.as_str(),70),
@@ -1028,12 +1093,34 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let fp_metadata=stage_fingerprint(&[metadata.as_str(),runtime_records.as_str(),swift_types.as_str(),objc_classes.as_str()]);
  let fp_structure=stage_fingerprint(&[functions.as_str(),cfg.as_str(),xrefs.as_str(),call_graph.as_str(),jump_tables.as_str()]);
  let fp_linkage=stage_fingerprint(&[relocation_xrefs.as_str(),dyld_imports.as_str(),dyld_linking.as_str(),softlinking.as_str(),symbolication.as_str(),symbol_resolver.as_str(),apple_symbolication.as_str(),resolved_imports.as_str(),symbol_provenance.as_str(),linkage_records.as_str()]);
- let fp_synthesis=stage_fingerprint(&[function_intelligence.as_str(),function_neighborhoods.as_str(),data_references.as_str(),analysis_quality.as_str(),analysis_insights.as_str()]);
+ let fp_synthesis=stage_fingerprint(&[function_intelligence.as_str(),function_neighborhoods.as_str(),call_values.as_str(),data_references.as_str(),analysis_quality.as_str(),analysis_insights.as_str()]);
  eprintln!("VG_EVIDENCE_MANIFEST\t{{\"schema\":1,\"record_count\":{},\"truncated\":{},\"stage_fingerprints\":{{\"metadata\":{},\"structure\":{},\"linkage\":{},\"synthesis\":{}}}}}",evidence_count,if evidence_truncated{"true"}else{"false"},super::quote(&fp_metadata),super::quote(&fp_structure),super::quote(&fp_linkage),super::quote(&fp_synthesis));
  let coverage=if instruction_words==0{0.0}else{decoded as f64*100.0/instruction_words as f64};
  let code_state=if map.encrypted{"Code bytes: declared encrypted by Mach-O metadata; instruction/CFG/SSA decode intentionally skipped. Metadata, symbols, linkage and bounded non-code evidence remain available.\n"}else{""};
- let summary=format!("ARM64 analysis v14\nCode range: {:#018x}..{:#018x}\nScanned: {} / {} code bytes\n{}Functions: {}\nSymbols in __text: {}\nBasic blocks: {}\nDirect code xrefs: {}\nDirect BL call edges: {}\nCross-function B tail-call candidates: {}\n__text relocations: {}\nIndirect branch candidates: {}\nInstructions scanned: {}\nData-in-code words skipped: {}\nDecoder coverage: {:.1}% ({}/{})\nString scan: first {} bytes of captured object\nDominators, immediate dominators, and dominance frontiers are solved per function under an explicit block budget; structural phi sites remain derived from the bounded CFG when code bytes are available; register SSA remains conservative across unsupported semantics. LC_FUNCTION_STARTS and LC_DATA_IN_CODE metadata do not veto analysis. Relocation xrefs are sourced from Mach-O relocation records. Indirect branch candidates are promoted only to stronger evidence when a nearby modeled load defines the branch register. Objective-C/Swift metadata reporting is section-grounded; string records, runtime reference edges, selector/message-send xrefs, and Swift nominal descriptor targets are emitted only when their ranges/targets validate. SSA renaming remains conservative across opaque semantics. Phi operand provenance is emitted only when modeled definitions are found on at least two predecessor paths. The unified symbol resolver ranks exact nlist names over exact indirect-symbol names and function-start-only ranges while retaining provenance; name-only imports/exports are never assigned invented addresses. Objective-C class/method and Swift context reconstruction require validated mapped records; call arguments report bounded register-definition provenance, not guessed runtime values.",map.address,map.address+map.bytes,scan_bytes,map.bytes,code_state,starts.len(),symbols.len(),block_count,edges.iter().filter(|(_,_,k)|*k!="fallthrough").count(),calls.len(),tail_call_facts.len(),relocations.len(),jump_tables.lines().count(),instruction_words,data_words,coverage,decoded,instruction_words,size.min(4*1024*1024));
+ let summary=format!("ARM64 analysis v16\nCode range: {:#018x}..{:#018x}\nScanned: {} / {} code bytes\n{}Functions: {}\nSymbols in __text: {}\nBasic blocks: {}\nDirect code xrefs: {}\nDirect BL call edges: {}\nCross-function B tail-call candidates: {}\n__text relocations: {}\nIndirect branch candidates: {}\nInstructions scanned: {}\nData-in-code words skipped: {}\nDecoder coverage: {:.1}% ({}/{})\nString scan: first {} bytes of captured object\nDominators, immediate dominators, and dominance frontiers are solved per function under an explicit block budget; structural phi sites remain derived from the bounded CFG when code bytes are available; register SSA remains conservative across unsupported semantics. LC_FUNCTION_STARTS and LC_DATA_IN_CODE metadata do not veto analysis. Relocation xrefs are sourced from Mach-O relocation records. Indirect branch candidates are promoted only to stronger evidence when a nearby modeled load defines the branch register. Objective-C/Swift metadata reporting is section-grounded; string records, runtime reference edges, selector/message-send xrefs, and Swift nominal descriptor targets are emitted only when their ranges/targets validate. SSA renaming remains conservative across opaque semantics. Phi operand provenance is emitted only when modeled definitions are found on at least two predecessor paths. The unified symbol resolver ranks exact nlist names over exact indirect-symbol names and function-start-only ranges while retaining provenance; name-only imports/exports are never assigned invented addresses. Objective-C class/method and Swift context reconstruction require validated mapped records; arguments, incoming parameter candidates, and explicit integer casts report bounded instruction provenance rather than guessed source declarations.",map.address,map.address+map.bytes,scan_bytes,map.bytes,code_state,starts.len(),symbols.len(),block_count,edges.iter().filter(|(_,_,k)|*k!="fallthrough").count(),calls.len(),tail_call_facts.len(),relocations.len(),jump_tables.lines().count(),instruction_words,data_words,coverage,decoded,instruction_words,size.min(4*1024*1024));
  analysis_progress(97,"finalize","Rechecking captured-object identity and serializing the bounded analysis report.");
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured object changed during analysis"));}
  Ok(format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{},\"functions\":{},\"cfg\":{},\"ir\":{},\"strings\":{},\"xrefs\":{},\"call_graph\":{},\"dataflow\":{},\"ssa\":{},\"dominators\":{},\"phi_nodes\":{},\"dominance_frontiers\":{},\"relocations\":{},\"jump_tables\":{},\"metadata\":{},\"runtime_records\":{},\"annotated_disassembly\":{},\"ssa_renamed\":{},\"runtime_graph\":{},\"swift_types\":{},\"selector_xrefs\":{},\"phi_operands\":{},\"objc_classes\":{},\"swift_contexts\":{},\"call_values\":{},\"chained_fixups\":{},\"chained_starts\":{},\"objc_protocols\":{},\"swift_fields\":{},\"swift_field_records\":{},\"interblock_values\":{},\"predecessor_values\":{},\"chained_pointers\":{},\"chained_multistarts\":{},\"arm64e_pointers\":{},\"swift_field_ownership\":{},\"propagated_values\":{},\"indirect_calls\":{},\"dyld_imports\":{},\"dyld_linking\":{},\"softlinking\":{},\"symbolication\":{},\"symbol_resolver\":{},\"apple_symbolication\":{},\"arm64e_bind_symbols\":{},\"dylib_ordinals\":{},\"resolved_imports\":{},\"authenticated_bind_targets\":{},\"indirect_symbols\":{},\"pointer_slots\":{},\"export_trie\":{},\"symbol_provenance\":{},\"linkage_records\":{},\"symbol_callers\":{},\"got_auth_slots\":{},\"import_export_collisions\":{},\"function_intelligence\":{},\"data_references\":{},\"tail_call_candidates\":{},\"function_neighborhoods\":{},\"analysis_quality\":{},\"analysis_insights\":{},\"summary\":{}}}",super::quote(id),super::quote(digest),starts.len(),symbols.len(),block_count,instruction_words,if truncated{"true"}else{"false"},super::quote(&functions),super::quote(&cfg),super::quote(&ir),super::quote(&strings),super::quote(&xrefs),super::quote(&call_graph),super::quote(&dataflow),super::quote(&ssa),super::quote(&dominators),super::quote(&phi_nodes),super::quote(&dominance_frontiers),super::quote(&relocation_xrefs),super::quote(&jump_tables),super::quote(&metadata),super::quote(&runtime_records),super::quote(&annotated_disassembly),super::quote(&ssa_renamed),super::quote(&runtime_graph),super::quote(&swift_types),super::quote(&selector_xrefs),super::quote(&phi_operands),super::quote(&objc_classes),super::quote(&swift_contexts),super::quote(&call_values),super::quote(&chained_fixups),super::quote(&chained_starts),super::quote(&objc_protocols),super::quote(&swift_fields),super::quote(&swift_field_records),super::quote(&interblock_values),super::quote(&predecessor_values),super::quote(&chained_pointers),super::quote(&chained_multistarts),super::quote(&arm64e_pointers),super::quote(&swift_field_ownership),super::quote(&propagated_values),super::quote(&indirect_calls),super::quote(&dyld_imports),super::quote(&dyld_linking),super::quote(&softlinking),super::quote(&symbolication),super::quote(&symbol_resolver),super::quote(&apple_symbolication),super::quote(&arm64e_bind_symbols),super::quote(&dylib_ordinals),super::quote(&resolved_imports),super::quote(&authenticated_bind_targets),super::quote(&indirect_symbols),super::quote(&pointer_slots),super::quote(&export_trie),super::quote(&symbol_provenance),super::quote(&linkage_records),super::quote(&symbol_callers),super::quote(&got_auth_slots),super::quote(&import_export_collisions),super::quote(&function_intelligence),super::quote(&data_references),super::quote(&tail_call_candidates),super::quote(&function_neighborhoods),super::quote(&analysis_quality),super::quote(&analysis_insights),super::quote(&summary)))
+}
+
+#[cfg(test)]
+mod tests {
+ use super::{explicit_integer_cast,function_parameter_candidates};
+
+ #[test]
+ fn recognizes_exact_integer_extension_aliases() {
+  assert_eq!(explicit_integer_cast(0x5300_1c20),Some((0,1,"zero-extend-u8-to-u32","unsigned-u32")));
+  assert_eq!(explicit_integer_cast(0x9340_7c43),Some((3,2,"sign-extend-i32-to-i64","signed-i64")));
+  assert_eq!(explicit_integer_cast(0xd340_7c20),Some((0,1,"zero-extend-u32-to-u64","unsigned-u64")));
+  assert_eq!(explicit_integer_cast(0xd340_7820),None);
+ }
+
+ #[test]
+ fn reports_entry_block_register_uses_as_parameter_candidates() {
+  let words=[0x9100_0408u32,0xf900_03e1,0xd65f_03c0];
+  let code=words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+  let report=function_parameter_candidates(&[0x1000],&code,0x1000,&[]);
+  assert!(report.contains("parameter-registers=[x0, x1]"));
+  assert!(report.contains("highest-abi-position=2"));
+ }
 }

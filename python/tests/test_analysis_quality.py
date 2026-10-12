@@ -5,6 +5,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKER = ROOT / "rust/crates/worker/src/preview.rs"
 MESSAGES = ROOT / "Shared/WorkbenchMessages.swift"
 CONTENT = ROOT / "App/ContentView.swift"
+NAVIGATION = ROOT / "App/AnalysisNavigation.swift"
 
 class AnalysisQualityContract(unittest.TestCase):
     def test_external_calls_are_not_misattributed_to_last_internal_function(self):
@@ -43,6 +44,19 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn("AArch64 PCS signature evidence", body)
         self.assertIn("return-register=x0", body)
         self.assertIn("No source-level types or callee prototypes are inferred", body)
+
+    def test_parameters_arguments_and_casts_have_bounded_provenance(self):
+        source = WORKER.read_text()
+        body = source[source.index("fn explicit_integer_cast"):source.index("fn annotated_disassembly")]
+        self.assertIn("incoming-parameter-candidate", body)
+        self.assertIn("entry-block-use-before-modeled-definition", body)
+        self.assertIn("observed-argument-register-definitions", body)
+        self.assertIn("explicit-integer-cast", body)
+        self.assertIn("decoded-bitfield-alias", body)
+        self.assertIn("zero-extend-u32-to-u64", body)
+        self.assertIn("sign-extend-i32-to-i64", body)
+        self.assertIn('(\"Arguments & Types\",\"Call Values\",\"Semantic\",call_values.as_str(),80)', source)
+        self.assertIn('name: "Arguments & Types", workspace: "Call Values"', NAVIGATION.read_text())
 
     def test_swift_type_records_carry_validation_provenance(self):
         source = WORKER.read_text()
