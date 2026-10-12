@@ -49,7 +49,7 @@ for arch in "${arches[@]}"; do
   if [[ -n "$RUSTUP" ]] && ! "$RUSTUP" target list --installed | /usr/bin/grep -qx "$target"; then
     rew_die "Rust target '$target' is not installed. Run: $RUSTUP target add $target"
   fi
-  args=(build --manifest-path "$ROOT/rust/Cargo.toml" --locked --jobs 2 --target "$target" -p reworkbench-bridge -p reworkbench-worker)
+  args=(build --manifest-path "$ROOT/rust/Cargo.toml" --locked --jobs 1 --target "$target" -p reworkbench-bridge -p reworkbench-worker)
   if [[ "${VECTORGLASS_CARGO_OFFLINE:-${REWORKBENCH_CARGO_OFFLINE:-1}}" != "0" ]]; then args+=(--offline); fi
   [[ $release_flag -eq 1 ]] && args+=(--release)
   echo "HindSight Rust build: configuration=$configuration arch=$arch target=$target deployment=$MACOSX_DEPLOYMENT_TARGET"
