@@ -3485,7 +3485,6 @@ struct ContentView: View {
                 AnyView(statusBar())
             }
             .groupBoxStyle(VGPanelGroupBoxStyle())
-            .navigationTitle(VGProduct.displayName)
         }
         .frame(minWidth: 900, minHeight: 680)
         .sheet(isPresented: $commandPalettePresented) {

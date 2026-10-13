@@ -9,6 +9,7 @@ struct HindSightApp: App {
             ContentView(model: model)
                 .frame(minWidth: 900, minHeight: 680)
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1480, height: 920)
         Settings {
             HindSightSettingsView(model: model)
