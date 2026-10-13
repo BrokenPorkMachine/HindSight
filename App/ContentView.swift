@@ -1283,6 +1283,16 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         analysisToolbar(record)
                         VGAnalysisTriageView(model: model)
+                        DisclosureGroup("Structural insights") {
+                            Text("Rankings use bounded structural evidence; they are not measured performance results.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            clickableEvidence(model.currentAnalysis?.analysis_insights ?? "Run Analyze binary to synthesize structural evidence.")
+                                .frame(minHeight: 160)
+                        }
+                        DisclosureGroup("Coverage and analysis limits") {
+                            monospaced(model.currentAnalysis?.analysis_quality ?? "Run Analyze binary to review code coverage, truncation, and evidence limits.")
+                                .frame(minHeight: 120)
+                        }
                     }.padding(8)
                 }
             case "Analysis Insights":
@@ -1930,13 +1940,14 @@ struct ContentView: View {
             default:
                 VStack(alignment: .leading, spacing: 16) {
                     VStack(alignment:.leading,spacing:8) {
-                        Text("See the machine, not just the file.").font(.largeTitle).fontWeight(.semibold)
-                        Text("Static semantics, live process state, deterministic emulation and evidence provenance share one project. Every surface is designed to make the next investigative move obvious without hiding uncertainty.").font(.title3).foregroundStyle(.secondary).frame(maxWidth:900,alignment:.leading)
-                        if model.mentorMode { Text("Mentor: begin with Navigator for broad orientation, then pivot to Annotated Code/CFG for proven static facts. Use Debugger or VectorEmu only when you need runtime evidence.").font(.caption).foregroundStyle(.secondary) }
+                        Text("Start with the question you need to answer.").font(.largeTitle).fontWeight(.semibold)
+                        Text("Inspect a binary, compare builds, review runtime observations, or preserve evidence. HindSight keeps measured observations distinct from structural analysis and hypotheses.").font(.title3).foregroundStyle(.secondary).frame(maxWidth:900,alignment:.leading)
+                        if model.mentorMode { Text("Mentor: use Binary Workspace for code and references, Binary Diff for build changes, and Trace Explorer for debugger observations. Use Triage to preserve evidence and record what remains unknown.").font(.caption).foregroundStyle(.secondary) }
                         Button("Quick Start…", systemImage: "questionmark.circle") { quickStartPresented = true }
                             .buttonStyle(.bordered)
                     }.padding(.bottom,4)
                     investigationPath(record)
+                    performanceReadiness()
                     handoffSummary(record)
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 190), spacing: 10)], spacing: 10) {
                         VGMetricTile(title: "Functions", value: String(model.currentAnalysis?.function_count ?? 0), detail: model.currentAnalysis == nil ? "Run analysis" : "bounded discoveries", icon: "function")
@@ -1944,14 +1955,10 @@ struct ContentView: View {
                         VGMetricTile(title: "Targets", value: String(model.unifiedTargets.count), detail: model.selectedUnifiedTarget?.state ?? "none active", icon: "scope")
                     }
                     LazyVGrid(columns:[GridItem(.adaptive(minimum:210),spacing:10)],spacing:10) {
-                        reToolCard("Navigator","Search every analysis surface at once","safari")
-                        reToolCard("Annotated Code","Verified symbols + branch evidence","text.alignleft")
-                        reToolCard("CFG","Control flow without invented targets","point.3.connected.trianglepath.dotted")
-                        reToolCard("Debugger","Native Mach runtime state","ladybug")
-                        reToolCard("VectorEmu Lab","Deterministic machine execution","cpu")
-                        reToolCard("Hypervisor RE Suite","Hardware-assisted guest inspection","memorychip")
-                        reToolCard("Python Console","Automate repeatable analysis","terminal")
-                        reToolCard("Notes","Keep conclusions beside evidence","note.text")
+                        reToolCard("Binary Workspace","Functions, code, flow, and references in one place","rectangle.3.group")
+                        reToolCard("Binary Diff","Compare two captured builds","arrow.left.arrow.right.square")
+                        reToolCard("Analysis Triage","Review, pin, and annotate findings","scope")
+                        reToolCard("Trace Explorer","Inspect debugger observations and static correlation","point.topleft.down.to.point.bottomright.curvepath")
                     }
                     GroupBox("Evidence doctrine") {
                         Text("Observed bytes, decoded structure, inferred semantics, modeled hardware and runtime observations remain separately attributable. HindSight should make uncertainty visible instead of laundering it into confident-looking output.").font(.caption).foregroundStyle(.secondary).padding(8)
@@ -2653,8 +2660,19 @@ struct ContentView: View {
                 }
 
                 Menu {
-                    Picker("Task Layout", selection: $model.layoutPreset) {
-                        ForEach(VGWorkspaceCatalog.layouts, id: \.self) { Text($0).tag($0) }
+                    Section("Analyze") {
+                        Button("Review findings") { model.workspace = "Analysis Triage" }
+                        Button("Inspect code") { model.workspace = "Binary Workspace" }
+                        Button("Compare builds") { model.workspace = "Binary Diff" }
+                        Button("Search analysis") { model.workspace = "Navigator" }
+                    }
+                    Section("Runtime") {
+                        Button("Runtime session") { model.workspace = "Trace Explorer" }
+                        Button("Debugger") { model.workspace = "Debugger" }
+                    }
+                    Section("Evidence") {
+                        Button("Evidence graph") { model.workspace = "Evidence Graph" }
+                        Button("Investigation handoff") { model.workspace = "Investigation Ledger" }
                     }
                     Divider()
                     ForEach(model.plugins.filter { $0.enabled }) { plugin in
@@ -2667,7 +2685,7 @@ struct ContentView: View {
                         }
                     }
                 } label: {
-                    Label(model.layoutPreset, systemImage: "rectangle.3.group")
+                    Label("Workflows", systemImage: "rectangle.3.group")
                 }
                 .fixedSize()
 
@@ -2951,7 +2969,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Quick Start")
                         .font(.title2.weight(.semibold))
-                    Text("A short path from bytes to a defensible investigation handoff.")
+                    Text("Choose a task, follow the evidence, and keep the limits of each result visible.")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -2988,6 +3006,7 @@ struct ContentView: View {
                     Label("Verified structure and decoded observations are kept separate from inferred semantics.", systemImage: "checkmark.seal")
                     Label("Unresolved branches, indirect targets, source lines, and types remain explicitly unresolved.", systemImage: "questionmark.diamond")
                     Label("Encrypted or compressed firmware containers must be unpacked before import.", systemImage: "lock.doc")
+                    Label("Debugger stop history is not CPU profiling; HindSight does not yet import sampling, latency, throughput, or allocation profiles.", systemImage: "speedometer")
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2998,7 +3017,7 @@ struct ContentView: View {
             GroupBox("Bundled tutorial fixture") {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("Try Tests/Fixtures/arm64-integer-sample.macho for a deterministic first investigation. It is synthetic, non-runnable test data with visible ARM64 instructions and deliberate unsupported words.")
-                    Text("Expected path: import → capture → analyze → open Analysis Triage, Annotated Code, and Analysis Quality → annotate one result → export the ledger.")
+                    Text("Expected path: import → capture → analyze → review Triage (including its insights and coverage disclosures) → inspect code → annotate a finding → export the ledger.")
                     Text("Full walkthrough: docs/HINDSIGHT_TUTORIAL.md")
                         .font(.system(.caption, design: .monospaced))
                 }
@@ -3111,6 +3130,35 @@ struct ContentView: View {
                         enabled: hasReviewContext
                     )
                 }
+            }
+            .padding(8)
+        }
+    }
+
+    @ViewBuilder private func performanceReadiness() -> some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Label("Performance workload support", systemImage: "speedometer")
+                        .font(.headline)
+                    Spacer()
+                    Text("PROFILE IMPORT NOT AVAILABLE")
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(.quaternary, in: Capsule())
+                }
+                Text("HindSight can provide static code structure and debugger stop observations, but it does not currently collect or import CPU-time, sampling, latency, throughput, or allocation profiles. Debugger stops are not performance samples.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                VGFlowLayout {
+                    Button("Review static structure") { model.workspace = "Analysis Triage" }
+                        .disabled(model.currentAnalysis == nil)
+                    Button("Open runtime observations") { model.workspace = "Trace Explorer" }
+                        .disabled(model.currentAnalysis == nil)
+                    Button("Compare builds") { model.workspace = "Binary Diff" }
+                }
+                .buttonStyle(.borderless)
             }
             .padding(8)
         }

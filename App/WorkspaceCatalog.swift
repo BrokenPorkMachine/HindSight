@@ -71,7 +71,7 @@ enum VGWorkspaceCatalog {
 
         add(.start,
             ["Overview", "Targets", "Selected Symbol"],
-            sidebar: ["Overview", "Targets", "Selected Symbol"],
+            sidebar: ["Overview", "Targets"],
             subtitle: "Orient, select a target, and follow the current investigation.",
             icon: "scope",
             overrides: [
@@ -82,7 +82,7 @@ enum VGWorkspaceCatalog {
 
         add(.staticAnalysis,
             ["Binary Workspace", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Annotated Code", "Functions", "Function Intelligence", "Function Neighborhoods", "Tail-Call Candidates", "CFG", "Dominators", "Dominance Frontiers", "Phi Nodes", "IR", "SSA", "SSA Rename", "Strings", "Xrefs", "Data References", "Relocations", "Jump Tables", "Call Graph", "Data Flow", "Metadata", "Runtime Records", "Runtime Graph", "ObjC Classes", "Swift Types", "Swift Contexts", "Selector Xrefs", "Call Values", "Chained Fixups", "Chained Starts", "ObjC Protocols", "Swift Fields", "Swift Field Records", "Inter-block Values", "Predecessor Values", "Chained Pointers", "Multi-Start Chains", "ARM64e Pointers", "Swift Ownership", "Propagated Values", "Indirect Calls", "Dyld Imports", "Dyld Linking", "Soft Linking", "Symbolication", "Symbol Resolver", "Apple Symbolication", "Dylib Ordinals", "Resolved Imports", "ARM64e Bind Symbols", "Authenticated Targets", "Indirect Symbols", "Pointer Slots", "Exports", "Symbol Provenance", "Linkage Records", "Symbol Callers", "GOT/Auth-GOT", "Import/Export Collisions"],
-            sidebar: ["Binary Workspace", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Functions", "Function Neighborhoods", "Call Values", "CFG", "Strings", "Xrefs", "Runtime Graph", "Symbol Resolver", "Symbol Provenance"],
+            sidebar: ["Binary Workspace", "Binary Diff", "Analysis Triage", "Navigator", "CFG"],
             subtitle: "Understand code, control flow, data, symbols, and Apple runtime evidence.",
             icon: "doc.text.magnifyingglass",
             overrides: [
@@ -110,7 +110,7 @@ enum VGWorkspaceCatalog {
 
         add(.runtime,
             ["Trace Explorer", "Runtime Correlation", "Debugger", "Threads", "Memory Map", "Modules", "Backtrace", "Live Disassembly", "Stop Context"],
-            sidebar: ["Trace Explorer", "Runtime Correlation", "Debugger", "Live Disassembly", "Threads", "Memory Map", "Modules", "Stop Context"],
+            sidebar: ["Trace Explorer", "Debugger"],
             subtitle: "Inspect a live process, execution state, memory, modules, and stops.",
             icon: "ladybug",
             overrides: [
