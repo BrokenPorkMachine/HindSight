@@ -113,3 +113,19 @@ assert 'opaque instruction: semantics unavailable' in semantic
 assert b'"source":"Semantic Preview"' in process.stderr
 assert b'"address":"0x00000001000000cc"' in process.stderr
 print('ARM64 instruction-derived semantic preview and provenance passed')
+
+with tempfile.TemporaryDirectory() as directory:
+    source = pathlib.Path(directory) / 'straight-line.macho'
+    data = image(words=(0x52800020, 0x11000400, 0xd65f03c0))
+    source.write_bytes(data)
+    process = subprocess.run(
+        [sys.argv[1], '--analyze', str(source), hashlib.sha256(data).hexdigest(),
+         str(len(data)), str(uuid.uuid4())],
+        capture_output=True, timeout=120, check=True,
+    )
+    report = json.loads(read_frame(io.BytesIO(process.stdout)))
+    semantic = report['semantic_preview']
+    assert 'AArch64 register semantics v2' in semantic
+    assert 'constant=0x2 proven_by=[0x1000000b8,0x1000000bc]' in semantic
+    assert 'ABI result register x0 /* constant=0x2 proven_by=[0x1000000b8,0x1000000bc] */' in semantic
+print('ARM64 straight-line constant provenance passed through worker analysis')

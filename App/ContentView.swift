@@ -142,7 +142,6 @@ struct ContentView: View {
     @State private var showInspector = true
     @State private var inspectorMode: VGInspectorMode = .context
     @State private var workspaceTabs = ["Overview"]
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var focusMode = false
     @State private var inspectorBeforeFocus = true
     @State private var quickStartPresented = false
@@ -195,12 +194,10 @@ struct ContentView: View {
     private func toggleFocusMode() {
         if focusMode {
             focusMode = false
-            columnVisibility = .all
             showInspector = inspectorBeforeFocus
         } else {
             inspectorBeforeFocus = showInspector
             focusMode = true
-            columnVisibility = .detailOnly
             showInspector = false
         }
     }
@@ -2178,7 +2175,26 @@ struct ContentView: View {
                     Text(model.dyldCachePath.isEmpty ? "No cache selected." : model.dyldCachePath).font(.caption).textSelection(.enabled)
                     if let c=model.dyldCache {
                         Text("\(c.magic) • \(c.imageCount) images • \(c.mappingCount) mappings").font(.caption)
-                        List(selection:$model.selectedDyldImageID) { ForEach(model.filteredDyldImages) { img in VStack(alignment:.leading){Text(img.path).lineLimit(1);Text("\(img.loadAddress) • __TEXT \(img.textSize) bytes").font(.caption).foregroundStyle(.secondary)}.tag(img.id) } }.frame(minHeight:300).onChange(of:model.selectedDyldImageID) { _,_ in model.useSelectedDyldImageAddress() }
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 2) {
+                                ForEach(model.filteredDyldImages) { img in
+                                    Button { model.selectedDyldImageID = img.id } label: {
+                                        VStack(alignment: .leading) {
+                                            Text(img.path).lineLimit(1)
+                                            Text("\(img.loadAddress) • __TEXT \(img.textSize) bytes")
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                        .padding(7)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(img.id == model.selectedDyldImageID ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .frame(minHeight: 300)
+                        .onChange(of: model.selectedDyldImageID) { _, _ in model.useSelectedDyldImageAddress() }
                         Divider()
                         Text("Bounded cache read").font(.headline)
                         Text("Translates a cache virtual address through the primary mapping table and reads only validated file-backed bytes. Addresses in subcaches remain explicitly unresolved until that subcache is opened.").font(.caption).foregroundStyle(.secondary)
@@ -2218,7 +2234,21 @@ struct ContentView: View {
                     }
                     Button("Fetch from The Apple Wiki",action:model.fetchSelectedFirmwareKeys).disabled(model.firmwareBuildID.isEmpty)
                     Text("Only publicly published firmware IV/key material is imported. HindSight does not generate or infer UID/GID/device-unique secrets.").font(.caption).foregroundStyle(.secondary)
-                    List(model.firmwareKeys) { k in VStack(alignment:.leading,spacing:3){Text(k.filename).font(.headline);Text("IV  \(k.iv)").font(.system(.caption,design:.monospaced)).textSelection(.enabled);Text("KEY \(k.key)").font(.system(.caption,design:.monospaced)).textSelection(.enabled);Text(k.sourcePage).font(.caption2).foregroundStyle(.secondary)} }.frame(minHeight:360)
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(model.firmwareKeys) { k in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(k.filename).font(.headline)
+                                    Text("IV  \(k.iv)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                                    Text("KEY \(k.key)").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                                    Text(k.sourcePage).font(.caption2).foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(8)
+                    }
+                    .frame(minHeight: 360)
                 }.padding(8) }
             } else if tool == "Full-System iPhemeral" {
                 GroupBox("Full-System iPhemeral • advanced external backend") { VStack(alignment:.leading,spacing:10) {
@@ -2450,6 +2480,13 @@ struct ContentView: View {
         .help(available ? descriptor.helpText : VGHostPlatform.unavailableReason(for: descriptor.name))
     }
 
+    private func sidebarSectionHeading(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 7)
+    }
+
     @ViewBuilder private func workbenchSidebar() -> some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 12) {
@@ -2495,8 +2532,10 @@ struct ContentView: View {
 
             Divider()
 
-            List {
-                Section {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 8) {
+                    sidebarSectionHeading("Investigation")
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(alignment: .center) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -2564,25 +2603,23 @@ struct ContentView: View {
                         }
                     }
                     .padding(.vertical, 4)
-                } header: {
-                    Text("Investigation")
                 }
 
-                Section {
-                    TextField("Filter tools", text: $sidebarQuery)
-                        .textFieldStyle(.roundedBorder)
-                }
+                TextField("Filter tools", text: $sidebarQuery)
+                    .textFieldStyle(.roundedBorder)
 
                 if sidebarQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     ForEach(VGWorkspaceGroup.allCases) { group in
-                        Section(group.rawValue) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            sidebarSectionHeading(group.rawValue)
                             ForEach(VGWorkspaceCatalog.sidebar(in: group)) { descriptor in
                                 sidebarWorkspaceButton(descriptor)
                             }
                         }
                     }
                 } else {
-                    Section("Matching Tools") {
+                    VStack(alignment: .leading, spacing: 5) {
+                        sidebarSectionHeading("Matching Tools")
                         let matches = Array(VGWorkspaceCatalog.search(sidebarQuery).prefix(24))
                         if matches.isEmpty {
                             Text("No tools match ‘\(sidebarQuery)’.")
@@ -2596,7 +2633,7 @@ struct ContentView: View {
                     }
                 }
 
-                Section {
+                VStack(alignment: .leading, spacing: 8) {
                     Button {
                         quickStartPresented = true
                     } label: {
@@ -2610,10 +2647,11 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                 }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 12)
             }
-            .listStyle(.sidebar)
         }
-        .navigationSplitViewColumnWidth(min: 245, ideal: 285, max: 330)
     }
 
     @ViewBuilder private func workspaceHeader(_ record: ProjectRecord?) -> some View {
@@ -2644,7 +2682,8 @@ struct ContentView: View {
                         .disabled(model.busy || !model.projectServiceReady || !(record?.result.captured ?? false))
                 }
             }
-            .padding(.horizontal, 14)
+            .padding(.leading, focusMode ? 82 : 14)
+            .padding(.trailing, 14)
             .padding(.top, 10)
             .padding(.bottom, 7)
 
@@ -3472,9 +3511,12 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            workbenchSidebar()
-        } detail: {
+        HSplitView {
+            if !focusMode {
+                workbenchSidebar()
+                    .padding(.top, 30)
+                    .frame(minWidth: 245, idealWidth: 285, maxWidth: 330)
+            }
             VStack(spacing: 0) {
                 // Bound generic expansion at the three top-level regions. Swift
                 // 6.4 otherwise recurses through every workspace's opaque view
@@ -3493,6 +3535,7 @@ struct ContentView: View {
             }
             .groupBoxStyle(VGPanelGroupBoxStyle())
         }
+        .ignoresSafeArea(.container, edges: .top)
         .frame(minWidth: 900, minHeight: 680)
         .sheet(isPresented: $commandPalettePresented) {
             VGCommandPalette(

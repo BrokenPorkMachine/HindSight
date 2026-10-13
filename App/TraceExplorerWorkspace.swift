@@ -133,16 +133,25 @@ struct VGTraceExplorerWorkspace: View {
             if filteredEvents.isEmpty {
                 ContentUnavailableView("No debugger observations", systemImage: "timeline.selection", description: Text("Attach or launch a target, then step/stop execution to populate the bounded runtime history."))
             } else {
-                List(filteredEvents, selection: $selectedEventID) { event in
-                    traceRow(event)
-                        .tag(event.id)
-                        .contextMenu {
-                            if let preferred = event.preferredPC {
-                                Button("Open static address") { onSelectStaticAddress(VGTargetUtilities.hex(preferred)) }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(filteredEvents) { event in
+                            Button { selectedEventID = event.id } label: {
+                                traceRow(event)
+                                    .padding(7)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(event.id == selectedEventID ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                if let preferred = event.preferredPC {
+                                    Button("Open static address") { onSelectStaticAddress(VGTargetUtilities.hex(preferred)) }
+                                }
                             }
                         }
+                    }
+                    .padding(8)
                 }
-                .listStyle(.sidebar)
             }
         }
     }

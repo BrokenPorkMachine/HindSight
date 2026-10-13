@@ -169,19 +169,28 @@ struct VGBinaryDiffWorkspace: View {
                 .labelsHidden().frame(width: 110)
             }
             .padding(.horizontal, 10).padding(.top, 10)
-            List(visibleFunctions, selection: $selectedDiffID) { item in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        statusBadge(item.status)
-                        Text(item.displayName).font(.system(.body, design: .monospaced)).fontWeight(.semibold).lineLimit(1)
-                        Spacer()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(visibleFunctions) { item in
+                        Button { selectedDiffID = item.id } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    statusBadge(item.status)
+                                    Text(item.displayName).font(.system(.body, design: .monospaced)).fontWeight(.semibold).lineLimit(1)
+                                    Spacer()
+                                }
+                                Text(item.changeSummary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                Text("\(item.baselineAddress)  →  \(item.candidateAddress)")
+                                    .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
+                            }
+                            .padding(7)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(item.id == selectedDiffID ? Color.accentColor.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
+                        }
+                        .buttonStyle(.plain)
                     }
-                    Text(item.changeSummary).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                    Text("\(item.baselineAddress)  →  \(item.candidateAddress)")
-                        .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
                 }
-                .padding(.vertical, 3)
-                .tag(item.id)
+                .padding(8)
             }
         }
     }

@@ -191,58 +191,70 @@ struct VGInvestigationLedgerWorkspace: View {
     }
 
     private var timeline: some View {
-        List(filteredEntries) { entry in
-            Button {
-                onSelectEntry(entry.id)
-            } label: {
-                HStack(alignment: .top, spacing: 10) {
-                    VStack(spacing: 3) {
-                        Circle().fill(color(entry.provenance)).frame(width: 9, height: 9)
-                        Rectangle().fill(Color.secondary.opacity(0.15)).frame(width: 1, height: 37)
-                    }
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(entry.title).font(.system(size: 12, weight: .semibold))
-                            Text(entry.provenance.title.uppercased()).font(.system(size: 8, weight: .bold)).foregroundStyle(color(entry.provenance))
-                            Spacer()
-                            Text(entry.timestamp, style: .time).font(.caption2).foregroundStyle(.secondary)
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(filteredEntries) { entry in
+                    Button {
+                        onSelectEntry(entry.id)
+                    } label: {
+                        HStack(alignment: .top, spacing: 10) {
+                            VStack(spacing: 3) {
+                                Circle().fill(color(entry.provenance)).frame(width: 9, height: 9)
+                                Rectangle().fill(Color.secondary.opacity(0.15)).frame(width: 1, height: 37)
+                            }
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(entry.title).font(.system(size: 12, weight: .semibold))
+                                    Text(entry.provenance.title.uppercased()).font(.system(size: 8, weight: .bold)).foregroundStyle(color(entry.provenance))
+                                    Spacer()
+                                    Text(entry.timestamp, style: .time).font(.caption2).foregroundStyle(.secondary)
+                                }
+                                Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                HStack(spacing: 8) {
+                                    Label(entry.context.workspace, systemImage: "rectangle.3.group").font(.caption2)
+                                    if let address = entry.context.address { Text(address).font(.system(size: 9, design: .monospaced)) }
+                                    if let symbol = entry.context.symbol, !symbol.isEmpty { Text(symbol).font(.caption2) }
+                                }.foregroundStyle(.secondary)
+                            }
                         }
-                        Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                        HStack(spacing: 8) {
-                            Label(entry.context.workspace, systemImage: "rectangle.3.group").font(.caption2)
-                            if let address = entry.context.address { Text(address).font(.system(size: 9, design: .monospaced)) }
-                            if let symbol = entry.context.symbol, !symbol.isEmpty { Text(symbol).font(.caption2) }
-                        }.foregroundStyle(.secondary)
+                        .padding(.vertical, 3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 8)
+                        .background(entry.id == selectedEntryID ? Color.accentColor.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 7))
                     }
+                    .buttonStyle(.plain)
                 }
-                .padding(.vertical, 3)
             }
-            .buttonStyle(.plain)
-            .listRowBackground(entry.id == selectedEntryID ? Color.accentColor.opacity(0.10) : Color.clear)
+            .padding(8)
         }
-        .listStyle(.inset)
     }
 
     private var hypotheses: some View {
         VStack(spacing: 0) {
-            List(ledger.hypotheses.filter { queryMatch($0.title + " " + $0.detail) }.reversed()) { hypothesis in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(hypothesis.title).font(.headline)
-                        Spacer()
-                        Menu(hypothesis.status.title) {
-                            ForEach(VGHypothesisStatus.allCases, id: \.self) { status in
-                                Button(status.title) { onSetHypothesisStatus(hypothesis.id, status) }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(ledger.hypotheses.filter { queryMatch($0.title + " " + $0.detail) }.reversed()) { hypothesis in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(hypothesis.title).font(.headline)
+                                Spacer()
+                                Menu(hypothesis.status.title) {
+                                    ForEach(VGHypothesisStatus.allCases, id: \.self) { status in
+                                        Button(status.title) { onSetHypothesisStatus(hypothesis.id, status) }
+                                    }
+                                }
+                                .menuStyle(.borderlessButton)
+                            }
+                            Text(hypothesis.detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            if !hypothesis.linkedAddresses.isEmpty {
+                                Text(hypothesis.linkedAddresses.joined(separator: " · ")).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
                             }
                         }
-                        .menuStyle(.borderlessButton)
-                    }
-                    Text(hypothesis.detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                    if !hypothesis.linkedAddresses.isEmpty {
-                        Text(hypothesis.linkedAddresses.joined(separator: " · ")).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                        .padding(.vertical, 5)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                .padding(.vertical, 5)
+                .padding(12)
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
@@ -256,12 +268,19 @@ struct VGInvestigationLedgerWorkspace: View {
 
     private var bookmarks: some View {
         VStack(spacing: 0) {
-            List(ledger.bookmarks.filter { queryMatch($0.title + " " + $0.note + " " + ($0.address ?? "")) }.reversed()) { bookmark in
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(bookmark.title).font(.headline)
-                    HStack { Text(bookmark.workspace); if let address = bookmark.address { Text(address).font(.system(size: 9, design: .monospaced)) } }.font(.caption).foregroundStyle(.secondary)
-                    if !bookmark.note.isEmpty { Text(bookmark.note).font(.caption).textSelection(.enabled) }
-                }.padding(.vertical, 4)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(ledger.bookmarks.filter { queryMatch($0.title + " " + $0.note + " " + ($0.address ?? "")) }.reversed()) { bookmark in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(bookmark.title).font(.headline)
+                            HStack { Text(bookmark.workspace); if let address = bookmark.address { Text(address).font(.system(size: 9, design: .monospaced)) } }.font(.caption).foregroundStyle(.secondary)
+                            if !bookmark.note.isEmpty { Text(bookmark.note).font(.caption).textSelection(.enabled) }
+                        }
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(12)
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
@@ -276,19 +295,24 @@ struct VGInvestigationLedgerWorkspace: View {
     }
 
     private var snapshots: some View {
-        List(ledger.snapshots.filter { queryMatch($0.title + " " + $0.workspace + " " + $0.address) }.reversed()) { snapshot in
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(snapshot.title).font(.headline)
-                    Text("\(snapshot.workspace) · \(snapshot.layoutPreset)").font(.caption).foregroundStyle(.secondary)
-                    if !snapshot.address.isEmpty { Text(snapshot.address).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary) }
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 6) {
+                ForEach(ledger.snapshots.filter { queryMatch($0.title + " " + $0.workspace + " " + $0.address) }.reversed()) { snapshot in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(snapshot.title).font(.headline)
+                            Text("\(snapshot.workspace) · \(snapshot.layoutPreset)").font(.caption).foregroundStyle(.secondary)
+                            if !snapshot.address.isEmpty { Text(snapshot.address).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary) }
+                        }
+                        Spacer()
+                        Button("Restore") { onRestoreSnapshot(snapshot) }
+                    }
+                    .padding(.vertical, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Spacer()
-                Button("Restore") { onRestoreSnapshot(snapshot) }
             }
-            .padding(.vertical, 4)
+            .padding(12)
         }
-        .listStyle(.inset)
     }
 
     private var selectedEntry: VGLedgerEntry? { ledger.entries.first(where: { $0.id == selectedEntryID }) }

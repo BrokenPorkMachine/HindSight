@@ -27,28 +27,72 @@ fn signed_target(pc: u64, displacement: i64) -> u64 {
     pc.wrapping_add_signed(displacement)
 }
 
-/// Return a statement only for encodings whose operands and effects are
-/// modeled here. Decoded instructions outside this set remain opaque.
-fn lift(word: u32, pc: u64) -> String {
+#[derive(Clone, Copy)]
+struct Register {
+    index: u32,
+    wide: bool,
+    stack_pointer: bool,
+}
+
+impl Register {
+    fn name(self) -> String {
+        register(self.index, self.wide, self.stack_pointer)
+    }
+
+    fn mask(self, value: u64) -> u64 {
+        if self.wide {
+            value
+        } else {
+            value & 0xffff_ffff
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Operation {
+    Nop,
+    Return(Register),
+    Call(u64),
+    Branch(u64),
+    AddImmediate {
+        dst: Register,
+        src: Register,
+        value: u64,
+        subtract: bool,
+    },
+    AddRegister {
+        dst: Register,
+        left: Register,
+        right: Register,
+        subtract: bool,
+    },
+    MoveZero {
+        dst: Register,
+        value: u64,
+    },
+    Discard(&'static str),
+    Opaque,
+}
+
+/// Decode only encodings with modeled operand and effect semantics.
+fn decode(word: u32, pc: u64) -> Operation {
     if word == 0xd503_201f {
-        return "/* nop */".into();
+        return Operation::Nop;
     }
     if word & 0xffff_fc1f == 0xd65f_0000 {
-        return format!(
-            "return /* ABI result register x0; return type unknown, via {} */;",
-            register((word >> 5) & 31, true, false)
-        );
+        return Operation::Return(Register {
+            index: (word >> 5) & 31,
+            wide: true,
+            stack_pointer: false,
+        });
     }
     if word & 0xfc00_0000 == 0x9400_0000 {
         let imm = ((word & 0x03ff_ffff) as i32) << 6 >> 4;
-        return format!(
-            "call({:#x}); /* signature, arguments, result and side effects unresolved */",
-            signed_target(pc, imm as i64)
-        );
+        return Operation::Call(signed_target(pc, imm as i64));
     }
     if word & 0xfc00_0000 == 0x1400_0000 {
         let imm = ((word & 0x03ff_ffff) as i32) << 6 >> 4;
-        return format!("goto {:#x};", signed_target(pc, imm as i64));
+        return Operation::Branch(signed_target(pc, imm as i64));
     }
     // ADD/SUB (immediate), excluding flag-setting variants and reserved shift.
     if word & 0x1f00_0000 == 0x1100_0000 && word & (1 << 29) == 0 {
@@ -58,13 +102,20 @@ fn lift(word: u32, pc: u64) -> String {
             let rd = word & 31;
             let rn = (word >> 5) & 31;
             let imm = ((word >> 10) & 0xfff) << if shift == 1 { 12 } else { 0 };
-            return format!(
-                "{} = {} {} {:#x};",
-                register(rd, wide, true),
-                register(rn, wide, true),
-                if word & (1 << 30) == 0 { "+" } else { "-" },
-                imm
-            );
+            return Operation::AddImmediate {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: true,
+                },
+                src: Register {
+                    index: rn,
+                    wide,
+                    stack_pointer: true,
+                },
+                value: imm as u64,
+                subtract: word & (1 << 30) != 0,
+            };
         }
     }
     // ADD/SUB (shifted register), only unshifted LSL #0 and no flags.
@@ -78,15 +129,26 @@ fn lift(word: u32, pc: u64) -> String {
         let rn = (word >> 5) & 31;
         let rm = (word >> 16) & 31;
         if rd == 31 {
-            return "/* arithmetic result discarded in zero register */".into();
+            return Operation::Discard("arithmetic result discarded in zero register");
         }
-        return format!(
-            "{} = {} {} {};",
-            register(rd, wide, false),
-            register(rn, wide, false),
-            if word & (1 << 30) == 0 { "+" } else { "-" },
-            register(rm, wide, false)
-        );
+        return Operation::AddRegister {
+            dst: Register {
+                index: rd,
+                wide,
+                stack_pointer: false,
+            },
+            left: Register {
+                index: rn,
+                wide,
+                stack_pointer: false,
+            },
+            right: Register {
+                index: rm,
+                wide,
+                stack_pointer: false,
+            },
+            subtract: word & (1 << 30) != 0,
+        };
     }
     // MOVZ: exact constant definition; no source-level type is inferred.
     if word & 0x7f80_0000 == 0x5280_0000 {
@@ -94,13 +156,186 @@ fn lift(word: u32, pc: u64) -> String {
         let hw = (word >> 21) & 3;
         if wide || hw < 2 {
             if word & 31 == 31 {
-                return "/* constant discarded in zero register */".into();
+                return Operation::Discard("constant discarded in zero register");
             }
             let value = (((word >> 5) & 0xffff) as u64) << (hw * 16);
-            return format!("{} = {value:#x};", register(word & 31, wide, false));
+            return Operation::MoveZero {
+                dst: Register {
+                    index: word & 31,
+                    wide,
+                    stack_pointer: false,
+                },
+                value,
+            };
         }
     }
-    "/* opaque instruction: semantics unavailable; value flow stops here */".into()
+    Operation::Opaque
+}
+
+#[derive(Clone)]
+struct KnownValue {
+    value: u64,
+    origins: Vec<u64>,
+}
+
+struct Flow {
+    registers: [Option<KnownValue>; 31],
+}
+
+impl Flow {
+    fn new() -> Self {
+        Self {
+            registers: std::array::from_fn(|_| None),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.registers.fill(None);
+    }
+
+    fn read(&self, reg: Register) -> Option<KnownValue> {
+        if reg.index == 31 {
+            return (!reg.stack_pointer).then_some(KnownValue {
+                value: 0,
+                origins: Vec::new(),
+            });
+        }
+        self.registers[reg.index as usize]
+            .as_ref()
+            .map(|v| KnownValue {
+                value: reg.mask(v.value),
+                origins: v.origins.clone(),
+            })
+    }
+
+    fn write(&mut self, reg: Register, value: Option<KnownValue>) {
+        if reg.index < 31 {
+            self.registers[reg.index as usize] = value.map(|mut v| {
+                v.value = reg.mask(v.value);
+                v
+            });
+        }
+    }
+}
+
+fn combine_origins(left: &[u64], right: &[u64], pc: u64) -> Option<Vec<u64>> {
+    let mut result = Vec::new();
+    for origin in left.iter().chain(right).chain(std::iter::once(&pc)) {
+        if !result.contains(origin) {
+            result.push(*origin);
+        }
+        if result.len() > 8 {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+fn resolved_suffix(value: Option<&KnownValue>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    let sources = value
+        .origins
+        .iter()
+        .map(|pc| format!("{pc:#x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(" /* constant={:#x} proven_by=[{sources}] */", value.value)
+}
+
+impl Operation {
+    fn render(self, flow: &mut Flow, pc: u64) -> String {
+        match self {
+            Self::Nop => "/* nop */".into(),
+            Self::Return(via) => {
+                let candidate = flow.read(Register {
+                    index: 0,
+                    wide: true,
+                    stack_pointer: false,
+                });
+                let statement = format!(
+                    "return /* ABI result register x0{}; return type unknown, via {} */;",
+                    resolved_suffix(candidate.as_ref()),
+                    via.name()
+                );
+                flow.clear();
+                statement
+            }
+            Self::Call(target) => {
+                flow.clear();
+                format!("call({target:#x}); /* signature, arguments, result and side effects unresolved */")
+            }
+            Self::Branch(target) => {
+                flow.clear();
+                format!("goto {target:#x};")
+            }
+            Self::AddImmediate {
+                dst,
+                src,
+                value,
+                subtract,
+            } => {
+                let known = flow.read(src).and_then(|input| {
+                    Some(KnownValue {
+                        value: dst.mask(if subtract {
+                            input.value.wrapping_sub(value)
+                        } else {
+                            input.value.wrapping_add(value)
+                        }),
+                        origins: combine_origins(&input.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = {} {} {value:#x};{}",
+                    dst.name(),
+                    src.name(),
+                    if subtract { "-" } else { "+" },
+                    resolved_suffix(known.as_ref())
+                )
+            }
+            Self::AddRegister {
+                dst,
+                left,
+                right,
+                subtract,
+            } => {
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    Some(KnownValue {
+                        value: dst.mask(if subtract {
+                            a.value.wrapping_sub(b.value)
+                        } else {
+                            a.value.wrapping_add(b.value)
+                        }),
+                        origins: combine_origins(&a.origins, &b.origins, pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = {} {} {};{}",
+                    dst.name(),
+                    left.name(),
+                    if subtract { "-" } else { "+" },
+                    right.name(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
+            Self::MoveZero { dst, value } => {
+                let known = KnownValue {
+                    value: dst.mask(value),
+                    origins: vec![pc],
+                };
+                flow.write(dst, Some(known));
+                format!("{} = {value:#x};", dst.name())
+            }
+            Self::Discard(reason) => format!("/* {reason} */"),
+            Self::Opaque => {
+                flow.clear();
+                "/* opaque instruction: semantics unavailable; value flow stops here */".into()
+            }
+        }
+    }
 }
 
 pub fn render(
@@ -114,7 +349,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v1; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v2; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -126,6 +361,7 @@ pub fn render(
         let low = (start - base) as usize;
         let high =
             ((function_end - base) as usize).min(low.saturating_add(MAX_WORDS_PER_FUNCTION * 4));
+        let mut flow = Flow::new();
         for (i, bytes) in code[low..high].chunks_exact(4).enumerate() {
             let pc = start + (i * 4) as u64;
             let position = file_offset.saturating_add(pc - base);
@@ -134,9 +370,10 @@ pub fn render(
                 .iter()
                 .any(|&(lo, hi, _)| position < hi && position.saturating_add(4) > lo)
             {
+                flow.clear();
                 "/* data-in-code barrier */".into()
             } else {
-                lift(word, pc)
+                decode(word, pc).render(&mut flow, pc)
             };
             out.push_str(&format!("  {pc:#018x}  {statement} // word={word:08x}\n"));
             if out.len() >= MAX_OUTPUT {
@@ -156,7 +393,11 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::{lift, render};
+    use super::{decode, render, Flow};
+
+    fn lift(word: u32, pc: u64) -> String {
+        decode(word, pc).render(&mut Flow::new(), pc)
+    }
 
     #[test]
     fn lifts_exact_integer_operations_with_provenance() {
@@ -194,5 +435,46 @@ mod tests {
         assert!(lift(0x5280_003f, 0x1000).contains("discarded"));
         assert!(lift(0x0b01_001f, 0x1000).contains("discarded"));
         assert_eq!(lift(0x1100_07ff, 0x1000), "wsp = wsp + 0x1;");
+    }
+
+    #[test]
+    fn constants_propagate_only_through_modeled_straight_line_operations() {
+        let words = [0x5280_0020u32, 0x1100_0400, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("w0 = w0 + 0x1; /* constant=0x2 proven_by=[0x1000,0x1004] */"));
+        assert!(
+            report.contains("ABI result register x0 /* constant=0x2 proven_by=[0x1000,0x1004] */")
+        );
+
+        for barrier in [0xffff_ffffu32, 0x9400_0001, 0x1400_0001] {
+            let words = [0x5280_0020, barrier, 0xd65f_03c0];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+            assert!(!report.contains("ABI result register x0 /* constant="));
+        }
+    }
+
+    #[test]
+    fn function_boundaries_and_data_barriers_clear_constants() {
+        let words = [0x5280_0020u32, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000, 0x1004], &[]);
+        assert!(!report.contains("ABI result register x0 /* constant="));
+
+        let words = [0x5280_0020u32, 0xd503_201f, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[(0x204, 0x208, 1)]);
+        assert!(!report.contains("ABI result register x0 /* constant="));
+
+        let words = [0x5280_0020u32, 0xd65f_03c0, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert_eq!(
+            report
+                .matches("ABI result register x0 /* constant=")
+                .count(),
+            1
+        );
     }
 }
