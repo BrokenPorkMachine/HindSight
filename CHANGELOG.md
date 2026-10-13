@@ -7,7 +7,7 @@
 - Bound SwiftUI workspace type expansion to fix the reproduced Swift 6.4 SIL-generation crash in ContentView.
 - Regenerate consistent build settings and add clean, commit-based source recreation without Git metadata, DerivedData, or Xcode user state.
 
-# 0.5.10 — Evidence Graph Navigation and Analysis Cache Control
+# 0.5.11 — Evidence Graph Navigation and Analysis Cache Control
 
 - Make Evidence Graph minimap navigation match Flow Graph with a draggable viewport rectangle and click-to-jump behavior.
 - Preserve graph geometry while panning and make minimap clicks jump every graph to the selected location.

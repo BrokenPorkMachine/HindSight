@@ -26,9 +26,9 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.10)
+## Current baseline (0.5.11)
 
-## 0.5.10 — Evidence graph navigation and cache control
+## 0.5.11 — Evidence graph navigation and cache control
 
 The current release aligns Evidence Graph and Flow Graph navigation: minimaps show the same viewport rectangle, support click-to-jump and drag navigation, and preserve graph geometry while panning. Function and symbol names are used consistently in function-oriented evidence and runtime surfaces. Analysis results can be cleared from the analysis toolbar with bounded project-local cache removal.
 

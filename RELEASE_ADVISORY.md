@@ -1,4 +1,4 @@
-# Release Advisory: HindSight v0.5.10
+# Release Advisory: HindSight v0.5.11
 
 ## Code Signing Requirements
 
