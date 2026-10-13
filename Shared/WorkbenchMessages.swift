@@ -200,7 +200,7 @@ struct AnalysisReport: Codable, Sendable {
         "dyld_imports", "dyld_linking", "softlinking", "symbolication", "symbol_resolver", "apple_symbolication", "arm64e_bind_symbols", "dylib_ordinals", "resolved_imports",
         "authenticated_bind_targets", "indirect_symbols", "pointer_slots", "export_trie",
         "symbol_provenance", "linkage_records", "symbol_callers", "got_auth_slots",
-        "import_export_collisions", "function_intelligence", "data_references", "tail_call_candidates", "function_neighborhoods", "analysis_quality", "analysis_insights", "summary"
+        "import_export_collisions", "function_intelligence", "data_references", "tail_call_candidates", "function_neighborhoods", "analysis_quality", "analysis_insights", "semantic_preview", "summary"
     ]
     let `protocol`: Int
     let kind: String
@@ -214,6 +214,7 @@ struct AnalysisReport: Codable, Sendable {
     let functions: String
     let cfg: String
     let ir: String
+    var semantic_preview: String? = nil
     let strings: String
     let xrefs: String
     let call_graph: String
@@ -290,7 +291,7 @@ struct AnalysisReport: Codable, Sendable {
     func matches(id: String, digest: String) -> Bool {
         `protocol` == 1 && kind == "analysis_result" && request_id == id && source_sha256 == digest &&
         function_count >= 0 && symbol_count >= 0 && basic_block_count >= 0 && analyzed_instructions >= 0 &&
-        functions.utf8.count < 65536 && cfg.utf8.count < 65536 && ir.utf8.count < 65536 &&
+        functions.utf8.count < 65536 && cfg.utf8.count < 65536 && ir.utf8.count < 65536 && (semantic_preview?.utf8.count ?? 0) < 65536 &&
         strings.utf8.count < 65536 && xrefs.utf8.count < 65536 && call_graph.utf8.count < 65536 &&
         dataflow.utf8.count < 65536 && ssa.utf8.count < 65536 && dominators.utf8.count < 65536 &&
         phi_nodes.utf8.count < 65536 && dominance_frontiers.utf8.count < 65536 && relocations.utf8.count < 65536 && jump_tables.utf8.count < 65536 &&

@@ -1439,6 +1439,13 @@ struct ContentView: View {
                         Text("Conservative first-stage IR: op, branch, conditional branch, terminal, or opaque. This is the substrate for later SSA and pseudocode.")
                             .font(.caption).foregroundStyle(.secondary)
                         monospaced(model.currentAnalysis?.ir ?? "Run Analyze binary to generate IR.")
+                        if let semantic = model.currentAnalysis?.semantic_preview, !semantic.isEmpty {
+                            DisclosureGroup("Instruction-derived ARM64 semantics (bounded)") {
+                                Text("Machine-register statements with instruction provenance. Opaque instructions stop value flow; source types and call signatures remain unresolved.")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                clickableEvidence(semantic)
+                            }
+                        }
                         DisclosureGroup("Structural pseudocode preview (bounded, experimental)") {
                             Text("Control-flow sketch only; unknown machine semantics are never reconstructed as C statements.").font(.caption).foregroundStyle(.secondary)
                             monospaced(vgStructuralPseudocode(model.currentAnalysis?.ir ?? "No IR available"))

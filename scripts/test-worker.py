@@ -95,3 +95,21 @@ with tempfile.TemporaryDirectory() as directory:
     assert '16 of 16 words shown; 13 decoded, 3 unsupported.' in response['disassembly']
     assert 'A64 subset v2' in response['disassembly']
 print('Integer decoder fixture capture and preview passed')
+
+source = pathlib.Path(__file__).resolve().parents[1] / 'Tests/Fixtures/arm64-integer-sample.macho'
+data = source.read_bytes()
+process = subprocess.run(
+    [sys.argv[1], '--analyze', str(source), hashlib.sha256(data).hexdigest(),
+     str(len(data)), str(uuid.uuid4())],
+    capture_output=True, timeout=120, check=True,
+)
+report = json.loads(read_frame(io.BytesIO(process.stdout)))
+assert report['kind'] == 'analysis_result'
+semantic = report['semantic_preview']
+assert 'function 0x00000001000000b8' in semantic
+assert '0x00000001000000cc  x0 = x0 + x1;' in semantic
+assert 'word=8b010000' in semantic
+assert 'opaque instruction: semantics unavailable' in semantic
+assert b'"source":"Semantic Preview"' in process.stderr
+assert b'"address":"0x00000001000000cc"' in process.stderr
+print('ARM64 instruction-derived semantic preview and provenance passed')
