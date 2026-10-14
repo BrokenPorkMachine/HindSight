@@ -413,17 +413,18 @@ settings_app=(R/'App/HindSightApp.swift').read_text()
 assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.formStyle(' not in settings_app
 
 # v0.5.11 ARM64 semantic-preview extension: the bounded preview models the whole
-# move-wide immediate family (MOVN/MOVZ/MOVK) and flag-neutral logical operations
-# (AND/ORR/EOR bitmask immediates and unshifted register AND/ORR/EOR/BIC/ORN/EON)
-# as provenance-carrying constants without changing the 72-field report or the
-# cache engine identity.
+# move-wide immediate family (MOVN/MOVZ/MOVK), flag-neutral logical operations
+# (AND/ORR/EOR bitmask immediates and unshifted register AND/ORR/EOR/BIC/ORN/EON),
+# and PC-relative ADR/ADRP address materialization as provenance-carrying
+# constants without changing the 72-field report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v4', 'MoveNot', 'MoveKeep', 'MoveZero',
-              'LogicalImmediate', 'LogicalRegister', 'decode_bitmask',
+for token in ['AArch64 register semantics v5', 'MoveNot', 'MoveKeep', 'MoveZero',
+              'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'word & 0x1f80_0000 == 0x1280_0000',
               'word & 0x1f80_0000 == 0x1200_0000',
-              'word & 0x1f00_0000 == 0x0a00_0000']:
+              'word & 0x1f00_0000 == 0x0a00_0000',
+              'word & 0x1f00_0000 == 0x1000_0000']:
     assert token in semantic_source, token
 
 for capability in ['graph_workspace','cfg_canvas','graph_minimap','synchronized_semantics','debugger_graph_highlight','dockable_analysis_panes']:

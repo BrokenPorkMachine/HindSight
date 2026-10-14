@@ -166,6 +166,11 @@ enum Operation {
         op: LogicalOp,
         negate_right: bool,
     },
+    Address {
+        dst: Register,
+        value: u64,
+        page: bool,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -189,6 +194,34 @@ fn decode(word: u32, pc: u64) -> Operation {
     if word & 0xfc00_0000 == 0x1400_0000 {
         let imm = ((word & 0x03ff_ffff) as i32) << 6 >> 4;
         return Operation::Branch(signed_target(pc, imm as i64));
+    }
+    // PC-relative addressing: ADR (op=0) adds a signed byte offset to PC; ADRP
+    // (op=1) adds a signed 4 KiB page offset to the page-aligned PC. Both write a
+    // 64-bit address constant carrying the instruction as provenance.
+    if word & 0x1f00_0000 == 0x1000_0000 {
+        if word & 31 == 31 {
+            return Operation::Discard("address discarded in zero register");
+        }
+        let page = word >> 31 != 0;
+        let immlo = (word >> 29) & 3;
+        let immhi = (word >> 5) & 0x7ffff;
+        let raw = ((immhi << 2) | immlo) as i64;
+        let imm = if raw & (1 << 20) != 0 {
+            raw - (1 << 21)
+        } else {
+            raw
+        };
+        let base = if page { pc & !0xfff } else { pc };
+        let offset = if page { imm << 12 } else { imm };
+        return Operation::Address {
+            dst: Register {
+                index: word & 31,
+                wide: true,
+                stack_pointer: false,
+            },
+            value: base.wrapping_add_signed(offset),
+            page,
+        };
     }
     // ADD/SUB (immediate), excluding flag-setting variants and reserved shift.
     if word & 0x1f00_0000 == 0x1100_0000 && word & (1 << 29) == 0 {
@@ -598,6 +631,22 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::Address { dst, value, page } => {
+                let value = dst.mask(value);
+                flow.write(
+                    dst,
+                    Some(KnownValue {
+                        value,
+                        origins: vec![pc],
+                    }),
+                );
+                let label = if page {
+                    "pc-relative page"
+                } else {
+                    "pc-relative"
+                };
+                format!("{} = {value:#x}; /* {label} */", dst.name())
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -617,7 +666,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v4; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v5; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -860,5 +909,39 @@ mod tests {
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report
             .contains("w0 = w0 | ~w1; /* constant=0xfffffff0 proven_by=[0x1000,0x1004,0x1008] */"));
+    }
+
+    #[test]
+    fn lifts_pc_relative_addresses() {
+        assert_eq!(lift(0x1000_0080, 0x1000), "x0 = 0x1010; /* pc-relative */");
+        // A negative byte offset wraps below the instruction address.
+        assert_eq!(lift(0x10ff_ffe1, 0x1000), "x1 = 0xffc; /* pc-relative */");
+        // ADRP adds a signed page offset to the page-aligned PC.
+        assert_eq!(
+            lift(0xb000_0002, 0x1000),
+            "x2 = 0x2000; /* pc-relative page */"
+        );
+        assert_eq!(
+            lift(0xf000_0903, 0x1000),
+            "x3 = 0x124000; /* pc-relative page */"
+        );
+    }
+
+    #[test]
+    fn adr_and_adrp_fold_into_pointer_constants_with_provenance() {
+        // adrp x0, #0x1000 ; add x0, x0, #0x10 ; ret  (unslid pc = 0x1000)
+        let words = [0xb000_0000u32, 0x9100_4000, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = 0x2000; /* pc-relative page */"));
+        assert!(report.contains("x0 = x0 + 0x10; /* constant=0x2010 proven_by=[0x1000,0x1004] */"));
+        assert!(report
+            .contains("ABI result register x0 /* constant=0x2010 proven_by=[0x1000,0x1004] */"));
+    }
+
+    #[test]
+    fn address_writes_to_the_zero_register_are_discarded() {
+        assert!(lift(0x1000_005f, 0x1000).contains("discarded"));
+        assert!(lift(0xb000_001f, 0x1000).contains("discarded"));
     }
 }

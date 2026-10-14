@@ -9,17 +9,17 @@ enter the worker's typed evidence sideband and the synthesis fingerprint.
 This slice models the move-wide immediate family (`MOVN`, `MOVZ`, `MOVK`),
 flag-neutral `ADD`/`SUB` with immediate operands, unshifted register `ADD`/`SUB`,
 flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and
-unshifted register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`), direct
-`B`/`BL`, `RET`, and `NOP`. It emits an explicit opaque barrier for every other
-instruction and for `LC_DATA_IN_CODE` ranges. Output is bounded to eight
-functions and 128 words per function. The structural backend emits an empty
-field. The cache engine identity advances to `arm64-analysis-v18-schema72` so
-reports from older workers are not reused as if they contained semantic output.
-The move-wide and logical extensions stay inside that `v18`/72-field contract:
-they only refine instructions earlier builds marked opaque, so a cached report
-from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v4` banner identifies the statement set that
-produced a preview.
+unshifted register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`),
+PC-relative `ADR`/`ADRP`, direct `B`/`BL`, `RET`, and `NOP`. It emits an explicit
+opaque barrier for every other instruction and for `LC_DATA_IN_CODE` ranges.
+Output is bounded to eight functions and 128 words per function. The structural
+backend emits an empty field. The cache engine identity advances to
+`arm64-analysis-v18-schema72` so reports from older workers are not reused as if
+they contained semantic output. The move-wide, logical, and address extensions
+stay inside that `v18`/72-field contract: they only refine instructions earlier
+builds marked opaque, so a cached report from an older worker is conservatively
+incomplete rather than contradictory. The `AArch64 register semantics v5` banner
+identifies the statement set that produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument
@@ -31,7 +31,11 @@ register becomes unknown (no constant is inferred). Logical operations render a
 bitmask immediate or a register operand, with a leading `~` when the negated
 `BIC`/`ORN`/`EON` form complements the right operand. The immediate is the
 architectural `DecodeBitMasks` `wmask`; reserved bitmask encodings, flag-setting
-`ANDS`/`BICS`, and shifted register operands stay opaque. A typed operation
+`ANDS`/`BICS`, and shifted register operands stay opaque. `ADR` writes the sum of
+the instruction address and a signed 21-bit byte offset; `ADRP` writes the sum of
+the page-aligned instruction address and a signed 21-bit page offset shifted left
+twelve bits. Both are address constants in unslid space and carry the
+instruction as provenance. A typed operation
 representation tracks exact integer constants through supported straight-line
 instructions and records the contributing instruction addresses. Opaque
 instructions, calls, branches, returns, data ranges, and function boundaries
@@ -48,4 +52,6 @@ statement, its instruction word and address, plus an opaque barrier. A synthetic
 `MOVZ`+`MOVK` pair additionally asserts the merged constant, its
 `proven_by` instruction addresses, and the exact `MOVK` word. A synthetic
 `AND`-immediate plus `EOR`-register sequence asserts a bitmask operand, the folded
-constant, its `proven_by` addresses, and the exact logical words.
+constant, its `proven_by` addresses, and the exact logical words. A synthetic
+`ADRP`+`ADD` sequence asserts the materialized address, the folded pointer
+constant, its `proven_by` addresses, and the exact `ADRP` word.
