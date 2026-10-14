@@ -20,7 +20,7 @@ they contained semantic output. The move-wide, logical, address, and control-flo
 extensions stay inside that `v18`/72-field contract: they only refine
 instructions earlier builds marked opaque, so a cached report from an older worker
 is conservatively incomplete rather than contradictory. The `AArch64 register
-semantics v6` banner identifies the statement set that produced a preview.
+semantics v7` banner identifies the statement set that produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument
@@ -39,7 +39,9 @@ twelve bits. Both are address constants in unslid space and carry the
 instruction as provenance. `B.cond` names the condition code directly without
 tracking PSTATE flags; `CBZ`/`CBNZ` test a register against zero and `TBZ`/`TBNZ`
 test a single bit, both of which name the register operand. `BR` and `BLR` name
-the register that holds an unresolved indirect target. Every conditional and
+the register that holds an indirect target: when that register carries a proven
+constant, the target address is resolved and its provenance is printed, otherwise
+the register is named as an unresolved target. Every conditional and
 indirect transfer clears tracked constants like any other control-flow barrier. A
 typed operation
 representation tracks exact integer constants through supported straight-line
@@ -63,4 +65,5 @@ constant, its `proven_by` addresses, and the exact logical words. A synthetic
 constant, its `proven_by` addresses, and the exact `ADRP` word. A synthetic
 `B.cond`/`CBZ`/`TBZ`/`BLR`/`BR` sequence asserts each rendered condition, the
 named indirect targets, the exact branch word, and that the transfers clear a
-preceding constant.
+preceding constant. A synthetic `MOVZ`+`BR` and `MOVZ`+`BLR` pair asserts that a
+proven-constant indirect target is resolved to its address with provenance.

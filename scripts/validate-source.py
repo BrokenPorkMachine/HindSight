@@ -415,12 +415,13 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # v0.5.11 ARM64 semantic-preview extension: the bounded preview models the whole
 # move-wide immediate family (MOVN/MOVZ/MOVK), flag-neutral logical operations
 # (AND/ORR/EOR bitmask immediates and unshifted register AND/ORR/EOR/BIC/ORN/EON),
-# PC-relative ADR/ADRP address materialization, and conditional/indirect control
-# flow (B.cond, CBZ/CBNZ, TBZ/TBNZ, BR/BLR) as provenance-carrying constants and
-# barriers without changing the 72-field report or the cache engine identity.
+# PC-relative ADR/ADRP address materialization, conditional/indirect control
+# flow (B.cond, CBZ/CBNZ, TBZ/TBNZ, BR/BLR) with indirect targets resolved from
+# proven constants, as provenance-carrying constants and barriers without
+# changing the 72-field report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v6', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v7', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'word & 0x1f80_0000 == 0x1280_0000',

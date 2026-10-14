@@ -548,17 +548,21 @@ fn combine_origins(left: &[u64], right: &[u64], pc: u64) -> Option<Vec<u64>> {
     Some(result)
 }
 
+fn proven_by(value: &KnownValue) -> String {
+    let sources = value
+        .origins
+        .iter()
+        .map(|origin| format!("{origin:#x}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("proven_by=[{sources}]")
+}
+
 fn resolved_suffix(value: Option<&KnownValue>) -> String {
     let Some(value) = value else {
         return String::new();
     };
-    let sources = value
-        .origins
-        .iter()
-        .map(|pc| format!("{pc:#x}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(" /* constant={:#x} proven_by=[{sources}] */", value.value)
+    format!(" /* constant={:#x} {} */", value.value, proven_by(value))
 }
 
 impl Operation {
@@ -760,15 +764,36 @@ impl Operation {
                 format!("if ({condition}) goto {target:#x};")
             }
             Self::IndirectBranch { target } => {
+                // A proven constant target is resolved; an untracked register
+                // stays named as an unresolved indirect target. Either way the
+                // transfer is a barrier.
+                let resolved = flow.read(target).filter(|value| !value.origins.is_empty());
                 flow.clear();
-                format!("goto {}; /* indirect target unresolved */", target.name())
+                match resolved {
+                    Some(value) => format!(
+                        "goto {:#x}; /* indirect via {}; {} */",
+                        value.value,
+                        target.name(),
+                        proven_by(&value)
+                    ),
+                    None => format!("goto {}; /* indirect target unresolved */", target.name()),
+                }
             }
             Self::IndirectCall { target } => {
+                let resolved = flow.read(target).filter(|value| !value.origins.is_empty());
                 flow.clear();
-                format!(
-                    "call({}); /* indirect; signature, arguments, result and side effects unresolved */",
-                    target.name()
-                )
+                match resolved {
+                    Some(value) => format!(
+                        "call({:#x}); /* indirect via {}; {}; signature, arguments, result and side effects unresolved */",
+                        value.value,
+                        target.name(),
+                        proven_by(&value)
+                    ),
+                    None => format!(
+                        "call({}); /* indirect; signature, arguments, result and side effects unresolved */",
+                        target.name()
+                    ),
+                }
             }
             Self::Opaque => {
                 flow.clear();
@@ -789,7 +814,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v6; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v7; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1103,6 +1128,23 @@ mod tests {
     }
 
     #[test]
+    fn resolves_indirect_targets_from_proven_constants() {
+        // movz x8, #0x30 ; br x8  -> the indirect target is a proven constant.
+        let words = [0xd280_0608u32, 0xd61f_0100];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("goto 0x30; /* indirect via x8; proven_by=[0x1000] */"));
+
+        // movz x9, #0x40 ; blr x9  -> the indirect call target is a proven constant.
+        let words = [0xd280_0809u32, 0xd63f_0120];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "call(0x40); /* indirect via x9; proven_by=[0x1000]; signature, arguments, result and side effects unresolved */"
+        ));
+    }
+
+    #[test]
     fn conditional_and_indirect_branches_clear_constants() {
         // movz w0, #0x1 ; b.eq 0x102c ; ret  -> the branch clears the constant.
         let words = [0x5280_0020u32, 0x5400_0140, 0xd65f_03c0];
@@ -1116,6 +1158,14 @@ mod tests {
         let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report.contains("goto x8; /* indirect target unresolved */"));
+        assert!(!report.contains("ABI result register x0 /* constant="));
+
+        // movz x0, #0x1 ; movz x8, #0x8 ; br x8 ; ret  -> a resolved indirect
+        // branch is still a barrier that clears the earlier constant.
+        let words = [0x5280_0020u32, 0xd280_0108, 0xd61f_0100, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("goto 0x8; /* indirect via x8; proven_by=[0x1004] */"));
         assert!(!report.contains("ABI result register x0 /* constant="));
     }
 }
