@@ -70,6 +70,15 @@ enum Operation {
         dst: Register,
         value: u64,
     },
+    MoveNot {
+        dst: Register,
+        value: u64,
+    },
+    MoveKeep {
+        dst: Register,
+        value: u16,
+        shift: u32,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -150,22 +159,42 @@ fn decode(word: u32, pc: u64) -> Operation {
             subtract: word & (1 << 30) != 0,
         };
     }
-    // MOVZ: exact constant definition; no source-level type is inferred.
-    if word & 0x7f80_0000 == 0x5280_0000 {
+    // Move wide immediate family. MOVN (opc=00), MOVZ (opc=10), and MOVK (opc=11)
+    // share `sf opc:2 100101 hw:2 imm16:16 Rd:5`; opc=01 and 32-bit hw>=2 are
+    // unallocated. Only exact constant definitions and merges are modeled, and no
+    // source-level type is inferred.
+    if word & 0x1f80_0000 == 0x1280_0000 {
+        let opc = (word >> 29) & 3;
         let wide = word >> 31 != 0;
         let hw = (word >> 21) & 3;
-        if wide || hw < 2 {
+        if opc != 1 && (wide || hw < 2) {
             if word & 31 == 31 {
                 return Operation::Discard("constant discarded in zero register");
             }
-            let value = (((word >> 5) & 0xffff) as u64) << (hw * 16);
-            return Operation::MoveZero {
-                dst: Register {
-                    index: word & 31,
-                    wide,
-                    stack_pointer: false,
+            let imm = (word >> 5) & 0xffff;
+            let shift = hw * 16;
+            let dst = Register {
+                index: word & 31,
+                wide,
+                stack_pointer: false,
+            };
+            return match opc {
+                0 => {
+                    let raw = (imm as u64) << shift;
+                    Operation::MoveNot {
+                        dst,
+                        value: if wide { !raw } else { (!raw) & 0xffff_ffff },
+                    }
+                }
+                2 => Operation::MoveZero {
+                    dst,
+                    value: (imm as u64) << shift,
                 },
-                value,
+                _ => Operation::MoveKeep {
+                    dst,
+                    value: imm as u16,
+                    shift,
+                },
             };
         }
     }
@@ -329,6 +358,36 @@ impl Operation {
                 flow.write(dst, Some(known));
                 format!("{} = {value:#x};", dst.name())
             }
+            Self::MoveNot { dst, value } => {
+                let known = KnownValue {
+                    value: dst.mask(value),
+                    origins: vec![pc],
+                };
+                flow.write(dst, Some(known));
+                format!("{} = {value:#x};", dst.name())
+            }
+            Self::MoveKeep { dst, value, shift } => {
+                let field = 0xffffu64 << shift;
+                let inserted = (value as u64) << shift;
+                // MOVK merges into the previous value of the same register, so a
+                // proven constant requires a known prior definition; otherwise the
+                // merged value is unknown and only the bitfield insert is rendered.
+                let known = flow.read(dst).and_then(|prior| {
+                    Some(KnownValue {
+                        value: dst.mask((prior.value & !field) | inserted),
+                        origins: combine_origins(&prior.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = ({} & {:#x}) | {:#x};{}",
+                    dst.name(),
+                    dst.name(),
+                    dst.mask(!field),
+                    dst.mask(inserted),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::Discard(reason) => format!("/* {reason} */"),
             Self::Opaque => {
                 flow.clear();
@@ -349,7 +408,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v2; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v3; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -453,6 +512,49 @@ mod tests {
             let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
             assert!(!report.contains("ABI result register x0 /* constant="));
         }
+    }
+
+    #[test]
+    fn move_not_defines_a_complemented_constant() {
+        // MOVN writes the bitwise complement of the shifted immediate.
+        assert_eq!(lift(0x1280_0000, 0x1000), "w0 = 0xffffffff;");
+        assert_eq!(lift(0x9280_0000, 0x1000), "x0 = 0xffffffffffffffff;");
+        assert_eq!(lift(0x1280_0020, 0x1000), "w0 = 0xfffffffe;");
+        // A MOVN into the zero register is discarded, not claimed as an assignment.
+        assert!(lift(0x1280_001f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn move_keep_merges_into_a_known_constant_with_provenance() {
+        // movz x0, #0x1234, lsl #0 ; movk x0, #0x5678, lsl #16 ; ret
+        let words = [0xd282_4680u32, 0xf2aa_cf00, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "0x0000000000001004  x0 = (x0 & 0xffffffff0000ffff) | 0x56780000; /* constant=0x56781234 proven_by=[0x1000,0x1004] */"
+        ));
+        assert!(report.contains(
+            "ABI result register x0 /* constant=0x56781234 proven_by=[0x1000,0x1004] */"
+        ));
+    }
+
+    #[test]
+    fn move_keep_without_a_known_base_is_not_claimed_as_a_constant() {
+        assert_eq!(
+            lift(0xf280_0020, 0x1000),
+            "x0 = (x0 & 0xffffffffffff0000) | 0x1;"
+        );
+        // The 32-bit form masks the kept field to the register width.
+        assert_eq!(lift(0x7280_0020, 0x1000), "w0 = (w0 & 0xffff0000) | 0x1;");
+    }
+
+    #[test]
+    fn unallocated_move_wide_forms_remain_opaque() {
+        // opc=01 is unallocated.
+        assert!(lift(0x3280_0000, 0x1000).contains("opaque instruction"));
+        // 32-bit MOVZ/MOVK with hw>=2 are unallocated.
+        assert!(lift(0x52c0_0000, 0x1000).contains("opaque instruction"));
+        assert!(lift(0x72c0_0000, 0x1000).contains("opaque instruction"));
     }
 
     #[test]

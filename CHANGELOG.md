@@ -14,6 +14,7 @@
 - Show function and symbol names wherever function information is presented, including runtime/evidence details and image context.
 - Add bounded project-local analysis-cache clearing from the analysis toolbar.
 - Replace the remaining SwiftUI `Form` in Settings and document the `List`/`NSOutlineView` live-resize AttributeGraph crash; keep the workbench on `ScrollView` + `LazyVStack` and guard against `List`/`OutlineGroup`/`Form` reintroduction.
+- Extend the ARM64 semantic preview to the full move-wide immediate family (`MOVN`, `MOVZ`, `MOVK`), so proven 64-bit constant materialization carries instruction provenance; `MOVK` claims a constant only when the prior value is known. No report field or engine-identity change.
 - Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses

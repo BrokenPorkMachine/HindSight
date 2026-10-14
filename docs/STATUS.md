@@ -2,7 +2,7 @@
 
 ## Current milestone: stable universal-macOS analysis/review baseline
 
-HindSight 0.5.11 is the current stable source identity (`stable`, protocol ABI 1, bundle build `5911`). The evidence engine is `arm64-analysis-v18-schema72` with the exact 72-field `AnalysisReport`, analysis-cache envelope schema 3 (with schema-2 backward reads), project SQLite schema 1, and analysis-continuity schema 5. The semantic preview now tracks proven constants through supported straight-line ARM64 operations; it is not source decompilation.
+HindSight 0.5.11 is the current stable source identity (`stable`, protocol ABI 1, bundle build `5911`). The evidence engine is `arm64-analysis-v18-schema72` with the exact 72-field `AnalysisReport`, analysis-cache envelope schema 3 (with schema-2 backward reads), project SQLite schema 1, and analysis-continuity schema 5. The semantic preview now models the full move-wide immediate family (`MOVN`/`MOVZ`/`MOVK`) and tracks proven constants through supported straight-line ARM64 operations; it is not source decompilation.
 
 The 0.4.9 feature line added bounded analyst Follow-Up Queue workflow over the existing collection/review system. Older analysis caches are reused only when their source and engine identities match the current engine; the 0.5.3→0.5.7 engine bump intentionally invalidated prior analysis results so the scalability budgets and hang fixes are not bypassed by cache reuse.
 
