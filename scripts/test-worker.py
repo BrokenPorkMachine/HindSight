@@ -125,7 +125,7 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v3' in semantic
+    assert 'AArch64 register semantics v4' in semantic
     assert 'constant=0x2 proven_by=[0x1000000b8,0x1000000bc]' in semantic
     assert 'ABI result register x0 /* constant=0x2 proven_by=[0x1000000b8,0x1000000bc] */' in semantic
 print('ARM64 straight-line constant provenance passed through worker analysis')
@@ -141,8 +141,26 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v3' in semantic
+    assert 'AArch64 register semantics v4' in semantic
     assert 'x0 = (x0 & 0xffffffff0000ffff) | 0x56780000;' in semantic
     assert 'constant=0x56781234 proven_by=[0x1000000b8,0x1000000bc]' in semantic
     assert 'word=f2aacf00' in semantic
 print('ARM64 move-wide constant materialization passed through worker analysis')
+
+with tempfile.TemporaryDirectory() as directory:
+    source = pathlib.Path(directory) / 'logical.macho'
+    data = image(words=(0x12000920, 0x52801fe0, 0x528001e1, 0x4a010000, 0xd65f03c0))
+    source.write_bytes(data)
+    process = subprocess.run(
+        [sys.argv[1], '--analyze', str(source), hashlib.sha256(data).hexdigest(),
+         str(len(data)), str(uuid.uuid4())],
+        capture_output=True, timeout=120, check=True,
+    )
+    report = json.loads(read_frame(io.BytesIO(process.stdout)))
+    semantic = report['semantic_preview']
+    assert 'AArch64 register semantics v4' in semantic
+    assert 'w0 = w9 & 0x7;' in semantic
+    assert 'word=12000920' in semantic
+    assert 'w0 = w0 ^ w1; /* constant=0xf0 proven_by=[0x1000000bc,0x1000000c0,0x1000000c4] */' in semantic
+    assert 'ABI result register x0 /* constant=0xf0 proven_by=[0x1000000bc,0x1000000c0,0x1000000c4] */' in semantic
+print('ARM64 logical operations passed through worker analysis')

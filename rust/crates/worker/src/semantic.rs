@@ -49,6 +49,80 @@ impl Register {
 }
 
 #[derive(Clone, Copy)]
+enum LogicalOp {
+    And,
+    Orr,
+    Eor,
+}
+
+impl LogicalOp {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::And => "&",
+            Self::Orr => "|",
+            Self::Eor => "^",
+        }
+    }
+
+    fn apply(self, left: u64, right: u64) -> u64 {
+        match self {
+            Self::And => left & right,
+            Self::Orr => left | right,
+            Self::Eor => left ^ right,
+        }
+    }
+}
+
+/// Decode an AArch64 bitmask immediate to its 64-bit `wmask` (Architecture
+/// Reference Manual `DecodeBitMasks` with `immediate = true`). Returns `None` for
+/// reserved encodings so they stay opaque.
+fn decode_bitmask(n: u32, immr: u32, imms: u32, wide: bool) -> Option<u64> {
+    if !wide && n != 0 {
+        return None;
+    }
+    let total = if wide { 64 } else { 32 };
+    let selector = (n << 6) | ((!imms) & 0x3f);
+    if selector == 0 {
+        return None;
+    }
+    let len = 31 - selector.leading_zeros();
+    if len < 1 || (!wide && len > 5) {
+        return None;
+    }
+    let levels = (1u32 << len) - 1;
+    let s = imms & levels;
+    let r = immr & levels;
+    if s == levels {
+        return None;
+    }
+    let esize = 1u32 << len;
+    let welem = rotate_right(elem_mask(s + 1), r, esize) & elem_mask(esize);
+    let mut mask = 0u64;
+    let mut shift = 0u32;
+    while shift < total {
+        mask |= welem << shift;
+        shift += esize;
+    }
+    Some(mask & if wide { u64::MAX } else { 0xffff_ffff })
+}
+
+fn elem_mask(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+fn rotate_right(value: u64, amount: u32, width: u32) -> u64 {
+    let amount = amount % width;
+    if amount == 0 {
+        return value;
+    }
+    ((value >> amount) | (value << (width - amount))) & elem_mask(width)
+}
+
+#[derive(Clone, Copy)]
 enum Operation {
     Nop,
     Return(Register),
@@ -78,6 +152,19 @@ enum Operation {
         dst: Register,
         value: u16,
         shift: u32,
+    },
+    LogicalImmediate {
+        dst: Register,
+        src: Register,
+        op: LogicalOp,
+        mask: u64,
+    },
+    LogicalRegister {
+        dst: Register,
+        left: Register,
+        right: Register,
+        op: LogicalOp,
+        negate_right: bool,
     },
     Discard(&'static str),
     Opaque,
@@ -158,6 +245,78 @@ fn decode(word: u32, pc: u64) -> Operation {
             },
             subtract: word & (1 << 30) != 0,
         };
+    }
+    // Logical (immediate): flag-neutral AND/ORR/EOR with a bitmask immediate.
+    // ANDS is excluded because flag effects are not modeled, and reserved
+    // bitmask encodings stay opaque.
+    if word & 0x1f80_0000 == 0x1200_0000 {
+        let opc = (word >> 29) & 3;
+        if opc != 3 {
+            let wide = word >> 31 != 0;
+            let n = (word >> 22) & 1;
+            let immr = (word >> 16) & 0x3f;
+            let imms = (word >> 10) & 0x3f;
+            if let Some(mask) = decode_bitmask(n, immr, imms, wide) {
+                if word & 31 == 31 {
+                    return Operation::Discard("logical result discarded in zero register");
+                }
+                return Operation::LogicalImmediate {
+                    dst: Register {
+                        index: word & 31,
+                        wide,
+                        stack_pointer: false,
+                    },
+                    src: Register {
+                        index: (word >> 5) & 31,
+                        wide,
+                        stack_pointer: false,
+                    },
+                    op: match opc {
+                        0 => LogicalOp::And,
+                        1 => LogicalOp::Orr,
+                        _ => LogicalOp::Eor,
+                    },
+                    mask,
+                };
+            }
+        }
+    }
+    // Logical (shifted register): flag-neutral AND/ORR/EOR and their negated
+    // BIC/ORN/EON forms with an unshifted register operand. Flag-setting
+    // variants and shifted operands stay opaque.
+    if word & 0x1f00_0000 == 0x0a00_0000 {
+        let opc = (word >> 29) & 3;
+        let shift = (word >> 22) & 3;
+        let imm6 = (word >> 10) & 0x3f;
+        if opc != 3 && shift == 0 && imm6 == 0 {
+            let wide = word >> 31 != 0;
+            if word & 31 == 31 {
+                return Operation::Discard("logical result discarded in zero register");
+            }
+            return Operation::LogicalRegister {
+                dst: Register {
+                    index: word & 31,
+                    wide,
+                    stack_pointer: false,
+                },
+                left: Register {
+                    index: (word >> 5) & 31,
+                    wide,
+                    stack_pointer: false,
+                },
+                right: Register {
+                    index: (word >> 16) & 31,
+                    wide,
+                    stack_pointer: false,
+                },
+                op: match opc {
+                    0 => LogicalOp::And,
+                    1 => LogicalOp::Orr,
+                    _ => LogicalOp::Eor,
+                },
+                negate_right: word & (1 << 21) != 0,
+            };
+        }
     }
     // Move wide immediate family. MOVN (opc=00), MOVZ (opc=10), and MOVK (opc=11)
     // share `sf opc:2 100101 hw:2 imm16:16 Rd:5`; opc=01 and 32-bit hw>=2 are
@@ -389,6 +548,56 @@ impl Operation {
                 )
             }
             Self::Discard(reason) => format!("/* {reason} */"),
+            Self::LogicalImmediate { dst, src, op, mask } => {
+                let known = flow.read(src).and_then(|input| {
+                    Some(KnownValue {
+                        value: dst.mask(op.apply(input.value, mask)),
+                        origins: combine_origins(&input.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = {} {} {:#x};{}",
+                    dst.name(),
+                    src.name(),
+                    op.symbol(),
+                    dst.mask(mask),
+                    resolved_suffix(known.as_ref())
+                )
+            }
+            Self::LogicalRegister {
+                dst,
+                left,
+                right,
+                op,
+                negate_right,
+            } => {
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let rhs = if negate_right {
+                        dst.mask(!b.value)
+                    } else {
+                        b.value
+                    };
+                    Some(KnownValue {
+                        value: dst.mask(op.apply(a.value, rhs)),
+                        origins: combine_origins(&a.origins, &b.origins, pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                let rhs = if negate_right {
+                    format!("~{}", right.name())
+                } else {
+                    right.name()
+                };
+                format!(
+                    "{} = {} {} {};{}",
+                    dst.name(),
+                    left.name(),
+                    op.symbol(),
+                    rhs,
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -408,7 +617,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v3; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v4; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -578,5 +787,78 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn lifts_logical_immediate_forms() {
+        assert_eq!(lift(0x1200_0000, 0x1000), "w0 = w0 & 0x1;");
+        assert_eq!(lift(0x1200_0920, 0x1000), "w0 = w9 & 0x7;");
+        assert_eq!(lift(0x9240_0000, 0x1000), "x0 = x0 & 0x1;");
+        assert_eq!(lift(0x1201_0000, 0x1000), "w0 = w0 & 0x80000000;");
+        assert_eq!(lift(0x5200_1c00, 0x1000), "w0 = w0 ^ 0xff;");
+        assert_eq!(lift(0x9240_1c00, 0x1000), "x0 = x0 & 0xff;");
+        // ORR against the zero register materializes the bitmask and is proven.
+        assert_eq!(
+            lift(0x3200_0be0, 0x1000),
+            "w0 = wzr | 0x7; /* constant=0x7 proven_by=[0x1000] */"
+        );
+    }
+
+    #[test]
+    fn reserved_logical_immediates_remain_opaque() {
+        // selector == 0 (N=0, imms=all ones).
+        assert!(lift(0x1200_fc00, 0x1000).contains("opaque instruction"));
+        // immediate && (imms & levels) == levels.
+        assert!(lift(0x1200_7c00, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_logical_register_and_negated_forms() {
+        assert_eq!(lift(0x8a01_0000, 0x1000), "x0 = x0 & x1;");
+        assert_eq!(lift(0xca02_0020, 0x1000), "x0 = x1 ^ x2;");
+        assert_eq!(lift(0x2a01_0000, 0x1000), "w0 = w0 | w1;");
+        assert_eq!(lift(0x0a24_0062, 0x1000), "w2 = w3 & ~w4;");
+        assert_eq!(lift(0x4a2b_0149, 0x1000), "w9 = w10 ^ ~w11;");
+        // MVN is ORN with a zero register source.
+        assert_eq!(lift(0xaa21_03e0, 0x1000), "x0 = xzr | ~x1;");
+    }
+
+    #[test]
+    fn flag_setting_and_shifted_logical_forms_remain_opaque() {
+        // ANDS sets flags, which are not modeled.
+        assert!(lift(0x6a01_0000, 0x1000).contains("opaque instruction"));
+        // A shifted register operand is out of scope.
+        assert!(lift(0x8a02_0c20, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn logical_writes_to_the_zero_register_are_discarded() {
+        assert!(lift(0x0a01_001f, 0x1000).contains("discarded"));
+        assert!(lift(0x1200_001f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn logical_operations_fold_known_constants_including_complements() {
+        // movz w0, #0x1234 ; and w0, w0, #0xff ; ret
+        let words = [0x5282_4680u32, 0x1200_1c00, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("w0 = w0 & 0xff; /* constant=0x34 proven_by=[0x1000,0x1004] */"));
+
+        // movz w0, #0xff ; movz w1, #0xf ; eor w0, w0, w1 ; ret
+        let words = [0x5280_1fe0u32, 0x5280_01e1, 0x4a01_0000, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("w0 = w0 ^ w1; /* constant=0xf0 proven_by=[0x1000,0x1004,0x1008] */")
+        );
+
+        // movz w0, #0xf0 ; movz w1, #0xf ; orn w0, w0, w1 ; ret
+        // ORN complements the right operand within the register width.
+        let words = [0x5280_1e00u32, 0x5280_01e1, 0x2a21_0000, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report
+            .contains("w0 = w0 | ~w1; /* constant=0xfffffff0 proven_by=[0x1000,0x1004,0x1008] */"));
     }
 }
