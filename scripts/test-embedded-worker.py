@@ -15,7 +15,7 @@ payload = proc.stdout[4:]
 if len(payload) != length:
     raise SystemExit(f"worker frame length mismatch: header={length}, payload={len(payload)}")
 obj = json.loads(payload)
-expected = {"protocol": 1, "kind": "health", "version": "0.5.10", "worker": True}
+expected = {"protocol": 1, "kind": "health", "version": "0.5.11", "worker": True}
 if obj != expected:
     raise SystemExit(f"unexpected worker health payload: {obj!r}")
 print("Embedded worker self-test passed:", obj)

@@ -23,5 +23,5 @@ for executable in "$app/Contents/MacOS/HindSight" "$service/Contents/MacOS/Coord
   /usr/bin/codesign --verify --strict --verbose=2 "$executable"
 done
 "$ROOT/scripts/test-embedded-worker.py" "$service/Contents/MacOS/reworker"
-"$service/Contents/MacOS/vg-emu-server" --version | /usr/bin/grep -F "0.5.10"
+"$service/Contents/MacOS/vg-emu-server" --version | /usr/bin/grep -F "0.5.11"
 printf '%s\n' "Universal macOS build/signature/bundle gates completed on $(uname -m)."

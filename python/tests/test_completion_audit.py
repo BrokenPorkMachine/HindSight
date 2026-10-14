@@ -17,18 +17,18 @@ class CompletionAuditTests(unittest.TestCase):
         for text in (embedded, beta, macos, server, cargo):
             self.assertNotIn("0.5.0", text)
             self.assertNotIn("0.4.3", text)
-        self.assertIn("0.5.10", embedded)
-        self.assertIn("0.5.10", server)
-        self.assertIn('version = "0.5.10"', cargo)
+        self.assertIn("0.5.11", embedded)
+        self.assertIn("0.5.11", server)
+        self.assertIn('version = "0.5.11"', cargo)
 
     def test_release_readiness_matches_active_identity(self):
         readiness = self.read("docs/RELEASE_READINESS.md")
         release_script = self.read("scripts/test-release-macos.sh")
-        self.assertIn("HindSight 0.5.10", readiness)
-        self.assertIn("bundle build is `5910`", readiness)
+        self.assertIn("HindSight 0.5.11", readiness)
+        self.assertIn("bundle build is `5911`", readiness)
         self.assertNotIn("0.5.0", readiness)
-        self.assertIn('expected stable version 0.5.10', release_script)
-        self.assertIn('expected build 5910', release_script)
+        self.assertIn('expected stable version 0.5.11', release_script)
+        self.assertIn('expected build 5911', release_script)
 
     def test_hfsplus_reader_is_not_a_placeholder(self):
         src = self.read("Engines/VectorEmu/crates/iphem-devices/src/hfsplus.rs")
