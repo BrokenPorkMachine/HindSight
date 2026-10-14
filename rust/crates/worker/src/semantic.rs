@@ -123,6 +123,29 @@ fn rotate_right(value: u64, amount: u32, width: u32) -> u64 {
 }
 
 #[derive(Clone, Copy)]
+enum BranchTest {
+    /// Condition-code test named directly from the encoding field; PSTATE flags
+    /// are not tracked.
+    Code(u8),
+    /// Register zero / nonzero test for CBZ / CBNZ.
+    Zero { reg: Register, nonzero: bool },
+    /// Single-bit test for TBZ / TBNZ.
+    Bit {
+        reg: Register,
+        bit: u8,
+        nonzero: bool,
+    },
+}
+
+fn condition_name(code: u8) -> &'static str {
+    const NAMES: [&str; 16] = [
+        "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
+        "nv",
+    ];
+    NAMES[(code & 15) as usize]
+}
+
+#[derive(Clone, Copy)]
 enum Operation {
     Nop,
     Return(Register),
@@ -171,6 +194,16 @@ enum Operation {
         value: u64,
         page: bool,
     },
+    ConditionalBranch {
+        target: u64,
+        test: BranchTest,
+    },
+    IndirectBranch {
+        target: Register,
+    },
+    IndirectCall {
+        target: Register,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -187,6 +220,26 @@ fn decode(word: u32, pc: u64) -> Operation {
             stack_pointer: false,
         });
     }
+    // BR / BLR: indirect transfer through a register. The target value is not
+    // resolved here; the register operand is named.
+    if word & 0xffff_fc1f == 0xd61f_0000 {
+        return Operation::IndirectBranch {
+            target: Register {
+                index: (word >> 5) & 31,
+                wide: true,
+                stack_pointer: false,
+            },
+        };
+    }
+    if word & 0xffff_fc1f == 0xd63f_0000 {
+        return Operation::IndirectCall {
+            target: Register {
+                index: (word >> 5) & 31,
+                wide: true,
+                stack_pointer: false,
+            },
+        };
+    }
     if word & 0xfc00_0000 == 0x9400_0000 {
         let imm = ((word & 0x03ff_ffff) as i32) << 6 >> 4;
         return Operation::Call(signed_target(pc, imm as i64));
@@ -194,6 +247,49 @@ fn decode(word: u32, pc: u64) -> Operation {
     if word & 0xfc00_0000 == 0x1400_0000 {
         let imm = ((word & 0x03ff_ffff) as i32) << 6 >> 4;
         return Operation::Branch(signed_target(pc, imm as i64));
+    }
+    // B.cond: a PC-relative signed imm19 branch tested against a condition code.
+    // The condition code is named directly; PSTATE flags are not modeled.
+    if word & 0xff00_0010 == 0x5400_0000 {
+        let imm = (((word >> 5) & 0x7ffff) as i32) << 13 >> 11;
+        return Operation::ConditionalBranch {
+            target: signed_target(pc, imm as i64),
+            test: BranchTest::Code((word & 15) as u8),
+        };
+    }
+    // CBZ / CBNZ: PC-relative signed imm19 branch on a register being zero.
+    if word & 0x7e00_0000 == 0x3400_0000 {
+        let imm = (((word >> 5) & 0x7ffff) as i32) << 13 >> 11;
+        return Operation::ConditionalBranch {
+            target: signed_target(pc, imm as i64),
+            test: BranchTest::Zero {
+                reg: Register {
+                    index: word & 31,
+                    wide: word >> 31 != 0,
+                    stack_pointer: false,
+                },
+                nonzero: word & (1 << 24) != 0,
+            },
+        };
+    }
+    // TBZ / TBNZ: PC-relative signed imm14 branch on a single bit. Bit 31 extends
+    // the bit index past 31 and selects the 64-bit register naming.
+    if word & 0x7e00_0000 == 0x3600_0000 {
+        let high = word >> 31 != 0;
+        let imm = (((word >> 5) & 0x3fff) as i32) << 18 >> 16;
+        let bit = ((word >> 19) & 0x1f) as u8 + if high { 32 } else { 0 };
+        return Operation::ConditionalBranch {
+            target: signed_target(pc, imm as i64),
+            test: BranchTest::Bit {
+                reg: Register {
+                    index: word & 31,
+                    wide: high,
+                    stack_pointer: false,
+                },
+                bit,
+                nonzero: word & (1 << 24) != 0,
+            },
+        };
     }
     // PC-relative addressing: ADR (op=0) adds a signed byte offset to PC; ADRP
     // (op=1) adds a signed 4 KiB page offset to the page-aligned PC. Both write a
@@ -647,6 +743,33 @@ impl Operation {
                 };
                 format!("{} = {value:#x}; /* {label} */", dst.name())
             }
+            Self::ConditionalBranch { target, test } => {
+                let condition = match test {
+                    BranchTest::Code(code) => condition_name(code).to_string(),
+                    BranchTest::Zero { reg, nonzero } => {
+                        format!("{} {} 0", reg.name(), if nonzero { "!=" } else { "==" })
+                    }
+                    BranchTest::Bit { reg, bit, nonzero } => format!(
+                        "({} & {:#x}) {} 0",
+                        reg.name(),
+                        1u64 << bit,
+                        if nonzero { "!=" } else { "==" }
+                    ),
+                };
+                flow.clear();
+                format!("if ({condition}) goto {target:#x};")
+            }
+            Self::IndirectBranch { target } => {
+                flow.clear();
+                format!("goto {}; /* indirect target unresolved */", target.name())
+            }
+            Self::IndirectCall { target } => {
+                flow.clear();
+                format!(
+                    "call({}); /* indirect; signature, arguments, result and side effects unresolved */",
+                    target.name()
+                )
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -666,7 +789,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v5; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v6; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -943,5 +1066,56 @@ mod tests {
     fn address_writes_to_the_zero_register_are_discarded() {
         assert!(lift(0x1000_005f, 0x1000).contains("discarded"));
         assert!(lift(0xb000_001f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn lifts_conditional_branches() {
+        assert_eq!(lift(0x5400_0140, 0x1000), "if (eq) goto 0x1028;");
+        assert_eq!(lift(0x54ff_ffe1, 0x1000), "if (ne) goto 0xffc;");
+        assert_eq!(lift(0x5400_004e, 0x1000), "if (al) goto 0x1008;");
+        assert_eq!(lift(0x54ff_feeb, 0x1000), "if (lt) goto 0xfdc;");
+    }
+
+    #[test]
+    fn lifts_zero_and_bit_test_branches() {
+        assert_eq!(lift(0x3400_0100, 0x1000), "if (w0 == 0) goto 0x1020;");
+        assert_eq!(lift(0xb5ff_ffa1, 0x1000), "if (x1 != 0) goto 0xff4;");
+        assert_eq!(
+            lift(0x3618_00c2, 0x1000),
+            "if ((w2 & 0x8) == 0) goto 0x1018;"
+        );
+        assert_eq!(
+            lift(0xb747_ff63, 0x1000),
+            "if ((x3 & 0x10000000000) != 0) goto 0xfec;"
+        );
+    }
+
+    #[test]
+    fn lifts_indirect_branches_and_calls() {
+        assert_eq!(
+            lift(0xd61f_0100, 0x1000),
+            "goto x8; /* indirect target unresolved */"
+        );
+        assert_eq!(
+            lift(0xd63f_0120, 0x1000),
+            "call(x9); /* indirect; signature, arguments, result and side effects unresolved */"
+        );
+    }
+
+    #[test]
+    fn conditional_and_indirect_branches_clear_constants() {
+        // movz w0, #0x1 ; b.eq 0x102c ; ret  -> the branch clears the constant.
+        let words = [0x5280_0020u32, 0x5400_0140, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("if (eq) goto 0x102c;"));
+        assert!(!report.contains("ABI result register x0 /* constant="));
+
+        // movz x0, #0x1 ; br x8 ; ret  -> the indirect branch clears the constant.
+        let words = [0xd280_0020u32, 0xd61f_0100, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("goto x8; /* indirect target unresolved */"));
+        assert!(!report.contains("ABI result register x0 /* constant="));
     }
 }

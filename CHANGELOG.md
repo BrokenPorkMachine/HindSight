@@ -17,6 +17,7 @@
 - Extend the ARM64 semantic preview to the full move-wide immediate family (`MOVN`, `MOVZ`, `MOVK`), so proven 64-bit constant materialization carries instruction provenance; `MOVK` claims a constant only when the prior value is known. No report field or engine-identity change.
 - Extend the ARM64 semantic preview to flag-neutral logical operations: `AND`/`ORR`/`EOR` bitmask immediates and unshifted register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`, folding known constants and complements with instruction provenance. Reserved bitmask encodings, `ANDS`/`BICS`, and shifted register operands stay opaque. No report field or engine-identity change.
 - Extend the ARM64 semantic preview to PC-relative `ADR`/`ADRP` address materialization, so `adrp`/`add` pointer constants carry instruction provenance. Address values are unslid and no source-level type is inferred. No report field or engine-identity change.
+- Extend the ARM64 semantic preview to conditional and indirect control flow (`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`): condition codes, register zero/nonzero tests, single-bit tests, and unresolved indirect targets are rendered, and every such transfer clears tracked constants like any other barrier. No PSTATE-flag or indirect-target value recovery, and no report field or engine-identity change.
 - Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses

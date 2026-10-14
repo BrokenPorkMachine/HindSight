@@ -125,7 +125,7 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v5' in semantic
+    assert 'AArch64 register semantics v6' in semantic
     assert 'constant=0x2 proven_by=[0x1000000b8,0x1000000bc]' in semantic
     assert 'ABI result register x0 /* constant=0x2 proven_by=[0x1000000b8,0x1000000bc] */' in semantic
 print('ARM64 straight-line constant provenance passed through worker analysis')
@@ -141,7 +141,7 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v5' in semantic
+    assert 'AArch64 register semantics v6' in semantic
     assert 'x0 = (x0 & 0xffffffff0000ffff) | 0x56780000;' in semantic
     assert 'constant=0x56781234 proven_by=[0x1000000b8,0x1000000bc]' in semantic
     assert 'word=f2aacf00' in semantic
@@ -158,7 +158,7 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v5' in semantic
+    assert 'AArch64 register semantics v6' in semantic
     assert 'w0 = w9 & 0x7;' in semantic
     assert 'word=12000920' in semantic
     assert 'w0 = w0 ^ w1; /* constant=0xf0 proven_by=[0x1000000bc,0x1000000c0,0x1000000c4] */' in semantic
@@ -176,9 +176,29 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v5' in semantic
+    assert 'AArch64 register semantics v6' in semantic
     assert 'x0 = 0x100001000; /* pc-relative page */' in semantic
     assert 'word=b0000000' in semantic
     assert 'x0 = x0 + 0x10; /* constant=0x100001010 proven_by=[0x1000000b8,0x1000000bc] */' in semantic
     assert 'ABI result register x0 /* constant=0x100001010 proven_by=[0x1000000b8,0x1000000bc] */' in semantic
 print('ARM64 PC-relative address materialization passed through worker analysis')
+
+with tempfile.TemporaryDirectory() as directory:
+    source = pathlib.Path(directory) / 'control-flow.macho'
+    data = image(words=(0x54000140, 0x34000100, 0x361800c2, 0xd63f0120, 0xd61f0100, 0xd65f03c0))
+    source.write_bytes(data)
+    process = subprocess.run(
+        [sys.argv[1], '--analyze', str(source), hashlib.sha256(data).hexdigest(),
+         str(len(data)), str(uuid.uuid4())],
+        capture_output=True, timeout=120, check=True,
+    )
+    report = json.loads(read_frame(io.BytesIO(process.stdout)))
+    semantic = report['semantic_preview']
+    assert 'AArch64 register semantics v6' in semantic
+    assert 'if (eq) goto 0x1000000e0;' in semantic
+    assert 'if (w0 == 0) goto 0x1000000dc;' in semantic
+    assert 'if ((w2 & 0x8) == 0) goto 0x1000000d8;' in semantic
+    assert 'call(x9); /* indirect; signature, arguments, result and side effects unresolved */' in semantic
+    assert 'goto x8; /* indirect target unresolved */' in semantic
+    assert 'word=54000140' in semantic
+print('ARM64 conditional and indirect control flow passed through worker analysis')
