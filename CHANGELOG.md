@@ -13,6 +13,8 @@
 - Preserve graph geometry while panning and make minimap clicks jump every graph to the selected location.
 - Show function and symbol names wherever function information is presented, including runtime/evidence details and image context.
 - Add bounded project-local analysis-cache clearing from the analysis toolbar.
+- Replace the remaining SwiftUI `Form` in Settings and document the `List`/`NSOutlineView` live-resize AttributeGraph crash; keep the workbench on `ScrollView` + `LazyVStack` and guard against `List`/`OutlineGroup`/`Form` reintroduction.
+- Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses
 

@@ -402,6 +402,15 @@ for path in ['App/BinaryWorkspace.swift','App/GraphWorkspace.swift','App/TraceEx
 assert 'VGHorizontalOverflowBar' in (R/'App/BinaryDiffWorkspace.swift').read_text()
 assert (R/'python/tests/test_ui_density.py').is_file()
 assert (R/'docs/UI_POLISH_0.4.2.md').is_file()
+# v0.5.11 SwiftUI List crash mitigation: the workbench must not reintroduce
+# NSOutlineView-backed List/OutlineGroup/Form in resizable surfaces.
+assert (R/'docs/SWIFTUI_LIST_CRASH.md').is_file()
+for path in (R/'App').glob('*.swift'):
+    source=path.read_text()
+    assert not re.search(r'(?<![A-Za-z0-9_])List\s*[\(\{]', source), path
+    assert not re.search(r'(?<![A-Za-z0-9_])OutlineGroup\b', source), path
+settings_app=(R/'App/HindSightApp.swift').read_text()
+assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.formStyle(' not in settings_app
 
 for capability in ['graph_workspace','cfg_canvas','graph_minimap','synchronized_semantics','debugger_graph_highlight','dockable_analysis_panes']:
     assert f'\\"{capability}\\":true' in bridge_caps, capability

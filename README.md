@@ -30,7 +30,7 @@ See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FO
 
 ## 0.5.11 — Evidence graph navigation and cache control
 
-The current release aligns Evidence Graph and Flow Graph navigation: minimaps show the same viewport rectangle, support click-to-jump and drag navigation, and preserve graph geometry while panning. Function and symbol names are used consistently in function-oriented evidence and runtime surfaces. Analysis results can be cleared from the analysis toolbar with bounded project-local cache removal.
+The current release aligns Evidence Graph and Flow Graph navigation: minimaps show the same viewport rectangle, support click-to-jump and drag navigation, and preserve graph geometry while panning. Function and symbol names are used consistently in function-oriented evidence and runtime surfaces. Analysis results can be cleared from the analysis toolbar with bounded project-local cache removal. The Settings surface and the remaining list-based workspaces no longer use SwiftUI `List`/`Form`, removing the `NSOutlineView` live-resize AttributeGraph crash documented in [`docs/SWIFTUI_LIST_CRASH.md`](docs/SWIFTUI_LIST_CRASH.md).
 
 ## 0.5.8 — Scheduler, Demangling, Structural Pseudocode
 

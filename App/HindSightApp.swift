@@ -76,80 +76,94 @@ private struct HindSightSettingsView: View {
     @ObservedObject var model: WorkbenchModel
 
     var body: some View {
-        Form {
-            Section("Startup") {
-                Picker("Preferred layout", selection: $model.preferredLayoutPreset) {
-                    ForEach(VGWorkspaceCatalog.layouts, id: \.self) { Text($0).tag($0) }
-                }
-                Button("Apply to current project") { model.layoutPreset = model.preferredLayoutPreset }
-                    .disabled(model.layoutPreset == model.preferredLayoutPreset)
-                Text("The last project view is restored when available; this preference is used as the default for a new session.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("Investigation") {
-                Toggle("Show mentor guidance", isOn: $model.mentorMode)
-                Text("Mentor mode adds short explanations around investigation controls without changing analysis results.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Section("REA Agents") {
-                LabeledContent("Integration", value: "Optional · local MCP bridge")
-                LabeledContent("Provider", value: "rea-agents")
-                Text("REA support is designed to run as a separately versioned local process. HindSight will request an explicit target and preserve REA evidence provenance when the bridge is enabled.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text("Upstream project: github.com/morluto/rea")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                VGReadinessRow(label: "Probe", value: model.reaStatus)
-                Button("Probe local REA agent") { model.probeREAAgents() }
-                    .disabled(!model.connected || model.busy)
-                TextField("Absolute target path", text: $model.reaTargetPath)
-                    .textFieldStyle(.roundedBorder)
-                Picker("Operation", selection: $model.reaOperation) {
-                    Text("Binary overview").tag("binary_overview")
-                    Text("List procedures").tag("list_procedures")
-                    Text("List names").tag("list_names")
-                }
-                Picker("Provider", selection: $model.reaProvider) {
-                    Text("Automatic").tag("auto")
-                    Text("Hopper").tag("hopper")
-                    Text("Ghidra").tag("ghidra")
-                    Text("IDA").tag("ida")
-                }
-                Button("Analyze selected target with REA") { model.runREAOperation() }
-                    .disabled(!model.connected || model.busy || model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            Section("Support & Readiness") {
-                VGReadinessRow(label: "Build", value: buildIdentity)
-                VGReadinessRow(label: "Host", value: hostIdentity)
-                VGReadinessRow(label: "Coordinator", value: coordinatorIdentity)
-                VGReadinessRow(label: "Project session", value: model.projectSessionReady ? "Ready" : "Not ready")
-                VGReadinessRow(label: "Native debugger", value: VGHostPlatform.supportsArm64NativeDebugger ? "Available" : "Unavailable")
-                VGReadinessRow(label: "Hypervisor", value: VGHostPlatform.supportsAppleSiliconHypervisor ? "Available" : "Unavailable")
-                Divider()
-                HStack {
-                    Button("Copy diagnostics") { model.copyDiagnostics() }
-                    Button("Export diagnostics…") { model.exportDiagnostics() }
-                    Button("Reconnect Coordinator") { model.reconnect() }
-                        .disabled(model.busy || model.connectingToCoordinator || model.restoringProjectSession)
-                }
-                if let error = model.operationErrors.last {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Last operation issue · \(error.code)").font(.caption).fontWeight(.semibold)
-                        Text(error.message).font(.caption).foregroundStyle(.secondary)
-                        Text("Recovery: \(error.recovery)").font(.caption2).foregroundStyle(.secondary)
+        // A SwiftUI Form is List-backed on macOS and shares the NSOutlineView
+        // teardown path that crashed AttributeGraph during live window resize
+        // (SwiftUI.OutlineListCoordinator / AG::Graph::resolve_offset). Settings
+        // therefore uses the same crash-safe ScrollView primitive as the rest of
+        // the workbench and keeps only plain controls inside it.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                settingsSection("Startup") {
+                    Picker("Preferred layout", selection: $model.preferredLayoutPreset) {
+                        ForEach(VGWorkspaceCatalog.layouts, id: \.self) { Text($0).tag($0) }
                     }
+                    Button("Apply to current project") { model.layoutPreset = model.preferredLayoutPreset }
+                        .disabled(model.layoutPreset == model.preferredLayoutPreset)
+                    settingsNote("The last project view is restored when available; this preference is used as the default for a new session.")
                 }
-                Text("Diagnostics contain runtime and capability state, not target-file contents. Share them only with your support team.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                settingsSection("Investigation") {
+                    Toggle("Show mentor guidance", isOn: $model.mentorMode)
+                    settingsNote("Mentor mode adds short explanations around investigation controls without changing analysis results.")
+                }
+                settingsSection("REA Agents") {
+                    LabeledContent("Integration", value: "Optional · local MCP bridge")
+                    LabeledContent("Provider", value: "rea-agents")
+                    settingsNote("REA support is designed to run as a separately versioned local process. HindSight will request an explicit target and preserve REA evidence provenance when the bridge is enabled.")
+                    settingsNote("Upstream project: github.com/morluto/rea")
+                    VGReadinessRow(label: "Probe", value: model.reaStatus)
+                    Button("Probe local REA agent") { model.probeREAAgents() }
+                        .disabled(!model.connected || model.busy)
+                    TextField("Absolute target path", text: $model.reaTargetPath)
+                        .textFieldStyle(.roundedBorder)
+                    Picker("Operation", selection: $model.reaOperation) {
+                        Text("Binary overview").tag("binary_overview")
+                        Text("List procedures").tag("list_procedures")
+                        Text("List names").tag("list_names")
+                    }
+                    Picker("Provider", selection: $model.reaProvider) {
+                        Text("Automatic").tag("auto")
+                        Text("Hopper").tag("hopper")
+                        Text("Ghidra").tag("ghidra")
+                        Text("IDA").tag("ida")
+                    }
+                    Button("Analyze selected target with REA") { model.runREAOperation() }
+                        .disabled(!model.connected || model.busy || model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                settingsSection("Support & Readiness") {
+                    VGReadinessRow(label: "Build", value: buildIdentity)
+                    VGReadinessRow(label: "Host", value: hostIdentity)
+                    VGReadinessRow(label: "Coordinator", value: coordinatorIdentity)
+                    VGReadinessRow(label: "Project session", value: model.projectSessionReady ? "Ready" : "Not ready")
+                    VGReadinessRow(label: "Native debugger", value: VGHostPlatform.supportsArm64NativeDebugger ? "Available" : "Unavailable")
+                    VGReadinessRow(label: "Hypervisor", value: VGHostPlatform.supportsAppleSiliconHypervisor ? "Available" : "Unavailable")
+                    Divider()
+                    VGFlowLayout {
+                        Button("Copy diagnostics") { model.copyDiagnostics() }
+                        Button("Export diagnostics…") { model.exportDiagnostics() }
+                        Button("Reconnect Coordinator") { model.reconnect() }
+                            .disabled(model.busy || model.connectingToCoordinator || model.restoringProjectSession)
+                    }
+                    if let error = model.operationErrors.last {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Last operation issue · \(error.code)").font(.caption).fontWeight(.semibold)
+                            Text(error.message).font(.caption).foregroundStyle(.secondary)
+                            Text("Recovery: \(error.recovery)").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    settingsNote("Diagnostics contain runtime and capability state, not target-file contents. Share them only with your support team.")
+                }
             }
+            .padding()
         }
-        .formStyle(.grouped)
         .frame(width: 460)
-        .padding()
+    }
+
+    @ViewBuilder private func settingsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private func settingsNote(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var buildIdentity: String { "\(VGProduct.version) · \(VGProduct.releaseChannel)" }

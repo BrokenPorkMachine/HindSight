@@ -110,6 +110,29 @@ class UIDensityContracts(unittest.TestCase):
         for token in forbidden:
             self.assertNotIn(token, content)
 
+    def test_app_sources_do_not_reintroduce_list_backed_containers(self):
+        # A SwiftUI List/OutlineGroup is NSOutlineView-backed on macOS and
+        # crashed AttributeGraph during window live-resize teardown
+        # (SwiftUI.OutlineListCoordinator -> AG::Graph::resolve_offset, see
+        # docs/SWIFTUI_LIST_CRASH.md). Binary Diff, Investigation Ledger, Trace
+        # Explorer, and Settings were moved to ScrollView + LazyVStack. Keep
+        # the workbench on those crash-safe primitives so the regression cannot
+        # silently return.
+        list_pattern = re.compile(r"(?<![A-Za-z0-9_])List\s*[\(\{]")
+        outline_pattern = re.compile(r"(?<![A-Za-z0-9_])OutlineGroup\b")
+        for path in sorted((ROOT / "App").glob("*.swift")):
+            source = path.read_text()
+            self.assertIsNone(list_pattern.search(source), f"{path.name} reintroduced a SwiftUI List")
+            self.assertIsNone(outline_pattern.search(source), f"{path.name} reintroduced an OutlineGroup")
+
+    def test_settings_surface_avoids_list_backed_form(self):
+        # Form is List-backed on macOS; Settings must stay on ScrollView.
+        app = self.text("App/HindSightApp.swift")
+        self.assertIn("struct HindSightSettingsView: View", app)
+        self.assertIn("ScrollView {", app)
+        self.assertNotIn("Form {", app)
+        self.assertNotIn(".formStyle(", app)
+
 
 if __name__ == "__main__":
     unittest.main()
