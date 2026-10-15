@@ -374,6 +374,22 @@ enum Operation {
         /// Log2 of the memory access width in bytes (`size` field, 0..=3).
         size: u32,
     },
+    LoadPair {
+        dst1: Register,
+        dst2: Register,
+        base: Register,
+        offset: i64,
+        writeback: Writeback,
+        size: u32,
+    },
+    StorePair {
+        base: Register,
+        src1: Register,
+        src2: Register,
+        offset: i64,
+        writeback: Writeback,
+        size: u32,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -953,6 +969,88 @@ fn decode(word: u32, pc: u64) -> Operation {
                         address,
                         size,
                         signed: true,
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    // Load/store register pair (LDP/STP), V=0:
+    // `size:2 111 V:1 01 opc:2 0 imm7:7 10 Rt2:5 Rn:5 Rt:5` (post-index)
+    // `size:2 111 V:1 01 opc:2 0 imm7:7 11 Rt2:5 Rn:5 Rt:5` (pre-index)
+    // `size:2 111 V:1 01 opc:2 0 imm7:7 00 Rt2:5 Rn:5 Rt:5` (signed offset, no WB)
+    // opc: 0=STP (both src), 1=LDP (both dst, zero-extend), 2=LDP (sign-extend 64), 3=LDP (sign-extend 32).
+    if word & 0x3f00_0000 == 0x2900_0000 {
+        let size = (word >> 30) & 3;
+        let opc = (word >> 22) & 3;
+        let rn = (word >> 5) & 31;
+        let rt = word & 31;
+        let rt2 = (word >> 10) & 31;
+        let imm7 = (word >> 15) & 0x7f;
+        let mode = (word >> 23) & 3;
+        // Sign-extend the 7-bit immediate and scale by access size.
+        let offset = (((imm7 << 25) as i32) >> 25) as i64 * (1 << size);
+        let writeback = match mode {
+            0 => Writeback::None,
+            1 => Writeback::Post,
+            3 => Writeback::Pre,
+            _ => Writeback::Unprivileged, // 2 is invalid/reserved
+        };
+        if !matches!(writeback, Writeback::Unprivileged) {
+            let base = Register {
+                index: rn,
+                wide: true,
+                stack_pointer: rn == 31,
+            };
+            let reg1 = |wide: bool| Register {
+                index: rt,
+                wide,
+                stack_pointer: false,
+            };
+            let reg2 = |wide: bool| Register {
+                index: rt2,
+                wide,
+                stack_pointer: false,
+            };
+            match (size, opc) {
+                (_, 0) => { // STP: store pair
+                    return Operation::StorePair {
+                        base,
+                        src1: reg1(size == 3),
+                        src2: reg2(size == 3),
+                        offset,
+                        writeback,
+                        size,
+                    };
+                }
+                (_, 1) => { // LDP: zero-extending load pair
+                    return Operation::LoadPair {
+                        dst1: reg1(size == 3),
+                        dst2: reg2(size == 3),
+                        base,
+                        offset,
+                        writeback,
+                        size,
+                    };
+                }
+                (0..=2, 2) => { // LDP: sign-extending into 64-bit
+                    return Operation::LoadPair {
+                        dst1: reg1(true),
+                        dst2: reg2(true),
+                        base,
+                        offset,
+                        writeback,
+                        size,
+                    };
+                }
+                (0..=1, 3) => { // LDP: sign-extending into 32-bit
+                    return Operation::LoadPair {
+                        dst1: reg1(false),
+                        dst2: reg2(false),
+                        base,
+                        offset,
+                        writeback,
+                        size,
                     };
                 }
                 _ => {}
@@ -1745,6 +1843,72 @@ impl Operation {
                 }
                 statement
             }
+            Self::LoadPair {
+                dst1,
+                dst2,
+                base,
+                offset,
+                writeback,
+                size,
+            } => {
+                let base_known = flow.read(base);
+                let combined = base_known.as_ref().and_then(|input| {
+                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                        value: input.value.wrapping_add(offset as u64),
+                        origins,
+                    })
+                });
+                let expr = if offset >= 0 {
+                    format!("{} + {:#x}", base.name(), offset as u64)
+                } else {
+                    format!("{} - {:#x}", base.name(), offset.unsigned_abs())
+                };
+                let access1 = memory_access_operand(&expr, size, false, dst1.wide);
+                let access2 = memory_access_operand(&expr, size, false, dst2.wide);
+                let suffix = address_suffix(combined.as_ref());
+                flow.write(dst1, None);
+                flow.write(dst2, None);
+                let mut statement = format!("{} = {};{}; {} = {};{}", dst1.name(), access1, suffix, dst2.name(), access2, suffix);
+                if let Writeback::Pre | Writeback::Post = writeback {
+                    if let Some(value) = &combined {
+                        flow.write(base, Some(value.clone()));
+                        statement.push_str(&format!(" {} = {expr};", base.name()));
+                    }
+                }
+                statement
+            }
+            Self::StorePair {
+                base,
+                src1,
+                src2,
+                offset,
+                writeback,
+                size,
+            } => {
+                let base_known = flow.read(base);
+                let combined = base_known.as_ref().and_then(|input| {
+                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                        value: input.value.wrapping_add(offset as u64),
+                        origins,
+                    })
+                });
+                let expr = if offset >= 0 {
+                    format!("{} + {:#x}", base.name(), offset as u64)
+                } else {
+                    format!("{} - {:#x}", base.name(), offset.unsigned_abs())
+                };
+                let access1 = memory_access_operand(&expr, size, false, src1.wide);
+                let access2 = memory_access_operand(&expr, size, false, src2.wide);
+                let suffix = address_suffix(combined.as_ref());
+                let mut statement = format!("{access1} = {};{suffix}; {access2} = {};{suffix}", src1.name(), src2.name());
+                if let Writeback::Pre | Writeback::Post = writeback {
+                    if let Some(value) = &combined {
+                        flow.write(base, Some(value.clone()));
+                        statement.push_str(&format!(" {} = {expr};", base.name()));
+                    }
+                }
+                statement
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -2340,12 +2504,14 @@ mod tests {
 
     #[test]
     fn unmodeled_load_store_forms_remain_opaque() {
-        // stp x29, x30, [sp, #-16]! = 0xa9bf7bfd (pre-indexed pair)
-        assert!(lift(0xa9bf_7bfd, 0x1000).contains("opaque instruction"));
+        // stp x29, x30, [sp, #-16]! = 0xa9bf7bfd (pre-indexed pair) - now modeled
         // ldtr x0, [x1, #8] = 0xf8408820 (unprivileged, mode 10)
         assert!(lift(0xf840_8820, 0x1000).contains("opaque instruction"));
         // sttr x0, [x1, #8] = 0xf8008820 (unprivileged, mode 10)
         assert!(lift(0xf800_8820, 0x1000).contains("opaque instruction"));
+        // stp with invalid mode (2) should be opaque
+        // size=3 opc=2 imm7=0 mode=2 rn=31 rt=29 rt2=30 = 0xebff7bfd
+        assert!(lift(0xebff_7bfd, 0x1000).contains("opaque instruction"));
     }
 
     #[test]
