@@ -146,6 +146,41 @@ fn condition_name(code: u8) -> &'static str {
 }
 
 #[derive(Clone, Copy)]
+enum ShiftKind {
+    Left,
+    LogicalRight,
+    ArithmeticRight,
+}
+
+impl ShiftKind {
+    fn operator(self) -> &'static str {
+        match self {
+            Self::Left => "<<",
+            Self::LogicalRight => ">>",
+            // Verilog-style arithmetic right shift (sign-propagating).
+            Self::ArithmeticRight => ">>>",
+        }
+    }
+}
+
+fn shift_value(value: u64, kind: ShiftKind, amount: u8, wide: bool) -> u64 {
+    if wide {
+        match kind {
+            ShiftKind::Left => value << amount,
+            ShiftKind::LogicalRight => value >> amount,
+            ShiftKind::ArithmeticRight => ((value as i64) >> amount) as u64,
+        }
+    } else {
+        let value = value as u32;
+        match kind {
+            ShiftKind::Left => (value << amount) as u64,
+            ShiftKind::LogicalRight => (value >> amount) as u64,
+            ShiftKind::ArithmeticRight => (((value as i32) >> amount) as u32) as u64,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Operation {
     Nop,
     Return(Register),
@@ -203,6 +238,12 @@ enum Operation {
     },
     IndirectCall {
         target: Register,
+    },
+    Shift {
+        dst: Register,
+        src: Register,
+        kind: ShiftKind,
+        amount: u8,
     },
     Discard(&'static str),
     Opaque,
@@ -445,6 +486,56 @@ fn decode(word: u32, pc: u64) -> Operation {
                 },
                 negate_right: word & (1 << 21) != 0,
             };
+        }
+    }
+    // Shift aliases of the bitfield group `sf opc:2 100110 N:1 immr:6 imms:6`.
+    // Only the canonical single-field forms are modeled: LSR is UBFM with
+    // imms == width-1, ASR is SBFM with imms == width-1, and LSL is UBFM with
+    // imms == width-1-shift and immr == (width-shift) mod width. N must equal sf;
+    // other bitfield forms (BFM, extracts, sign/zero extends) stay opaque.
+    if word & 0x1f80_0000 == 0x1300_0000 {
+        let opc = (word >> 29) & 3;
+        let sf = word >> 31 != 0;
+        let n = (word >> 22) & 1;
+        let immr = ((word >> 16) & 0x3f) as u8;
+        let imms = ((word >> 10) & 0x3f) as u8;
+        let width: u8 = if sf { 64 } else { 32 };
+        if n == u32::from(sf) {
+            let (kind, amount) = if imms == width - 1 {
+                match opc {
+                    2 => (Some(ShiftKind::LogicalRight), immr),
+                    0 => (Some(ShiftKind::ArithmeticRight), immr),
+                    _ => (None, immr),
+                }
+            } else if opc == 2 && immr != 0 {
+                let shift = (width - immr) % width;
+                if imms == width - 1 - shift {
+                    (Some(ShiftKind::Left), shift)
+                } else {
+                    (None, immr)
+                }
+            } else {
+                (None, immr)
+            };
+            if let Some(kind) = kind {
+                if word & 31 == 31 {
+                    return Operation::Discard("shift result discarded in zero register");
+                }
+                return Operation::Shift {
+                    dst: Register {
+                        index: word & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    src: Register {
+                        index: (word >> 5) & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    kind,
+                    amount,
+                };
+            }
         }
     }
     // Move wide immediate family. MOVN (opc=00), MOVZ (opc=10), and MOVK (opc=11)
@@ -795,6 +886,27 @@ impl Operation {
                     ),
                 }
             }
+            Self::Shift {
+                dst,
+                src,
+                kind,
+                amount,
+            } => {
+                let known = flow.read(src).and_then(|input| {
+                    Some(KnownValue {
+                        value: dst.mask(shift_value(input.value, kind, amount, dst.wide)),
+                        origins: combine_origins(&input.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = {} {} {amount};{}",
+                    dst.name(),
+                    src.name(),
+                    kind.operator(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -814,7 +926,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v7; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v8; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1142,6 +1254,44 @@ mod tests {
         assert!(report.contains(
             "call(0x40); /* indirect via x9; proven_by=[0x1000]; signature, arguments, result and side effects unresolved */"
         ));
+    }
+
+    #[test]
+    fn lifts_immediate_shifts() {
+        // lsl w2, w3, #3 (UBFM) = 0x531d7062
+        assert_eq!(lift(0x531d_7062, 0x1000), "w2 = w3 << 3;");
+        // lsr w8, w9, #3 = 0x53037d28
+        assert_eq!(lift(0x5303_7d28, 0x1000), "w8 = w9 >> 3;");
+        // asr w14, w15, #3 = 0x13037dee
+        assert_eq!(lift(0x1303_7dee, 0x1000), "w14 = w15 >>> 3;");
+        // lsl x2, x3, #3 = 0xd37df062
+        assert_eq!(lift(0xd37d_f062, 0x1000), "x2 = x3 << 3;");
+        // lsr x6, x7, #3 = 0xd343fce6
+        assert_eq!(lift(0xd343_fce6, 0x1000), "x6 = x7 >> 3;");
+        // asr x8, x9, #3 = 0x9343fd28
+        assert_eq!(lift(0x9343_fd28, 0x1000), "x8 = x9 >>> 3;");
+        // lsr w0, w1, #0 = 0x53007c20
+        assert_eq!(lift(0x5300_7c20, 0x1000), "w0 = w1 >> 0;");
+    }
+
+    #[test]
+    fn folds_immediate_shifts_into_constants() {
+        let words = [
+            0x1280_0001u32, // movn w1, #0     -> w1 = 0xffffffff
+            0x1304_7c22,    // asr w2, w1, #4  -> 0xffffffff (sign-propagating)
+            0x5304_7c23,    // lsr w3, w1, #4  -> 0x0fffffff
+            0x529f_ffe4,    // movz w4, #0xffff
+            0x530c_2c84,    // lsl w4, w4, #20 -> 0xfff00000 (truncated to 32 bits)
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("w2 = w1 >>> 4; /* constant=0xffffffff proven_by=[0x1000,0x1004] */")
+        );
+        assert!(report.contains("w3 = w1 >> 4; /* constant=0xfffffff proven_by=[0x1000,0x1008] */"));
+        assert!(
+            report.contains("w4 = w4 << 20; /* constant=0xfff00000 proven_by=[0x100c,0x1010] */")
+        );
     }
 
     #[test]

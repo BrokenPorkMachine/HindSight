@@ -417,15 +417,18 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # (AND/ORR/EOR bitmask immediates and unshifted register AND/ORR/EOR/BIC/ORN/EON),
 # PC-relative ADR/ADRP address materialization, conditional/indirect control
 # flow (B.cond, CBZ/CBNZ, TBZ/TBNZ, BR/BLR) with indirect targets resolved from
-# proven constants, as provenance-carrying constants and barriers without
-# changing the 72-field report or the cache engine identity.
+# proven constants, and the LSL/LSR/ASR immediate shift aliases of the bitfield
+# group, as provenance-carrying constants and barriers without changing the
+# 72-field report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v7', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v8', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
+              'ShiftKind', 'shift_value',
               'word & 0x1f80_0000 == 0x1280_0000',
               'word & 0x1f80_0000 == 0x1200_0000',
+              'word & 0x1f80_0000 == 0x1300_0000',
               'word & 0x1f00_0000 == 0x0a00_0000',
               'word & 0x1f00_0000 == 0x1000_0000',
               'word & 0xff00_0010 == 0x5400_0000',
