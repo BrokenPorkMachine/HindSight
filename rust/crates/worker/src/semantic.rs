@@ -20,6 +20,9 @@ fn register(index: u32, wide: bool, stack_pointer: bool) -> String {
         }
         .into();
     }
+    if index == 32 {
+        return "pc".into();
+    }
     format!("{}{}", if wide { "x" } else { "w" }, index)
 }
 
@@ -44,6 +47,15 @@ impl Register {
             value
         } else {
             value & 0xffff_ffff
+        }
+    }
+
+    /// A pseudo-register representing the current PC for literal loads.
+    fn pc() -> Self {
+        Register {
+            index: 32, // synthetic index outside 0..31
+            wide: true,
+            stack_pointer: false,
         }
     }
 }
@@ -263,6 +275,8 @@ enum AddressForm {
         s: bool,
         size: u32,
     },
+    /// PC-relative literal load: `PC + (imm19 << 2)`.
+    Literal(i64),
 }
 
 #[derive(Clone, Copy)]
@@ -1057,6 +1071,62 @@ fn decode(word: u32, pc: u64) -> Operation {
             }
         }
     }
+    // Load literal (PC-relative), V=0:
+    // `size:2 01101 opc:2 imm19:19 Rt:5`. The address is `PC + (sign_extend(imm19) << 2)`.
+    // opc: 1=LDR (zero-extend, dst width follows size), 2=LDRSW (sign-extend 32 to 64),
+    // 3=LDRSB/LDRSH (sign-extend 8/16 to 32). size=3 opc=1 is PRFM (opaque).
+    if word & 0x3e00_0000 == 0x1a00_0000 {
+        let size = (word >> 30) & 3;
+        let opc = (word >> 22) & 3;
+        let imm19 = (word >> 3) & 0x7ffff;
+        let rt = word & 31;
+        // Sign-extend the 19-bit immediate and scale by 2 (shifted by 2 in encoding).
+        let offset = (((imm19 << 13) as i32) >> 13) as i64 * 4;
+        let data = |wide: bool| Register {
+            index: rt,
+            wide,
+            stack_pointer: false,
+        };
+        let address = AddressForm::Literal(offset);
+        match (size, opc) {
+            (_, 1) => { // LDR: zero-extending
+                if size == 3 {
+                    // PRFM - opaque
+                } else {
+                    // size 0 = 32-bit reg/access, size 1/2 = 64-bit reg/access
+                    let is_64 = size != 0;
+                    let access_size = if is_64 { 3 } else { 2 }; // 64-bit=size3(8bytes), 32-bit=size2(4bytes)
+                    return Operation::Load {
+                        dst: data(is_64),
+                        base: Register::pc(),
+                        address,
+                        size: access_size,
+                        signed: false,
+                    };
+                }
+            }
+            (2, 2) => { // LDRSW: sign-extend 32 to 64, 32-bit access
+                return Operation::Load {
+                    dst: data(true),
+                    base: Register::pc(),
+                    address,
+                    size: 2, // 32-bit access
+                    signed: true,
+                };
+            }
+            (0..=1, 3) => { // LDRSB (size 0) / LDRSH (size 1): sign-extend to 32
+                let access_size = if size == 0 { 0 } else { 1 }; // 8-bit or 16-bit access
+                return Operation::Load {
+                    dst: data(false), // 32-bit destination
+                    base: Register::pc(),
+                    address,
+                    size: access_size,
+                    signed: true,
+                };
+            }
+            _ => {}
+        }
+    }
     // Data-processing (3 source): MADD (o0=0) and MSUB (o0=1) with 32x32
     // operands and an optional addend. When Ra is the zero register the addend is
     // omitted, which is the MUL (o0=0) / MNEG (o0=1) alias. Other op31 variants
@@ -1404,6 +1474,24 @@ fn resolve_address(
             AddressResolution {
                 operand: expr,
                 access: addr,
+                writeback: None,
+                writeback_pre: false,
+            }
+        }
+        AddressForm::Literal(offset) => {
+            let target = pc.wrapping_add_signed(*offset);
+            let combined = combine_origins(&[], &[], pc).map(|origins| KnownValue {
+                value: target,
+                origins,
+            });
+            let operand = if *offset >= 0 {
+                format!("pc + {:#x}", offset)
+            } else {
+                format!("pc - {:#x}", offset.unsigned_abs())
+            };
+            AddressResolution {
+                operand,
+                access: combined,
                 writeback: None,
                 writeback_pre: false,
             }
@@ -2678,5 +2766,28 @@ mod tests {
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report
             .contains("x0 = *(x1 + x2); /* address=0x1020 proven_by=[0x1000,0x1004,0x1008] */"));
+    }
+
+    #[test]
+    fn lifts_literal_loads() {
+        // ldr x0, #0x1000 (pc=0x1000) size=1 (64-bit zero-extend) = 0x5a402000 -> target 0x2000
+        assert_eq!(lift(0x5a40_2000, 0x1000), "x0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        // ldr w0, #0x1000 (pc=0x1000) size=0 (32-bit zero-extend) = 0x1a402000
+        assert_eq!(lift(0x1a40_2000, 0x1000), "w0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        // ldrsw x0, #0x1000 (pc=0x1000) size=2 opc=2 = 0x9a802000
+        assert_eq!(lift(0x9a80_2000, 0x1000), "x0 = *(s32 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        // ldrsb w0, #0x1000 (pc=0x1000) size=0 opc=3 = 0x1ac02000
+        assert_eq!(lift(0x1ac0_2000, 0x1000), "w0 = *(s8 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        // ldrsh w0, #0x1000 (pc=0x1000) size=1 opc=3 = 0x5ac02000
+        assert_eq!(lift(0x5ac0_2000, 0x1000), "w0 = *(s16 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        // Negative offset: ldr w0, #-0x1000 (pc=0x2000) -> target 0x1000
+        // imm19 = -0x400 = 0x7fc00, encoded as 0x1a7fe000
+        assert_eq!(lift(0x1a7f_e000, 0x2000), "w0 = *(pc - 0x1000); /* address=0x1000 proven_by=[0x2000] */");
+    }
+
+    #[test]
+    fn prfm_literal_remains_opaque() {
+        // prfm pldl1keep, #0x1000 = size=3 opc=1 = 0xfa402000
+        assert!(lift(0xfa40_2000, 0x1000).contains("opaque instruction"));
     }
 }

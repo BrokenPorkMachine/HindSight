@@ -29,7 +29,7 @@ bitfield, memory, address, and control-flow extensions stay inside that
 `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v16` banner identifies the statement set that
+`AArch64 register semantics v17` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -83,9 +83,12 @@ post-index `[Rn], #imm` (access uses `base`, then `Rn = Rn + imm`, rendered as
 `x0 = *(x1); x1 = x1 + 0x8;`), and pre-index `[Rn, #imm]!` (access uses
 `Rn + imm` and `Rn` is updated first, rendered as `x0 = *(x1 + 0x8); x1 = x1 + 0x8;`).
 The writeback propagates proven constants into the base register with its provenance
-when available. Prefetch (`size 3`, opc 2), the unallocated `opc 3` 32/64-bit
-forms, the unprivileged `LDTR`/`STTR` (mode 10), and SIMD/scalar-FP stay opaque.
-`ADR`
+when available. PC-relative literal loads (`LDR`/`LDRSW`/`LDRSB`/`LDRSH` literal)
+are modeled with the address rendered as `pc + offset` (or `pc - abs(offset)` for
+negative offsets) and the resolved target address with provenance. The prefetch
+literal form (`PRFM` literal) stays opaque. Prefetch (`size 3`, opc 2), the
+unallocated `opc 3` 32/64-bit forms, the unprivileged `LDTR`/`STTR` (mode 10),
+and SIMD/scalar-FP stay opaque. `ADR`
 writes the sum of
 the instruction address and a signed 21-bit byte offset; `ADRP` writes the sum of
 the page-aligned instruction address and a signed 21-bit page offset shifted left
@@ -142,4 +145,8 @@ width-qualified dereferences, the signed-versus-zero extension, and that
 prefetch and the unallocated `opc 3` forms remain opaque. A synthetic
 register-offset and writeback sequence asserts the combined base+index address
 and provenance, a negative signed immediate, post-index writeback rendering and
-provenance, and that `LDTR`/`STTR` and prefetch remain opaque.
+provenance, and that `LDTR`/`STTR` and prefetch remain opaque. A synthetic
+literal load sequence asserts the PC-relative address rendering, negative offsets,
+the zero-extending and sign-extending literal forms (`LDR`/`LDRSW`/`LDRSB`/`LDRSH`),
+their resolved target addresses with provenance, and that `PRFM` literal stays
+opaque.
