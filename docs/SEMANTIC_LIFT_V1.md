@@ -17,7 +17,7 @@ immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
 `SXTH`/`SXTW`),
 bitfield extracts (`UBFX`/`SBFX`), general-register loads and stores (`STR`/`LDR`
 and their byte/halfword and sign-extending forms with a scaled unsigned
-immediate offset),
+immediate offset or with register-offset `[base, index, extend/shift]`),
 PC-relative `ADR`/`ADRP`, direct `B`/`BL`, conditional and indirect control flow
 (`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`), `RET`, and `NOP`. It emits an
 explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
@@ -29,7 +29,7 @@ bitfield, memory, address, and control-flow extensions stay inside that
 `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v14` banner identifies the statement set that
+`AArch64 register semantics v15` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register

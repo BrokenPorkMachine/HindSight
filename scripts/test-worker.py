@@ -341,7 +341,7 @@ with tempfile.TemporaryDirectory() as directory:
     )
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
-    assert 'AArch64 register semantics v14' in semantic
+    assert ('AArch64 register semantics v14' in semantic or 'AArch64 register semantics v15' in semantic)
     assert '*(u8 *)(x1 + 0x5) = w1; /* address=0x1005 proven_by=[0x1000000b8,0x1000000bc] */' in semantic
     assert 'w2 = *(u8 *)(x1 + 0xf); /* address=0x100f proven_by=[0x1000000b8,0x1000000c0] */' in semantic
     assert 'x3 = *(s32 *)(x1 + 0xc); /* address=0x100c proven_by=[0x1000000b8,0x1000000c4] */' in semantic

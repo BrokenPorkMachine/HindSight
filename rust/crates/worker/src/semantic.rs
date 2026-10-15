@@ -239,6 +239,20 @@ fn operand_shift(selector: u32, amount: u8) -> Option<(ShiftKind, u8)> {
 }
 
 #[derive(Clone, Copy)]
+enum AddressForm {
+    /// `[base, #imm]` with a scaled unsigned immediate byte offset.
+    Immediate(u64),
+    /// `[base, index, extend/shift]` for register-offset load/store.
+    #[allow(dead_code)]
+    RegOffset {
+        rm_index: u32,
+        option: u32,
+        s: bool,
+        size: u32,
+    },
+}
+
+#[derive(Clone, Copy)]
 enum Operation {
     Nop,
     Return(Register),
@@ -333,8 +347,8 @@ enum Operation {
     Load {
         dst: Register,
         base: Register,
-        /// Scaled unsigned immediate byte offset (`imm12 << size`).
-        offset: u64,
+        /// Addressing form for the load.
+        address: AddressForm,
         /// Log2 of the memory access width in bytes (`size` field, 0..=3).
         size: u32,
         /// Whether the load sign-extends into the destination register.
@@ -342,7 +356,7 @@ enum Operation {
     },
     Store {
         base: Register,
-        offset: u64,
+        address: AddressForm,
         src: Register,
         /// Log2 of the memory access width in bytes (`size` field, 0..=3).
         size: u32,
@@ -734,7 +748,7 @@ fn decode(word: u32, pc: u64) -> Operation {
             (_, 0) => {
                 return Operation::Store {
                     base,
-                    offset,
+                    address: AddressForm::Immediate(offset),
                     src: data(size == 3),
                     size,
                 };
@@ -744,7 +758,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                 return Operation::Load {
                     dst: data(size == 3),
                     base,
-                    offset,
+                    address: AddressForm::Immediate(offset),
                     size,
                     signed: false,
                 };
@@ -754,7 +768,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                 return Operation::Load {
                     dst: data(true),
                     base,
-                    offset,
+                    address: AddressForm::Immediate(offset),
                     size,
                     signed: true,
                 };
@@ -764,12 +778,97 @@ fn decode(word: u32, pc: u64) -> Operation {
                 return Operation::Load {
                     dst: data(false),
                     base,
-                    offset,
+                    address: AddressForm::Immediate(offset),
                     size,
                     signed: true,
                 };
             }
             // Prefetch (size 3, opc 2) and the unallocated opc 3 forms.
+            _ => {}
+        }
+    }
+    // Load/store register (register offset), V=0:
+    // `size:2 111 V:1 00 opc:2 1 Rm:5 option:3 S:1 10 Rn:5 Rt:5`
+    // Same general-register family as the unsigned-immediate form; the index is
+    // `Rm` extended by `option` (UXTW/LSL/SXTW/SXTX) and optionally scaled by
+    // `size` when `S==1`. Only these option values are modeled.
+    if word & 0x3f200c00 == ((word & 0xc0000000) | 0x38200c00) {
+        let size = (word >> 30) & 3;
+        let opc = (word >> 22) & 3;
+        let rn = (word >> 5) & 31;
+        let rm_index = (word >> 16) & 31;
+        let option = (word >> 13) & 7;
+        let s = (word >> 12) & 1 == 1;
+        let rt = word & 31;
+        let base = Register {
+            index: rn,
+            wide: true,
+            stack_pointer: rn == 31,
+        };
+        let data = |wide: bool| Register {
+            index: rt,
+            wide,
+            stack_pointer: false,
+        };
+        match option {
+            2 | 3 | 6 | 7 => match (size, opc) {
+                (_, 0) => {
+                    return Operation::Store {
+                        base,
+                        address: AddressForm::RegOffset {
+                            rm_index,
+                            option,
+                            s,
+                            size,
+                        },
+                        src: data(size == 3),
+                        size,
+                    };
+                }
+                (_, 1) => {
+                    return Operation::Load {
+                        dst: data(size == 3),
+                        base,
+                        address: AddressForm::RegOffset {
+                            rm_index,
+                            option,
+                            s,
+                            size,
+                        },
+                        size,
+                        signed: false,
+                    };
+                }
+                (0..=2, 2) => {
+                    return Operation::Load {
+                        dst: data(true),
+                        base,
+                        address: AddressForm::RegOffset {
+                            rm_index,
+                            option,
+                            s,
+                            size,
+                        },
+                        size,
+                        signed: true,
+                    };
+                }
+                (0..=1, 3) => {
+                    return Operation::Load {
+                        dst: data(false),
+                        base,
+                        address: AddressForm::RegOffset {
+                            rm_index,
+                            option,
+                            s,
+                            size,
+                        },
+                        size,
+                        signed: true,
+                    };
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -935,11 +1034,7 @@ fn memory_operand(base: &Register, offset: u64) -> String {
     }
 }
 
-/// Renders a load/store dereference. The dereference is untyped when the access
-/// width equals the data-register width (the whole-register forms); otherwise
-/// the exact access width and signedness are named (`*(u8 *)`, `*(s16 *)`, ...).
-fn memory_access(base: &Register, offset: u64, size: u32, signed: bool, wide: bool) -> String {
-    let operand = memory_operand(base, offset);
+fn memory_access_operand(operand: &str, size: u32, signed: bool, wide: bool) -> String {
     let bytes = 1u32 << size;
     let natural = if wide { 8 } else { 4 };
     if !signed && bytes == natural {
@@ -948,6 +1043,68 @@ fn memory_access(base: &Register, offset: u64, size: u32, signed: bool, wide: bo
         let bits = bytes * 8;
         let prefix = if signed { 's' } else { 'u' };
         format!("*({prefix}{bits} *)({operand})")
+    }
+}
+
+fn sign_extend_32(value: u64) -> u64 {
+    let v = value as u32;
+    ((v as i32) as i64) as u64
+}
+
+fn index_register(option: u32, rm_index: u32) -> Register {
+    match option {
+        2 => Register {
+            index: rm_index,
+            wide: false,
+            stack_pointer: false,
+        }, // UXTW
+        3 => Register {
+            index: rm_index,
+            wide: true,
+            stack_pointer: false,
+        }, // LSL
+        6 => Register {
+            index: rm_index,
+            wide: false,
+            stack_pointer: false,
+        }, // SXTW
+        7 => Register {
+            index: rm_index,
+            wide: true,
+            stack_pointer: false,
+        }, // SXTX
+        _ => Register {
+            index: rm_index,
+            wide: true,
+            stack_pointer: false,
+        },
+    }
+}
+
+fn index_expression(index_reg: &Register, option: u32, s: bool, size: u32) -> String {
+    let expr = match option {
+        6 => format!("sext({}, 32)", index_reg.name()), // SXTW
+        _ => index_reg.name(),
+    };
+    if s {
+        format!("({expr} << {size})")
+    } else {
+        expr
+    }
+}
+
+fn index_resolved(value: u64, option: u32, s: bool, size: u32) -> u64 {
+    let extended = match option {
+        2 => value & 0xffff_ffff,   // UXTW
+        3 => value,                 // LSL
+        6 => sign_extend_32(value), // SXTW
+        7 => value,                 // SXTX
+        _ => value,
+    };
+    if s {
+        extended << size
+    } else {
+        extended
     }
 }
 
@@ -1348,43 +1505,109 @@ impl Operation {
             Self::Load {
                 dst,
                 base,
-                offset,
+                address,
                 size,
                 signed,
             } => {
-                let address = flow.read(base).and_then(|input| {
-                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
-                        value: input.value.wrapping_add(offset),
-                        origins,
-                    })
-                });
+                let (addr_expr, addr_resolved) = match address {
+                    AddressForm::Immediate(offset) => {
+                        let addr = flow.read(base).and_then(|input| {
+                            combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                                value: input.value.wrapping_add(offset),
+                                origins,
+                            })
+                        });
+                        (memory_operand(&base, offset), addr)
+                    }
+                    AddressForm::RegOffset {
+                        rm_index,
+                        option,
+                        s,
+                        size: scale,
+                    } => {
+                        let index_reg = index_register(option, rm_index);
+                        let base_known = flow.read(base);
+                        let index_known = flow.read(index_reg);
+                        let expr = format!(
+                            "{} + {}",
+                            base.name(),
+                            index_expression(&index_reg, option, s, scale)
+                        );
+                        let addr = match (base_known, index_known) {
+                            (Some(b), Some(i)) => {
+                                let offset_val = index_resolved(i.value, option, s, scale);
+                                combine_origins(&b.origins, &i.origins, pc).map(|origins| {
+                                    KnownValue {
+                                        value: b.value.wrapping_add(offset_val),
+                                        origins,
+                                    }
+                                })
+                            }
+                            _ => None,
+                        };
+                        (expr, addr)
+                    }
+                };
                 // The loaded value is not known: the destination register becomes
                 // an unknown barrier while the base address register is preserved.
                 flow.write(dst, None);
                 format!(
                     "{} = {};{}",
                     dst.name(),
-                    memory_access(&base, offset, size, signed, dst.wide),
-                    address_suffix(address.as_ref())
+                    memory_access_operand(&addr_expr, size, signed, dst.wide),
+                    address_suffix(addr_resolved.as_ref())
                 )
             }
             Self::Store {
                 base,
-                offset,
+                address,
                 src,
                 size,
             } => {
-                let address = flow.read(base).and_then(|input| {
-                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
-                        value: input.value.wrapping_add(offset),
-                        origins,
-                    })
-                });
+                let (addr_expr, addr_resolved) = match address {
+                    AddressForm::Immediate(offset) => {
+                        let addr = flow.read(base).and_then(|input| {
+                            combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                                value: input.value.wrapping_add(offset),
+                                origins,
+                            })
+                        });
+                        (memory_operand(&base, offset), addr)
+                    }
+                    AddressForm::RegOffset {
+                        rm_index,
+                        option,
+                        s,
+                        size: scale,
+                    } => {
+                        let index_reg = index_register(option, rm_index);
+                        let base_known = flow.read(base);
+                        let index_known = flow.read(index_reg);
+                        let expr = format!(
+                            "{} + {}",
+                            base.name(),
+                            index_expression(&index_reg, option, s, scale)
+                        );
+                        let addr = match (base_known, index_known) {
+                            (Some(b), Some(i)) => {
+                                let offset_val = index_resolved(i.value, option, s, scale);
+                                combine_origins(&b.origins, &i.origins, pc).map(|origins| {
+                                    KnownValue {
+                                        value: b.value.wrapping_add(offset_val),
+                                        origins,
+                                    }
+                                })
+                            }
+                            _ => None,
+                        };
+                        (expr, addr)
+                    }
+                };
                 format!(
                     "{} = {};{}",
-                    memory_access(&base, offset, size, false, src.wide),
+                    memory_access_operand(&addr_expr, size, false, src.wide),
                     src.name(),
-                    address_suffix(address.as_ref())
+                    address_suffix(addr_resolved.as_ref())
                 )
             }
             Self::Opaque => {
@@ -1406,7 +1629,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v14; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v15; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
