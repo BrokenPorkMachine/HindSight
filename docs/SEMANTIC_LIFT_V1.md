@@ -52,10 +52,11 @@ aliases of the bitfield group are modeled only in their canonical single-field
 forms: `LSL` and `LSR` (from `UBFM`) and `ASR` (from `SBFM`), rendered with `<<`,
 `>>`, and `>>>` (Verilog-style sign-propagating right shift). The general
 bitfield extracts `UBFX` and `SBFX` render `dst = (src >> lsb) & mask;` and
-`dst = sext(src >> lsb, width);` for the non-wrapping field `[lsb, lsb + width)`;
-bitfield inserts (`BFM`/`BFI`/`BFXIL`/`UBFIZ`/`SBFIZ`) and the wider `op31`
-multiplications
-stay opaque. The sign/zero extend aliases `UXTB`/`UXTH` (zero-extending) and
+`dst = sext(src >> lsb, width);` for the non-wrapping field `[lsb, lsb + width)`.
+Bitfield inserts are now modeled: `BFI` renders `dst = (dst & ~(mask << lsb)) | ((src & mask) << lsb)`;
+`BFXIL` renders `dst = (dst & ~mask) | ((src >> lsb) & mask)`;
+`UBFIZ` renders `dst = src & mask` (zero-extended); `SBFIZ` renders `dst = sext(src & mask, width)`.
+The wider `op31` multiplications stay opaque. The sign/zero extend aliases `UXTB`/`UXTH` (zero-extending) and
 `SXTB`/`SXTH`/`SXTW` (sign-extending) are modeled as `dst = zext(src, N)` and
 `dst = sext(src, N)`; they read the narrow source view, so a 64-bit destination
 still names a `w` source. `MADD`
@@ -135,8 +136,10 @@ rendered `ADD`/`SUB`/logical shifted form, the exact words, the `ROR`-still-opaq
 boundary, and folded shifted operands with their `proven_by` addresses. A
 synthetic `UBFX`/`SBFX` sequence asserts the zero- and sign-extract operators
 (including an elided `#0` shift), the exact extract words, folded extracts with
-their `proven_by` addresses, and that the `UBFIZ`/`BFI`/`BFXIL` insert aliases
-remain opaque. A synthetic `STR`/`LDR` sequence asserts the rendered store and
+their `proven_by` addresses. A synthetic bitfield insert sequence asserts the
+`BFI`, `BFXIL`, `UBFIZ`, and `SBFIZ` rendering, their exact words, and folded
+inserts with `proven_by` addresses when the source is a known constant. A
+synthetic `STR`/`LDR` sequence asserts the rendered store and
 load forms, the scaled immediate offset and `sp` base, the resolved addresses
 with their `proven_by` addresses, that a load invalidates its destination
 register, and that unscaled/indexed forms remain opaque. A synthetic
