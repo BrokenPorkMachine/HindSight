@@ -29,7 +29,7 @@ bitfield, memory, address, and control-flow extensions stay inside that
 `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v15` banner identifies the statement set that
+`AArch64 register semantics v16` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -72,9 +72,20 @@ in `w6 = *(u8 *)(x7);` and `x20 = *(s32 *)(x21);`. The
 base is a 64-bit address register (`sp` when `Rn == 31`); a load defines its
 destination as unknown while preserving the base, and a store leaves tracked
 registers unchanged. When the base carries an exact constant, the resolved
-address and its provenance are printed. Prefetch (`size 3`, opc 2), the
-unallocated `opc 3` 32/64-bit forms, SIMD/scalar-FP, unscaled, and
-pre/post-indexed forms stay opaque. `ADR`
+address and its provenance are printed. The register-offset family
+(`[base, index, extend/shift]` with the `UXTW`/`LSL`/`SXTW`/`SXTX` options and
+the optional left shift by the access size) builds its index from the source
+register (zero-extension for `UXTW`, sign-extension for `SXTW`, full width for
+`LSL`/`SXTX`) and combines the proven base and proven index into one resolved
+address. The unscaled and writeback forms are also modeled: `LDUR`/`STUR` with a
+signed immediate (`base + off` or `base - abs(off)`, as in `*(x1 - 0x8)`),
+post-index `[Rn], #imm` (access uses `base`, then `Rn = Rn + imm`, rendered as
+`x0 = *(x1); x1 = x1 + 0x8;`), and pre-index `[Rn, #imm]!` (access uses
+`Rn + imm` and `Rn` is updated first, rendered as `x0 = *(x1 + 0x8); x1 = x1 + 0x8;`).
+The writeback propagates proven constants into the base register with its provenance
+when available. Prefetch (`size 3`, opc 2), the unallocated `opc 3` 32/64-bit
+forms, the unprivileged `LDTR`/`STTR` (mode 10), and SIMD/scalar-FP stay opaque.
+`ADR`
 writes the sum of
 the instruction address and a signed 21-bit byte offset; `ADRP` writes the sum of
 the page-aligned instruction address and a signed 21-bit page offset shifted left
@@ -128,4 +139,7 @@ with their `proven_by` addresses, that a load invalidates its destination
 register, and that unscaled/indexed forms remain opaque. A synthetic
 `STRB`/`LDRB`/`LDRSW` sequence asserts the byte/halfword and sign-extending
 width-qualified dereferences, the signed-versus-zero extension, and that
-prefetch and the unallocated `opc 3` forms remain opaque.
+prefetch and the unallocated `opc 3` forms remain opaque. A synthetic
+register-offset and writeback sequence asserts the combined base+index address
+and provenance, a negative signed immediate, post-index writeback rendering and
+provenance, and that `LDTR`/`STTR` and prefetch remain opaque.

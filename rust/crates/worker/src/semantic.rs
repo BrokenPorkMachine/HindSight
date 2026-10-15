@@ -239,11 +239,24 @@ fn operand_shift(selector: u32, amount: u8) -> Option<(ShiftKind, u8)> {
 }
 
 #[derive(Clone, Copy)]
+enum Writeback {
+    /// Unscaled immediate (`LDUR`/`STUR`): address is `base + offset`, no writeback.
+    None,
+    /// Pre-index `[Rn, #imm]!`: address is `base + offset`, base is updated to it.
+    Pre,
+    /// Post-index `[Rn], #imm`: address is `base`, base is updated to `base + offset`.
+    Post,
+    /// Unprivileged `LDTR`/`STTR`: not modeled.
+    Unprivileged,
+}
+
+#[derive(Clone, Copy)]
 enum AddressForm {
-    /// `[base, #imm]` with a scaled unsigned immediate byte offset.
+    /// `[base, #imm]` with a scaled unsigned immediate byte offset (unsigned).
     Immediate(u64),
+    /// `[base, #imm]` with a signed immediate offset (unscaled) and optional writeback.
+    ImmediateSigned(i64, Writeback),
     /// `[base, index, extend/shift]` for register-offset load/store.
-    #[allow(dead_code)]
     RegOffset {
         rm_index: u32,
         option: u32,
@@ -792,7 +805,7 @@ fn decode(word: u32, pc: u64) -> Operation {
     // Same general-register family as the unsigned-immediate form; the index is
     // `Rm` extended by `option` (UXTW/LSL/SXTW/SXTX) and optionally scaled by
     // `size` when `S==1`. Only these option values are modeled.
-    if word & 0x3f200c00 == ((word & 0xc0000000) | 0x38200c00) {
+    if word & 0x3f20_0c00 == 0x3820_0800 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
         let rn = (word >> 5) & 31;
@@ -870,6 +883,80 @@ fn decode(word: u32, pc: u64) -> Operation {
                 _ => {}
             },
             _ => {}
+        }
+    }
+    // Load/store register (unscaled immediate / immediate pre-, post-indexed), V=0:
+    // `size:2 111 V:1 00 opc:2 0 imm9:9 mode:2 Rn:5 Rt:5`. Same general-register
+    // family as the unsigned-immediate form, but with a signed 9-bit unscaled
+    // offset. `mode` selects the addressing mode: `00` unscaled (`LDUR`/`STUR`),
+    // `01` post-index (`[Rn], #imm`), `11` pre-index (`[Rn, #imm]!`); `10` is the
+    // unprivileged `LDTR`/`STTR` form, which stays opaque. Prefetch and the
+    // unallocated `opc 3` forms are opaque as in the unsigned-immediate class.
+    if word & 0x3f20_0000 == 0x3800_0000 {
+        let size = (word >> 30) & 3;
+        let opc = (word >> 22) & 3;
+        let rn = (word >> 5) & 31;
+        let mode = (word >> 10) & 3;
+        let imm9 = (word >> 12) & 0x1ff;
+        // Sign-extend the 9-bit immediate.
+        let offset = (((imm9 << 23) as i32) >> 23) as i64;
+        let writeback = match mode {
+            0 => Writeback::None,
+            1 => Writeback::Post,
+            3 => Writeback::Pre,
+            _ => Writeback::Unprivileged,
+        };
+        if !matches!(writeback, Writeback::Unprivileged) {
+            let base = Register {
+                index: rn,
+                wide: true,
+                stack_pointer: rn == 31,
+            };
+            let rt = word & 31;
+            let data = |wide: bool| Register {
+                index: rt,
+                wide,
+                stack_pointer: false,
+            };
+            let address = AddressForm::ImmediateSigned(offset, writeback);
+            match (size, opc) {
+                (_, 0) => {
+                    return Operation::Store {
+                        base,
+                        address,
+                        src: data(size == 3),
+                        size,
+                    };
+                }
+                (_, 1) => {
+                    return Operation::Load {
+                        dst: data(size == 3),
+                        base,
+                        address,
+                        size,
+                        signed: false,
+                    };
+                }
+                (0..=2, 2) => {
+                    return Operation::Load {
+                        dst: data(true),
+                        base,
+                        address,
+                        size,
+                        signed: true,
+                    };
+                }
+                (0..=1, 3) => {
+                    return Operation::Load {
+                        dst: data(false),
+                        base,
+                        address,
+                        size,
+                        signed: true,
+                    };
+                }
+                _ => {}
+            }
         }
     }
     // Data-processing (3 source): MADD (o0=0) and MSUB (o0=1) with 32x32
@@ -1114,6 +1201,115 @@ fn address_suffix(value: Option<&KnownValue>) -> String {
     match value {
         Some(value) => format!(" /* address={:#x} {} */", value.value, proven_by(value)),
         None => String::new(),
+    }
+}
+
+/// Renders a signed immediate memory operand (`base`, `base + off`, or
+/// `base - off`), eliding a zero offset.
+fn signed_memory_operand(base: &Register, offset: i64) -> String {
+    if offset == 0 {
+        base.name()
+    } else if offset > 0 {
+        format!("{} + {:#x}", base.name(), offset as u64)
+    } else {
+        format!("{} - {:#x}", base.name(), offset.unsigned_abs())
+    }
+}
+
+/// The resolved pieces of a load/store address form, shared by the load and
+/// store renderers.
+struct AddressResolution {
+    /// Dereference operand, e.g. `x1 + 0x8` or `x1` (post-index).
+    operand: String,
+    /// Proven access address, when the base register carries an exact constant.
+    access: Option<KnownValue>,
+    /// Writeback applied to the base register: the new-value expression and its
+    /// proven value. Present for pre- and post-indexed forms.
+    writeback: Option<(String, Option<KnownValue>)>,
+    /// Whether the writeback precedes the access (pre-index), so a load into the
+    /// base register observes the loaded value rather than the address.
+    writeback_pre: bool,
+}
+
+fn resolve_address(
+    flow: &Flow,
+    base: &Register,
+    address: &AddressForm,
+    pc: u64,
+) -> AddressResolution {
+    match address {
+        AddressForm::Immediate(offset) => AddressResolution {
+            operand: memory_operand(base, *offset),
+            access: flow.read(*base).and_then(|input| {
+                combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                    value: input.value.wrapping_add(*offset),
+                    origins,
+                })
+            }),
+            writeback: None,
+            writeback_pre: false,
+        },
+        AddressForm::ImmediateSigned(offset, writeback) => {
+            let base_known = flow.read(*base);
+            let combined = base_known.as_ref().and_then(|input| {
+                combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                    value: input.value.wrapping_add(*offset as u64),
+                    origins,
+                })
+            });
+            let new_base = signed_memory_operand(base, *offset);
+            match writeback {
+                Writeback::Pre => AddressResolution {
+                    operand: new_base.clone(),
+                    access: combined.clone(),
+                    writeback: Some((new_base, combined)),
+                    writeback_pre: true,
+                },
+                Writeback::Post => AddressResolution {
+                    operand: base.name(),
+                    access: base_known,
+                    writeback: Some((new_base, combined)),
+                    writeback_pre: false,
+                },
+                _ => AddressResolution {
+                    operand: new_base,
+                    access: combined,
+                    writeback: None,
+                    writeback_pre: false,
+                },
+            }
+        }
+        AddressForm::RegOffset {
+            rm_index,
+            option,
+            s,
+            size: scale,
+        } => {
+            let index_reg = index_register(*option, *rm_index);
+            let base_known = flow.read(*base);
+            let index_known = flow.read(index_reg);
+            let expr = format!(
+                "{} + {}",
+                base.name(),
+                index_expression(&index_reg, *option, *s, *scale)
+            );
+            let addr = match (base_known, index_known) {
+                (Some(b), Some(i)) => {
+                    let offset_val = index_resolved(i.value, *option, *s, *scale);
+                    combine_origins(&b.origins, &i.origins, pc).map(|origins| KnownValue {
+                        value: b.value.wrapping_add(offset_val),
+                        origins,
+                    })
+                }
+                _ => None,
+            };
+            AddressResolution {
+                operand: expr,
+                access: addr,
+                writeback: None,
+                writeback_pre: false,
+            }
+        }
     }
 }
 
@@ -1509,54 +1705,29 @@ impl Operation {
                 size,
                 signed,
             } => {
-                let (addr_expr, addr_resolved) = match address {
-                    AddressForm::Immediate(offset) => {
-                        let addr = flow.read(base).and_then(|input| {
-                            combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
-                                value: input.value.wrapping_add(offset),
-                                origins,
-                            })
-                        });
-                        (memory_operand(&base, offset), addr)
+                let resolution = resolve_address(flow, &base, &address, pc);
+                let access = memory_access_operand(&resolution.operand, size, signed, dst.wide);
+                let suffix = address_suffix(resolution.access.as_ref());
+                // A pre-indexed writeback happens before the access, so a load
+                // into the base register observes the loaded value; a post-indexed
+                // writeback happens after, so it observes the address.
+                let mut statement = String::new();
+                if resolution.writeback_pre {
+                    if let Some((_, value)) = &resolution.writeback {
+                        flow.write(base, value.clone());
                     }
-                    AddressForm::RegOffset {
-                        rm_index,
-                        option,
-                        s,
-                        size: scale,
-                    } => {
-                        let index_reg = index_register(option, rm_index);
-                        let base_known = flow.read(base);
-                        let index_known = flow.read(index_reg);
-                        let expr = format!(
-                            "{} + {}",
-                            base.name(),
-                            index_expression(&index_reg, option, s, scale)
-                        );
-                        let addr = match (base_known, index_known) {
-                            (Some(b), Some(i)) => {
-                                let offset_val = index_resolved(i.value, option, s, scale);
-                                combine_origins(&b.origins, &i.origins, pc).map(|origins| {
-                                    KnownValue {
-                                        value: b.value.wrapping_add(offset_val),
-                                        origins,
-                                    }
-                                })
-                            }
-                            _ => None,
-                        };
-                        (expr, addr)
-                    }
-                };
+                }
                 // The loaded value is not known: the destination register becomes
                 // an unknown barrier while the base address register is preserved.
                 flow.write(dst, None);
-                format!(
-                    "{} = {};{}",
-                    dst.name(),
-                    memory_access_operand(&addr_expr, size, signed, dst.wide),
-                    address_suffix(addr_resolved.as_ref())
-                )
+                statement.push_str(&format!("{} = {access};{suffix}", dst.name()));
+                if let Some((expr, value)) = &resolution.writeback {
+                    if !resolution.writeback_pre {
+                        flow.write(base, value.clone());
+                    }
+                    statement.push_str(&format!(" {} = {expr};", base.name()));
+                }
+                statement
             }
             Self::Store {
                 base,
@@ -1564,51 +1735,15 @@ impl Operation {
                 src,
                 size,
             } => {
-                let (addr_expr, addr_resolved) = match address {
-                    AddressForm::Immediate(offset) => {
-                        let addr = flow.read(base).and_then(|input| {
-                            combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
-                                value: input.value.wrapping_add(offset),
-                                origins,
-                            })
-                        });
-                        (memory_operand(&base, offset), addr)
-                    }
-                    AddressForm::RegOffset {
-                        rm_index,
-                        option,
-                        s,
-                        size: scale,
-                    } => {
-                        let index_reg = index_register(option, rm_index);
-                        let base_known = flow.read(base);
-                        let index_known = flow.read(index_reg);
-                        let expr = format!(
-                            "{} + {}",
-                            base.name(),
-                            index_expression(&index_reg, option, s, scale)
-                        );
-                        let addr = match (base_known, index_known) {
-                            (Some(b), Some(i)) => {
-                                let offset_val = index_resolved(i.value, option, s, scale);
-                                combine_origins(&b.origins, &i.origins, pc).map(|origins| {
-                                    KnownValue {
-                                        value: b.value.wrapping_add(offset_val),
-                                        origins,
-                                    }
-                                })
-                            }
-                            _ => None,
-                        };
-                        (expr, addr)
-                    }
-                };
-                format!(
-                    "{} = {};{}",
-                    memory_access_operand(&addr_expr, size, false, src.wide),
-                    src.name(),
-                    address_suffix(addr_resolved.as_ref())
-                )
+                let resolution = resolve_address(flow, &base, &address, pc);
+                let access = memory_access_operand(&resolution.operand, size, false, src.wide);
+                let suffix = address_suffix(resolution.access.as_ref());
+                let mut statement = format!("{access} = {};{suffix}", src.name());
+                if let Some((expr, value)) = &resolution.writeback {
+                    flow.write(base, value.clone());
+                    statement.push_str(&format!(" {} = {expr};", base.name()));
+                }
+                statement
             }
             Self::Opaque => {
                 flow.clear();
@@ -1629,7 +1764,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v15; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v16; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -2205,10 +2340,59 @@ mod tests {
 
     #[test]
     fn unmodeled_load_store_forms_remain_opaque() {
-        // ldur x0, [x1, #8] = 0xf8408020 (unscaled immediate)
-        assert!(lift(0xf840_8020, 0x1000).contains("opaque instruction"));
         // stp x29, x30, [sp, #-16]! = 0xa9bf7bfd (pre-indexed pair)
         assert!(lift(0xa9bf_7bfd, 0x1000).contains("opaque instruction"));
+        // ldtr x0, [x1, #8] = 0xf8408820 (unprivileged, mode 10)
+        assert!(lift(0xf840_8820, 0x1000).contains("opaque instruction"));
+        // sttr x0, [x1, #8] = 0xf8008820 (unprivileged, mode 10)
+        assert!(lift(0xf800_8820, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_unscaled_and_indexed_load_store() {
+        // stur x0, [x1, #8] = 0xf8008020 (unscaled, no writeback)
+        assert_eq!(lift(0xf800_8020, 0x1000), "*(x1 + 0x8) = x0;");
+        // ldur x0, [x1, #8] = 0xf8408020
+        assert_eq!(lift(0xf840_8020, 0x1000), "x0 = *(x1 + 0x8);");
+        // stur x0, [x1, #-8] = 0xf81f8020 (negative offset)
+        assert_eq!(lift(0xf81f_8020, 0x1000), "*(x1 - 0x8) = x0;");
+        // ldur w2, [x3, #-1] = 0x385ff062 (byte access, signed immediate)
+        assert_eq!(lift(0x385f_f062, 0x1000), "w2 = *(u8 *)(x3 - 0x1);");
+        // ldr x0, [x1], #8 = 0xf8408420 (post-index: access then writeback)
+        assert_eq!(lift(0xf840_8420, 0x1000), "x0 = *(x1); x1 = x1 + 0x8;");
+        // ldr x0, [x1, #8]! = 0xf8408c20 (pre-index: writeback to the address)
+        assert_eq!(
+            lift(0xf840_8c20, 0x1000),
+            "x0 = *(x1 + 0x8); x1 = x1 + 0x8;"
+        );
+        // str x2, [x3], #16 = 0xf8010462 (post-indexed store)
+        assert_eq!(lift(0xf801_0462, 0x1000), "*(x3) = x2; x3 = x3 + 0x10;");
+        // str x2, [x3, #16]! = 0xf8010c62 (pre-indexed store)
+        assert_eq!(
+            lift(0xf801_0c62, 0x1000),
+            "*(x3 + 0x10) = x2; x3 = x3 + 0x10;"
+        );
+    }
+
+    #[test]
+    fn indexed_load_store_tracks_writeback_constants() {
+        // movz x1, #0x1000 ; ldr x0, [x1], #8 ; ldr x2, [x1]
+        let words = [
+            0xd282_0001u32, // movz x1, #0x1000
+            0xf840_8420,    // ldr x0, [x1], #8  -> x0 unknown, x1 = 0x1008
+            0xf940_0022,    // ldr x2, [x1]       -> address 0x1008
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        // The post-indexed access uses the pre-writeback base (0x1000) and then
+        // updates x1 to the next address (0x1008 with added provenance).
+        assert!(
+            report.contains("x0 = *(x1); /* address=0x1000 proven_by=[0x1000] */ x1 = x1 + 0x8;")
+        );
+        // The next load observes the updated base as a proven constant.
+        assert!(
+            report.contains("x2 = *(x1); /* address=0x1008 proven_by=[0x1000,0x1004,0x1008] */")
+        );
     }
 
     #[test]
@@ -2295,5 +2479,38 @@ mod tests {
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report.contains("goto 0x8; /* indirect via x8; proven_by=[0x1004] */"));
         assert!(!report.contains("ABI result register x0 /* constant="));
+    }
+
+    #[test]
+    fn lifts_register_offset_load_store() {
+        // ldr x0, [x1, x2] = 0xf8626820 (LSL by 0: unshifted)
+        assert_eq!(lift(0xf862_6820, 0x1000), "x0 = *(x1 + x2);");
+        // ldr x0, [x1, x2, lsl #3] = 0xf8627820
+        assert_eq!(lift(0xf862_7820, 0x1000), "x0 = *(x1 + (x2 << 3));");
+        // ldr x0, [x1, w2, uxtw] = 0xf8624820
+        assert_eq!(lift(0xf862_4820, 0x1000), "x0 = *(x1 + w2);");
+        // str w0, [x1, w2, uxtw #2] = 0xb8225820
+        assert_eq!(lift(0xb822_5820, 0x1000), "*(x1 + (w2 << 2)) = w0;");
+        // ldr x0, [x1, w2, sxtw] = 0xf862c820 (sign-extends the 32-bit index)
+        assert_eq!(lift(0xf862_c820, 0x1000), "x0 = *(x1 + sext(w2, 32));");
+        // ldrsb x0, [x1, w2, sxtw] = 0x38a2d820
+        assert_eq!(
+            lift(0x38a2_d820, 0x1000),
+            "x0 = *(s8 *)(x1 + (sext(w2, 32) << 0));"
+        );
+    }
+
+    #[test]
+    fn register_offset_load_store_resolves_base_and_index() {
+        // movz x1, #0x1000 ; movz x2, #0x20 ; ldr x0, [x1, x2]
+        let words = [
+            0xd282_0001u32, // movz x1, #0x1000
+            0xd280_0402,    // movz x2, #0x20
+            0xf862_6820,    // ldr x0, [x1, x2] -> address 0x1020
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report
+            .contains("x0 = *(x1 + x2); /* address=0x1020 proven_by=[0x1000,0x1004,0x1008] */"));
     }
 }
