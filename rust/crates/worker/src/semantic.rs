@@ -218,6 +218,40 @@ fn extract_value(value: u64, lsb: u8, width: u8) -> u64 {
     (value >> lsb) & mask
 }
 
+/// Computes ARM64 `SDIV`/`UDIV`. A zero divisor yields zero; signed division
+/// saturates instead of wrapping on the `INT_MIN / -1` overflow.
+fn divide_value(dividend: u64, divisor: u64, signed: bool, wide: bool) -> u64 {
+    if divisor == 0 {
+        return 0;
+    }
+    if !signed {
+        let mask = if wide { u64::MAX } else { 0xffff_ffff };
+        return (dividend & mask).wrapping_div(divisor & mask);
+    }
+    if wide {
+        let a = dividend as i64;
+        let b = divisor as i64;
+        if b == 0 {
+            return 0;
+        }
+        // Saturate on the one overflowing case rather than wrapping.
+        if a == i64::MIN && b == -1 {
+            return i64::MIN as u64;
+        }
+        a.wrapping_div(b) as u64
+    } else {
+        let a = dividend as u32 as i32;
+        let b = divisor as u32 as i32;
+        if b == 0 {
+            return 0;
+        }
+        if a == i32::MIN && b == -1 {
+            return i32::MIN as u32 as u64;
+        }
+        a.wrapping_div(b) as u32 as u64
+    }
+}
+
 /// Applies an optional register-operand shift, leaving `value` unchanged when the
 /// operand is unshifted.
 fn shifted_value(value: u64, shift: Option<(ShiftKind, u8)>, wide: bool) -> u64 {
@@ -367,6 +401,13 @@ enum Operation {
         /// `None` when the accumulator is the zero register (`MUL` / `MNEG`).
         addend: Option<Register>,
         subtract: bool,
+    },
+    Divide {
+        dst: Register,
+        left: Register,
+        right: Register,
+        /// `true` for `SDIV`, `false` for `UDIV`.
+        signed: bool,
     },
     Extend {
         dst: Register,
@@ -1133,7 +1174,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                 stack_pointer: false,
             };
             match (size, opc) {
-                (_, 0) => { // STP: store pair
+                (_, 0) => {
+                    // STP: store pair
                     return Operation::StorePair {
                         base,
                         src1: reg1(size == 3),
@@ -1143,7 +1185,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                         size,
                     };
                 }
-                (_, 1) => { // LDP: zero-extending load pair
+                (_, 1) => {
+                    // LDP: zero-extending load pair
                     return Operation::LoadPair {
                         dst1: reg1(size == 3),
                         dst2: reg2(size == 3),
@@ -1153,7 +1196,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                         size,
                     };
                 }
-                (0..=2, 2) => { // LDP: sign-extending into 64-bit
+                (0..=2, 2) => {
+                    // LDP: sign-extending into 64-bit
                     return Operation::LoadPair {
                         dst1: reg1(true),
                         dst2: reg2(true),
@@ -1163,7 +1207,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                         size,
                     };
                 }
-                (0..=1, 3) => { // LDP: sign-extending into 32-bit
+                (0..=1, 3) => {
+                    // LDP: sign-extending into 32-bit
                     return Operation::LoadPair {
                         dst1: reg1(false),
                         dst2: reg2(false),
@@ -1176,6 +1221,38 @@ fn decode(word: u32, pc: u64) -> Operation {
                 _ => {}
             }
         }
+    }
+    // Data-processing (2 source) division: SDIV (bit 10 = 1) and UDIV (bit 10 = 0)
+    // with `sf 0011010110 Rm:5 00001 o0:1 Rn:5 Rd:5`. The middle field
+    // (bits 15-11 == 1) identifies the divide class among the 2/3-source group.
+    // This is decoded before the literal-load class because their fixed bits
+    // overlap at bits 29-24; the divide middle field disambiguates them.
+    // ARM64 semantics: division by zero yields zero, and INT_MIN / -1 saturates
+    // to INT_MIN, so the result is always defined.
+    if word & 0x7fe0_0000 == 0x1ac0_0000 && (word >> 11) & 0x1f == 1 {
+        let signed = word & (1 << 10) != 0;
+        if word & 31 == 31 {
+            return Operation::Discard("division result discarded in zero register");
+        }
+        let sf = word >> 31 != 0;
+        return Operation::Divide {
+            dst: Register {
+                index: word & 31,
+                wide: sf,
+                stack_pointer: false,
+            },
+            left: Register {
+                index: (word >> 5) & 31,
+                wide: sf,
+                stack_pointer: false,
+            },
+            right: Register {
+                index: (word >> 16) & 31,
+                wide: sf,
+                stack_pointer: false,
+            },
+            signed,
+        };
     }
     // Load literal (PC-relative), V=0:
     // `size:2 01101 opc:2 imm19:19 Rt:5`. The address is `PC + (sign_extend(imm19) << 2)`.
@@ -1195,7 +1272,8 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
         let address = AddressForm::Literal(offset);
         match (size, opc) {
-            (_, 1) => { // LDR: zero-extending
+            (_, 1) => {
+                // LDR: zero-extending
                 if size == 3 {
                     // PRFM - opaque
                 } else {
@@ -1211,7 +1289,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                     };
                 }
             }
-            (2, 2) => { // LDRSW: sign-extend 32 to 64, 32-bit access
+            (2, 2) => {
+                // LDRSW: sign-extend 32 to 64, 32-bit access
                 return Operation::Load {
                     dst: data(true),
                     base: Register::pc(),
@@ -1220,7 +1299,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                     signed: true,
                 };
             }
-            (0..=1, 3) => { // LDRSB (size 0) / LDRSH (size 1): sign-extend to 32
+            (0..=1, 3) => {
+                // LDRSB (size 0) / LDRSH (size 1): sign-extend to 32
                 let access_size = if size == 0 { 0 } else { 1 }; // 8-bit or 16-bit access
                 return Operation::Load {
                     dst: data(false), // 32-bit destination
@@ -1923,6 +2003,35 @@ impl Operation {
                     ),
                 }
             }
+            Self::Divide {
+                dst,
+                left,
+                right,
+                signed,
+            } => {
+                // ARM64 division never traps: a zero divisor yields zero and the
+                // signed INT_MIN / -1 overflow saturates to INT_MIN.
+                let known =
+                    flow.read(left)
+                        .zip(flow.read(right))
+                        .and_then(|(dividend, divisor)| {
+                            let value =
+                                divide_value(dividend.value, divisor.value, signed, dst.wide);
+                            Some(KnownValue {
+                                value,
+                                origins: combine_origins(&dividend.origins, &divisor.origins, pc)?,
+                            })
+                        });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = {} {} {};{}",
+                    dst.name(),
+                    left.name(),
+                    if signed { "sdiv" } else { "udiv" },
+                    right.name(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::Extend {
                 dst,
                 src,
@@ -2146,7 +2255,15 @@ impl Operation {
                 let suffix = address_suffix(combined.as_ref());
                 flow.write(dst1, None);
                 flow.write(dst2, None);
-                let mut statement = format!("{} = {};{}; {} = {};{}", dst1.name(), access1, suffix, dst2.name(), access2, suffix);
+                let mut statement = format!(
+                    "{} = {};{}; {} = {};{}",
+                    dst1.name(),
+                    access1,
+                    suffix,
+                    dst2.name(),
+                    access2,
+                    suffix
+                );
                 if let Writeback::Pre | Writeback::Post = writeback {
                     if let Some(value) = &combined {
                         flow.write(base, Some(value.clone()));
@@ -2178,7 +2295,11 @@ impl Operation {
                 let access1 = memory_access_operand(&expr, size, false, src1.wide);
                 let access2 = memory_access_operand(&expr, size, false, src2.wide);
                 let suffix = address_suffix(combined.as_ref());
-                let mut statement = format!("{access1} = {};{suffix}; {access2} = {};{suffix}", src1.name(), src2.name());
+                let mut statement = format!(
+                    "{access1} = {};{suffix}; {access2} = {};{suffix}",
+                    src1.name(),
+                    src2.name()
+                );
                 if let Writeback::Pre | Writeback::Post = writeback {
                     if let Some(value) = &combined {
                         flow.write(base, Some(value.clone()));
@@ -2206,7 +2327,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v17; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v18; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -2641,6 +2762,56 @@ mod tests {
     }
 
     #[test]
+    fn lifts_division_forms() {
+        // sdiv x0, x1, x2 = 0x9ac20c20
+        assert_eq!(lift(0x9ac2_0c20, 0x1000), "x0 = x1 sdiv x2;");
+        // udiv x0, x1, x2 = 0x9ac20820
+        assert_eq!(lift(0x9ac2_0820, 0x1000), "x0 = x1 udiv x2;");
+        // sdiv w0, w1, w2 = 0x1ac20c20
+        assert_eq!(lift(0x1ac2_0c20, 0x1000), "w0 = w1 sdiv w2;");
+        // udiv w0, w1, w2 = 0x1ac20820
+        assert_eq!(lift(0x1ac2_0820, 0x1000), "w0 = w1 udiv w2;");
+    }
+
+    #[test]
+    fn division_writes_to_the_zero_register_are_discarded() {
+        // sdiv xzr, x1, x2 = 0x9ac20c3f
+        assert!(lift(0x9ac2_0c3f, 0x1000).contains("discarded"));
+        // udiv wzr, w1, w2 = 0x1ac2083f
+        assert!(lift(0x1ac2_083f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn folds_division_into_constants() {
+        // movz x1, #0x64 ; movz x2, #0xc ; sdiv x0, x1, x2 -> 100/12 = 8
+        let words = [
+            0xd280_0c81u32, // movz x1, #0x64 (100)
+            0xd280_0182,    // movz x2, #0xc (12)
+            0x9ac2_0c20,    // sdiv x0, x1, x2 -> 8
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("x0 = x1 sdiv x2; /* constant=0x8 proven_by=[0x1000,0x1004,0x1008] */")
+        );
+    }
+
+    #[test]
+    fn division_by_zero_yields_zero() {
+        // movz x1, #0x64 ; movz x2, #0x0 ; sdiv x0, x1, x2 -> 0 (div by zero)
+        let words = [
+            0xd280_0c81u32, // movz x1, #0x64 (100)
+            0xd280_0002,    // movz x2, #0x0 (0)
+            0x9ac2_0c20,    // sdiv x0, x1, x2 -> 0
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("x0 = x1 sdiv x2; /* constant=0x0 proven_by=[0x1000,0x1004,0x1008] */")
+        );
+    }
+
+    #[test]
     fn folds_multiply_add_into_constants() {
         let words = [
             0x5280_0061u32, // movz w1, #3
@@ -2746,10 +2917,7 @@ mod tests {
     fn lifts_bitfield_inserts() {
         // ubfiz w6, w7, #12, #8 = 0x53141ce6
         // Insert w7[0..8) into w6 at bit 0, zero-extend: w6 = w7 & 0xff
-        assert_eq!(
-            lift(0x5314_1ce6, 0x1000),
-            "w6 = w7 & 0xff;"
-        );
+        assert_eq!(lift(0x5314_1ce6, 0x1000), "w6 = w7 & 0xff;");
         // bfi w8, w9, #4, #8 = 0x331c1d28
         // Insert w9[0..8) into w8 at bit 4
         assert_eq!(
@@ -2991,18 +3159,36 @@ mod tests {
     #[test]
     fn lifts_literal_loads() {
         // ldr x0, #0x1000 (pc=0x1000) size=1 (64-bit zero-extend) = 0x5a402000 -> target 0x2000
-        assert_eq!(lift(0x5a40_2000, 0x1000), "x0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        assert_eq!(
+            lift(0x5a40_2000, 0x1000),
+            "x0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
+        );
         // ldr w0, #0x1000 (pc=0x1000) size=0 (32-bit zero-extend) = 0x1a402000
-        assert_eq!(lift(0x1a40_2000, 0x1000), "w0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        assert_eq!(
+            lift(0x1a40_2000, 0x1000),
+            "w0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
+        );
         // ldrsw x0, #0x1000 (pc=0x1000) size=2 opc=2 = 0x9a802000
-        assert_eq!(lift(0x9a80_2000, 0x1000), "x0 = *(s32 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        assert_eq!(
+            lift(0x9a80_2000, 0x1000),
+            "x0 = *(s32 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
+        );
         // ldrsb w0, #0x1000 (pc=0x1000) size=0 opc=3 = 0x1ac02000
-        assert_eq!(lift(0x1ac0_2000, 0x1000), "w0 = *(s8 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        assert_eq!(
+            lift(0x1ac0_2000, 0x1000),
+            "w0 = *(s8 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
+        );
         // ldrsh w0, #0x1000 (pc=0x1000) size=1 opc=3 = 0x5ac02000
-        assert_eq!(lift(0x5ac0_2000, 0x1000), "w0 = *(s16 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */");
+        assert_eq!(
+            lift(0x5ac0_2000, 0x1000),
+            "w0 = *(s16 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
+        );
         // Negative offset: ldr w0, #-0x1000 (pc=0x2000) -> target 0x1000
         // imm19 = -0x400 = 0x7fc00, encoded as 0x1a7fe000
-        assert_eq!(lift(0x1a7f_e000, 0x2000), "w0 = *(pc - 0x1000); /* address=0x1000 proven_by=[0x2000] */");
+        assert_eq!(
+            lift(0x1a7f_e000, 0x2000),
+            "w0 = *(pc - 0x1000); /* address=0x1000 proven_by=[0x2000] */"
+        );
     }
 
     #[test]

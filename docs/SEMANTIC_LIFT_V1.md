@@ -13,7 +13,7 @@ flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and
 register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`, also with an
 `LSL`/`LSR`/`ASR`-shifted register operand),
 immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
-`MUL`/`MNEG` zero-addend aliases), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/
+`MUL`/`MNEG` zero-addend aliases), integer division (`SDIV`/`UDIV`), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/
 `SXTH`/`SXTW`),
 bitfield extracts (`UBFX`/`SBFX`), general-register loads and stores (`STR`/`LDR`
 and their byte/halfword and sign-extending forms with a scaled unsigned
@@ -29,7 +29,7 @@ bitfield, memory, address, and control-flow extensions stay inside that
 `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v17` banner identifies the statement set that
+`AArch64 register semantics v18` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -63,7 +63,11 @@ still names a `w` source. `MADD`
 and `MSUB` with `op31==0` render `dst = left * right + add` and
 `dst = add - left * right`; when the accumulator is the zero register the addend
 is omitted as `dst = left * right` (`MUL`) or `dst = 0 - left * right` (`MNEG`),
-and the wider `op31` variants (`SMADDL`/`UMADDL`/...) stay opaque. The complete
+and the wider `op31` variants (`SMADDL`/`UMADDL`/...) stay opaque. Integer
+division `SDIV`/`UDIV` renders `dst = left sdiv right` / `udiv right`. ARM64
+division never traps: a zero divisor yields zero, and the signed
+`INT_MIN / -1` overflow saturates to `INT_MIN`, so a divided constant is always
+defined and folds with its operand provenance. The complete
 general-register load/store family with a scaled unsigned immediate offset is
 modeled: `STR`/`LDR` (size 2/3) plus the byte/halfword and sign-extending forms
 (`STRB`/`STRH`/`LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`LDRSW`). The dereference is
@@ -129,6 +133,8 @@ synthetic `LSL`/`LSR`/`ASR` sequence asserts each shift operator, the exact shif
 word, and sign-propagating arithmetic-shift constant folding. A synthetic
 `MUL`/`MADD`/`MSUB` sequence asserts each rendered form, the exact multiply word,
 and folded products and differences with their `proven_by` addresses. A synthetic
+`SDIV`/`UDIV` sequence asserts each rendered form, the exact division words, folded
+quotients with `proven_by` addresses, and that a zero divisor folds to zero. A synthetic
 `SXTB`/`UXTB`/`SXTW` sequence asserts the sign- and zero-extension operators, the
 exact extend words, and width-correct folded values (including a 32-bit source
 sign-extended into 64 bits). A synthetic shifted-register sequence asserts each
