@@ -195,6 +195,38 @@ fn extend_value(value: u64, signed: bool, from: u8, wide: bool) -> u64 {
     }
 }
 
+/// Applies an optional register-operand shift, leaving `value` unchanged when the
+/// operand is unshifted.
+fn shifted_value(value: u64, shift: Option<(ShiftKind, u8)>, wide: bool) -> u64 {
+    match shift {
+        Some((kind, amount)) => shift_value(value, kind, amount, wide),
+        None => value,
+    }
+}
+
+/// Renders a register operand with its optional shift, parenthesized so the
+/// shift binds before the enclosing arithmetic or logical operator.
+fn render_shifted(name: &str, shift: Option<(ShiftKind, u8)>) -> String {
+    match shift {
+        Some((kind, amount)) => format!("({name} {} {amount})", kind.operator()),
+        None => name.to_string(),
+    }
+}
+
+/// Decodes the 2-bit shift selector and 6-bit amount of a shifted-register
+/// operand. A zero amount is the unshifted operand.
+fn operand_shift(selector: u32, amount: u8) -> Option<(ShiftKind, u8)> {
+    if amount == 0 {
+        return None;
+    }
+    match selector {
+        0 => Some((ShiftKind::Left, amount)),
+        1 => Some((ShiftKind::LogicalRight, amount)),
+        2 => Some((ShiftKind::ArithmeticRight, amount)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Nop,
@@ -212,6 +244,8 @@ enum Operation {
         left: Register,
         right: Register,
         subtract: bool,
+        /// Immediate `LSL`/`LSR`/`ASR` applied to `right`; `None` is unshifted.
+        shift: Option<(ShiftKind, u8)>,
     },
     MoveZero {
         dst: Register,
@@ -238,6 +272,8 @@ enum Operation {
         right: Register,
         op: LogicalOp,
         negate_right: bool,
+        /// Immediate `LSL`/`LSR`/`ASR` applied to `right`; `None` is unshifted.
+        shift: Option<(ShiftKind, u8)>,
     },
     Address {
         dst: Register,
@@ -413,37 +449,39 @@ fn decode(word: u32, pc: u64) -> Operation {
             };
         }
     }
-    // ADD/SUB (shifted register), only unshifted LSL #0 and no flags.
-    if word & 0x1f20_0000 == 0x0b00_0000
-        && word & (1 << 29) == 0
-        && word & (3 << 22) == 0
-        && word & (0x3f << 10) == 0
-    {
-        let wide = word >> 31 != 0;
-        let rd = word & 31;
-        let rn = (word >> 5) & 31;
-        let rm = (word >> 16) & 31;
-        if rd == 31 {
-            return Operation::Discard("arithmetic result discarded in zero register");
+    // ADD/SUB (shifted register), without flags. The shift is LSL/LSR/ASR with a
+    // 6-bit amount; ROR (shift=11) is not encodable here and stays opaque.
+    if word & 0x1f20_0000 == 0x0b00_0000 && word & (1 << 29) == 0 {
+        let shift = (word >> 22) & 3;
+        let amount = ((word >> 10) & 0x3f) as u8;
+        if shift != 3 {
+            let wide = word >> 31 != 0;
+            let rd = word & 31;
+            let rn = (word >> 5) & 31;
+            let rm = (word >> 16) & 31;
+            if rd == 31 {
+                return Operation::Discard("arithmetic result discarded in zero register");
+            }
+            return Operation::AddRegister {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: false,
+                },
+                left: Register {
+                    index: rn,
+                    wide,
+                    stack_pointer: false,
+                },
+                right: Register {
+                    index: rm,
+                    wide,
+                    stack_pointer: false,
+                },
+                subtract: word & (1 << 30) != 0,
+                shift: operand_shift(shift, amount),
+            };
         }
-        return Operation::AddRegister {
-            dst: Register {
-                index: rd,
-                wide,
-                stack_pointer: false,
-            },
-            left: Register {
-                index: rn,
-                wide,
-                stack_pointer: false,
-            },
-            right: Register {
-                index: rm,
-                wide,
-                stack_pointer: false,
-            },
-            subtract: word & (1 << 30) != 0,
-        };
     }
     // Logical (immediate): flag-neutral AND/ORR/EOR with a bitmask immediate.
     // ANDS is excluded because flag effects are not modeled, and reserved
@@ -481,13 +519,13 @@ fn decode(word: u32, pc: u64) -> Operation {
         }
     }
     // Logical (shifted register): flag-neutral AND/ORR/EOR and their negated
-    // BIC/ORN/EON forms with an unshifted register operand. Flag-setting
-    // variants and shifted operands stay opaque.
+    // BIC/ORN/EON forms with an LSL/LSR/ASR-shifted register operand.
+    // Flag-setting variants and ROR stay opaque.
     if word & 0x1f00_0000 == 0x0a00_0000 {
         let opc = (word >> 29) & 3;
         let shift = (word >> 22) & 3;
-        let imm6 = (word >> 10) & 0x3f;
-        if opc != 3 && shift == 0 && imm6 == 0 {
+        let amount = ((word >> 10) & 0x3f) as u8;
+        if opc != 3 && shift != 3 {
             let wide = word >> 31 != 0;
             if word & 31 == 31 {
                 return Operation::Discard("logical result discarded in zero register");
@@ -514,6 +552,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                     _ => LogicalOp::Eor,
                 },
                 negate_right: word & (1 << 21) != 0,
+                shift: operand_shift(shift, amount),
             };
         }
     }
@@ -810,13 +849,15 @@ impl Operation {
                 left,
                 right,
                 subtract,
+                shift,
             } => {
                 let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let b_value = shifted_value(b.value, shift, dst.wide);
                     Some(KnownValue {
                         value: dst.mask(if subtract {
-                            a.value.wrapping_sub(b.value)
+                            a.value.wrapping_sub(b_value)
                         } else {
-                            a.value.wrapping_add(b.value)
+                            a.value.wrapping_add(b_value)
                         }),
                         origins: combine_origins(&a.origins, &b.origins, pc)?,
                     })
@@ -827,7 +868,7 @@ impl Operation {
                     dst.name(),
                     left.name(),
                     if subtract { "-" } else { "+" },
-                    right.name(),
+                    render_shifted(&right.name(), shift),
                     resolved_suffix(known.as_ref())
                 )
             }
@@ -893,12 +934,14 @@ impl Operation {
                 right,
                 op,
                 negate_right,
+                shift,
             } => {
                 let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let b_value = shifted_value(b.value, shift, dst.wide);
                     let rhs = if negate_right {
-                        dst.mask(!b.value)
+                        dst.mask(!b_value)
                     } else {
-                        b.value
+                        b_value
                     };
                     Some(KnownValue {
                         value: dst.mask(op.apply(a.value, rhs)),
@@ -906,11 +949,8 @@ impl Operation {
                     })
                 });
                 flow.write(dst, known.clone());
-                let rhs = if negate_right {
-                    format!("~{}", right.name())
-                } else {
-                    right.name()
-                };
+                let rhs = render_shifted(&right.name(), shift);
+                let rhs = if negate_right { format!("~{rhs}") } else { rhs };
                 format!(
                     "{} = {} {} {};{}",
                     dst.name(),
@@ -1111,7 +1151,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v10; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v11; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1318,11 +1358,59 @@ mod tests {
     }
 
     #[test]
-    fn flag_setting_and_shifted_logical_forms_remain_opaque() {
+    fn flag_setting_and_rotated_logical_forms_remain_opaque() {
         // ANDS sets flags, which are not modeled.
         assert!(lift(0x6a01_0000, 0x1000).contains("opaque instruction"));
-        // A shifted register operand is out of scope.
-        assert!(lift(0x8a02_0c20, 0x1000).contains("opaque instruction"));
+        // A ROR-shifted register operand is out of scope.
+        assert!(lift(0x0ac2_0c20, 0x1000).contains("opaque instruction"));
+        assert!(lift(0x8ac2_1420, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_shifted_register_operands() {
+        // add w0, w1, w2, lsl #3 = 0x0b020c20
+        assert_eq!(lift(0x0b02_0c20, 0x1000), "w0 = w1 + (w2 << 3);");
+        // add w0, w1, w2, lsr #3 = 0x0b420c20
+        assert_eq!(lift(0x0b42_0c20, 0x1000), "w0 = w1 + (w2 >> 3);");
+        // add w0, w1, w2, asr #3 = 0x0b820c20
+        assert_eq!(lift(0x0b82_0c20, 0x1000), "w0 = w1 + (w2 >>> 3);");
+        // sub w0, w1, w2, lsl #2 = 0x4b020820
+        assert_eq!(lift(0x4b02_0820, 0x1000), "w0 = w1 - (w2 << 2);");
+        // add x0, x1, x2, lsl #4 = 0x8b021020
+        assert_eq!(lift(0x8b02_1020, 0x1000), "x0 = x1 + (x2 << 4);");
+        // sub x0, x1, x2, asr #5 = 0xcb821420
+        assert_eq!(lift(0xcb82_1420, 0x1000), "x0 = x1 - (x2 >>> 5);");
+        // and w0, w1, w2, lsl #3 = 0x0a020c20
+        assert_eq!(lift(0x0a02_0c20, 0x1000), "w0 = w1 & (w2 << 3);");
+        // orr w0, w1, w2, lsr #3 = 0x2a420c20
+        assert_eq!(lift(0x2a42_0c20, 0x1000), "w0 = w1 | (w2 >> 3);");
+        // eor w0, w1, w2, asr #3 = 0x4a820c20
+        assert_eq!(lift(0x4a82_0c20, 0x1000), "w0 = w1 ^ (w2 >>> 3);");
+        // bic w0, w1, w2, lsl #3 = 0x0a220c20
+        assert_eq!(lift(0x0a22_0c20, 0x1000), "w0 = w1 & ~(w2 << 3);");
+    }
+
+    #[test]
+    fn folds_shifted_register_operands_into_constants() {
+        let words = [
+            0x5280_00a1u32, // movz w1, #5
+            0x5280_0062,    // movz w2, #3
+            0x0b02_0820,    // add w0, w1, w2, lsl #2 -> 5 + 12 = 0x11
+            0x5280_0203,    // movz w3, #0x10
+            0x2a43_1064,    // orr w4, w3, w3, lsr #4 -> 0x10 | 0x1 = 0x11
+            0x5280_1fe5,    // movz w5, #0xff
+            0x0a25_10a6,    // bic w6, w5, w5, lsl #4 -> 0xff & ~0xff0 = 0xf
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report
+            .contains("w0 = w1 + (w2 << 2); /* constant=0x11 proven_by=[0x1000,0x1004,0x1008] */"));
+        assert!(
+            report.contains("w4 = w3 | (w3 >> 4); /* constant=0x11 proven_by=[0x100c,0x1010] */")
+        );
+        assert!(
+            report.contains("w6 = w5 & ~(w5 << 4); /* constant=0xf proven_by=[0x1014,0x1018] */")
+        );
     }
 
     #[test]

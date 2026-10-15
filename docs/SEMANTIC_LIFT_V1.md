@@ -7,9 +7,11 @@ the IR view can pivot to the exact disassembly evidence. Addressed rows also
 enter the worker's typed evidence sideband and the synthesis fingerprint.
 
 This slice models the move-wide immediate family (`MOVN`, `MOVZ`, `MOVK`),
-flag-neutral `ADD`/`SUB` with immediate operands, unshifted register `ADD`/`SUB`,
+flag-neutral `ADD`/`SUB` with immediate or register operands (including an
+`LSL`/`LSR`/`ASR`-shifted register operand),
 flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and
-unshifted register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`),
+register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`, also with an
+`LSL`/`LSR`/`ASR`-shifted register operand),
 immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
 `MUL`/`MNEG` zero-addend aliases), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/
 `SXTH`/`SXTW`),
@@ -23,7 +25,7 @@ they contained semantic output. The move-wide, logical, shift, multiply, extend,
 address, and control-flow extensions stay inside that `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v10` banner identifies the statement set that
+`AArch64 register semantics v11` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -36,7 +38,12 @@ register becomes unknown (no constant is inferred). Logical operations render a
 bitmask immediate or a register operand, with a leading `~` when the negated
 `BIC`/`ORN`/`EON` form complements the right operand. The immediate is the
 architectural `DecodeBitMasks` `wmask`; reserved bitmask encodings, flag-setting
-`ANDS`/`BICS`, and shifted register operands stay opaque. The immediate shift
+`ANDS`/`BICS`, and the `ROR` shift stay opaque. A register operand of a modeled
+`ADD`/`SUB` or logical operation may carry an `LSL`/`LSR`/`ASR` immediate shift,
+rendered parenthesized (for example `w0 = w1 + (w2 << 3);` or
+`w0 = w1 & ~(w2 >> 4);`), with the shift applied before the enclosing operation.
+Shifted-register `ADD`/`SUB` never use `ROR`; the logical forms allow it and it
+stays opaque. The immediate shift
 aliases of the bitfield group are modeled only in their canonical single-field
 forms: `LSL` and `LSR` (from `UBFM`) and `ASR` (from `SBFM`), rendered with `<<`,
 `>>`, and `>>>` (Verilog-style sign-propagating right shift). Bitfield inserts
@@ -90,4 +97,6 @@ word, and sign-propagating arithmetic-shift constant folding. A synthetic
 and folded products and differences with their `proven_by` addresses. A synthetic
 `SXTB`/`UXTB`/`SXTW` sequence asserts the sign- and zero-extension operators, the
 exact extend words, and width-correct folded values (including a 32-bit source
-sign-extended into 64 bits).
+sign-extended into 64 bits). A synthetic shifted-register sequence asserts each
+rendered `ADD`/`SUB`/logical shifted form, the exact words, the `ROR`-still-opaque
+boundary, and folded shifted operands with their `proven_by` addresses.

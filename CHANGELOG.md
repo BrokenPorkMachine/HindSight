@@ -22,6 +22,7 @@
 - Extend the ARM64 semantic preview to immediate shifts (`LSL`/`LSR`/`ASR`, the canonical `UBFM`/`SBFM` aliases), folding known constants with sign-propagating arithmetic shift; bitfield inserts/extracts and the sign/zero extends stay opaque. No report field or engine-identity change.
 - Extend the ARM64 semantic preview to multiply-add (`MADD`/`MSUB`, with the `MUL`/`MNEG` zero-addend aliases) with 32/64-bit constant folding; the wider `SMADDL`/`UMADDL`/... variants stay opaque. No report field or engine-identity change.
 - Extend the ARM64 semantic preview to the sign/zero extend aliases (`UXTB`/`UXTH`/`SXTB`/`SXTH`/`SXTW`), folding width-correct signed and zero extensions with 32/64-bit destination widths; general bitfield extracts and inserts stay opaque. No report field or engine-identity change.
+- Extend the ARM64 semantic preview to `LSL`/`LSR`/`ASR`-shifted register operands on the modeled `ADD`/`SUB` and logical operations, applying the shift before the enclosing operation and folding it into known constants; `ROR` and flag-setting variants stay opaque. No report field or engine-identity change.
 - Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses
