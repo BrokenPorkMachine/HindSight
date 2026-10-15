@@ -195,6 +195,17 @@ fn extend_value(value: u64, signed: bool, from: u8, wide: bool) -> u64 {
     }
 }
 
+/// Zero-extracts the `width` bits starting at `lsb`. Only non-wrapping fields
+/// (`lsb + width <= 64`) reach this helper; `width < 64` in every modeled case.
+fn extract_value(value: u64, lsb: u8, width: u8) -> u64 {
+    let mask = if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
+    (value >> lsb) & mask
+}
+
 /// Applies an optional register-operand shift, leaving `value` unchanged when the
 /// operand is unshifted.
 fn shifted_value(value: u64, shift: Option<(ShiftKind, u8)>, wide: bool) -> u64 {
@@ -309,6 +320,15 @@ enum Operation {
         src: Register,
         signed: bool,
         from: u8,
+    },
+    Extract {
+        dst: Register,
+        src: Register,
+        /// Bit position of the least-significant extracted bit (`immr`).
+        lsb: u8,
+        /// Number of extracted bits; the field is `[lsb, lsb + width)`.
+        width: u8,
+        signed: bool,
     },
     Discard(&'static str),
     Opaque,
@@ -637,6 +657,32 @@ fn decode(word: u32, pc: u64) -> Operation {
                     },
                     signed,
                     from,
+                };
+            }
+            // Bitfield extract aliases: UBFX (opc=2) and SBFX (opc=0) with
+            // lsb == immr and field end lsb + width - 1 == imms >= immr. The
+            // single-field shift aliases were handled above (LSR has
+            // imms == width-1; LSL has imms == immr-1). Inserts (imms < immr:
+            // UBFIZ/SBFIZ) and BFM (opc=1) stay opaque.
+            if (opc == 2 || opc == 0) && imms >= immr {
+                let width = imms - immr + 1;
+                if word & 31 == 31 {
+                    return Operation::Discard("extract result discarded in zero register");
+                }
+                return Operation::Extract {
+                    dst: Register {
+                        index: word & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    src: Register {
+                        index: (word >> 5) & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    lsb: immr,
+                    width,
+                    signed: opc == 0,
                 };
             }
         }
@@ -1132,6 +1178,52 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::Extract {
+                dst,
+                src,
+                lsb,
+                width,
+                signed,
+            } => {
+                let known = flow.read(src).and_then(|input| {
+                    let extracted = extract_value(input.value, lsb, width);
+                    let value = if signed {
+                        extend_value(extracted, true, width, dst.wide)
+                    } else {
+                        extracted
+                    };
+                    Some(KnownValue {
+                        value: dst.mask(value),
+                        origins: combine_origins(&input.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                let suffix = resolved_suffix(known.as_ref());
+                let mask = if width >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                if signed {
+                    if lsb == 0 {
+                        format!("{} = sext({}, {width});{suffix}", dst.name(), src.name())
+                    } else {
+                        format!(
+                            "{} = sext({} >> {lsb}, {width});{suffix}",
+                            dst.name(),
+                            src.name()
+                        )
+                    }
+                } else if lsb == 0 {
+                    format!("{} = {} & {mask:#x};{suffix}", dst.name(), src.name())
+                } else {
+                    format!(
+                        "{} = ({} >> {lsb}) & {mask:#x};{suffix}",
+                        dst.name(),
+                        src.name()
+                    )
+                }
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -1151,7 +1243,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v11; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v12; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1644,6 +1736,61 @@ mod tests {
         assert!(report.contains(
             "x6 = sext(w5, 32); /* constant=0xffffffff80000000 proven_by=[0x100c,0x1010,0x1014] */"
         ));
+    }
+
+    #[test]
+    fn lifts_bitfield_extracts() {
+        // ubfx w0, w1, #4, #8 = 0x53042c20
+        assert_eq!(lift(0x5304_2c20, 0x1000), "w0 = (w1 >> 4) & 0xff;");
+        // ubfx x2, x3, #4, #8 = 0xd3442c62
+        assert_eq!(lift(0xd344_2c62, 0x1000), "x2 = (x3 >> 4) & 0xff;");
+        // sbfx w4, w5, #4, #8 = 0x13042ca4
+        assert_eq!(lift(0x1304_2ca4, 0x1000), "w4 = sext(w5 >> 4, 8);");
+        // sbfx x6, x7, #4, #8 = 0x93442ce6
+        assert_eq!(lift(0x9344_2ce6, 0x1000), "x6 = sext(x7 >> 4, 8);");
+        // ubfx w10, w11, #0, #10 = 0x5300256a (lsb 0 elides the shift)
+        assert_eq!(lift(0x5300_256a, 0x1000), "w10 = w11 & 0x3ff;");
+        // sbfx w12, w13, #0, #1 = 0x130001ac
+        assert_eq!(lift(0x1300_01ac, 0x1000), "w12 = sext(w13, 1);");
+        // ubfx x14, x15, #40, #8 = 0xd368bdee
+        assert_eq!(lift(0xd368_bdee, 0x1000), "x14 = (x15 >> 40) & 0xff;");
+        // sbfx x16, x17, #40, #8 = 0x9368be30
+        assert_eq!(lift(0x9368_be30, 0x1000), "x16 = sext(x17 >> 40, 8);");
+    }
+
+    #[test]
+    fn folds_bitfield_extracts_into_constants() {
+        let words = [
+            0x5281_0001u32, // movz w1, #0x800
+            0x1304_2c22,    // sbfx w2, w1, #4, #8 -> 0xffffff80
+            0x5304_2c23,    // ubfx w3, w1, #4, #8 -> 0x80
+            0x9344_2c25,    // sbfx x5, x1, #4, #8 -> 0xffffffffffffff80
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "w2 = sext(w1 >> 4, 8); /* constant=0xffffff80 proven_by=[0x1000,0x1004] */"
+        ));
+        assert!(
+            report.contains("w3 = (w1 >> 4) & 0xff; /* constant=0x80 proven_by=[0x1000,0x1008] */")
+        );
+        assert!(report.contains(
+            "x5 = sext(x1 >> 4, 8); /* constant=0xffffffffffffff80 proven_by=[0x1000,0x100c] */"
+        ));
+    }
+
+    #[test]
+    fn bitfield_inserts_and_shifted_aliases_remain_opaque() {
+        // ubfiz w6, w7, #12, #8 = 0x53141ce6
+        assert!(lift(0x5314_1ce6, 0x1000).contains("opaque instruction"));
+        // bfi w8, w9, #4, #8 = 0x331c1d28
+        assert!(lift(0x331c_1d28, 0x1000).contains("opaque instruction"));
+        // bfxil w10, w11, #4, #8 = 0x33042d6a
+        assert!(lift(0x3304_2d6a, 0x1000).contains("opaque instruction"));
+        // bfi x12, x13, #4, #8 = 0xb37c1dac
+        assert!(lift(0xb37c_1dac, 0x1000).contains("opaque instruction"));
+        // bfxil x14, x15, #4, #8 = 0xb3442dee
+        assert!(lift(0xb344_2dee, 0x1000).contains("opaque instruction"));
     }
 
     #[test]

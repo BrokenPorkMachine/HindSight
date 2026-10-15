@@ -25,7 +25,7 @@ they contained semantic output. The move-wide, logical, shift, multiply, extend,
 address, and control-flow extensions stay inside that `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v11` banner identifies the statement set that
+`AArch64 register semantics v12` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -46,8 +46,11 @@ Shifted-register `ADD`/`SUB` never use `ROR`; the logical forms allow it and it
 stays opaque. The immediate shift
 aliases of the bitfield group are modeled only in their canonical single-field
 forms: `LSL` and `LSR` (from `UBFM`) and `ASR` (from `SBFM`), rendered with `<<`,
-`>>`, and `>>>` (Verilog-style sign-propagating right shift). Bitfield inserts
-(`BFM`), general extracts (`UBFX`/`SBFX`), and the wider `op31` multiplications
+`>>`, and `>>>` (Verilog-style sign-propagating right shift). The general
+bitfield extracts `UBFX` and `SBFX` render `dst = (src >> lsb) & mask;` and
+`dst = sext(src >> lsb, width);` for the non-wrapping field `[lsb, lsb + width)`;
+bitfield inserts (`BFM`/`BFI`/`BFXIL`/`UBFIZ`/`SBFIZ`) and the wider `op31`
+multiplications
 stay opaque. The sign/zero extend aliases `UXTB`/`UXTH` (zero-extending) and
 `SXTB`/`SXTH`/`SXTW` (sign-extending) are modeled as `dst = zext(src, N)` and
 `dst = sext(src, N)`; they read the narrow source view, so a 64-bit destination
@@ -99,4 +102,8 @@ and folded products and differences with their `proven_by` addresses. A syntheti
 exact extend words, and width-correct folded values (including a 32-bit source
 sign-extended into 64 bits). A synthetic shifted-register sequence asserts each
 rendered `ADD`/`SUB`/logical shifted form, the exact words, the `ROR`-still-opaque
-boundary, and folded shifted operands with their `proven_by` addresses.
+boundary, and folded shifted operands with their `proven_by` addresses. A
+synthetic `UBFX`/`SBFX` sequence asserts the zero- and sign-extract operators
+(including an elided `#0` shift), the exact extract words, folded extracts with
+their `proven_by` addresses, and that the `UBFIZ`/`BFI`/`BFXIL` insert aliases
+remain opaque.
