@@ -330,6 +330,17 @@ enum Operation {
         width: u8,
         signed: bool,
     },
+    Load {
+        dst: Register,
+        base: Register,
+        /// Scaled unsigned immediate byte offset (`imm12 << size`).
+        offset: u64,
+    },
+    Store {
+        base: Register,
+        offset: u64,
+        src: Register,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -687,6 +698,45 @@ fn decode(word: u32, pc: u64) -> Operation {
             }
         }
     }
+    // Load/store register (unsigned immediate), V=0:
+    // `size:2 111 V:1 01 opc:2 imm12:12 Rn:5 Rt:5`. Only the 32- and 64-bit
+    // general-register forms (size 2/3, opc 0=STR, 1=zero-extending LDR) are
+    // modeled; byte/halfword, sign-extending, prefetch, SIMD/scalar-FP,
+    // unscaled, and pre/post-indexed forms stay opaque. The base register holds
+    // a 64-bit address (Rn=31 means SP); the data register is `w` for size 2 and
+    // `x` for size 3.
+    if word & 0x3f00_0000 == 0x3900_0000 {
+        let size = (word >> 30) & 3;
+        let opc = (word >> 22) & 3;
+        if (size == 2 || size == 3) && (opc == 0 || opc == 1) {
+            let rn = (word >> 5) & 31;
+            let base = Register {
+                index: rn,
+                wide: true,
+                stack_pointer: rn == 31,
+            };
+            let wide = size == 3;
+            let offset = u64::from((word >> 10) & 0xfff) << size;
+            let data = Register {
+                index: word & 31,
+                wide,
+                stack_pointer: false,
+            };
+            return if opc == 0 {
+                Operation::Store {
+                    base,
+                    offset,
+                    src: data,
+                }
+            } else {
+                Operation::Load {
+                    dst: data,
+                    base,
+                    offset,
+                }
+            };
+        }
+    }
     // Data-processing (3 source): MADD (o0=0) and MSUB (o0=1) with 32x32
     // operands and an optional addend. When Ra is the zero register the addend is
     // omitted, which is the MUL (o0=0) / MNEG (o0=1) alias. Other op31 variants
@@ -837,6 +887,25 @@ fn resolved_suffix(value: Option<&KnownValue>) -> String {
         return String::new();
     };
     format!(" /* constant={:#x} {} */", value.value, proven_by(value))
+}
+
+/// Renders a load/store memory operand: the base register plus the scaled
+/// unsigned immediate byte offset, elided when the offset is zero.
+fn memory_operand(base: &Register, offset: u64) -> String {
+    if offset == 0 {
+        base.name()
+    } else {
+        format!("{} + {offset:#x}", base.name())
+    }
+}
+
+/// Renders the proven address of a load/store statement, with provenance, when
+/// the base address register carries an exact constant.
+fn address_suffix(value: Option<&KnownValue>) -> String {
+    match value {
+        Some(value) => format!(" /* address={:#x} {} */", value.value, proven_by(value)),
+        None => String::new(),
+    }
 }
 
 impl Operation {
@@ -1224,6 +1293,37 @@ impl Operation {
                     )
                 }
             }
+            Self::Load { dst, base, offset } => {
+                let address = flow.read(base).and_then(|input| {
+                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                        value: input.value.wrapping_add(offset),
+                        origins,
+                    })
+                });
+                // The loaded value is not known: the destination register becomes
+                // an unknown barrier while the base address register is preserved.
+                flow.write(dst, None);
+                format!(
+                    "{} = *({});{}",
+                    dst.name(),
+                    memory_operand(&base, offset),
+                    address_suffix(address.as_ref())
+                )
+            }
+            Self::Store { base, offset, src } => {
+                let address = flow.read(base).and_then(|input| {
+                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+                        value: input.value.wrapping_add(offset),
+                        origins,
+                    })
+                });
+                format!(
+                    "*({}) = {};{}",
+                    memory_operand(&base, offset),
+                    src.name(),
+                    address_suffix(address.as_ref())
+                )
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -1243,7 +1343,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v12; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v13; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1791,6 +1891,63 @@ mod tests {
         assert!(lift(0xb37c_1dac, 0x1000).contains("opaque instruction"));
         // bfxil x14, x15, #4, #8 = 0xb3442dee
         assert!(lift(0xb344_2dee, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_load_store_immediate() {
+        // str x0, [x1] = 0xf9000020
+        assert_eq!(lift(0xf900_0020, 0x1000), "*(x1) = x0;");
+        // ldr x0, [x1] = 0xf9400020
+        assert_eq!(lift(0xf940_0020, 0x1000), "x0 = *(x1);");
+        // str w0, [x1, #4] = 0xb9000420
+        assert_eq!(lift(0xb900_0420, 0x1000), "*(x1 + 0x4) = w0;");
+        // ldr w2, [x3, #8] = 0xb9400862
+        assert_eq!(lift(0xb940_0862, 0x1000), "w2 = *(x3 + 0x8);");
+        // str x0, [sp] = 0xf90003e0 (Rn=31 is SP, not XZR)
+        assert_eq!(lift(0xf900_03e0, 0x1000), "*(sp) = x0;");
+        // ldr x0, [sp, #16] = 0xf9400be0
+        assert_eq!(lift(0xf940_0be0, 0x1000), "x0 = *(sp + 0x10);");
+        // str x0, [x1, #32760] = 0xf93ffc20 (max imm12 scaled by 8)
+        assert_eq!(lift(0xf93f_fc20, 0x1000), "*(x1 + 0x7ff8) = x0;");
+        // ldr x9, [x10, #24] = 0xf9400d49
+        assert_eq!(lift(0xf940_0d49, 0x1000), "x9 = *(x10 + 0x18);");
+        // str wzr, [x1] = 0xb900003f (Rt=31 stores zero)
+        assert_eq!(lift(0xb900_003f, 0x1000), "*(x1) = wzr;");
+        // ldr xzr, [x1] = 0xf940003f (Rt=31 discards the load)
+        assert_eq!(lift(0xf940_003f, 0x1000), "xzr = *(x1);");
+    }
+
+    #[test]
+    fn unmodeled_load_store_forms_remain_opaque() {
+        // ldrb w0, [x1] = 0x39400020 (size 0)
+        assert!(lift(0x3940_0020, 0x1000).contains("opaque instruction"));
+        // strb w0, [x1] = 0x39000020 (size 0)
+        assert!(lift(0x3900_0020, 0x1000).contains("opaque instruction"));
+        // ldrsw x0, [x1] = 0xb9800020 (opc 2)
+        assert!(lift(0xb980_0020, 0x1000).contains("opaque instruction"));
+        // ldur x0, [x1, #8] = 0xf8408020 (unscaled immediate)
+        assert!(lift(0xf840_8020, 0x1000).contains("opaque instruction"));
+        // stp x29, x30, [sp, #-16]! = 0xa9bf7bfd (pre-indexed pair)
+        assert!(lift(0xa9bf_7bfd, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn load_store_resolves_addresses_and_loads_barrier() {
+        let words = [
+            0xd282_0001u32, // movz x1, #0x1000
+            0xf900_0420,    // str x0, [x1, #8]
+            0xf940_0422,    // ldr x2, [x1, #8]
+            0x5280_00e3,    // movz w3, #7
+            0xb940_0023,    // ldr w3, [x1] -> w3 becomes unknown
+            0x1100_0464,    // add w4, w3, #1
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("*(x1 + 0x8) = x0; /* address=0x1008 proven_by=[0x1000,0x1004] */"));
+        assert!(report.contains("x2 = *(x1 + 0x8); /* address=0x1008 proven_by=[0x1000,0x1008] */"));
+        // The load overwrites w3's tracked constant, so the add stays symbolic.
+        assert!(report.contains("w3 = *(x1); /* address=0x1000 proven_by=[0x1000,0x1010] */"));
+        assert!(report.contains("w4 = w3 + 0x1;"));
     }
 
     #[test]
