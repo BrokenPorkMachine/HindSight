@@ -20,6 +20,7 @@
 - Extend the ARM64 semantic preview to conditional and indirect control flow (`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`): condition codes, register zero/nonzero tests, single-bit tests, and unresolved indirect targets are rendered, and every such transfer clears tracked constants like any other barrier. No PSTATE-flag or indirect-target value recovery, and no report field or engine-identity change.
 - Resolve `BR`/`BLR` indirect targets in the ARM64 semantic preview when the register holds a proven constant, printing the target address with its instruction provenance; untracked registers stay named as unresolved. No report field or engine-identity change.
 - Extend the ARM64 semantic preview to immediate shifts (`LSL`/`LSR`/`ASR`, the canonical `UBFM`/`SBFM` aliases), folding known constants with sign-propagating arithmetic shift; bitfield inserts/extracts and the sign/zero extends stay opaque. No report field or engine-identity change.
+- Extend the ARM64 semantic preview to multiply-add (`MADD`/`MSUB`, with the `MUL`/`MNEG` zero-addend aliases) with 32/64-bit constant folding; the wider `SMADDL`/`UMADDL`/... variants stay opaque. No report field or engine-identity change.
 - Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses

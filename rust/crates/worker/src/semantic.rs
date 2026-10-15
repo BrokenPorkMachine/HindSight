@@ -245,6 +245,14 @@ enum Operation {
         kind: ShiftKind,
         amount: u8,
     },
+    MultiplyAdd {
+        dst: Register,
+        mul_left: Register,
+        mul_right: Register,
+        /// `None` when the accumulator is the zero register (`MUL` / `MNEG`).
+        addend: Option<Register>,
+        subtract: bool,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -537,6 +545,40 @@ fn decode(word: u32, pc: u64) -> Operation {
                 };
             }
         }
+    }
+    // Data-processing (3 source): MADD (o0=0) and MSUB (o0=1) with 32x32
+    // operands and an optional addend. When Ra is the zero register the addend is
+    // omitted, which is the MUL (o0=0) / MNEG (o0=1) alias. Other op31 variants
+    // (SMADDL/UMADDL/...) stay opaque.
+    if word & 0x7fe0_0000 == 0x1b00_0000 {
+        if word & 31 == 31 {
+            return Operation::Discard("arithmetic result discarded in zero register");
+        }
+        let sf = word >> 31 != 0;
+        let ra = (word >> 10) & 31;
+        return Operation::MultiplyAdd {
+            dst: Register {
+                index: word & 31,
+                wide: sf,
+                stack_pointer: false,
+            },
+            mul_left: Register {
+                index: (word >> 5) & 31,
+                wide: sf,
+                stack_pointer: false,
+            },
+            mul_right: Register {
+                index: (word >> 16) & 31,
+                wide: sf,
+                stack_pointer: false,
+            },
+            addend: (ra != 31).then_some(Register {
+                index: ra,
+                wide: sf,
+                stack_pointer: false,
+            }),
+            subtract: word & (1 << 15) != 0,
+        };
     }
     // Move wide immediate family. MOVN (opc=00), MOVZ (opc=10), and MOVK (opc=11)
     // share `sf opc:2 100101 hw:2 imm16:16 Rd:5`; opc=01 and 32-bit hw>=2 are
@@ -907,6 +949,72 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::MultiplyAdd {
+                dst,
+                mul_left,
+                mul_right,
+                addend,
+                subtract,
+            } => {
+                let known =
+                    flow.read(mul_left)
+                        .zip(flow.read(mul_right))
+                        .and_then(|(left, right)| {
+                            let product = left.value.wrapping_mul(right.value);
+                            let (addend_value, addend_origins) = match addend {
+                                Some(reg) => {
+                                    let value = flow.read(reg)?;
+                                    (value.value, value.origins)
+                                }
+                                None => (0, Vec::new()),
+                            };
+                            let value = if subtract {
+                                addend_value.wrapping_sub(product)
+                            } else {
+                                addend_value.wrapping_add(product)
+                            };
+                            let mut product_origins = left.origins.clone();
+                            product_origins.extend_from_slice(&right.origins);
+                            Some(KnownValue {
+                                value: dst.mask(value),
+                                origins: combine_origins(&product_origins, &addend_origins, pc)?,
+                            })
+                        });
+                flow.write(dst, known.clone());
+                let suffix = resolved_suffix(known.as_ref());
+                match (addend, subtract) {
+                    (Some(reg), false) => format!(
+                        "{} = {} * {} + {};{}",
+                        dst.name(),
+                        mul_left.name(),
+                        mul_right.name(),
+                        reg.name(),
+                        suffix
+                    ),
+                    (Some(reg), true) => format!(
+                        "{} = {} - {} * {};{}",
+                        dst.name(),
+                        reg.name(),
+                        mul_left.name(),
+                        mul_right.name(),
+                        suffix
+                    ),
+                    (None, false) => format!(
+                        "{} = {} * {};{}",
+                        dst.name(),
+                        mul_left.name(),
+                        mul_right.name(),
+                        suffix
+                    ),
+                    (None, true) => format!(
+                        "{} = 0 - {} * {};{}",
+                        dst.name(),
+                        mul_left.name(),
+                        mul_right.name(),
+                        suffix
+                    ),
+                }
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -926,7 +1034,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v8; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v9; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1292,6 +1400,47 @@ mod tests {
         assert!(
             report.contains("w4 = w4 << 20; /* constant=0xfff00000 proven_by=[0x100c,0x1010] */")
         );
+    }
+
+    #[test]
+    fn lifts_multiply_add_forms() {
+        // mul w0, w1, w2 = MADD with a zero addend = 0x1b027c20
+        assert_eq!(lift(0x1b02_7c20, 0x1000), "w0 = w1 * w2;");
+        // madd w0, w1, w2, w3 = 0x1b020c20
+        assert_eq!(lift(0x1b02_0c20, 0x1000), "w0 = w1 * w2 + w3;");
+        // msub w0, w1, w2, w3 = 0x1b028c20
+        assert_eq!(lift(0x1b02_8c20, 0x1000), "w0 = w3 - w1 * w2;");
+        // mul x4, x5, x6 = 0x9b067ca4
+        assert_eq!(lift(0x9b06_7ca4, 0x1000), "x4 = x5 * x6;");
+        // madd x4, x5, x6, x7 = 0x9b061ca4
+        assert_eq!(lift(0x9b06_1ca4, 0x1000), "x4 = x5 * x6 + x7;");
+        // msub x4, x5, x6, x7 = 0x9b069ca4
+        assert_eq!(lift(0x9b06_9ca4, 0x1000), "x4 = x7 - x5 * x6;");
+        // mneg w8, w9, w10 = MSUB with a zero addend = 0x1b0afd28
+        assert_eq!(lift(0x1b0a_fd28, 0x1000), "w8 = 0 - w9 * w10;");
+    }
+
+    #[test]
+    fn folds_multiply_add_into_constants() {
+        let words = [
+            0x5280_0061u32, // movz w1, #3
+            0x5280_00a2,    // movz w2, #5
+            0x1b02_7c23,    // mul w3, w1, w2    -> 0xf
+            0x1b02_fc24,    // mneg w4, w1, w2   -> 0xfffffff1
+            0x5280_0025,    // movz w5, #1
+            0x1b02_1420,    // madd w0, w1, w2, w5 -> 0x10
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("w3 = w1 * w2; /* constant=0xf proven_by=[0x1000,0x1004,0x1008] */")
+        );
+        assert!(report.contains(
+            "w4 = 0 - w1 * w2; /* constant=0xfffffff1 proven_by=[0x1000,0x1004,0x100c] */"
+        ));
+        assert!(report.contains(
+            "w0 = w1 * w2 + w5; /* constant=0x10 proven_by=[0x1000,0x1004,0x1010,0x1014] */"
+        ));
     }
 
     #[test]
