@@ -180,6 +180,21 @@ fn shift_value(value: u64, kind: ShiftKind, amount: u8, wide: bool) -> u64 {
     }
 }
 
+fn extend_value(value: u64, signed: bool, from: u8, wide: bool) -> u64 {
+    let truncated = value & ((1u64 << from) - 1);
+    if signed {
+        let shift = 64 - from;
+        let sign_extended = (((truncated << shift) as i64) >> shift) as u64;
+        if wide {
+            sign_extended
+        } else {
+            sign_extended & 0xffff_ffff
+        }
+    } else {
+        truncated
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Nop,
@@ -252,6 +267,12 @@ enum Operation {
         /// `None` when the accumulator is the zero register (`MUL` / `MNEG`).
         addend: Option<Register>,
         subtract: bool,
+    },
+    Extend {
+        dst: Register,
+        src: Register,
+        signed: bool,
+        from: u8,
     },
     Discard(&'static str),
     Opaque,
@@ -496,11 +517,13 @@ fn decode(word: u32, pc: u64) -> Operation {
             };
         }
     }
-    // Shift aliases of the bitfield group `sf opc:2 100110 N:1 immr:6 imms:6`.
-    // Only the canonical single-field forms are modeled: LSR is UBFM with
+    // Bitfield group `sf opc:2 100110 N:1 immr:6 imms:6`. Only the canonical
+    // single-field shift and extend aliases are modeled. LSR is UBFM with
     // imms == width-1, ASR is SBFM with imms == width-1, and LSL is UBFM with
-    // imms == width-1-shift and immr == (width-shift) mod width. N must equal sf;
-    // other bitfield forms (BFM, extracts, sign/zero extends) stay opaque.
+    // imms == width-1-shift and immr == (width-shift) mod width. The sign/zero
+    // extends are immr == 0 with a narrow field: UXTB/UXTH (UBFM) and
+    // SXTB/SXTH/SXTW (SBFM). N must equal sf; other bitfield forms (BFM and
+    // general extracts) stay opaque.
     if word & 0x1f80_0000 == 0x1300_0000 {
         let opc = (word >> 29) & 3;
         let sf = word >> 31 != 0;
@@ -542,6 +565,39 @@ fn decode(word: u32, pc: u64) -> Operation {
                     },
                     kind,
                     amount,
+                };
+            }
+            let extend = if immr == 0 {
+                match (opc, imms) {
+                    (2, 7) => Some((false, 8u8)),
+                    (2, 15) => Some((false, 16)),
+                    (0, 7) => Some((true, 8)),
+                    (0, 15) => Some((true, 16)),
+                    (0, 31) if sf => Some((true, 32)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((signed, from)) = extend {
+                if word & 31 == 31 {
+                    return Operation::Discard("extend result discarded in zero register");
+                }
+                return Operation::Extend {
+                    dst: Register {
+                        index: word & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    // The extend aliases read the narrow (32-bit) view of the
+                    // source; the low `from` bits are identical either way.
+                    src: Register {
+                        index: (word >> 5) & 31,
+                        wide: false,
+                        stack_pointer: false,
+                    },
+                    signed,
+                    from,
                 };
             }
         }
@@ -1015,6 +1071,27 @@ impl Operation {
                     ),
                 }
             }
+            Self::Extend {
+                dst,
+                src,
+                signed,
+                from,
+            } => {
+                let known = flow.read(src).and_then(|input| {
+                    Some(KnownValue {
+                        value: dst.mask(extend_value(input.value, signed, from, dst.wide)),
+                        origins: combine_origins(&input.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                let op = if signed { "sext" } else { "zext" };
+                format!(
+                    "{} = {op}({}, {from});{}",
+                    dst.name(),
+                    src.name(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -1034,7 +1111,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v9; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v10; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1440,6 +1517,44 @@ mod tests {
         ));
         assert!(report.contains(
             "w0 = w1 * w2 + w5; /* constant=0x10 proven_by=[0x1000,0x1004,0x1010,0x1014] */"
+        ));
+    }
+
+    #[test]
+    fn lifts_sign_and_zero_extends() {
+        // uxtb w0, w1 = 0x53001c20
+        assert_eq!(lift(0x5300_1c20, 0x1000), "w0 = zext(w1, 8);");
+        // uxth w4, w5 = 0x53003ca4
+        assert_eq!(lift(0x5300_3ca4, 0x1000), "w4 = zext(w5, 16);");
+        // sxtb w8, w9 = 0x13001d28
+        assert_eq!(lift(0x1300_1d28, 0x1000), "w8 = sext(w9, 8);");
+        // sxtb x10, w11 = 0x93401d6a (64-bit destination, still a W source)
+        assert_eq!(lift(0x9340_1d6a, 0x1000), "x10 = sext(w11, 8);");
+        // sxth w12, w13 = 0x13003dac
+        assert_eq!(lift(0x1300_3dac, 0x1000), "w12 = sext(w13, 16);");
+        // sxth x14, w15 = 0x93403dee
+        assert_eq!(lift(0x9340_3dee, 0x1000), "x14 = sext(w15, 16);");
+        // sxtw x16, w17 = 0x93407e30
+        assert_eq!(lift(0x9340_7e30, 0x1000), "x16 = sext(w17, 32);");
+    }
+
+    #[test]
+    fn folds_sign_and_zero_extends_into_constants() {
+        let words = [
+            0x5280_1001u32, // movz w1, #0x80
+            0x1300_1c22,    // sxtb w2, w1  -> 0xffffff80
+            0x5300_1c23,    // uxtb w3, w1  -> 0x80
+            0x5290_0005,    // movz w5, #0x8000
+            0x5310_3ca5,    // lsl w5, w5, #16 -> 0x80000000
+            0x9340_7ca6,    // sxtw x6, w5  -> 0xffffffff80000000
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report
+            .contains("w2 = sext(w1, 8); /* constant=0xffffff80 proven_by=[0x1000,0x1004] */"));
+        assert!(report.contains("w3 = zext(w1, 8); /* constant=0x80 proven_by=[0x1000,0x1008] */"));
+        assert!(report.contains(
+            "x6 = sext(w5, 32); /* constant=0xffffffff80000000 proven_by=[0x100c,0x1010,0x1014] */"
         ));
     }
 

@@ -11,18 +11,20 @@ flag-neutral `ADD`/`SUB` with immediate operands, unshifted register `ADD`/`SUB`
 flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and
 unshifted register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`),
 immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
-`MUL`/`MNEG` zero-addend aliases),
+`MUL`/`MNEG` zero-addend aliases), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/
+`SXTH`/`SXTW`),
 PC-relative `ADR`/`ADRP`, direct `B`/`BL`, conditional and indirect control flow
 (`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`), `RET`, and `NOP`. It emits an
 explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
 ranges. Output is bounded to eight functions and 128 words per function. The
 structural backend emits an empty field. The cache engine identity advances to
 `arm64-analysis-v18-schema72` so reports from older workers are not reused as if
-they contained semantic output. The move-wide, logical, shift, multiply, address,
-and control-flow extensions stay inside that `v18`/72-field contract: they only
-refine instructions earlier builds marked opaque, so a cached report from an older
-worker is conservatively incomplete rather than contradictory. The `AArch64
-register semantics v9` banner identifies the statement set that produced a preview.
+they contained semantic output. The move-wide, logical, shift, multiply, extend,
+address, and control-flow extensions stay inside that `v18`/72-field contract:
+they only refine instructions earlier builds marked opaque, so a cached report
+from an older worker is conservatively incomplete rather than contradictory. The
+`AArch64 register semantics v10` banner identifies the statement set that
+produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument
@@ -38,7 +40,11 @@ architectural `DecodeBitMasks` `wmask`; reserved bitmask encodings, flag-setting
 aliases of the bitfield group are modeled only in their canonical single-field
 forms: `LSL` and `LSR` (from `UBFM`) and `ASR` (from `SBFM`), rendered with `<<`,
 `>>`, and `>>>` (Verilog-style sign-propagating right shift). Bitfield inserts
-(`BFM`), extracts (`UBFX`/`SBFX`), and the sign/zero extends stay opaque. `MADD`
+(`BFM`), general extracts (`UBFX`/`SBFX`), and the wider `op31` multiplications
+stay opaque. The sign/zero extend aliases `UXTB`/`UXTH` (zero-extending) and
+`SXTB`/`SXTH`/`SXTW` (sign-extending) are modeled as `dst = zext(src, N)` and
+`dst = sext(src, N)`; they read the narrow source view, so a 64-bit destination
+still names a `w` source. `MADD`
 and `MSUB` with `op31==0` render `dst = left * right + add` and
 `dst = add - left * right`; when the accumulator is the zero register the addend
 is omitted as `dst = left * right` (`MUL`) or `dst = 0 - left * right` (`MNEG`),
@@ -81,4 +87,7 @@ proven-constant indirect target is resolved to its address with provenance. A
 synthetic `LSL`/`LSR`/`ASR` sequence asserts each shift operator, the exact shift
 word, and sign-propagating arithmetic-shift constant folding. A synthetic
 `MUL`/`MADD`/`MSUB` sequence asserts each rendered form, the exact multiply word,
-and folded products and differences with their `proven_by` addresses.
+and folded products and differences with their `proven_by` addresses. A synthetic
+`SXTB`/`UXTB`/`SXTW` sequence asserts the sign- and zero-extension operators, the
+exact extend words, and width-correct folded values (including a 32-bit source
+sign-extended into 64 bits).
