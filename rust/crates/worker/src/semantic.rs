@@ -335,11 +335,17 @@ enum Operation {
         base: Register,
         /// Scaled unsigned immediate byte offset (`imm12 << size`).
         offset: u64,
+        /// Log2 of the memory access width in bytes (`size` field, 0..=3).
+        size: u32,
+        /// Whether the load sign-extends into the destination register.
+        signed: bool,
     },
     Store {
         base: Register,
         offset: u64,
         src: Register,
+        /// Log2 of the memory access width in bytes (`size` field, 0..=3).
+        size: u32,
     },
     Discard(&'static str),
     Opaque,
@@ -699,42 +705,72 @@ fn decode(word: u32, pc: u64) -> Operation {
         }
     }
     // Load/store register (unsigned immediate), V=0:
-    // `size:2 111 V:1 01 opc:2 imm12:12 Rn:5 Rt:5`. Only the 32- and 64-bit
-    // general-register forms (size 2/3, opc 0=STR, 1=zero-extending LDR) are
-    // modeled; byte/halfword, sign-extending, prefetch, SIMD/scalar-FP,
-    // unscaled, and pre/post-indexed forms stay opaque. The base register holds
-    // a 64-bit address (Rn=31 means SP); the data register is `w` for size 2 and
-    // `x` for size 3.
+    // `size:2 111 V:1 01 opc:2 imm12:12 Rn:5 Rt:5`. The general-register forms
+    // are modeled: stores (opc 0), zero-extending loads (opc 1), sign-extending
+    // loads into a 64-bit destination (opc 2, `LDRSB`/`LDRSH`/`LDRSW`) and into a
+    // 32-bit destination (opc 3, `LDRSB`/`LDRSH`). The base register holds a
+    // 64-bit address (Rn=31 means SP); the data register is `w` unless it is a
+    // 64-bit store/zero-extending load or a 64-bit sign-extending load. Prefetch
+    // (`size 3`, opc 2), the unallocated `opc 3` 32/64-bit forms, SIMD/scalar-FP,
+    // unscaled, and pre/post-indexed forms stay opaque.
     if word & 0x3f00_0000 == 0x3900_0000 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
-        if (size == 2 || size == 3) && (opc == 0 || opc == 1) {
-            let rn = (word >> 5) & 31;
-            let base = Register {
-                index: rn,
-                wide: true,
-                stack_pointer: rn == 31,
-            };
-            let wide = size == 3;
-            let offset = u64::from((word >> 10) & 0xfff) << size;
-            let data = Register {
-                index: word & 31,
-                wide,
-                stack_pointer: false,
-            };
-            return if opc == 0 {
-                Operation::Store {
+        let rn = (word >> 5) & 31;
+        let base = Register {
+            index: rn,
+            wide: true,
+            stack_pointer: rn == 31,
+        };
+        let offset = u64::from((word >> 10) & 0xfff) << size;
+        let rt = word & 31;
+        let data = |wide: bool| Register {
+            index: rt,
+            wide,
+            stack_pointer: false,
+        };
+        match (size, opc) {
+            // STR: whole register (X for size 3, otherwise W).
+            (_, 0) => {
+                return Operation::Store {
                     base,
                     offset,
-                    src: data,
-                }
-            } else {
-                Operation::Load {
-                    dst: data,
+                    src: data(size == 3),
+                    size,
+                };
+            }
+            // LDR: zero-extending; destination width follows the access width.
+            (_, 1) => {
+                return Operation::Load {
+                    dst: data(size == 3),
                     base,
                     offset,
-                }
-            };
+                    size,
+                    signed: false,
+                };
+            }
+            // LDRSB/LDRSH/LDRSW: sign-extending into a 64-bit destination.
+            (0..=2, 2) => {
+                return Operation::Load {
+                    dst: data(true),
+                    base,
+                    offset,
+                    size,
+                    signed: true,
+                };
+            }
+            // LDRSB/LDRSH: sign-extending into a 32-bit destination.
+            (0..=1, 3) => {
+                return Operation::Load {
+                    dst: data(false),
+                    base,
+                    offset,
+                    size,
+                    signed: true,
+                };
+            }
+            // Prefetch (size 3, opc 2) and the unallocated opc 3 forms.
+            _ => {}
         }
     }
     // Data-processing (3 source): MADD (o0=0) and MSUB (o0=1) with 32x32
@@ -896,6 +932,22 @@ fn memory_operand(base: &Register, offset: u64) -> String {
         base.name()
     } else {
         format!("{} + {offset:#x}", base.name())
+    }
+}
+
+/// Renders a load/store dereference. The dereference is untyped when the access
+/// width equals the data-register width (the whole-register forms); otherwise
+/// the exact access width and signedness are named (`*(u8 *)`, `*(s16 *)`, ...).
+fn memory_access(base: &Register, offset: u64, size: u32, signed: bool, wide: bool) -> String {
+    let operand = memory_operand(base, offset);
+    let bytes = 1u32 << size;
+    let natural = if wide { 8 } else { 4 };
+    if !signed && bytes == natural {
+        format!("*({operand})")
+    } else {
+        let bits = bytes * 8;
+        let prefix = if signed { 's' } else { 'u' };
+        format!("*({prefix}{bits} *)({operand})")
     }
 }
 
@@ -1293,7 +1345,13 @@ impl Operation {
                     )
                 }
             }
-            Self::Load { dst, base, offset } => {
+            Self::Load {
+                dst,
+                base,
+                offset,
+                size,
+                signed,
+            } => {
                 let address = flow.read(base).and_then(|input| {
                     combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
                         value: input.value.wrapping_add(offset),
@@ -1304,13 +1362,18 @@ impl Operation {
                 // an unknown barrier while the base address register is preserved.
                 flow.write(dst, None);
                 format!(
-                    "{} = *({});{}",
+                    "{} = {};{}",
                     dst.name(),
-                    memory_operand(&base, offset),
+                    memory_access(&base, offset, size, signed, dst.wide),
                     address_suffix(address.as_ref())
                 )
             }
-            Self::Store { base, offset, src } => {
+            Self::Store {
+                base,
+                offset,
+                src,
+                size,
+            } => {
                 let address = flow.read(base).and_then(|input| {
                     combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
                         value: input.value.wrapping_add(offset),
@@ -1318,8 +1381,8 @@ impl Operation {
                     })
                 });
                 format!(
-                    "*({}) = {};{}",
-                    memory_operand(&base, offset),
+                    "{} = {};{}",
+                    memory_access(&base, offset, size, false, src.wide),
                     src.name(),
                     address_suffix(address.as_ref())
                 )
@@ -1343,7 +1406,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v13; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v14; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -1919,12 +1982,6 @@ mod tests {
 
     #[test]
     fn unmodeled_load_store_forms_remain_opaque() {
-        // ldrb w0, [x1] = 0x39400020 (size 0)
-        assert!(lift(0x3940_0020, 0x1000).contains("opaque instruction"));
-        // strb w0, [x1] = 0x39000020 (size 0)
-        assert!(lift(0x3900_0020, 0x1000).contains("opaque instruction"));
-        // ldrsw x0, [x1] = 0xb9800020 (opc 2)
-        assert!(lift(0xb980_0020, 0x1000).contains("opaque instruction"));
         // ldur x0, [x1, #8] = 0xf8408020 (unscaled immediate)
         assert!(lift(0xf840_8020, 0x1000).contains("opaque instruction"));
         // stp x29, x30, [sp, #-16]! = 0xa9bf7bfd (pre-indexed pair)
@@ -1948,6 +2005,48 @@ mod tests {
         // The load overwrites w3's tracked constant, so the add stays symbolic.
         assert!(report.contains("w3 = *(x1); /* address=0x1000 proven_by=[0x1000,0x1010] */"));
         assert!(report.contains("w4 = w3 + 0x1;"));
+    }
+
+    #[test]
+    fn lifts_subwidth_and_signed_load_store() {
+        // strb w0, [x1] = 0x39000020
+        assert_eq!(lift(0x3900_0020, 0x1000), "*(u8 *)(x1) = w0;");
+        // strb w2, [x3, #5] = 0x39001462
+        assert_eq!(lift(0x3900_1462, 0x1000), "*(u8 *)(x3 + 0x5) = w2;");
+        // strh w4, [x5] = 0x790000a4
+        assert_eq!(lift(0x7900_00a4, 0x1000), "*(u16 *)(x5) = w4;");
+        // ldrb w6, [x7] = 0x394000e6
+        assert_eq!(lift(0x3940_00e6, 0x1000), "w6 = *(u8 *)(x7);");
+        // ldrb w8, [x9, #15] = 0x39403d28
+        assert_eq!(lift(0x3940_3d28, 0x1000), "w8 = *(u8 *)(x9 + 0xf);");
+        // ldrh w10, [x11, #6] = 0x79400d6a
+        assert_eq!(lift(0x7940_0d6a, 0x1000), "w10 = *(u16 *)(x11 + 0x6);");
+        // ldrsb w12, [x13] = 0x39c001ac (sign-extend into 32-bit destination)
+        assert_eq!(lift(0x39c0_01ac, 0x1000), "w12 = *(s8 *)(x13);");
+        // ldrsb x14, [x15] = 0x398001ee (sign-extend into 64-bit destination)
+        assert_eq!(lift(0x3980_01ee, 0x1000), "x14 = *(s8 *)(x15);");
+        // ldrsh w16, [x17] = 0x79c00230
+        assert_eq!(lift(0x79c0_0230, 0x1000), "w16 = *(s16 *)(x17);");
+        // ldrsh x18, [x19] = 0x79800272
+        assert_eq!(lift(0x7980_0272, 0x1000), "x18 = *(s16 *)(x19);");
+        // ldrsw x20, [x21] = 0xb98002b4
+        assert_eq!(lift(0xb980_02b4, 0x1000), "x20 = *(s32 *)(x21);");
+        // ldrsw x22, [x23, #12] = 0xb9800ef6
+        assert_eq!(lift(0xb980_0ef6, 0x1000), "x22 = *(s32 *)(x23 + 0xc);");
+        // ldrsb x24, [x25, #16] = 0x39804338 (byte offset is unscaled by 1)
+        assert_eq!(lift(0x3980_4338, 0x1000), "x24 = *(s8 *)(x25 + 0x10);");
+        // strb wzr, [x1] = 0x3900003f
+        assert_eq!(lift(0x3900_003f, 0x1000), "*(u8 *)(x1) = wzr;");
+    }
+
+    #[test]
+    fn prefetch_and_unallocated_load_store_forms_remain_opaque() {
+        // prfm pldl1keep, [x1] = 0xf9800020 (size 3, opc 2)
+        assert!(lift(0xf980_0020, 0x1000).contains("opaque instruction"));
+        // size 2, opc 3 = 0xb9c00020 (unallocated)
+        assert!(lift(0xb9c0_0020, 0x1000).contains("opaque instruction"));
+        // size 3, opc 3 = 0xf9c00020 (unallocated)
+        assert!(lift(0xf9c0_0020, 0x1000).contains("opaque instruction"));
     }
 
     #[test]

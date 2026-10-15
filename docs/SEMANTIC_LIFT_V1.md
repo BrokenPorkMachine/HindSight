@@ -15,8 +15,9 @@ register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`, also with an
 immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
 `MUL`/`MNEG` zero-addend aliases), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/
 `SXTH`/`SXTW`),
-bitfield extracts (`UBFX`/`SBFX`), 32/64-bit general-register loads and stores
-(`LDR`/`STR` with a scaled unsigned immediate offset),
+bitfield extracts (`UBFX`/`SBFX`), general-register loads and stores (`STR`/`LDR`
+and their byte/halfword and sign-extending forms with a scaled unsigned
+immediate offset),
 PC-relative `ADR`/`ADRP`, direct `B`/`BL`, conditional and indirect control flow
 (`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`), `RET`, and `NOP`. It emits an
 explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
@@ -28,7 +29,7 @@ bitfield, memory, address, and control-flow extensions stay inside that
 `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v13` banner identifies the statement set that
+`AArch64 register semantics v14` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -61,14 +62,19 @@ still names a `w` source. `MADD`
 and `MSUB` with `op31==0` render `dst = left * right + add` and
 `dst = add - left * right`; when the accumulator is the zero register the addend
 is omitted as `dst = left * right` (`MUL`) or `dst = 0 - left * right` (`MNEG`),
-and the wider `op31` variants (`SMADDL`/`UMADDL`/...) stay opaque. The 32- and
-64-bit general-register loads and stores (`LDR`/`STR` with a scaled unsigned
-immediate offset) render `dst = *(base + off);` and `*(base + off) = src;`. The
+and the wider `op31` variants (`SMADDL`/`UMADDL`/...) stay opaque. The complete
+general-register load/store family with a scaled unsigned immediate offset is
+modeled: `STR`/`LDR` (size 2/3) plus the byte/halfword and sign-extending forms
+(`STRB`/`STRH`/`LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`LDRSW`). The dereference is
+untyped when the access width equals the data-register width, as in `x0 = *(x1);`
+and `*(x1) = x0;`; otherwise the exact access width and signedness are named, as
+in `w6 = *(u8 *)(x7);` and `x20 = *(s32 *)(x21);`. The
 base is a 64-bit address register (`sp` when `Rn == 31`); a load defines its
 destination as unknown while preserving the base, and a store leaves tracked
 registers unchanged. When the base carries an exact constant, the resolved
-address and its provenance are printed. Byte, halfword, sign-extending,
-prefetch, SIMD/scalar-FP, unscaled, and pre/post-indexed forms stay opaque. `ADR`
+address and its provenance are printed. Prefetch (`size 3`, opc 2), the
+unallocated `opc 3` 32/64-bit forms, SIMD/scalar-FP, unscaled, and
+pre/post-indexed forms stay opaque. `ADR`
 writes the sum of
 the instruction address and a signed 21-bit byte offset; `ADRP` writes the sum of
 the page-aligned instruction address and a signed 21-bit page offset shifted left
@@ -119,4 +125,7 @@ their `proven_by` addresses, and that the `UBFIZ`/`BFI`/`BFXIL` insert aliases
 remain opaque. A synthetic `STR`/`LDR` sequence asserts the rendered store and
 load forms, the scaled immediate offset and `sp` base, the resolved addresses
 with their `proven_by` addresses, that a load invalidates its destination
-register, and that byte/sign-extending/unscaled/indexed forms remain opaque.
+register, and that unscaled/indexed forms remain opaque. A synthetic
+`STRB`/`LDRB`/`LDRSW` sequence asserts the byte/halfword and sign-extending
+width-qualified dereferences, the signed-versus-zero extension, and that
+prefetch and the unallocated `opc 3` forms remain opaque.
