@@ -227,6 +227,83 @@ impl VariableShiftKind {
     }
 }
 
+/// Data-processing (1 source): `RBIT`/`REV16`/`REV`/`REV32`/`CLZ`/`CLS`. Every
+/// form reads one register of the destination width and writes the same width,
+/// so the fold is width-aware.
+#[derive(Clone, Copy)]
+enum OneSourceKind {
+    ReverseBits,
+    ReverseBytes,
+    ReverseHalfwordBytes,
+    ReverseWordBytes,
+    CountLeadingZeros,
+    CountLeadingSign,
+}
+
+impl OneSourceKind {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            Self::ReverseBits => "rbit",
+            Self::ReverseBytes => "rev",
+            Self::ReverseHalfwordBytes => "rev16",
+            Self::ReverseWordBytes => "rev32",
+            Self::CountLeadingZeros => "clz",
+            Self::CountLeadingSign => "cls",
+        }
+    }
+
+    fn fold(self, value: u64, wide: bool) -> u64 {
+        match self {
+            Self::ReverseBits => {
+                if wide {
+                    value.reverse_bits()
+                } else {
+                    (value as u32).reverse_bits() as u64
+                }
+            }
+            Self::ReverseBytes => {
+                if wide {
+                    value.swap_bytes()
+                } else {
+                    (value as u32).swap_bytes() as u64
+                }
+            }
+            Self::ReverseHalfwordBytes => {
+                let mask = if wide {
+                    0x00ff_00ff_00ff_00ffu64
+                } else {
+                    0x00ff_00ffu64
+                };
+                ((value & mask) << 8) | ((value >> 8) & mask)
+            }
+            Self::ReverseWordBytes => {
+                // REV32 is 64-bit only: reverse the bytes of each 32-bit word.
+                let low = (value as u32).swap_bytes() as u64;
+                let high = ((value >> 32) as u32).swap_bytes() as u64;
+                (high << 32) | low
+            }
+            Self::CountLeadingZeros => {
+                if wide {
+                    value.leading_zeros() as u64
+                } else {
+                    (value as u32).leading_zeros() as u64
+                }
+            }
+            Self::CountLeadingSign => {
+                // Leading bits equal to the sign bit, minus the sign bit itself.
+                if wide {
+                    let probe = if value >> 63 != 0 { !value } else { value };
+                    (probe.leading_zeros() as u64).saturating_sub(1)
+                } else {
+                    let narrow = value as u32;
+                    let probe = if narrow >> 31 != 0 { !narrow } else { narrow };
+                    (probe.leading_zeros() as u64).saturating_sub(1)
+                }
+            }
+        }
+    }
+}
+
 fn extend_value(value: u64, signed: bool, from: u8, wide: bool) -> u64 {
     let truncated = value & ((1u64 << from) - 1);
     if signed {
@@ -484,6 +561,14 @@ enum Operation {
         src: Register,
         amount: Register,
         kind: VariableShiftKind,
+    },
+    /// Data-processing (1 source): `RBIT`/`REV16`/`REV`/`REV32`/`CLZ`/`CLS`,
+    /// rendered as `dst = rbit(src);` (etc.). The source and destination share
+    /// the width, and the flip/count is computed at that width.
+    OneSource {
+        dst: Register,
+        src: Register,
+        kind: OneSourceKind,
     },
     /// Widening and high-half multiply from the 3-source group:
     /// `SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` (with their `SMULL`/`UMULL`
@@ -1326,6 +1411,42 @@ fn decode(word: u32, pc: u64) -> Operation {
                 }
                 _ => {}
             }
+        }
+    }
+    // Data-processing (1 source): `sf 1 0 11010110 opcode:6 Rn:5 Rd:5`. Bits
+    // 20-16 are zero in this group (they select the register-pointer-auth subset
+    // when nonzero, which stays opaque). The opcode field (bits 15-10) selects
+    // the operation: 0 RBIT, 1 REV16, 2 REV (32-bit) / REV32 (64-bit),
+    // 3 REV (64-bit, `sf == 1` only), 4 CLZ, 5 CLS.
+    if word & 0x7fff_0000 == 0x5ac0_0000 {
+        let sf = word >> 31 != 0;
+        let kind = match (word >> 10) & 0x3f {
+            0 => Some(OneSourceKind::ReverseBits),
+            1 => Some(OneSourceKind::ReverseHalfwordBytes),
+            2 if sf => Some(OneSourceKind::ReverseWordBytes),
+            2 => Some(OneSourceKind::ReverseBytes),
+            3 if sf => Some(OneSourceKind::ReverseBytes),
+            4 => Some(OneSourceKind::CountLeadingZeros),
+            5 => Some(OneSourceKind::CountLeadingSign),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if word & 31 == 31 {
+                return Operation::Discard("one-source result discarded in zero register");
+            }
+            return Operation::OneSource {
+                dst: Register {
+                    index: word & 31,
+                    wide: sf,
+                    stack_pointer: false,
+                },
+                src: Register {
+                    index: (word >> 5) & 31,
+                    wide: sf,
+                    stack_pointer: false,
+                },
+                kind,
+            };
         }
     }
     // Data-processing (2 source) division: SDIV (bit 10 = 1) and UDIV (bit 10 = 0)
@@ -2272,6 +2393,22 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::OneSource { dst, src, kind } => {
+                let known = flow.read(src).and_then(|input| {
+                    Some(KnownValue {
+                        value: dst.mask(kind.fold(input.value, dst.wide)),
+                        origins: combine_origins(&input.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = {}({});{}",
+                    dst.name(),
+                    kind.mnemonic(),
+                    src.name(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::WideningMultiply {
                 dst,
                 left,
@@ -2658,7 +2795,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v22; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v23; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3237,6 +3374,100 @@ mod tests {
         // unallocated opcode such as 0 in the same group stays opaque.
         // 0x9ac20020: lsl-family with opcode 000000
         assert!(lift(0x9ac2_0020, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_one_source_forms() {
+        // Encodings produced by clang for ARM64.
+        // rbit x0, x1 = 0xdac00020 / rbit w0, w1 = 0x5ac00020
+        assert_eq!(lift(0xdac0_0020, 0x1000), "x0 = rbit(x1);");
+        assert_eq!(lift(0x5ac0_0020, 0x1000), "w0 = rbit(w1);");
+        // rev16 x0, x1 = 0xdac00420 / rev16 w0, w1 = 0x5ac00420
+        assert_eq!(lift(0xdac0_0420, 0x1000), "x0 = rev16(x1);");
+        assert_eq!(lift(0x5ac0_0420, 0x1000), "w0 = rev16(w1);");
+        // rev32 x0, x1 = 0xdac00820 (64-bit only) / rev w0, w1 = 0x5ac00820
+        assert_eq!(lift(0xdac0_0820, 0x1000), "x0 = rev32(x1);");
+        assert_eq!(lift(0x5ac0_0820, 0x1000), "w0 = rev(w1);");
+        // rev x0, x1 = 0xdac00c20
+        assert_eq!(lift(0xdac0_0c20, 0x1000), "x0 = rev(x1);");
+        // clz x0, x1 = 0xdac01020 / clz w0, w1 = 0x5ac01020
+        assert_eq!(lift(0xdac0_1020, 0x1000), "x0 = clz(x1);");
+        assert_eq!(lift(0x5ac0_1020, 0x1000), "w0 = clz(w1);");
+        // cls x0, x1 = 0xdac01420 / cls w0, w1 = 0x5ac01420
+        assert_eq!(lift(0xdac0_1420, 0x1000), "x0 = cls(x1);");
+        assert_eq!(lift(0x5ac0_1420, 0x1000), "w0 = cls(w1);");
+        // Independent operand fields: clz x3, x7 = 0xdac010e3
+        assert_eq!(lift(0xdac0_10e3, 0x1000), "x3 = clz(x7);");
+    }
+
+    #[test]
+    fn one_source_into_the_zero_register_is_discarded() {
+        // rbit xzr, x1 = 0xdac0003f / cls wzr, w1 = 0x5ac0143f
+        assert!(lift(0xdac0_003f, 0x1000).contains("discarded"));
+        assert!(lift(0x5ac0_143f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn folds_bit_reverse_and_byte_reverse_into_constants() {
+        // movz x1, #0x1 ; rbit x0, x1 -> 0x8000000000000000
+        let words = [0xd280_0021u32, 0xdac0_0020];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "x0 = rbit(x1); /* constant=0x8000000000000000 proven_by=[0x1000,0x1004] */"
+        ));
+
+        // movz x1, #0x1 ; rev x0, x1 -> 0x0100000000000000
+        let words = [0xd280_0021u32, 0xdac0_0c20];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report
+            .contains("x0 = rev(x1); /* constant=0x100000000000000 proven_by=[0x1000,0x1004] */"));
+
+        // movz x1, #0x1 ; rev16 x0, x1 -> 0x0000000000000100
+        let words = [0xd280_0021u32, 0xdac0_0420];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = rev16(x1); /* constant=0x100 proven_by=[0x1000,0x1004] */"));
+
+        // movz x1, #0x1 ; rev32 x0, x1 -> 0x0000000001000000
+        let words = [0xd280_0021u32, 0xdac0_0820];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("x0 = rev32(x1); /* constant=0x1000000 proven_by=[0x1000,0x1004] */")
+        );
+    }
+
+    #[test]
+    fn folds_count_leading_zeros_and_sign_into_constants() {
+        // movz x1, #0x1 ; clz x0, x1 -> 63
+        let words = [0xd280_0021u32, 0xdac0_1020];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = clz(x1); /* constant=0x3f proven_by=[0x1000,0x1004] */"));
+
+        // movz w1, #0x1 ; clz w0, w1 -> 31 (narrow count)
+        let words = [0x5280_0021u32, 0x5ac0_1020];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("w0 = clz(w1); /* constant=0x1f proven_by=[0x1000,0x1004] */"));
+
+        // movz x1, #0x1 ; cls x0, x1 -> 62
+        let words = [0xd280_0021u32, 0xdac0_1420];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = cls(x1); /* constant=0x3e proven_by=[0x1000,0x1004] */"));
+    }
+
+    #[test]
+    fn words_outside_the_one_source_group_stay_opaque() {
+        // opcode 000011 with sf == 0 is unallocated (`rev` 64-bit requires sf=1).
+        // rev-family with sf=0, opcode 000011 = 0x5ac00c20
+        assert!(lift(0x5ac0_0c20, 0x1000).contains("opaque instruction"));
+        // A nonzero register-pointer-auth selector (bits 20-16) leaves the group.
+        // rbit-family with bit 16 set = 0x5ac10020
+        assert!(lift(0x5ac1_0020, 0x1000).contains("opaque instruction"));
     }
 
     #[test]

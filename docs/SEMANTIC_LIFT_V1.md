@@ -19,6 +19,8 @@ and high-half multiplies (`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` with their
 `SMULL`/`UMULL` zero-addend aliases, and `SMULH`/`UMULH`), sign/zero extends
 (`UXTB`/`UXTH`/`SXTB`/
 `SXTH`/`SXTW`),
+one-source bit/byte reversals and leading-bit counts
+(`RBIT`/`REV16`/`REV`/`REV32`/`CLZ`/`CLS`),
 bitfield extracts (`UBFX`/`SBFX`), conditional select
 (`CSEL`/`CSINC`/`CSINV`/`CSNEG` and their `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG`
 aliases), general-register loads and stores (`STR`/`LDR`
@@ -30,7 +32,7 @@ explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
 ranges. Output is bounded to eight functions and 128 words per function. The
 structural backend emits an empty field. The cache engine identity advances to
 `arm64-analysis-v19-schema72` so reports from older workers are not reused as if
-they contained semantic output. The move-wide, logical, shift, multiply, extend,
+they contained semantic output. The move-wide, logical, shift, one-source, multiply, extend,
 bitfield, conditional-select, memory, address, and control-flow extensions stay
 inside that `v19`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
@@ -38,7 +40,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v22` banner identifies the statement set that
+`AArch64 register semantics v23` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -82,7 +84,15 @@ defined and folds with its operand provenance. Register-defined shifts
 `dst = ror(src, amount);`, with the shift amount read from a whole register and
 reduced modulo the register width (so a shift by the full width is a no-op);
 results fold with their operand provenance, and the remaining opcodes of the
-group stay opaque. The same `op31` group also models
+group stay opaque. The data-processing (1 source) family renders
+`dst = rbit(src);`, `dst = rev16(src);`, `dst = rev(src);`,
+`dst = rev32(src);`, `dst = clz(src);`, and `dst = cls(src);`, each computed at
+the register width and folded with provenance (bit/byte reversal, leading-zero
+count, and leading-sign count with the sign bit itself excluded). Within that
+group the opcode-2 word is `REV32` for a 64-bit register but 32-bit `REV` for a
+32-bit one, opcode-3 `REV` is 64-bit only, and the remaining opcodes (including
+the register pointer-authentication subset) stay opaque. The same `op31` group
+also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
 keeping the narrow 32-bit source view explicit while producing a 64-bit
@@ -178,7 +188,11 @@ quotients with `proven_by` addresses, and that a zero divisor folds to zero. A
 synthetic `LSLV`/`LSRV`/`ASRV`/`RORV` sequence asserts each rendered form, the
 exact shift words verified against `clang -arch arm64`, folded results including
 a shift amount that wraps modulo the register width and a sign-propagating
-`ASRV`, and that an unallocated opcode of the group stays opaque. A
+`ASRV`, and that an unallocated opcode of the group stays opaque. A synthetic
+`RBIT`/`REV16`/`REV`/`REV32`/`CLZ`/`CLS` sequence asserts each rendered form and
+its exact word, the 32-bit `REV`/`REV32` split, folded bit/byte reversals and
+leading-bit counts (including a narrow count), and that an unallocated opcode of
+the group stays opaque. A
 synthetic `SMULL`/`UMULL`/`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL`/`SMULH`/`UMULH`
 sequence asserts each rendered form, the exact multiply words verified against
 `clang -arch arm64`, folded products and quotients with `proven_by` addresses, and
