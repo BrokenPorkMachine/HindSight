@@ -252,6 +252,24 @@ fn divide_value(dividend: u64, divisor: u64, signed: bool, wide: bool) -> u64 {
     }
 }
 
+/// Computes the product of a widening or high-half multiply from the 3-source
+/// group. Widening forms (`high == false`) multiply two 32-bit sources and
+/// produce the full 64-bit product; high-half forms (`high == true`) multiply
+/// two 64-bit sources and keep the upper 64 bits of the 128-bit product.
+fn widening_product(left: u64, right: u64, signed: bool, high: bool) -> u64 {
+    if high {
+        if signed {
+            (((left as i64 as i128) * (right as i64 as i128)) >> 64) as u64
+        } else {
+            (((left as u128) * (right as u128)) >> 64) as u64
+        }
+    } else if signed {
+        ((left as u32 as i32 as i64) * (right as u32 as i32 as i64)) as u64
+    } else {
+        (left as u32 as u64) * (right as u32 as u64)
+    }
+}
+
 /// Applies an optional register-operand shift, leaving `value` unchanged when the
 /// operand is unshifted.
 fn shifted_value(value: u64, shift: Option<(ShiftKind, u8)>, wide: bool) -> u64 {
@@ -408,6 +426,23 @@ enum Operation {
         right: Register,
         /// `true` for `SDIV`, `false` for `UDIV`.
         signed: bool,
+    },
+    /// Widening and high-half multiply from the 3-source group:
+    /// `SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` (with their `SMULL`/`UMULL`
+    /// zero-addend aliases, which multiply two 32-bit sources into a 64-bit
+    /// destination) and `SMULH`/`UMULH` (which multiply two 64-bit sources and
+    /// keep the upper half of the product).
+    WideningMultiply {
+        dst: Register,
+        left: Register,
+        right: Register,
+        /// `None` for `SMULL`/`UMULL` and for the `SMULH`/`UMULH` forms.
+        addend: Option<Register>,
+        subtract: bool,
+        /// `true` for the signed forms (`SMADDL`/`SMSUBL`/`SMULL`/`SMULH`).
+        signed: bool,
+        /// `true` for `SMULH`/`UMULH`: the high half of a 64x64 product.
+        high: bool,
     },
     Extend {
         dst: Register,
@@ -1254,11 +1289,71 @@ fn decode(word: u32, pc: u64) -> Operation {
             signed,
         };
     }
+    // Data-processing (3 source), widening and high-half multiply:
+    // `sf 0011011 op31:3 Rm:5 o0:1 Ra:5 Rn:5 Rd:5`. `op31 == 0` (MADD/MSUB) is
+    // decoded below; `op31` 001/101 are SMADDL/SMSUBL and UMADDL/UMSUBL, which
+    // read two 32-bit sources and write a 64-bit destination, while 010/110 are
+    // SMULH/UMULH, which read two 64-bit sources and write the upper half of
+    // their product. `op31` 011/111 are unallocated, and the widening and
+    // high-half encodings are only allocated with `sf == 1`. This block is
+    // decoded before the literal-load class because `op31` 101/110 set the `opc`
+    // bits that the literal forms also use.
+    if word & 0x3f00_0000 == 0x1b00_0000 {
+        let op31 = (word >> 21) & 7;
+        let mode = match op31 {
+            1 => Some((true, false)),  // SMADDL / SMSUBL
+            2 => Some((true, true)),   // SMULH
+            5 => Some((false, false)), // UMADDL / UMSUBL
+            6 => Some((false, true)),  // UMULH
+            // 0 is MADD/MSUB (decoded below); 3, 4 and 7 are unallocated.
+            _ => None,
+        };
+        if let Some((signed, high)) = mode {
+            // The widening and high-half forms require a 64-bit destination;
+            // anything else falls through to the remaining (opaque) decoders.
+            if word >> 31 != 0 {
+                if word & 31 == 31 {
+                    return Operation::Discard("multiply result discarded in zero register");
+                }
+                let ra = (word >> 10) & 31;
+                return Operation::WideningMultiply {
+                    dst: Register {
+                        index: word & 31,
+                        wide: true,
+                        stack_pointer: false,
+                    },
+                    // Widening reads the narrow (32-bit) source view; the
+                    // high-half forms read the full 64-bit view.
+                    left: Register {
+                        index: (word >> 5) & 31,
+                        wide: high,
+                        stack_pointer: false,
+                    },
+                    right: Register {
+                        index: (word >> 16) & 31,
+                        wide: high,
+                        stack_pointer: false,
+                    },
+                    // SMULH/UMULH encode Ra as the zero register and ignore it.
+                    addend: (ra != 31).then_some(Register {
+                        index: ra,
+                        wide: true,
+                        stack_pointer: false,
+                    }),
+                    subtract: word & (1 << 15) != 0,
+                    signed,
+                    high,
+                };
+            }
+        }
+    }
     // Load literal (PC-relative), V=0:
     // `size:2 01101 opc:2 imm19:19 Rt:5`. The address is `PC + (sign_extend(imm19) << 2)`.
     // opc: 1=LDR (zero-extend, dst width follows size), 2=LDRSW (sign-extend 32 to 64),
     // 3=LDRSB/LDRSH (sign-extend 8/16 to 32). size=3 opc=1 is PRFM (opaque).
-    if word & 0x3e00_0000 == 0x1a00_0000 {
+    // Bit 24 is `0` here and `1` in the data-processing (3 source) group
+    // (`size 0011011 ...`), so including it keeps that group out of this class.
+    if word & 0x3f00_0000 == 0x1a00_0000 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
         let imm19 = (word >> 3) & 0x7ffff;
@@ -2032,6 +2127,60 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::WideningMultiply {
+                dst,
+                left,
+                right,
+                addend,
+                subtract,
+                signed,
+                high,
+            } => {
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(l, r)| {
+                    let product = widening_product(l.value, r.value, signed, high);
+                    let (addend_value, addend_origins) = match addend {
+                        Some(reg) => {
+                            let value = flow.read(reg)?;
+                            (value.value, value.origins)
+                        }
+                        None => (0, Vec::new()),
+                    };
+                    let value = if subtract {
+                        addend_value.wrapping_sub(product)
+                    } else {
+                        addend_value.wrapping_add(product)
+                    };
+                    let mut origins = l.origins.clone();
+                    origins.extend_from_slice(&r.origins);
+                    Some(KnownValue {
+                        value: dst.mask(value),
+                        origins: combine_origins(&origins, &addend_origins, pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                let suffix = resolved_suffix(known.as_ref());
+                // The narrowing view keeps the widening explicit: a widening
+                // product of 32-bit sources is sign/zero-extended, while the
+                // high-half forms name their mnemonic directly.
+                let product = if high {
+                    let op = if signed { "smulh" } else { "umulh" };
+                    format!("{op}({}, {})", left.name(), right.name())
+                } else if signed {
+                    format!("sext({}, 32) * sext({}, 32)", left.name(), right.name())
+                } else {
+                    format!("zext({}, 32) * zext({}, 32)", left.name(), right.name())
+                };
+                match (addend, subtract) {
+                    (Some(reg), false) => {
+                        format!("{} = {product} + {};{suffix}", dst.name(), reg.name())
+                    }
+                    (Some(reg), true) => {
+                        format!("{} = {} - {product};{suffix}", dst.name(), reg.name())
+                    }
+                    (None, false) => format!("{} = {product};{suffix}", dst.name()),
+                    (None, true) => format!("{} = 0 - {product};{suffix}", dst.name()),
+                }
+            }
             Self::Extend {
                 dst,
                 src,
@@ -2327,7 +2476,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v18; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v19; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -2809,6 +2958,105 @@ mod tests {
         assert!(
             report.contains("x0 = x1 sdiv x2; /* constant=0x0 proven_by=[0x1000,0x1004,0x1008] */")
         );
+    }
+
+    #[test]
+    fn lifts_widening_multiply_forms() {
+        // Encodings produced by clang for ARM64.
+        // smull x0, w0, w1 = 0x9b217c00
+        assert_eq!(
+            lift(0x9b21_7c00, 0x1000),
+            "x0 = sext(w0, 32) * sext(w1, 32);"
+        );
+        // umull x0, w0, w1 = 0x9ba17c00
+        assert_eq!(
+            lift(0x9ba1_7c00, 0x1000),
+            "x0 = zext(w0, 32) * zext(w1, 32);"
+        );
+        // smaddl x0, w0, w1, x2 = 0x9b210800
+        assert_eq!(
+            lift(0x9b21_0800, 0x1000),
+            "x0 = sext(w0, 32) * sext(w1, 32) + x2;"
+        );
+        // umaddl x0, w0, w1, x2 = 0x9ba10800
+        assert_eq!(
+            lift(0x9ba1_0800, 0x1000),
+            "x0 = zext(w0, 32) * zext(w1, 32) + x2;"
+        );
+        // smsubl x0, w0, w1, x2 = 0x9b218800
+        assert_eq!(
+            lift(0x9b21_8800, 0x1000),
+            "x0 = x2 - sext(w0, 32) * sext(w1, 32);"
+        );
+        // umsubl x0, w0, w1, x2 = 0x9ba18800
+        assert_eq!(
+            lift(0x9ba1_8800, 0x1000),
+            "x0 = x2 - zext(w0, 32) * zext(w1, 32);"
+        );
+        // smulh x0, x1, x2 = 0x9b427c20
+        assert_eq!(lift(0x9b42_7c20, 0x1000), "x0 = smulh(x1, x2);");
+        // umulh x0, x1, x2 = 0x9bc27c20
+        assert_eq!(lift(0x9bc2_7c20, 0x1000), "x0 = umulh(x1, x2);");
+    }
+
+    #[test]
+    fn widening_multiply_writes_to_the_zero_register_are_discarded() {
+        // smull xzr, w0, w1 = 0x9b217c1f
+        assert!(lift(0x9b21_7c1f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn unallocated_widening_encodings_remain_opaque() {
+        // op31 011 with sf=1: 10011011_0110... -> 0x9b624800
+        assert!(lift(0x9b62_4800, 0x1000).contains("opaque instruction"));
+        // op31 001 with sf=0: 00011011_0010... -> 0x1b224800
+        assert!(lift(0x1b22_4800, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn folds_widening_multiply_into_constants() {
+        // movz w20,#0xffff ; movk w20,#0x7fff,lsl#16 -> 0x7fffffff
+        // movz w21,#2 ; smull x10, w20, w21 -> 0xfffffffe
+        // movz w22,#1 ; smaddl x11, w20, w21, x22 -> 0xffffffff
+        // smsubl x12, w20, w21, x22 -> 1 - 0xfffffffe = 0xffffffff00000003
+        let words = [
+            0x529f_fff4u32, // movz w20, #0xffff
+            0x72af_fff4,    // movk w20, #0x7fff, lsl #16
+            0x5280_0055,    // movz w21, #2
+            0x9b35_7e8a,    // smull x10, w20, w21
+            0x5280_0036,    // movz w22, #1
+            0x9b35_5a8b,    // smaddl x11, w20, w21, x22
+            0x9b35_da8c,    // smsubl x12, w20, w21, x22
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x10 = sext(w20, 32) * sext(w21, 32); /* constant=0xfffffffe"));
+        assert!(
+            report.contains("x11 = sext(w20, 32) * sext(w21, 32) + x22; /* constant=0xffffffff")
+        );
+        assert!(report
+            .contains("x12 = x22 - sext(w20, 32) * sext(w21, 32); /* constant=0xffffffff00000003"));
+    }
+
+    #[test]
+    fn folds_high_half_multiply_into_constants() {
+        // movn x20,#0 -> 0xffffffffffffffff ; movn x21,#0 -> same
+        // umulh x10 -> 0xfffffffffffffffe ; smulh x11 -> 0
+        // movz x22,#0 ; umaddl x12, w20, w21, x22 -> (2^32-1)^2 = 0xfffffffe00000001
+        let words = [
+            0x9280_0014u32, // movn x20, #0
+            0x9280_0015,    // movn x21, #0
+            0x9bd5_7e8a,    // umulh x10, x20, x21
+            0x9b55_7e8b,    // smulh x11, x20, x21
+            0xd280_0016,    // movz x22, #0
+            0x9bb5_5a8c,    // umaddl x12, w20, w21, x22
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x10 = umulh(x20, x21); /* constant=0xfffffffffffffffe"));
+        assert!(report.contains("x11 = smulh(x20, x21); /* constant=0x0"));
+        assert!(report
+            .contains("x12 = zext(w20, 32) * zext(w21, 32) + x22; /* constant=0xfffffffe00000001"));
     }
 
     #[test]

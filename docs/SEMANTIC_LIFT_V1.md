@@ -13,7 +13,10 @@ flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and
 register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`, also with an
 `LSL`/`LSR`/`ASR`-shifted register operand),
 immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
-`MUL`/`MNEG` zero-addend aliases), integer division (`SDIV`/`UDIV`), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/
+`MUL`/`MNEG` zero-addend aliases), integer division (`SDIV`/`UDIV`), widening
+and high-half multiplies (`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` with their
+`SMULL`/`UMULL` zero-addend aliases, and `SMULH`/`UMULH`), sign/zero extends
+(`UXTB`/`UXTH`/`SXTB`/
 `SXTH`/`SXTW`),
 bitfield extracts (`UBFX`/`SBFX`), general-register loads and stores (`STR`/`LDR`
 and their byte/halfword and sign-extending forms with a scaled unsigned
@@ -29,7 +32,7 @@ bitfield, memory, address, and control-flow extensions stay inside that
 `v18`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
-`AArch64 register semantics v18` banner identifies the statement set that
+`AArch64 register semantics v19` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -67,7 +70,16 @@ and the wider `op31` variants (`SMADDL`/`UMADDL`/...) stay opaque. Integer
 division `SDIV`/`UDIV` renders `dst = left sdiv right` / `udiv right`. ARM64
 division never traps: a zero divisor yields zero, and the signed
 `INT_MIN / -1` overflow saturates to `INT_MIN`, so a divided constant is always
-defined and folds with its operand provenance. The complete
+defined and folds with its operand provenance. The same `op31` group also models
+the widening and high-half multiplies. `SMULL`/`UMULL` render
+`dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
+keeping the narrow 32-bit source view explicit while producing a 64-bit
+destination; `SMADDL`/`UMADDL` and `SMSUBL`/`UMSUBL` render the same product with
+a `+ accumulator` or `accumulator -` form. `SMULH`/`UMULH` read two 64-bit
+sources and write the upper half of their product, rendered as
+`dst = smulh(left, right);` / `dst = umulh(left, right);`. The widening and
+high-half encodings are only allocated with `sf == 1`; `op31` 011/111 stay
+opaque, and a zero-register destination discards the result. The complete
 general-register load/store family with a scaled unsigned immediate offset is
 modeled: `STR`/`LDR` (size 2/3) plus the byte/halfword and sign-extending forms
 (`STRB`/`STRH`/`LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`LDRSW`). The dereference is
@@ -134,7 +146,11 @@ word, and sign-propagating arithmetic-shift constant folding. A synthetic
 `MUL`/`MADD`/`MSUB` sequence asserts each rendered form, the exact multiply word,
 and folded products and differences with their `proven_by` addresses. A synthetic
 `SDIV`/`UDIV` sequence asserts each rendered form, the exact division words, folded
-quotients with `proven_by` addresses, and that a zero divisor folds to zero. A synthetic
+quotients with `proven_by` addresses, and that a zero divisor folds to zero. A
+synthetic `SMULL`/`UMULL`/`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL`/`SMULH`/`UMULH`
+sequence asserts each rendered form, the exact multiply words verified against
+`clang -arch arm64`, folded products and quotients with `proven_by` addresses, and
+that unallocated `op31` encodings and a zero-register destination stay opaque. A synthetic
 `SXTB`/`UXTB`/`SXTW` sequence asserts the sign- and zero-extension operators, the
 exact extend words, and width-correct folded values (including a 32-bit source
 sign-extended into 64 bits). A synthetic shifted-register sequence asserts each
