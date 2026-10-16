@@ -421,18 +421,19 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # extend, UBFX/SBFX bitfield extracts, LSL/LSR/ASR shifted-register operands on
 # the ADD/SUB and logical forms, 32/64-bit general-register load/store with a
 # scaled unsigned immediate offset (including the byte/halfword and
-# sign-extending forms), and multiply-add (MADD/MSUB/MUL/MNEG), as
+# sign-extending forms), multiply-add (MADD/MSUB/MUL/MNEG), and conditional
+# select (CSEL/CSINC/CSINV/CSNEG) as
 # provenance-carrying constants and barriers without changing the 72-field
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v20', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v21', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
               'shifted_value', 'render_shifted', 'operand_shift', 'Extract',
               'extract_value', 'Load', 'Store', 'memory_operand', 'memory_access',
-              'address_suffix',
+              'address_suffix', 'ConditionalSelect', 'ConditionalElse',
               'word & 0x7fe0_0000 == 0x1b00_0000',
               'word & 0x1f80_0000 == 0x1280_0000',
               'word & 0x1f80_0000 == 0x1200_0000',
@@ -440,6 +441,7 @@ for token in ['AArch64 register semantics v20', 'MoveNot', 'MoveKeep', 'MoveZero
               'word & 0x1f00_0000 == 0x0a00_0000',
               'word & 0x1f00_0000 == 0x1000_0000',
               'word & 0x3f00_0000 == 0x3900_0000',
+              'word & 0x3fe0_0800 == 0x1a80_0000',
               'word & 0xff00_0010 == 0x5400_0000',
               'word & 0x7e00_0000 == 0x3400_0000',
               'word & 0x7e00_0000 == 0x3600_0000',

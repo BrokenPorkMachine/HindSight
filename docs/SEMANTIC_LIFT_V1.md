@@ -18,7 +18,9 @@ and high-half multiplies (`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` with their
 `SMULL`/`UMULL` zero-addend aliases, and `SMULH`/`UMULH`), sign/zero extends
 (`UXTB`/`UXTH`/`SXTB`/
 `SXTH`/`SXTW`),
-bitfield extracts (`UBFX`/`SBFX`), general-register loads and stores (`STR`/`LDR`
+bitfield extracts (`UBFX`/`SBFX`), conditional select
+(`CSEL`/`CSINC`/`CSINV`/`CSNEG` and their `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG`
+aliases), general-register loads and stores (`STR`/`LDR`
 and their byte/halfword and sign-extending forms with a scaled unsigned
 immediate offset or with register-offset `[base, index, extend/shift]`),
 PC-relative `ADR`/`ADRP`, direct `B`/`BL`, conditional and indirect control flow
@@ -28,14 +30,14 @@ ranges. Output is bounded to eight functions and 128 words per function. The
 structural backend emits an empty field. The cache engine identity advances to
 `arm64-analysis-v19-schema72` so reports from older workers are not reused as if
 they contained semantic output. The move-wide, logical, shift, multiply, extend,
-bitfield, memory, address, and control-flow extensions stay inside that
-`v19`/72-field contract:
+bitfield, conditional-select, memory, address, and control-flow extensions stay
+inside that `v19`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
 from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v20` banner identifies the statement set that
+`AArch64 register semantics v21` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -82,9 +84,21 @@ a `+ accumulator` or `accumulator -` form. `SMULH`/`UMULH` read two 64-bit
 sources and write the upper half of their product, rendered as
 `dst = smulh(left, right);` / `dst = umulh(left, right);`. The widening and
 high-half encodings are only allocated with `sf == 1`; `op31` 011/111 stay
-opaque, and a zero-register destination discards the result. The complete
-general-register load/store family with a scaled unsigned immediate offset is
-modeled: `STR`/`LDR` (size 2/3) plus the byte/halfword and sign-extending forms
+opaque, and a zero-register destination discards the result. Conditional select
+(`CSEL`/`CSINC`/`CSINV`/`CSNEG`) renders the true operand selected by the
+condition against the false operand under its per-instruction transformation:
+`dst = cond ? rn : rm;`, `dst = cond ? rn : (rm + 1);` for `CSINC`,
+`dst = cond ? rn : (~rm);` for `CSINV`, and `dst = cond ? rn : (-rm);` for
+`CSNEG`, with the `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG` aliases sharing those
+encodings (so `cset x10, eq` renders `x10 = ne ? xzr : (xzr + 1);`). The
+condition code is named directly and PSTATE flags are not tracked, so a defined
+value is claimed only for the always-true (`al`) condition, where the true
+operand is selected unconditionally and its provenance is preserved; every other
+condition (including `nv`) writes an unknown barrier rather than guessing the
+flags. The flag-setting form (`S == 1`) and the reserved bit 11 stay opaque. The
+complete general-register load/store family with a scaled unsigned immediate
+offset is modeled: `STR`/`LDR` (size 2/3) plus the byte/halfword and
+sign-extending forms
 (`STRB`/`STRH`/`LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`LDRSW`). The dereference is
 untyped when the access width equals the data-register width, as in `x0 = *(x1);`
 and `*(x1) = x0;`; otherwise the exact access width and signedness are named, as
@@ -158,6 +172,12 @@ synthetic `SMULL`/`UMULL`/`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL`/`SMULH`/`UMULH`
 sequence asserts each rendered form, the exact multiply words verified against
 `clang -arch arm64`, folded products and quotients with `proven_by` addresses, and
 that unallocated `op31` encodings and a zero-register destination stay opaque. A synthetic
+conditional-select sequence asserts the `CSEL`/`CSINC`/`CSINV`/`CSNEG` renderings,
+their `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG` aliases, the exact words verified
+against `clang -arch arm64`/`otool`, that the always-true condition selects the
+true operand and folds its constant with `proven_by` addresses, that any other
+condition is a barrier, and that a zero-register destination and the reserved
+encoding bit stay opaque. A synthetic
 `SXTB`/`UXTB`/`SXTW` sequence asserts the sign- and zero-extension operators, the
 exact extend words, and width-correct folded values (including a 32-bit source
 sign-extended into 64 bits). A synthetic shifted-register sequence asserts each

@@ -343,6 +343,19 @@ enum InsertKind {
     Sbfiz,
 }
 
+/// The transformation applied to the false operand of a conditional select.
+#[derive(Clone, Copy)]
+enum ConditionalElse {
+    /// CSEL: select the false operand as-is.
+    None,
+    /// CSINC: select the false operand incremented by one.
+    Increment,
+    /// CSINV: select the bitwise complement of the false operand.
+    Invert,
+    /// CSNEG: select the negation of the false operand.
+    Negate,
+}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Nop,
@@ -443,6 +456,19 @@ enum Operation {
         signed: bool,
         /// `true` for `SMULH`/`UMULH`: the high half of a 64x64 product.
         high: bool,
+    },
+    /// Conditional select: `CSEL`/`CSINC`/`CSINV`/`CSNEG` and the
+    /// `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG` aliases. The result is the true
+    /// operand when the condition holds, otherwise the false operand under the
+    /// `else_op` transformation. Flags are not read or written.
+    ConditionalSelect {
+        dst: Register,
+        if_true: Register,
+        if_false: Register,
+        /// Condition-code field; PSTATE flags are not tracked, so only the
+        /// always-true (`al`) condition yields a defined value.
+        cond: u8,
+        else_op: ConditionalElse,
     },
     Extend {
         dst: Register,
@@ -1343,6 +1369,36 @@ fn decode(word: u32, pc: u64) -> Operation {
             }
         }
     }
+    // Conditional select: `sf op:1 00110100 00 op2:1 cond:4 Rm:5 Rn:5 Rd:5`.
+    // `op` (bit 30) selects inverting the false operand and `op2` (bit 10)
+    // selects incrementing it, giving CSEL (0,0), CSINC (0,1), CSINV (1,0) and
+    // CSNEG (1,1); the CSET/CSETM/CINC/CINV/CNEG aliases share these encodings.
+    // `S` (bit 29) must be 0 (the flag-setting forms are not modeled) and the
+    // reserved bit 11 must be 0. Flags are neither read nor written.
+    if word & 0x3fe0_0800 == 0x1a80_0000 {
+        let else_op = match ((word >> 30) & 1, (word >> 10) & 1) {
+            (0, 0) => ConditionalElse::None,
+            (0, 1) => ConditionalElse::Increment,
+            (1, 0) => ConditionalElse::Invert,
+            _ => ConditionalElse::Negate,
+        };
+        if word & 31 == 31 {
+            return Operation::Discard("conditional-select result discarded in zero register");
+        }
+        let sf = word >> 31 != 0;
+        let operand = |index: u32| Register {
+            index,
+            wide: sf,
+            stack_pointer: false,
+        };
+        return Operation::ConditionalSelect {
+            dst: operand(word & 31),
+            if_true: operand((word >> 5) & 31),
+            if_false: operand((word >> 16) & 31),
+            cond: ((word >> 12) & 15) as u8,
+            else_op,
+        };
+    }
     // Load register (literal, PC-relative), V=0:
     // `opc:2 011 V:1 00 imm19:19 Rt:5`, i.e. bits 29-24 == 011000 with V=0.
     // The address is `PC + (sign_extend(imm19) << 2)`.
@@ -2162,6 +2218,43 @@ impl Operation {
                     (None, true) => format!("{} = 0 - {product};{suffix}", dst.name()),
                 }
             }
+            Self::ConditionalSelect {
+                dst,
+                if_true,
+                if_false,
+                cond,
+                else_op,
+            } => {
+                // Only the always-true condition selects the true operand
+                // unconditionally; every other condition depends on PSTATE flags
+                // the preview does not track, so the result is an unknown
+                // barrier and no constant is claimed.
+                let known = if cond == 14 {
+                    flow.read(if_true).and_then(|value| {
+                        Some(KnownValue {
+                            value: dst.mask(value.value),
+                            origins: combine_origins(&value.origins, &[], pc)?,
+                        })
+                    })
+                } else {
+                    None
+                };
+                flow.write(dst, known.clone());
+                let else_operand = match else_op {
+                    ConditionalElse::None => if_false.name(),
+                    ConditionalElse::Increment => format!("({} + 1)", if_false.name()),
+                    ConditionalElse::Invert => format!("(~{})", if_false.name()),
+                    ConditionalElse::Negate => format!("(-{})", if_false.name()),
+                };
+                format!(
+                    "{} = {} ? {} : {};{}",
+                    dst.name(),
+                    condition_name(cond),
+                    if_true.name(),
+                    else_operand,
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::Extend {
                 dst,
                 src,
@@ -2457,7 +2550,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v20; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v21; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3431,5 +3524,84 @@ mod tests {
     fn prfm_literal_remains_opaque() {
         // prfm pldl1keep, #0x1000 opc=3 = 0xd8008000
         assert!(lift(0xd800_8000, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_conditional_select_forms() {
+        // Encodings produced by clang for ARM64.
+        // csel x10, x20, x21, eq = 0x9a95028a
+        assert_eq!(lift(0x9a95_028a, 0x1000), "x10 = eq ? x20 : x21;");
+        // csinc x10, x20, x21, eq = 0x9a95068a
+        assert_eq!(lift(0x9a95_068a, 0x1000), "x10 = eq ? x20 : (x21 + 1);");
+        // csinv x10, x20, x21, eq = 0xda95028a
+        assert_eq!(lift(0xda95_028a, 0x1000), "x10 = eq ? x20 : (~x21);");
+        // csneg x10, x20, x21, eq = 0xda95068a
+        assert_eq!(lift(0xda95_068a, 0x1000), "x10 = eq ? x20 : (-x21);");
+        // 32-bit forms read the narrow register view.
+        assert_eq!(lift(0x1a95_028a, 0x1000), "w10 = eq ? w20 : w21;");
+        assert_eq!(lift(0x1a95_068a, 0x1000), "w10 = eq ? w20 : (w21 + 1);");
+        assert_eq!(lift(0x5a95_028a, 0x1000), "w10 = eq ? w20 : (~w21);");
+        assert_eq!(lift(0x5a95_068a, 0x1000), "w10 = eq ? w20 : (-w21);");
+        // Named conditions come straight from the encoding field.
+        assert_eq!(lift(0x9a95_128a, 0x1000), "x10 = ne ? x20 : x21;");
+        assert_eq!(lift(0x9a95_b28a, 0x1000), "x10 = lt ? x20 : x21;");
+        assert_eq!(lift(0x9a95_c28a, 0x1000), "x10 = gt ? x20 : x21;");
+    }
+
+    #[test]
+    fn lifts_conditional_select_aliases() {
+        // cset x10, eq = 0x9a9f17ea (csinc with zero-register operands, cond ne)
+        assert_eq!(lift(0x9a9f_17ea, 0x1000), "x10 = ne ? xzr : (xzr + 1);");
+        // csetm x10, eq = 0xda9f13ea
+        assert_eq!(lift(0xda9f_13ea, 0x1000), "x10 = ne ? xzr : (~xzr);");
+        // cinc x10, x20, eq = 0x9a94168a
+        assert_eq!(lift(0x9a94_168a, 0x1000), "x10 = ne ? x20 : (x20 + 1);");
+        // cinv x10, x20, eq = 0xda94128a
+        assert_eq!(lift(0xda94_128a, 0x1000), "x10 = ne ? x20 : (~x20);");
+        // cneg x10, x20, eq = 0xda94168a
+        assert_eq!(lift(0xda94_168a, 0x1000), "x10 = ne ? x20 : (-x20);");
+    }
+
+    #[test]
+    fn conditional_select_with_always_true_condition_selects_true_operand() {
+        // csel x0, x1, x2, al = 0x9a82e020
+        assert_eq!(lift(0x9a82_e020, 0x1000), "x0 = al ? x1 : x2;");
+    }
+
+    #[test]
+    fn folds_conditional_select_with_always_true_condition_into_constants() {
+        // movz x1, #0x64 ; csel x0, x1, x2, al -> the true operand is selected.
+        let words = [
+            0xd280_0c81u32, // movz x1, #0x64 (100)
+            0x9a82_e020,    // csel x0, x1, x2, al
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = al ? x1 : x2; /* constant=0x64 proven_by=[0x1000,0x1004] */"));
+    }
+
+    #[test]
+    fn conditional_select_without_always_true_condition_is_a_barrier() {
+        // movz x1, #0x64 ; csel x0, x1, x2, eq -> flag-dependent, so no constant.
+        let words = [
+            0xd280_0c81u32, // movz x1, #0x64 (100)
+            0x9a82_0020,    // csel x0, x1, x2, eq
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(!report.contains("constant="));
+    }
+
+    #[test]
+    fn conditional_select_into_zero_register_is_discarded() {
+        // csel xzr, x20, x21, eq = 0x9a95029f
+        assert!(lift(0x9a95_029f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn words_outside_the_conditional_select_group_stay_opaque() {
+        // The reserved bit 11 must be zero; a word with it set is unallocated.
+        // csel-like with bit 11 set = 0x9a950a8a
+        assert!(lift(0x9a95_0a8a, 0x1000).contains("opaque instruction"));
     }
 }
