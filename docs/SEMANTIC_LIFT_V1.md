@@ -12,7 +12,8 @@ flag-neutral `ADD`/`SUB` with immediate or register operands (including an
 flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and
 register `AND`/`ORR`/`EOR` plus the negated `BIC`/`ORN`/`EON`, also with an
 `LSL`/`LSR`/`ASR`-shifted register operand),
-immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`, with the
+immediate shifts (`LSL`/`LSR`/`ASR`), register-defined variable shifts
+(`LSLV`/`LSRV`/`ASRV`/`RORV`), multiply-add (`MADD`/`MSUB`, with the
 `MUL`/`MNEG` zero-addend aliases), integer division (`SDIV`/`UDIV`), widening
 and high-half multiplies (`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` with their
 `SMULL`/`UMULL` zero-addend aliases, and `SMULH`/`UMULH`), sign/zero extends
@@ -37,7 +38,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v21` banner identifies the statement set that
+`AArch64 register semantics v22` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -75,7 +76,13 @@ and the wider `op31` variants (`SMADDL`/`UMADDL`/...) stay opaque. Integer
 division `SDIV`/`UDIV` renders `dst = left sdiv right` / `udiv right`. ARM64
 division never traps: a zero divisor yields zero, and the signed
 `INT_MIN / -1` overflow saturates to `INT_MIN`, so a divided constant is always
-defined and folds with its operand provenance. The same `op31` group also models
+defined and folds with its operand provenance. Register-defined shifts
+(`LSLV`/`LSRV`/`ASRV`/`RORV`) from the same two-source group render
+`dst = src << amount;`, `dst = src >> amount;`, `dst = src >>> amount;`, and
+`dst = ror(src, amount);`, with the shift amount read from a whole register and
+reduced modulo the register width (so a shift by the full width is a no-op);
+results fold with their operand provenance, and the remaining opcodes of the
+group stay opaque. The same `op31` group also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
 keeping the narrow 32-bit source view explicit while producing a 64-bit
@@ -168,6 +175,10 @@ word, and sign-propagating arithmetic-shift constant folding. A synthetic
 and folded products and differences with their `proven_by` addresses. A synthetic
 `SDIV`/`UDIV` sequence asserts each rendered form, the exact division words, folded
 quotients with `proven_by` addresses, and that a zero divisor folds to zero. A
+synthetic `LSLV`/`LSRV`/`ASRV`/`RORV` sequence asserts each rendered form, the
+exact shift words verified against `clang -arch arm64`, folded results including
+a shift amount that wraps modulo the register width and a sign-propagating
+`ASRV`, and that an unallocated opcode of the group stays opaque. A
 synthetic `SMULL`/`UMULL`/`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL`/`SMULH`/`UMULH`
 sequence asserts each rendered form, the exact multiply words verified against
 `clang -arch arm64`, folded products and quotients with `proven_by` addresses, and

@@ -192,6 +192,41 @@ fn shift_value(value: u64, kind: ShiftKind, amount: u8, wide: bool) -> u64 {
     }
 }
 
+/// Register-defined shift from the 2-source group (`LSLV`/`LSRV`/`ASRV`/`RORV`).
+/// Unlike the immediate shift forms, the shift amount is a whole register and is
+/// reduced modulo the register width before it is applied.
+#[derive(Clone, Copy)]
+enum VariableShiftKind {
+    Left,
+    LogicalRight,
+    ArithmeticRight,
+    Rotate,
+}
+
+impl VariableShiftKind {
+    fn operator(self) -> &'static str {
+        match self {
+            Self::Left => "<<",
+            Self::LogicalRight => ">>",
+            // Verilog-style arithmetic right shift (sign-propagating).
+            Self::ArithmeticRight => ">>>",
+            // Rotate renders as `ror(value, amount)` rather than an infix form.
+            Self::Rotate => "ror",
+        }
+    }
+
+    fn fold(self, value: u64, amount: u64, wide: bool) -> u64 {
+        let width: u32 = if wide { 64 } else { 32 };
+        let shift = (amount % width as u64) as u8;
+        match self {
+            Self::Left => shift_value(value, ShiftKind::Left, shift, wide),
+            Self::LogicalRight => shift_value(value, ShiftKind::LogicalRight, shift, wide),
+            Self::ArithmeticRight => shift_value(value, ShiftKind::ArithmeticRight, shift, wide),
+            Self::Rotate => rotate_right(value, shift as u32, width),
+        }
+    }
+}
+
 fn extend_value(value: u64, signed: bool, from: u8, wide: bool) -> u64 {
     let truncated = value & ((1u64 << from) - 1);
     if signed {
@@ -439,6 +474,16 @@ enum Operation {
         right: Register,
         /// `true` for `SDIV`, `false` for `UDIV`.
         signed: bool,
+    },
+    /// Register-defined shift from the 2-source group: `LSLV`/`LSRV`/`ASRV`
+    /// render as `dst = src << amount;` (and the `>>`/`>>>` forms), and `RORV`
+    /// as `dst = ror(src, amount);`. The shift amount is reduced modulo the
+    /// register width, so a shift by the full width is a no-op.
+    RegisterShift {
+        dst: Register,
+        src: Register,
+        amount: Register,
+        kind: VariableShiftKind,
     },
     /// Widening and high-half multiply from the 3-source group:
     /// `SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` (with their `SMULL`/`UMULL`
@@ -1313,6 +1358,43 @@ fn decode(word: u32, pc: u64) -> Operation {
             signed,
         };
     }
+    // Data-processing (2 source), variable shifts: `LSLV`/`LSRV`/`ASRV`/`RORV`
+    // with `sf 0011010110 Rm:5 opcode:6 Rn:5 Rd:5`. The opcode field (bits 15-10)
+    // selects the operation; the division forms (`00001o`) are decoded above and
+    // every other opcode in this group stays opaque.
+    if word & 0x7fe0_0000 == 0x1ac0_0000 {
+        let kind = match (word >> 10) & 0x3f {
+            8 => Some(VariableShiftKind::Left),
+            9 => Some(VariableShiftKind::LogicalRight),
+            10 => Some(VariableShiftKind::ArithmeticRight),
+            11 => Some(VariableShiftKind::Rotate),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if word & 31 == 31 {
+                return Operation::Discard("shift result discarded in zero register");
+            }
+            let sf = word >> 31 != 0;
+            return Operation::RegisterShift {
+                dst: Register {
+                    index: word & 31,
+                    wide: sf,
+                    stack_pointer: false,
+                },
+                src: Register {
+                    index: (word >> 5) & 31,
+                    wide: sf,
+                    stack_pointer: false,
+                },
+                amount: Register {
+                    index: (word >> 16) & 31,
+                    wide: sf,
+                    stack_pointer: false,
+                },
+                kind,
+            };
+        }
+    }
     // Data-processing (3 source), widening and high-half multiply:
     // `sf 0011011 op31:3 Rm:5 o0:1 Ra:5 Rn:5 Rd:5`. `op31 == 0` (MADD/MSUB) is
     // decoded below; `op31` 001/101 are SMADDL/SMSUBL and UMADDL/UMSUBL, which
@@ -2164,6 +2246,32 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::RegisterShift {
+                dst,
+                src,
+                amount,
+                kind,
+            } => {
+                let known = flow
+                    .read(src)
+                    .zip(flow.read(amount))
+                    .and_then(|(input, shift)| {
+                        Some(KnownValue {
+                            value: dst.mask(kind.fold(input.value, shift.value, dst.wide)),
+                            origins: combine_origins(&input.origins, &shift.origins, pc)?,
+                        })
+                    });
+                flow.write(dst, known.clone());
+                let expression = match kind {
+                    VariableShiftKind::Rotate => format!("ror({}, {})", src.name(), amount.name()),
+                    _ => format!("{} {} {}", src.name(), kind.operator(), amount.name()),
+                };
+                format!(
+                    "{} = {expression};{}",
+                    dst.name(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::WideningMultiply {
                 dst,
                 left,
@@ -2550,7 +2658,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v21; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v22; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3032,6 +3140,103 @@ mod tests {
         assert!(
             report.contains("x0 = x1 sdiv x2; /* constant=0x0 proven_by=[0x1000,0x1004,0x1008] */")
         );
+    }
+
+    #[test]
+    fn lifts_variable_shift_forms() {
+        // Encodings produced by clang for ARM64.
+        // lsl x0, x1, x2 = 0x9ac22020
+        assert_eq!(lift(0x9ac2_2020, 0x1000), "x0 = x1 << x2;");
+        // lsr x0, x1, x2 = 0x9ac22420
+        assert_eq!(lift(0x9ac2_2420, 0x1000), "x0 = x1 >> x2;");
+        // asr x0, x1, x2 = 0x9ac22820
+        assert_eq!(lift(0x9ac2_2820, 0x1000), "x0 = x1 >>> x2;");
+        // ror x0, x1, x2 = 0x9ac22c20
+        assert_eq!(lift(0x9ac2_2c20, 0x1000), "x0 = ror(x1, x2);");
+        // 32-bit forms read the narrow register view.
+        assert_eq!(lift(0x1ac2_2020, 0x1000), "w0 = w1 << w2;");
+        assert_eq!(lift(0x1ac2_2420, 0x1000), "w0 = w1 >> w2;");
+        assert_eq!(lift(0x1ac2_2820, 0x1000), "w0 = w1 >>> w2;");
+        assert_eq!(lift(0x1ac2_2c20, 0x1000), "w0 = ror(w1, w2);");
+        // Operand fields are independent of the destination.
+        // lsl w3, w7, w9 = 0x1ac920e3
+        assert_eq!(lift(0x1ac9_20e3, 0x1000), "w3 = w7 << w9;");
+    }
+
+    #[test]
+    fn variable_shift_into_the_zero_register_is_discarded() {
+        // lsl xzr, x1, x2 = 0x9ac2203f
+        assert!(lift(0x9ac2_203f, 0x1000).contains("discarded"));
+        // asr wzr, w1, w2 = 0x1ac2283f
+        assert!(lift(0x1ac2_283f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn folds_variable_shift_into_constants() {
+        // movz x1, #0x10 ; movz x2, #0x4 ; lsl x0, x1, x2 -> 0x10 << 4 = 0x100
+        let words = [
+            0xd280_0201u32, // movz x1, #0x10 (16)
+            0xd280_0082,    // movz x2, #0x4 (4)
+            0x9ac2_2020,    // lsl x0, x1, x2 -> 0x100
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("x0 = x1 << x2; /* constant=0x100 proven_by=[0x1000,0x1004,0x1008] */")
+        );
+    }
+
+    #[test]
+    fn variable_shift_amount_is_taken_modulo_the_width() {
+        // movz x1, #0xab ; movz x2, #0x40 (64) ; lsl x0, x1, x2 -> 64 % 64 = 0
+        let words = [
+            0xd280_1561u32, // movz x1, #0xab (171)
+            0xd280_0802,    // movz x2, #0x40 (64)
+            0x9ac2_2020,    // lsl x0, x1, x2 -> shift wraps to 0, so 0xab
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("x0 = x1 << x2; /* constant=0xab proven_by=[0x1000,0x1004,0x1008] */")
+        );
+    }
+
+    #[test]
+    fn folds_variable_rotate_into_constants() {
+        // movz x1, #0x1 ; movz x2, #0x4 ; ror x0, x1, x2 -> 0x1 ror 4 = 0x1000000000000000
+        let words = [
+            0xd280_0021u32, // movz x1, #0x1 (1)
+            0xd280_0082,    // movz x2, #0x4 (4)
+            0x9ac2_2c20,    // ror x0, x1, x2
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "x0 = ror(x1, x2); /* constant=0x1000000000000000 proven_by=[0x1000,0x1004,0x1008] */"
+        ));
+    }
+
+    #[test]
+    fn folds_variable_arithmetic_shift_with_sign_propagation() {
+        // movz w1, #0x8000, lsl #16 ; movz w2, #0x4 ; asr w0, w1, w2 -> 0xf8000000
+        let words = [
+            0x52b0_0001u32, // movz w1, #0x8000, lsl #16 (0x80000000)
+            0x5280_0082,    // movz w2, #0x4 (4)
+            0x1ac2_2820,    // asr w0, w1, w2 -> 0xf8000000
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "w0 = w1 >>> w2; /* constant=0xf8000000 proven_by=[0x1000,0x1004,0x1008] */"
+        ));
+    }
+
+    #[test]
+    fn words_outside_the_variable_shift_group_stay_opaque() {
+        // The 2-source group covers opcodes 8-11 (shifts) and 2-3 (divide); an
+        // unallocated opcode such as 0 in the same group stays opaque.
+        // 0x9ac20020: lsl-family with opcode 000000
+        assert!(lift(0x9ac2_0020, 0x1000).contains("opaque instruction"));
     }
 
     #[test]

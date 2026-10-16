@@ -427,14 +427,16 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v21', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v22', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
               'shifted_value', 'render_shifted', 'operand_shift', 'Extract',
               'extract_value', 'Load', 'Store', 'memory_operand', 'memory_access',
               'address_suffix', 'ConditionalSelect', 'ConditionalElse',
+              'RegisterShift', 'VariableShiftKind',
               'word & 0x7fe0_0000 == 0x1b00_0000',
+              'word & 0x7fe0_0000 == 0x1ac0_0000',
               'word & 0x1f80_0000 == 0x1280_0000',
               'word & 0x1f80_0000 == 0x1200_0000',
               'word & 0x1f80_0000 == 0x1300_0000',
