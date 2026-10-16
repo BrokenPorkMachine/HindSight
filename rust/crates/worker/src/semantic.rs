@@ -1260,8 +1260,6 @@ fn decode(word: u32, pc: u64) -> Operation {
     // Data-processing (2 source) division: SDIV (bit 10 = 1) and UDIV (bit 10 = 0)
     // with `sf 0011010110 Rm:5 00001 o0:1 Rn:5 Rd:5`. The middle field
     // (bits 15-11 == 1) identifies the divide class among the 2/3-source group.
-    // This is decoded before the literal-load class because their fixed bits
-    // overlap at bits 29-24; the divide middle field disambiguates them.
     // ARM64 semantics: division by zero yields zero, and INT_MIN / -1 saturates
     // to INT_MIN, so the result is always defined.
     if word & 0x7fe0_0000 == 0x1ac0_0000 && (word >> 11) & 0x1f == 1 {
@@ -1295,9 +1293,7 @@ fn decode(word: u32, pc: u64) -> Operation {
     // read two 32-bit sources and write a 64-bit destination, while 010/110 are
     // SMULH/UMULH, which read two 64-bit sources and write the upper half of
     // their product. `op31` 011/111 are unallocated, and the widening and
-    // high-half encodings are only allocated with `sf == 1`. This block is
-    // decoded before the literal-load class because `op31` 101/110 set the `opc`
-    // bits that the literal forms also use.
+    // high-half encodings are only allocated with `sf == 1`.
     if word & 0x3f00_0000 == 0x1b00_0000 {
         let op31 = (word >> 21) & 7;
         let mode = match op31 {
@@ -1347,64 +1343,49 @@ fn decode(word: u32, pc: u64) -> Operation {
             }
         }
     }
-    // Load literal (PC-relative), V=0:
-    // `size:2 01101 opc:2 imm19:19 Rt:5`. The address is `PC + (sign_extend(imm19) << 2)`.
-    // opc: 1=LDR (zero-extend, dst width follows size), 2=LDRSW (sign-extend 32 to 64),
-    // 3=LDRSB/LDRSH (sign-extend 8/16 to 32). size=3 opc=1 is PRFM (opaque).
-    // Bit 24 is `0` here and `1` in the data-processing (3 source) group
-    // (`size 0011011 ...`), so including it keeps that group out of this class.
-    if word & 0x3f00_0000 == 0x1a00_0000 {
-        let size = (word >> 30) & 3;
-        let opc = (word >> 22) & 3;
-        let imm19 = (word >> 3) & 0x7ffff;
+    // Load register (literal, PC-relative), V=0:
+    // `opc:2 011 V:1 00 imm19:19 Rt:5`, i.e. bits 29-24 == 011000 with V=0.
+    // The address is `PC + (sign_extend(imm19) << 2)`.
+    // opc: 0=LDR (32-bit), 1=LDR (64-bit), 2=LDRSW (sign-extend 32 to 64),
+    // 3=PRFM (prefetch, opaque). There is no LDRSB/LDRSH literal form. Bits 25
+    // and 24 are `0`; the data-processing (3 source) (`0011011`), (2 source)
+    // (`0011010110`), (1 source) (`1011010110`) and conditional-select
+    // (`11010100`) groups all set bit 25, so requiring `011000` keeps them out.
+    if word & 0x3f00_0000 == 0x1800_0000 {
+        let opc = (word >> 30) & 3;
+        let imm19 = (word >> 5) & 0x7ffff;
         let rt = word & 31;
-        // Sign-extend the 19-bit immediate and scale by 2 (shifted by 2 in encoding).
+        // Sign-extend the 19-bit immediate and scale by 4 (shifted by 2 in encoding).
         let offset = (((imm19 << 13) as i32) >> 13) as i64 * 4;
+        let address = AddressForm::Literal(offset);
         let data = |wide: bool| Register {
             index: rt,
             wide,
             stack_pointer: false,
         };
-        let address = AddressForm::Literal(offset);
-        match (size, opc) {
-            (_, 1) => {
-                // LDR: zero-extending
-                if size == 3 {
-                    // PRFM - opaque
-                } else {
-                    // size 0 = 32-bit reg/access, size 1/2 = 64-bit reg/access
-                    let is_64 = size != 0;
-                    let access_size = if is_64 { 3 } else { 2 }; // 64-bit=size3(8bytes), 32-bit=size2(4bytes)
-                    return Operation::Load {
-                        dst: data(is_64),
-                        base: Register::pc(),
-                        address,
-                        size: access_size,
-                        signed: false,
-                    };
-                }
+        match opc {
+            0 | 1 => {
+                // LDR: zero-extending, with destination and access width from opc.
+                let wide = opc == 1;
+                return Operation::Load {
+                    dst: data(wide),
+                    base: Register::pc(),
+                    address,
+                    size: if wide { 3 } else { 2 },
+                    signed: false,
+                };
             }
-            (2, 2) => {
-                // LDRSW: sign-extend 32 to 64, 32-bit access
+            2 => {
+                // LDRSW: sign-extend a 32-bit access into a 64-bit destination.
                 return Operation::Load {
                     dst: data(true),
                     base: Register::pc(),
                     address,
-                    size: 2, // 32-bit access
+                    size: 2,
                     signed: true,
                 };
             }
-            (0..=1, 3) => {
-                // LDRSB (size 0) / LDRSH (size 1): sign-extend to 32
-                let access_size = if size == 0 { 0 } else { 1 }; // 8-bit or 16-bit access
-                return Operation::Load {
-                    dst: data(false), // 32-bit destination
-                    base: Register::pc(),
-                    address,
-                    size: access_size,
-                    signed: true,
-                };
-            }
+            // 3 = PRFM (prefetch) stays opaque.
             _ => {}
         }
     }
@@ -2476,7 +2457,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v19; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v20; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3406,42 +3387,49 @@ mod tests {
 
     #[test]
     fn lifts_literal_loads() {
-        // ldr x0, #0x1000 (pc=0x1000) size=1 (64-bit zero-extend) = 0x5a402000 -> target 0x2000
+        // `opc:2 011 0 00 imm19:19 Rt:5`; bits 29-24 == 011000.
+        // ldr x0, #0x1000 (pc=0x1000) opc=1, imm19=0x400 -> 0x58008000, target 0x2000
         assert_eq!(
-            lift(0x5a40_2000, 0x1000),
+            lift(0x5800_8000, 0x1000),
             "x0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
         );
-        // ldr w0, #0x1000 (pc=0x1000) size=0 (32-bit zero-extend) = 0x1a402000
+        // ldr w0, #0x1000 opc=0 = 0x18008000
         assert_eq!(
-            lift(0x1a40_2000, 0x1000),
+            lift(0x1800_8000, 0x1000),
             "w0 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
         );
-        // ldrsw x0, #0x1000 (pc=0x1000) size=2 opc=2 = 0x9a802000
+        // ldrsw x0, #0x1000 opc=2 = 0x98008000
         assert_eq!(
-            lift(0x9a80_2000, 0x1000),
+            lift(0x9800_8000, 0x1000),
             "x0 = *(s32 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
         );
-        // ldrsb w0, #0x1000 (pc=0x1000) size=0 opc=3 = 0x1ac02000
+        // Register operand: ldr x5, #0x1000 = 0x58008005
         assert_eq!(
-            lift(0x1ac0_2000, 0x1000),
-            "w0 = *(s8 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
+            lift(0x5800_8005, 0x1000),
+            "x5 = *(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
         );
-        // ldrsh w0, #0x1000 (pc=0x1000) size=1 opc=3 = 0x5ac02000
+        // Negative offset: ldr w0, #-0x1000 (pc=0x2000) imm19=-0x400 = 0x18ff8000 -> 0x1000
         assert_eq!(
-            lift(0x5ac0_2000, 0x1000),
-            "w0 = *(s16 *)(pc + 0x1000); /* address=0x2000 proven_by=[0x1000] */"
-        );
-        // Negative offset: ldr w0, #-0x1000 (pc=0x2000) -> target 0x1000
-        // imm19 = -0x400 = 0x7fc00, encoded as 0x1a7fe000
-        assert_eq!(
-            lift(0x1a7f_e000, 0x2000),
+            lift(0x18ff_8000, 0x2000),
             "w0 = *(pc - 0x1000); /* address=0x1000 proven_by=[0x2000] */"
         );
     }
 
     #[test]
+    fn literal_class_does_not_claim_data_processing_words() {
+        // `lsl w0, w0, w0` (data-processing 2 source, `0011010110`) sets bit 25.
+        // The pre-fix mask `011010` mis-decoded it as a literal load; it must not
+        // be rendered as a PC-relative load.
+        let lslv = lift(0x1ac0_2000, 0x1000);
+        assert!(!lslv.contains("pc +") && !lslv.contains("pc -"));
+        // `abs w0, w0` (data-processing 1 source, `1011010110`) likewise.
+        let abs = lift(0x5ac0_2000, 0x1000);
+        assert!(!abs.contains("pc +") && !abs.contains("pc -"));
+    }
+
+    #[test]
     fn prfm_literal_remains_opaque() {
-        // prfm pldl1keep, #0x1000 = size=3 opc=1 = 0xfa402000
-        assert!(lift(0xfa40_2000, 0x1000).contains("opaque instruction"));
+        // prfm pldl1keep, #0x1000 opc=3 = 0xd8008000
+        assert!(lift(0xd800_8000, 0x1000).contains("opaque instruction"));
     }
 }
