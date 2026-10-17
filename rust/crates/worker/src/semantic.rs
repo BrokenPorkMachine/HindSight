@@ -226,6 +226,19 @@ fn compare_flags(kind: IrCompareKind, left: u64, right: u64, wide: bool) -> u8 {
         | overflow as u8
 }
 
+fn scalar_float_compare_flags(left: u64, right: u64, precision: IrFloatPrecision) -> u8 {
+    let ordering = match precision {
+        IrFloatPrecision::Single => f32::from_bits(left as u32).partial_cmp(&f32::from_bits(right as u32)),
+        IrFloatPrecision::Double => f64::from_bits(left).partial_cmp(&f64::from_bits(right)),
+    };
+    match ordering {
+        Some(std::cmp::Ordering::Equal) => 0b0110,
+        Some(std::cmp::Ordering::Less) => 0b1000,
+        Some(std::cmp::Ordering::Greater) => 0b0010,
+        None => 0b0011, // AArch64 unordered: N=0, Z=0, C=1, V=1.
+    }
+}
+
 fn condition_holds(flags: u8, condition: IrFlagPredicate) -> Option<bool> {
     let n = flags & 8 != 0;
     let z = flags & 4 != 0;
@@ -432,7 +445,10 @@ impl IrOperation {
         };
         match self {
             Self::Nop => Some("/* nop */".into()),
-            Self::Marker { mnemonic, domain } => Some(match domain {Some(domain)=>format!("/* {mnemonic} {domain} */"),None=>format!("/* {mnemonic} */")}),
+            Self::Marker { mnemonic, domain } => {
+                if mnemonic == "simd" { flow.v_registers.fill(None); }
+                Some(match domain {Some(domain)=>format!("/* {mnemonic} {domain} */"),None=>format!("/* {mnemonic} */")})
+            },
             Self::Assign { destination, value } => {
                 let destination = destination.target();
                 let known = match value {
@@ -954,23 +970,33 @@ impl IrOperation {
                 Some(statement)
             }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
+                flow.write_v(destination as u32, None);
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let symbol = match operator { IrFloatBinaryOperator::Add => "+", IrFloatBinaryOperator::Subtract => "-", IrFloatBinaryOperator::Multiply => "*", IrFloatBinaryOperator::Divide => "/" };
                 Some(format!("{} = {} {symbol} {};", register(destination), register(left), register(right)))
             }
             Self::ScalarFloatCompare { left, right, precision } => {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let right = right.map(register).unwrap_or_else(|| "#0.0".into());
-                Some(format!("fcmp {}, {right}; /* floating comparison flags not modeled */", register(left)))
+                let right_text = right.map(register).unwrap_or_else(|| "#0.0".into());
+                let left_value = flow.read_v(left as u32).map(|value| value.value as u64);
+                let right_value = right.map(|index| flow.read_v(index as u32).map(|value| value.value as u64)).unwrap_or(Some(0));
+                flow.flags = left_value.zip(right_value).map(|(left, right)| scalar_float_compare_flags(left, right, precision));
+                Some(format!("fcmp {}, {right_text}; /* floating comparison flags modeled when operands are known */", register(left)))
             }
             Self::ScalarFloatConvert { destination, destination_precision, source, source_precision } => {
+                flow.write_v(destination as u32, None);
                 let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 Some(format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source)))
             }
             Self::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
+                match destination {
+                    IrConversionRegister::Float { index, .. } => flow.write_v(index as u32, None),
+                    IrConversionRegister::Integer { index, wide } => flow.write(Register { index: index as u32, wide, stack_pointer: false }, None),
+                }
                 Some(render_int_float_conversion(destination, source, signed, fractional_bits))
             }
             Self::FloatLoad { destination, address, bytes, writeback } => {
+                flow.write_v(destination.index as u32, None);
                 let (expression, known) = match address {
                     IrMemoryAddress::BaseOffset { base, offset } => {
                         let base = base.target();
@@ -5271,6 +5297,7 @@ impl Operation {
                 statement
             }
             Self::FloatLoad { destination, base, address, size } => {
+                flow.write_v(destination.index as u32, None);
                 let resolution = resolve_address(flow, &base, &address, pc);
                 let ty = if size == 2 { "float" } else { "double" };
                 let mut statement = String::new();
@@ -5440,9 +5467,12 @@ impl Operation {
                     format!("{op}({}, {});", base.name(), src.name())
                 }
             }
-            Self::SystemMarker { mnemonic, domain } => match domain {
-                Some(domain) => format!("/* {mnemonic} {domain} */"),
-                None => format!("/* {mnemonic} */"),
+            Self::SystemMarker { mnemonic, domain } => {
+                if mnemonic == "simd" { flow.v_registers.fill(None); }
+                match domain {
+                    Some(domain) => format!("/* {mnemonic} {domain} */"),
+                    None => format!("/* {mnemonic} */"),
+                }
             },
             Self::Mrs {
                 dst,
@@ -5544,20 +5574,29 @@ impl Operation {
                 format!("/* fmov.{} v{}, #imm */", arrangement, vd)
             }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
+                flow.write_v(destination as u32, None);
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let symbol = match operator { IrFloatBinaryOperator::Add => "+", IrFloatBinaryOperator::Subtract => "-", IrFloatBinaryOperator::Multiply => "*", IrFloatBinaryOperator::Divide => "/" };
                 format!("{} = {} {symbol} {};", register(destination), register(left), register(right))
             }
             Self::ScalarFloatCompare { left, right, precision } => {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let right = right.map(register).unwrap_or_else(|| "#0.0".into());
-                format!("fcmp {}, {right}; /* floating comparison flags not modeled */", register(left))
+                let right_text = right.map(register).unwrap_or_else(|| "#0.0".into());
+                let left_value = flow.read_v(left as u32).map(|value| value.value as u64);
+                let right_value = right.map(|index| flow.read_v(index as u32).map(|value| value.value as u64)).unwrap_or(Some(0));
+                flow.flags = left_value.zip(right_value).map(|(left, right)| scalar_float_compare_flags(left, right, precision));
+                format!("fcmp {}, {right_text}; /* floating comparison flags modeled when operands are known */", register(left))
             }
             Self::ScalarFloatConvert { destination, destination_precision, source, source_precision } => {
+                flow.write_v(destination as u32, None);
                 let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source))
             }
             Self::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
+                match destination {
+                    IrConversionRegister::Float { index, .. } => flow.write_v(index as u32, None),
+                    IrConversionRegister::Integer { index, wide } => flow.write(Register { index: index as u32, wide, stack_pointer: false }, None),
+                }
                 render_int_float_conversion(destination, source, signed, fractional_bits)
             }
             Self::Exception { mnemonic, imm } => {
@@ -5741,7 +5780,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v40; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v41; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -6007,7 +6046,7 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, render, Flow};
+    use super::{decode, render, scalar_float_compare_flags, Flow, IrFloatPrecision};
 
     fn lift(word: u32, pc: u64) -> String {
         decode(word, pc).render(&mut Flow::new(), pc)
@@ -6045,8 +6084,8 @@ mod tests {
     #[test]
     fn scalar_float_compare_lifts_without_claiming_integer_flag_semantics() {
         let cases = [
-            (0x1e62_2020, "fcmp d1, d2; /* floating comparison flags not modeled */"),
-            (0x1e20_2068, "fcmp s3, #0.0; /* floating comparison flags not modeled */"),
+            (0x1e62_2020, "fcmp d1, d2; /* floating comparison flags modeled when operands are known */"),
+            (0x1e20_2068, "fcmp s3, #0.0; /* floating comparison flags modeled when operands are known */"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
@@ -6055,6 +6094,26 @@ mod tests {
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("target-specific"), "{report}");
         }
+    }
+
+    #[test]
+    fn scalar_float_compare_flags_match_aarch64_nzcv_and_prune_known_branch() {
+        assert_eq!(scalar_float_compare_flags(0.0f64.to_bits(), 0.0f64.to_bits(), IrFloatPrecision::Double), 0b0110);
+        assert_eq!(scalar_float_compare_flags(1.0f64.to_bits(), 0.0f64.to_bits(), IrFloatPrecision::Double), 0b0010);
+        assert_eq!(scalar_float_compare_flags((-1.0f64).to_bits(), 0.0f64.to_bits(), IrFloatPrecision::Double), 0b1000);
+        assert_eq!(scalar_float_compare_flags(f64::NAN.to_bits(), 0.0f64.to_bits(), IrFloatPrecision::Double), 0b0011);
+
+        let words = [0x6f00_e400, 0x1e60_2008, 0x5400_0040, 0xd280_0020, 0xd280_0040, 0xd65f_03c0];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("fcmp d0, #0.0; /* floating comparison flags modeled when operands are known */"), "{report}");
+        assert!(report.contains("if (eq) goto 0x1010; /* condition proven true */"), "{report}");
+
+        let overwritten = [0x6f00_e400, 0x1e62_4020, 0x1e60_2008, 0x5400_0040, 0xd280_0020, 0xd280_0040, 0xd65f_03c0];
+        let code: Vec<u8> = overwritten.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("if (eq) goto 0x1014; //"), "{report}");
+        assert!(!report.contains("if (eq) goto 0x1014; /* condition proven true */"), "{report}");
     }
 
     #[test]
