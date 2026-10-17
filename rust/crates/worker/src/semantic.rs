@@ -393,6 +393,7 @@ enum IrOperation {
     StorePair { address: IrMemoryAddress, first: IrRegister, second: IrRegister, bytes: u8, writeback: Option<IrWriteback> },
     AtomicLoad { destination: IrRegister, address: IrMemoryAddress, bytes: u8, ordering: IrAtomicOrdering, exclusive: bool },
     AtomicStore { status: Option<IrRegister>, address: IrMemoryAddress, value: IrRegister, bytes: u8, ordering: IrAtomicOrdering, exclusive: bool },
+    ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
     ScalarFloatBinary { destination: u8, left: u8, right: u8, precision: IrFloatPrecision, operator: IrFloatBinaryOperator },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
@@ -427,6 +428,7 @@ impl IrOperation {
             | Self::Insert { .. } | Self::Load { .. } | Self::Store { .. }
             | Self::LoadPair { .. } | Self::StorePair { .. }
             | Self::AtomicLoad { .. } | Self::AtomicStore { .. }
+            | Self::ScalarFloatMove { .. }
             | Self::ScalarFloatBinary { .. }
             | Self::FloatLoad { .. } | Self::FloatStore { .. }
         );
@@ -968,6 +970,16 @@ impl IrOperation {
                 let value=value.target();let operation=if exclusive{"exclusive_store"}else{"atomic_store"};let ordering=match ordering{IrAtomicOrdering::Relaxed=>"relaxed",IrAtomicOrdering::Acquire=>"acquire",IrAtomicOrdering::Release=>"release"};
                 let statement=if let Some(status)=status.map(IrRegister::target){flow.write(status,None);format!("{} = {operation}_{ordering}{}({base}, {});{address_suffix_text}",status.name(),size_suffix(bytes.trailing_zeros()),value.name())}else{format!("{operation}_{ordering}{}({base}, {});{address_suffix_text}",size_suffix(bytes.trailing_zeros()),value.name())};
                 Some(statement)
+            }
+            Self::ScalarFloatMove { destination, source, precision } => {
+                let source_value = flow.read_v(source as u32);
+                let known = source_value.and_then(|value| {
+                    let bits = match precision { IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value as u64 };
+                    Some(VKnownValue { value: bits as u128, origins: combine_origins(&value.origins, &[], pc)? })
+                });
+                flow.write_v(destination as u32, known.clone());
+                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                Some(format!("{} = {};{}", register(destination), register(source), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default()))
             }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
                 flow.write_v(destination as u32, None);
@@ -2119,6 +2131,7 @@ enum Operation {
         precision: IrFloatPrecision,
         operator: IrFloatBinaryOperator,
     },
+    ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -2354,6 +2367,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
             ordering: if exclusive { if acquire { IrAtomicOrdering::Release } else { IrAtomicOrdering::Relaxed } } else { IrAtomicOrdering::Release }, exclusive,
         },
         Operation::ScalarFloatBinary { destination, left, right, precision, operator } => IrOperation::ScalarFloatBinary { destination, left, right, precision, operator },
+        Operation::ScalarFloatMove { destination, source, precision } => IrOperation::ScalarFloatMove { destination, source, precision },
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
         Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
@@ -4061,6 +4075,20 @@ fn decode(word: u32, pc: u64) -> Operation {
             source_precision,
         };
     }
+    // Scalar FMOV register copies preserve the exact low-lane bits and
+    // provenance while invalidating any stale destination value on failure.
+    let scalar_float_move = match word & 0xffff_fc00 {
+        0x1e20_4000 => Some(IrFloatPrecision::Single),
+        0x1e60_4000 => Some(IrFloatPrecision::Double),
+        _ => None,
+    };
+    if let Some(precision) = scalar_float_move {
+        return Operation::ScalarFloatMove {
+            destination: (word & 31) as u8,
+            source: ((word >> 5) & 31) as u8,
+            precision,
+        };
+    }
     // Scalar fixed-point integer/FP conversions. The encoded imm6 is 64-fbits;
     // 32-bit forms additionally require fbits <= 32. Keep rounding and overflow
     // behavior explicit in the rendered expression/comment.
@@ -5599,6 +5627,16 @@ impl Operation {
                 flow.write_v(vd as u32, None);
                 format!("/* fmov.{} v{}, #imm */", arrangement, vd)
             }
+            Self::ScalarFloatMove { destination, source, precision } => {
+                let source_value = flow.read_v(source as u32);
+                let known = source_value.and_then(|value| {
+                    let bits = match precision { IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value as u64 };
+                    Some(VKnownValue { value: bits as u128, origins: combine_origins(&value.origins, &[], pc)? })
+                });
+                flow.write_v(destination as u32, known.clone());
+                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                format!("{} = {};{}", register(destination), register(source), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default())
+            }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
                 flow.write_v(destination as u32, None);
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
@@ -5829,7 +5867,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v43; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v44; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);

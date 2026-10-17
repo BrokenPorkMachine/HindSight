@@ -1133,7 +1133,7 @@ fn recover_internal(
         assert!(call.starts_with("take_values(0.0, d1);"), "{call}");
         assert!(call.contains("constant argument evidence: ratio(s0)=0.0 proven_by=[0x1000]"), "{call}");
 
-        let overwritten = [0x6f00_e400u32, 0x1e204000u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let overwritten = [0x6f00_e400u32, 0x1e202800u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &overwritten, 0x1000, false, &BTreeMap::new());
         assert!(call.starts_with("take_values(s0, d1);"), "{call}");
         assert!(call.contains("no argument constants proven"), "{call}");
@@ -1152,6 +1152,13 @@ fn recover_internal(
         let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
         assert!(call.starts_with("take_ratio(0.0);"), "{call}");
         assert!(call.contains("constant argument evidence: ratio(s0)=0.0 proven_by=[0x1000,0x1004]"), "{call}");
+
+        let signature = Signature { language: "C", declaration: "void take_copy(double spare, double value);".into(), source: "test prototype" };
+        let signatures = BTreeMap::from([(0x2000, ("_take_copy".into(), signature))]);
+        let instructions = [0xd280_0009u32, 0x9e67_0120u32, 0x1e60_4001u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("take_copy(0.0, 0.0);"), "{call}");
+        assert!(call.contains("value(d1)=0.0 proven_by=[0x1000,0x1004,0x1008]"), "{call}");
     }
     #[test] fn resolved_indirect_calls_use_only_function_signature_evidence() {
         let signature = symbol("_CFRelease").unwrap();

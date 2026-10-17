@@ -28,7 +28,7 @@ def test_triage_exposes_focus_pinned_recent_and_changes():
 
 
 def test_change_tracking_is_explicitly_nonsemantic_and_engine_stable():
-    assert 'arm64-analysis-v77-schema120' in CONT
+    assert 'arm64-analysis-v78-schema121' in CONT
     assert 'continuity signal, not semantic diffing' in NAV
     assert 'vgContinuityFingerprint' in CONT
     assert 'sourceSHA256' in CONT

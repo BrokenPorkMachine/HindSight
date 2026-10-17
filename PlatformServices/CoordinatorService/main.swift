@@ -139,7 +139,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let firmwareLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.firmware", qos: .utility, maxConcurrent: 1, maxPending: 16, reservationBytes: 192 * 1_048_576)
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
     private let reaLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.rea", qos: .utility, maxConcurrent: 1, maxPending: 4, reservationBytes: 128 * 1_048_576)
-    private let analysisCacheEngineVersion = "arm64-analysis-v77-schema120"
+    private let analysisCacheEngineVersion = "arm64-analysis-v78-schema121"
     private let analysisCacheProducerVersion = "0.5.11"
     private let compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]
     func capabilities(withReply reply: @escaping (String) -> Void) {
