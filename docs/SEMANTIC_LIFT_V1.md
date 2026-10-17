@@ -22,6 +22,7 @@ and high-half multiplies (`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` with their
 one-source bit/byte reversals and leading-bit counts
 (`RBIT`/`REV16`/`REV`/`REV32`/`CLZ`/`CLS`),
 concatenated field extract (`EXTR` with its same-register `ROR` immediate alias),
+flag-neutral add/subtract with carry (`ADC`/`SBC`),
 bitfield extracts (`UBFX`/`SBFX`), conditional select
 (`CSEL`/`CSINC`/`CSINV`/`CSNEG` and their `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG`
 aliases), general-register loads and stores (`STR`/`LDR`
@@ -33,7 +34,7 @@ explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
 ranges. Output is bounded to eight functions and 128 words per function. The
 structural backend emits an empty field. The cache engine identity advances to
 `arm64-analysis-v19-schema72` so reports from older workers are not reused as if
-they contained semantic output. The move-wide, logical, shift, one-source, extract, multiply, extend,
+they contained semantic output. The move-wide, logical, shift, one-source, extract, add-with-carry, multiply, extend,
 bitfield, conditional-select, memory, address, and control-flow extensions stay
 inside that `v19`/72-field contract:
 they only refine instructions earlier builds marked opaque, so a cached report
@@ -41,7 +42,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v24` banner identifies the statement set that
+`AArch64 register semantics v25` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -98,7 +99,14 @@ field at `lsb` from the pair `left:right`, and collapses to
 `dst = ror(src, lsb);` when both sources are the same register (the `ROR`
 immediate alias). It folds with provenance, and for a 32-bit register `lsb` is
 bounded to 0..31 (a set bit 15 stays opaque); the encoding's `N == sf` and
-`o0 == 0` requirements are enforced. The same `op31` group
+`o0 == 0` requirements are enforced. The flag-neutral add/subtract with carry
+renders `dst = left + right + carry;` for `ADC` and `dst = left + ~right + carry;`
+for `SBC` (the architecture adds the inverted operand with carry). Because the
+carry input is `PSTATE.C`, which the preview does not track, the destination is
+always an unknown barrier: the shape is rendered but no constant is ever folded,
+and the write invalidates any previously tracked value of the destination. The
+flag-setting `ADCS`/`SBCS` forms (`S == 1`), like `ADDS`/`SUBS`, stay opaque, as
+do the conditional compares that share the class. The same `op31` group
 also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
@@ -203,7 +211,10 @@ the group stays opaque. A synthetic `EXTR`/`ROR`-immediate sequence asserts each
 rendered form and its exact word, the same-register rotate collapse, folded
 extracts (including an `lsb == 0` fold whose provenance omits the unused source)
 and rotates, and that an `N != sf` word and a 32-bit word with `imms == 32` stay
-opaque. A
+opaque. A synthetic `ADC`/`SBC` sequence asserts each rendered form (including
+the `SBC` inverted-operand shape) and its exact word, that known operands still
+never fold a constant, that a zero-register destination is discarded, and that
+the flag-setting `ADCS`/`SBCS` and the conditional-compare forms stay opaque. A
 synthetic `SMULL`/`UMULL`/`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL`/`SMULH`/`UMULH`
 sequence asserts each rendered form, the exact multiply words verified against
 `clang -arch arm64`, folded products and quotients with `proven_by` addresses, and

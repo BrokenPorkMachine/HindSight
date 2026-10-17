@@ -424,12 +424,14 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # sign-extending forms), multiply-add (MADD/MSUB/MUL/MNEG), conditional
 # select (CSEL/CSINC/CSINV/CSNEG), the register-defined variable shifts
 # (LSLV/LSRV/ASRV/RORV), the one-source family (RBIT/REV16/REV/REV32/CLZ/CLS),
-# and the extract/rotate-immediate family (EXTR and its ROR alias)
+# the extract/rotate-immediate family (EXTR and its ROR alias), and the
+# flag-neutral add/subtract with carry (ADC/SBC, whose carry input stays a
+# symbolic barrier)
 # as provenance-carrying constants and barriers without changing the 72-field
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v24', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v25', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -438,6 +440,7 @@ for token in ['AArch64 register semantics v24', 'MoveNot', 'MoveKeep', 'MoveZero
               'address_suffix', 'ConditionalSelect', 'ConditionalElse',
               'RegisterShift', 'VariableShiftKind', 'OneSource', 'OneSourceKind',
               'ExtractConcat', 'extract_class', '0x13c0_0000', '0x1380_0000',
+              'AddCarry', 'word & 0x3fe0_fc00 == 0x1a00_0000',
               'word & 0x7fe0_0000 == 0x1b00_0000',
               'word & 0x7fe0_0000 == 0x1ac0_0000',
               'word & 0x7fff_0000 == 0x5ac0_0000',

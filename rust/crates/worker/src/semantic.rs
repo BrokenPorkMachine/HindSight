@@ -580,6 +580,17 @@ enum Operation {
         right: Register,
         lsb: u8,
     },
+    /// Add/subtract with carry (`ADC`/`SBC`). The carry input is PSTATE.C,
+    /// which the preview does not track, so the destination is always an
+    /// unknown barrier and only the shape is rendered: `dst = left + right +
+    /// carry;` for the add form and `dst = left + ~right + carry;` for the
+    /// subtract form.
+    AddCarry {
+        dst: Register,
+        left: Register,
+        right: Register,
+        subtract: bool,
+    },
     /// Widening and high-half multiply from the 3-source group:
     /// `SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` (with their `SMULL`/`UMULL`
     /// zero-addend aliases, which multiply two 32-bit sources into a 64-bit
@@ -842,6 +853,39 @@ fn decode(word: u32, pc: u64) -> Operation {
                 shift: operand_shift(shift, amount),
             };
         }
+    }
+    // Add/subtract (with carry): `sf op S 11010000 Rm op2 00000 Rn Rd`. With
+    // op2 (bit 15) clear and S == 0 this is ADC (op=0) or SBC (op=1). The
+    // carry input is PSTATE.C, which the preview does not track, so the
+    // destination is an unknown barrier and only the shape is rendered. The
+    // flag-setting ADCS/SBCS forms (S == 1) and the conditional-compare forms
+    // stay opaque, matching the flag-neutral ADD/SUB rule.
+    if word & 0x3fe0_fc00 == 0x1a00_0000 {
+        let wide = word >> 31 != 0;
+        let rd = word & 31;
+        let rn = (word >> 5) & 31;
+        let rm = (word >> 16) & 31;
+        if rd == 31 {
+            return Operation::Discard("arithmetic result discarded in zero register");
+        }
+        return Operation::AddCarry {
+            dst: Register {
+                index: rd,
+                wide,
+                stack_pointer: false,
+            },
+            left: Register {
+                index: rn,
+                wide,
+                stack_pointer: false,
+            },
+            right: Register {
+                index: rm,
+                wide,
+                stack_pointer: false,
+            },
+            subtract: word & (1 << 30) != 0,
+        };
     }
     // Logical (immediate): flag-neutral AND/ORR/EOR with a bitmask immediate.
     // ANDS is excluded because flag effects are not modeled, and reserved
@@ -2493,6 +2537,26 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::AddCarry {
+                dst,
+                left,
+                right,
+                subtract,
+            } => {
+                // The carry input is PSTATE.C, which the preview does not
+                // track, so the result is always an unknown barrier and only
+                // the shape is rendered.
+                flow.write(dst, None);
+                let expression = if subtract {
+                    // SBC is `left + ~right + carry` in the architecture
+                    // pseudocode (it is an add-with-carry of the inverted
+                    // operand).
+                    format!("{} + ~{} + carry", left.name(), right.name())
+                } else {
+                    format!("{} + {} + carry", left.name(), right.name())
+                };
+                format!("{} = {expression};", dst.name())
+            }
             Self::WideningMultiply {
                 dst,
                 left,
@@ -2879,7 +2943,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v24; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v25; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3621,6 +3685,51 @@ mod tests {
         // 32-bit `imms` is bounded to 0..31; imms = 32 stays opaque.
         // extr w0, w1, w2, #32 = 0x13828020
         assert!(lift(0x1382_8020, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_add_with_carry_forms() {
+        // Encodings produced by clang for ARM64. The carry input is PSTATE.C,
+        // which is not tracked, so no constant is claimed.
+        // adc x0, x1, x2 = 0x9a020020
+        assert_eq!(lift(0x9a02_0020, 0x1000), "x0 = x1 + x2 + carry;");
+        // sbc x0, x1, x2 = 0xda020020
+        assert_eq!(lift(0xda02_0020, 0x1000), "x0 = x1 + ~x2 + carry;");
+        // adc w0, w1, w2 = 0x1a020020
+        assert_eq!(lift(0x1a02_0020, 0x1000), "w0 = w1 + w2 + carry;");
+        // sbc w3, w4, w5 = 0x5a050083
+        assert_eq!(lift(0x5a05_0083, 0x1000), "w3 = w4 + ~w5 + carry;");
+    }
+
+    #[test]
+    fn carry_into_the_zero_register_is_discarded() {
+        // adc xzr, x1, x2 = 0x9a02003f
+        assert!(lift(0x9a02_003f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn add_with_carry_never_folds_a_constant() {
+        // movz x1, #1 ; movz x2, #2 ; adc x0, x1, x2 -- the operands are known
+        // but the carry input is not, so the result stays an unknown barrier.
+        let words = [0xd280_0021u32, 0xd280_0042, 0x9a02_0020];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = x1 + x2 + carry;"));
+        assert!(!report.contains("constant="));
+    }
+
+    #[test]
+    fn flag_setting_carry_and_conditional_compare_forms_stay_opaque() {
+        // ADCS/SBCS set flags (S == 1), like ADDS/SUBS.
+        // adcs x0, x1, x2 = 0xba020020
+        assert!(lift(0xba02_0020, 0x1000).contains("opaque instruction"));
+        // sbcs x0, x1, x2 = 0xfa020020
+        assert!(lift(0xfa02_0020, 0x1000).contains("opaque instruction"));
+        // Conditional compare shares the class but sets bits 28-21 = 11010010.
+        // ccmp x1, x2, #0, eq = 0xfa420020
+        assert!(lift(0xfa42_0020, 0x1000).contains("opaque instruction"));
+        // ccmn x1, x2, #0, eq = 0xba420020
+        assert!(lift(0xba42_0020, 0x1000).contains("opaque instruction"));
     }
 
     #[test]
