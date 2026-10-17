@@ -414,6 +414,16 @@ fn operand_shift(selector: u32, amount: u8) -> Option<(ShiftKind, u8)> {
     }
 }
 
+/// Mnemonic suffix for a load/store access width: `b` for a byte (`size` 0),
+/// `h` for a halfword (`size` 1), and empty for the word/dword forms.
+fn size_suffix(size: u32) -> &'static str {
+    match size {
+        0 => "b",
+        1 => "h",
+        _ => "",
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Writeback {
     /// Unscaled immediate (`LDUR`/`STUR`): address is `base + offset`, no writeback.
@@ -694,6 +704,33 @@ enum Operation {
         offset: i64,
         writeback: Writeback,
         size: u32,
+    },
+    /// Load/store exclusive and acquire/release, from the exclusive group
+    /// (`LDXR`/`STXR`/`LDAXR`/`STLXR` and the ordered `LDAR`/`STLR`). The
+    /// address is the base register alone. `exclusive` is true for the `-XR`
+    /// reservation forms and `acquire` for the acquire bit (`LDAXR`/`STLXR`);
+    /// the ordered `LDAR`/`STLR` set `exclusive` false. The mnemonic encodes the
+    /// access width, which is also reflected in the data register's view.
+    LoadAtomic {
+        dst: Register,
+        base: Register,
+        /// Log2 of the memory access width in bytes (`size` field, 0..=3); the
+        /// `b`/`h` mnemonic suffix is derived from it.
+        size: u32,
+        exclusive: bool,
+        acquire: bool,
+    },
+    StoreAtomic {
+        base: Register,
+        /// The `-XR` forms write the success status into `Rs`; the ordered
+        /// `STLR` has no status register.
+        status: Option<Register>,
+        src: Register,
+        /// Log2 of the memory access width in bytes (`size` field, 0..=3); the
+        /// `b`/`h` mnemonic suffix is derived from it.
+        size: u32,
+        exclusive: bool,
+        acquire: bool,
     },
     Discard(&'static str),
     Opaque,
@@ -1211,6 +1248,80 @@ fn decode(word: u32, pc: u64) -> Operation {
                 };
             }
         }
+    }
+    // Load/store exclusive and acquire/release, V=0:
+    // `size:2 001000 o2:1 L:1 Rs:5 o1:1 Rn:5 Rt:5`. The ordered `LDAR`/`STLR`
+    // (o2=1, Rs=11111) and the single-register exclusive
+    // `LDXR`/`STXR`/`LDAXR`/`STLXR` (o2=0, o1=0, Rt2=11111, bit 15 acquire).
+    // The address is the base register alone. The pair forms (o1=1) stay opaque.
+    if word & 0x3fbffc00 == 0x089ffc00 {
+        let size = (word >> 30) & 3;
+        let wide = size == 3;
+        let load = word & 0x0040_0000 != 0;
+        let base = Register {
+            index: (word >> 5) & 31,
+            wide: true,
+            stack_pointer: false,
+        };
+        let data = Register {
+            index: word & 31,
+            wide,
+            stack_pointer: false,
+        };
+        if load {
+            return Operation::LoadAtomic {
+                dst: data,
+                base,
+                size,
+                exclusive: false,
+                acquire: true,
+            };
+        }
+        return Operation::StoreAtomic {
+            base,
+            status: None,
+            src: data,
+            size,
+            exclusive: false,
+            acquire: false,
+        };
+    }
+    if word & 0x3fa07c00 == 0x08007c00 {
+        let size = (word >> 30) & 3;
+        let wide = size == 3;
+        let load = word & 0x0040_0000 != 0;
+        let acquire = word & 0x0000_8000 != 0;
+        let base = Register {
+            index: (word >> 5) & 31,
+            wide: true,
+            stack_pointer: false,
+        };
+        let data = Register {
+            index: word & 31,
+            wide,
+            stack_pointer: false,
+        };
+        if load {
+            return Operation::LoadAtomic {
+                dst: data,
+                base,
+                size,
+                exclusive: true,
+                acquire,
+            };
+        }
+        return Operation::StoreAtomic {
+            base,
+            status: Some(Register {
+                index: (word >> 16) & 31,
+                wide: false,
+                stack_pointer: false,
+            }),
+            src: data,
+            size,
+            exclusive: true,
+            acquire,
+        };
     }
     // Load/store register (unsigned immediate), V=0:
     // `size:2 111 V:1 01 opc:2 imm12:12 Rn:5 Rt:5`. The general-register forms
@@ -3030,6 +3141,59 @@ impl Operation {
                 }
                 statement
             }
+            Self::LoadAtomic {
+                dst,
+                base,
+                size,
+                exclusive,
+                acquire,
+            } => {
+                let op = if exclusive {
+                    if acquire {
+                        "ldaxr"
+                    } else {
+                        "ldxr"
+                    }
+                } else {
+                    "ldar"
+                };
+                // The loaded value is not known: the destination becomes an
+                // unknown barrier while the base address register is preserved.
+                flow.write(dst, None);
+                format!(
+                    "{} = {op}{}({});",
+                    dst.name(),
+                    size_suffix(size),
+                    base.name()
+                )
+            }
+            Self::StoreAtomic {
+                base,
+                status,
+                src,
+                size,
+                exclusive,
+                acquire,
+            } => {
+                let op = if exclusive {
+                    if acquire {
+                        "stlxr"
+                    } else {
+                        "stxr"
+                    }
+                } else {
+                    "stlr"
+                };
+                let op = format!("{op}{}", size_suffix(size));
+                if let Some(status) = status {
+                    // The exclusive store reports success in the status register;
+                    // the value (0 or 1) is not known, so it becomes a barrier.
+                    flow.write(status, None);
+                    format!("{} = {op}({}, {});", status.name(), base.name(), src.name())
+                } else {
+                    format!("{op}({}, {});", base.name(), src.name())
+                }
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -3049,7 +3213,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v26; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v27; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -4542,5 +4706,86 @@ mod tests {
         assert_eq!(lift(0x9a95_028a, 0x1000), "x10 = eq ? x20 : x21;"); // conditional select
         assert_eq!(lift(0xf862_6820, 0x1000), "x0 = *(x1 + x2);"); // register-offset load
         assert_eq!(lift(0x93c2_1020, 0x1000), "x0 = extr(x1, x2, 4);"); // concatenated extract
+    }
+
+    #[test]
+    fn lifts_exclusive_load_store() {
+        // Encodings produced by clang for ARM64. The access width is named by
+        // the `b`/`h` mnemonic suffix and the data register's view.
+        // ldxr x0, [x1] = 0xc85f7c20
+        assert_eq!(lift(0xc85f_7c20, 0x1000), "x0 = ldxr(x1);");
+        // ldxr w0, [x1] = 0x885f7c20
+        assert_eq!(lift(0x885f_7c20, 0x1000), "w0 = ldxr(x1);");
+        // ldxrb w0, [x1] = 0x085f7c20
+        assert_eq!(lift(0x085f_7c20, 0x1000), "w0 = ldxrb(x1);");
+        // ldxrh w0, [x1] = 0x485f7c20
+        assert_eq!(lift(0x485f_7c20, 0x1000), "w0 = ldxrh(x1);");
+        // stxr w2, x0, [x1] = 0xc8027c20 (status register w2 becomes unknown)
+        assert_eq!(lift(0xc802_7c20, 0x1000), "w2 = stxr(x1, x0);");
+        // stxr w2, w0, [x1] = 0x88027c20
+        assert_eq!(lift(0x8802_7c20, 0x1000), "w2 = stxr(x1, w0);");
+        // stxrb w2, w0, [x1] = 0x08027c20
+        assert_eq!(lift(0x0802_7c20, 0x1000), "w2 = stxrb(x1, w0);");
+        // stxrh w2, w0, [x1] = 0x48027c20
+        assert_eq!(lift(0x4802_7c20, 0x1000), "w2 = stxrh(x1, w0);");
+    }
+
+    #[test]
+    fn lifts_acquire_release_and_exclusive_acquire_forms() {
+        // ldaxr x0, [x1] = 0xc85ffc20
+        assert_eq!(lift(0xc85f_fc20, 0x1000), "x0 = ldaxr(x1);");
+        // ldaxrb w0, [x1] = 0x085ffc20
+        assert_eq!(lift(0x085f_fc20, 0x1000), "w0 = ldaxrb(x1);");
+        // ldaxrh w0, [x1] = 0x485ffc20
+        assert_eq!(lift(0x485f_fc20, 0x1000), "w0 = ldaxrh(x1);");
+        // stlxr w2, x0, [x1] = 0xc802fc20
+        assert_eq!(lift(0xc802_fc20, 0x1000), "w2 = stlxr(x1, x0);");
+        // stlxrb w2, w0, [x1] = 0x0802fc20
+        assert_eq!(lift(0x0802_fc20, 0x1000), "w2 = stlxrb(x1, w0);");
+        // ldar x0, [x1] = 0xc8dffc20 (ordered acquire, not exclusive)
+        assert_eq!(lift(0xc8df_fc20, 0x1000), "x0 = ldar(x1);");
+        // ldar x0, [x1] byte/halfword
+        assert_eq!(lift(0x08df_fc20, 0x1000), "w0 = ldarb(x1);");
+        assert_eq!(lift(0x48df_fc20, 0x1000), "w0 = ldarh(x1);");
+        // stlr x0, [x1] = 0xc89ffc20 (ordered release, no status register)
+        assert_eq!(lift(0xc89f_fc20, 0x1000), "stlr(x1, x0);");
+        assert_eq!(lift(0x089f_fc20, 0x1000), "stlrb(x1, w0);");
+        assert_eq!(lift(0x489f_fc20, 0x1000), "stlrh(x1, w0);");
+    }
+
+    #[test]
+    fn exclusive_load_defines_its_destination_as_a_barrier() {
+        // movz x0, #0x80 ; ldxr x0, [x1] ; add x2, x0, x0 -> the load replaces
+        // x0 with an unknown value, so the following add must not fold x0.
+        let words = [0xd280_1000u32, 0xc85f_7c20, 0x8b00_0002];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = ldxr(x1);"));
+        assert!(report.contains("x2 = x0 + x0;"));
+        assert!(!report.contains("constant=0x100"));
+    }
+
+    #[test]
+    fn exclusive_store_reports_status_as_a_barrier() {
+        // movz w2, #7 ; stxr w2, x0, [x1] -> w2 is overwritten by the status,
+        // so any later use of w2 must not fold the earlier constant 7.
+        let words = [0x5280_00e2u32, 0xc802_7c20, 0x0b02_0043];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("w2 = stxr(x1, x0);"));
+        assert!(!report.contains("constant=0x7"));
+    }
+
+    #[test]
+    fn ordered_and_pair_exclusive_forms_outside_the_model_stay_opaque() {
+        // The exclusive pair forms (o1=1) are not modeled.
+        // ldxp x0, x2, [x1] = 0xc87f0820
+        assert!(lift(0xc87f_0820, 0x1000).contains("opaque instruction"));
+        // stxp w3, x0, x2, [x1] = 0xc8230820
+        assert!(lift(0xc823_0820, 0x1000).contains("opaque instruction"));
+        // ldaxp x0, x2, [x1] = 0xc87f8820
+        assert!(lift(0xc87f_8820, 0x1000).contains("opaque instruction"));
+        // stlxp w3, x0, x2, [x1] = 0xc8238820
+        assert!(lift(0xc823_8820, 0x1000).contains("opaque instruction"));
     }
 }

@@ -30,6 +30,8 @@ bitfield extracts (`UBFX`/`SBFX`), conditional select
 aliases), general-register loads and stores (`STR`/`LDR`
 and their byte/halfword and sign-extending forms with a scaled unsigned
 immediate offset or with register-offset `[base, index, extend/shift]`),
+the exclusive and acquire/release loads and stores
+(`LDXR`/`STXR`/`LDAXR`/`STLXR` and the ordered `LDAR`/`STLR`),
 PC-relative `ADR`/`ADRP`, direct `B`/`BL`, conditional and indirect control flow
 (`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`), `RET`, and `NOP`. It emits an
 explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
@@ -44,7 +46,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v26` banner identifies the statement set that
+`AArch64 register semantics v27` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -169,7 +171,17 @@ data-processing (1 source)/(2 source)/(3 source) and conditional-select groups
 (`01101x`), which do not have a literal form, stay out of it. Prefetch
 (`size 3`, opc 2), the
 unallocated `opc 3` 32/64-bit forms, the unprivileged `LDTR`/`STTR` (mode 10),
-and SIMD/scalar-FP stay opaque. `ADR`
+and SIMD/scalar-FP stay opaque. The exclusive and acquire/release loads and
+stores from the same top-level group are modeled with the base register alone as
+the address: `LDXR`/`LDAXR`/`LDAR` render `dst = ldxr(base);`,
+`dst = ldaxr(base);` and `dst = ldar(base);`, while `STXR`/`STLXR` render the
+success status as the assignment target, `status = stxr(base, src);` and
+`status = stlxr(base, src);`, and the ordered `STLR` renders
+`stlr(base, src);`. The `b`/`h` mnemonic suffix names the byte/halfword access
+width. A load defines its destination as an unknown barrier; an exclusive store
+defines its status register as an unknown barrier and leaves tracked registers
+(including the base) unchanged. The pair forms (`LDXP`/`STXP`/`LDAXP`/`STLXP`,
+`o1 == 1`) stay opaque. `ADR`
 writes the sum of
 the instruction address and a signed 21-bit byte offset; `ADRP` writes the sum of
 the page-aligned instruction address and a signed 21-bit page offset shifted left
