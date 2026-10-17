@@ -33,7 +33,9 @@ immediate offset or with register-offset `[base, index, extend/shift]`),
 the exclusive and acquire/release loads and stores
 (`LDXR`/`STXR`/`LDAXR`/`STLXR` and the ordered `LDAR`/`STLR`),
 PC-relative `ADR`/`ADRP`, direct `B`/`BL`, conditional and indirect control flow
-(`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`), `RET`, and `NOP`. It emits an
+(`B.cond`, `CBZ`/`CBNZ`, `TBZ`/`TBNZ`, `BR`/`BLR`), `RET`, and the `NOP`-family
+system instructions (barriers `DMB`/`DSB`/`ISB`/`CLREX`, the modeled HINTs, and
+the exception-generating `SVC`/`BRK`/`HLT`). It emits an
 explicit opaque barrier for every other instruction and for `LC_DATA_IN_CODE`
 ranges. Output is bounded to eight functions and 128 words per function. The
 structural backend emits an empty field. The cache engine identity advances to
@@ -46,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v27` banner identifies the statement set that
+`AArch64 register semantics v28` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -181,7 +183,16 @@ success status as the assignment target, `status = stxr(base, src);` and
 width. A load defines its destination as an unknown barrier; an exclusive store
 defines its status register as an unknown barrier and leaves tracked registers
 (including the base) unchanged. The pair forms (`LDXP`/`STXP`/`LDAXP`/`STLXP`,
-`o1 == 1`) stay opaque. `ADR`
+`o1 == 1`) stay opaque. The system instructions are modeled as markers because
+they have no tracked register effect: `DMB`/`DSB` render their domain
+(`dmb ish`, `dsb sy`, ...), `ISB` and `CLREX` render bare, and the modeled HINTs
+(`YIELD`/`WFE`/`WFI`/`SEV`/`SEVL`/`ESB`/`CSDB`; `NOP` was already modeled) render
+their mnemonic, all as `/* dmb ish */`-style comments. A `DMB`/`DSB` option that
+is unallocated and a HINT number without a modeled mnemonic (`BTI`, `HINT #8`)
+stay opaque. The exception-generating `SVC`/`BRK`/`HLT` render
+`/* svc(0): exception; value flow stops here */` and clear tracked values, since
+the trap may not return and its handler may clobber registers; the `DCPS` group
+stays opaque. `ADR`
 writes the sum of
 the instruction address and a signed 21-bit byte offset; `ADRP` writes the sum of
 the page-aligned instruction address and a signed 21-bit page offset shifted left

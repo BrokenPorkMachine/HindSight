@@ -431,7 +431,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v27', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v28', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -446,6 +446,13 @@ for token in ['AArch64 register semantics v27', 'AddExtended', '0x0b20_0000', 'M
               'LoadAtomic', 'StoreAtomic', 'size_suffix',
               'word & 0x3fbffc00 == 0x089ffc00',
               'word & 0x3fa07c00 == 0x08007c00',
+              'SystemMarker', 'Exception', 'barrier',
+              'barrier_domain', 'hint_mnemonic',
+              'word & 0xffff_f0ff', '0xd503_30bf', '0xd503_309f',
+              '0xd503_30df', '0xd503_305f',
+              'word & 0xffff_f01f', '0xd503_201f',
+              'word & 0xffe0_001f',
+              '0xd400_0001', '0xd420_0000', '0xd440_0000',
               'word & 0x7fff_0000 == 0x5ac0_0000',
               'word & 0x1f80_0000 == 0x1280_0000',
               'word & 0x1f80_0000 == 0x1200_0000',

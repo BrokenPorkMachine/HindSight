@@ -424,6 +424,56 @@ fn size_suffix(size: u32) -> &'static str {
     }
 }
 
+/// Barrier mnemonic and optional 4-bit option for `DMB`/`DSB`/`ISB`/`CLREX`,
+/// or `None` when the word is not a barrier.
+fn barrier(word: u32) -> Option<(&'static str, Option<u32>)> {
+    Some(match word & 0xffff_f0ff {
+        0xd503_30bf => ("dmb", Some((word >> 8) & 0xf)),
+        0xd503_309f => ("dsb", Some((word >> 8) & 0xf)),
+        0xd503_30df => ("isb", None),
+        0xd503_305f => ("clrex", None),
+        _ => return None,
+    })
+}
+
+/// Domain name for a `DMB`/`DSB` 4-bit option, or `None` when it is unallocated
+/// (such a word stays opaque).
+fn barrier_domain(option: u32) -> Option<&'static str> {
+    Some(match option {
+        0b1111 => "sy",
+        0b1110 => "st",
+        0b1101 => "ld",
+        0b1011 => "ish",
+        0b1010 => "ishst",
+        0b1001 => "ishld",
+        0b0111 => "nsh",
+        0b0110 => "nshst",
+        0b0101 => "nshld",
+        0b0011 => "osh",
+        0b0010 => "oshst",
+        0b0001 => "oshld",
+        _ => return None,
+    })
+}
+
+/// Mnemonic for the modeled `HINT` numbers, or `None` otherwise. `HINT #0` is
+/// `NOP` (handled earlier) and other numbers such as `BTI` stay opaque.
+fn hint_mnemonic(word: u32) -> Option<&'static str> {
+    if word & 0xffff_f01f != 0xd503_201f {
+        return None;
+    }
+    Some(match (word >> 5) & 0x7f {
+        1 => "yield",
+        2 => "wfe",
+        3 => "wfi",
+        4 => "sev",
+        5 => "sevl",
+        16 => "esb",
+        20 => "csdb",
+        _ => return None,
+    })
+}
+
 #[derive(Clone, Copy)]
 enum Writeback {
     /// Unscaled immediate (`LDUR`/`STUR`): address is `base + offset`, no writeback.
@@ -731,6 +781,24 @@ enum Operation {
         size: u32,
         exclusive: bool,
         acquire: bool,
+    },
+    /// A modeled system instruction with no tracked register effect: a memory or
+    /// instruction barrier, or a HINT (`YIELD`/`WFE`/`WFI`/`SEV`/`SEVL`/`ESB`/
+    /// `CSDB`). Rendered as a marker comment so the analyst can see it without
+    /// claiming a value effect; value flow is preserved.
+    SystemMarker {
+        /// The instruction mnemonic (`dmb`/`dsb`/`isb`/`clrex`/`yield`/...).
+        mnemonic: &'static str,
+        /// The barrier domain for `DMB`/`DSB` (`sy`/`ish`/`st`/...); `None` for
+        /// instructions with no option.
+        domain: Option<&'static str>,
+    },
+    /// An exception-generating instruction (`SVC`/`BRK`/`HLT`). The trap may not
+    /// return to the next instruction and its handler may clobber registers, so
+    /// value flow stops here (like an unknown call).
+    Exception {
+        mnemonic: &'static str,
+        imm: u32,
     },
     Discard(&'static str),
     Opaque,
@@ -1980,6 +2048,45 @@ fn decode(word: u32, pc: u64) -> Operation {
             };
         }
     }
+    // System instructions with no tracked register effect: memory/instruction
+    // barriers and HINTs. An unallocated `DMB`/`DSB` option or an unmodeled HINT
+    // number stays opaque.
+    if let Some((mnemonic, option)) = barrier(word) {
+        let domain = match option {
+            Some(option) => match barrier_domain(option) {
+                Some(domain) => Some(domain),
+                None => return Operation::Opaque,
+            },
+            None => None,
+        };
+        return Operation::SystemMarker { mnemonic, domain };
+    }
+    if let Some(mnemonic) = hint_mnemonic(word) {
+        return Operation::SystemMarker {
+            mnemonic,
+            domain: None,
+        };
+    }
+    // Exception generation: `SVC`/`BRK`/`HLT` (`opc` 000/001/010, imm16 at bits
+    // 20..5). The failing opc values and the `DCPS` group stay opaque.
+    if word & 0xffe0_001f == 0xd400_0001 {
+        return Operation::Exception {
+            mnemonic: "svc",
+            imm: (word >> 5) & 0xffff,
+        };
+    }
+    if word & 0xffe0_001f == 0xd420_0000 {
+        return Operation::Exception {
+            mnemonic: "brk",
+            imm: (word >> 5) & 0xffff,
+        };
+    }
+    if word & 0xffe0_001f == 0xd440_0000 {
+        return Operation::Exception {
+            mnemonic: "hlt",
+            imm: (word >> 5) & 0xffff,
+        };
+    }
     Operation::Opaque
 }
 
@@ -3194,6 +3301,14 @@ impl Operation {
                     format!("{op}({}, {});", base.name(), src.name())
                 }
             }
+            Self::SystemMarker { mnemonic, domain } => match domain {
+                Some(domain) => format!("/* {mnemonic} {domain} */"),
+                None => format!("/* {mnemonic} */"),
+            },
+            Self::Exception { mnemonic, imm } => {
+                flow.clear();
+                format!("/* {mnemonic}({imm}): exception; value flow stops here */")
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -3213,7 +3328,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v27; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v28; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -4787,5 +4902,79 @@ mod tests {
         assert!(lift(0xc87f_8820, 0x1000).contains("opaque instruction"));
         // stlxp w3, x0, x2, [x1] = 0xc8238820
         assert!(lift(0xc823_8820, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_barriers_and_hints_without_a_register_effect() {
+        // clang-produced encodings. Markers are comments because the engine
+        // tracks register values, and none of these has a register effect.
+        assert_eq!(lift(0xd503_3bbf, 0x1000), "/* dmb ish */");
+        assert_eq!(lift(0xd503_3fbf, 0x1000), "/* dmb sy */");
+        assert_eq!(lift(0xd503_3f9f, 0x1000), "/* dsb sy */");
+        assert_eq!(lift(0xd503_3b9f, 0x1000), "/* dsb ish */");
+        assert_eq!(lift(0xd503_3fdf, 0x1000), "/* isb */");
+        assert_eq!(lift(0xd503_3f5f, 0x1000), "/* clrex */");
+        assert_eq!(lift(0xd503_201f, 0x1000), "/* nop */");
+        assert_eq!(lift(0xd503_203f, 0x1000), "/* yield */");
+        assert_eq!(lift(0xd503_205f, 0x1000), "/* wfe */");
+        assert_eq!(lift(0xd503_207f, 0x1000), "/* wfi */");
+        assert_eq!(lift(0xd503_209f, 0x1000), "/* sev */");
+        assert_eq!(lift(0xd503_20bf, 0x1000), "/* sevl */");
+        assert_eq!(lift(0xd503_221f, 0x1000), "/* esb */");
+        assert_eq!(lift(0xd503_229f, 0x1000), "/* csdb */");
+    }
+
+    #[test]
+    fn barrier_and_hint_markers_preserve_value_flow() {
+        // movz w0, #7 ; dmb ish ; add w1, w0, w0 -- the barrier has no register
+        // effect, so the constant still folds.
+        let words = [0x5280_00e0u32, 0xd503_3bbf, 0x0b00_0001];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("/* dmb ish */"));
+        assert!(report.contains("w1 = w0 + w0;"));
+        assert!(report.contains("constant=0xe"));
+    }
+
+    #[test]
+    fn lifts_exception_instructions_and_stops_flow() {
+        // clang-produced encodings; imm16 is rendered in decimal.
+        assert_eq!(
+            lift(0xd400_0001, 0x1000),
+            "/* svc(0): exception; value flow stops here */"
+        );
+        assert_eq!(
+            lift(0xd400_1001, 0x1000),
+            "/* svc(128): exception; value flow stops here */"
+        );
+        assert_eq!(
+            lift(0xd420_0040, 0x1000),
+            "/* brk(2): exception; value flow stops here */"
+        );
+        assert_eq!(
+            lift(0xd440_0020, 0x1000),
+            "/* hlt(1): exception; value flow stops here */"
+        );
+        // movz w0, #7 ; svc #0 ; add w1, w0, w0 -- the trap clears tracked values.
+        let words = [0x5280_00e0u32, 0xd400_0001, 0x0b00_0001];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("w1 = w0 + w0;"));
+        assert!(!report.contains("constant=0xe"));
+    }
+
+    #[test]
+    fn unmodeled_system_encodings_stay_opaque() {
+        // BTI (HINT #32/#34) is a control-flow landing pad, not a plain HINT:
+        // `bti` and `bti c`.
+        assert!(lift(0xd503_241f, 0x1000).contains("opaque instruction"));
+        assert!(lift(0xd503_245f, 0x1000).contains("opaque instruction"));
+        // HINT #8 has no modeled mnemonic.
+        assert!(lift(0xd503_211f, 0x1000).contains("opaque instruction"));
+        // DMB with the unallocated option 0b0000 stays opaque.
+        assert!(lift(0xd503_30bf, 0x1000).contains("opaque instruction"));
+        // DCPS1/2/3 share the exception `opc` space but are not modeled.
+        assert!(lift(0xd4a0_0001, 0x1000).contains("opaque instruction"));
+        assert!(lift(0xd4a0_0003, 0x1000).contains("opaque instruction"));
     }
 }
