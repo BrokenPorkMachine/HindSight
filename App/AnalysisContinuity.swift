@@ -96,6 +96,50 @@ struct VGAnalysisAnnotation: Codable, Identifiable, Hashable {
     }
 }
 
+struct VGDecompilerFunctionOverride: Codable, Identifiable, Hashable {
+    let id: String
+    let recordID: String
+    let address: UInt64
+    var analystName: String
+    var signatureHypothesis: String
+    var note: String
+    var confidence: VGAnalysisConfidence
+    var updatedAt: Date
+
+    init(recordID: String, address: UInt64, analystName: String, signatureHypothesis: String, note: String, confidence: VGAnalysisConfidence, updatedAt: Date = Date()) {
+        self.id = "\(recordID)|function|\(String(address, radix: 16))"
+        self.recordID = recordID
+        self.address = address
+        self.analystName = vgBoundedUTF8(analystName.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 128)
+        self.signatureHypothesis = vgBoundedUTF8(signatureHypothesis.split(whereSeparator: \.isNewline).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 512)
+        self.note = vgBoundedUTF8(note.trimmingCharacters(in: .whitespacesAndNewlines), maxBytes: 1_024)
+        self.confidence = confidence
+        self.updatedAt = updatedAt
+    }
+}
+
+struct VGDecompilerFunctionOverrideRevision: Codable, Hashable {
+    let analystName: String
+    let signatureHypothesis: String
+    let note: String
+    let confidence: VGAnalysisConfidence
+    let updatedAt: Date
+
+    init(_ value: VGDecompilerFunctionOverride) {
+        self.init(analystName: value.analystName, signatureHypothesis: value.signatureHypothesis, note: value.note, confidence: value.confidence, updatedAt: value.updatedAt)
+    }
+
+    init(analystName: String, signatureHypothesis: String, note: String, confidence: VGAnalysisConfidence, updatedAt: Date) {
+        self.analystName = analystName
+        self.signatureHypothesis = signatureHypothesis
+        self.note = note
+        self.confidence = confidence
+        self.updatedAt = updatedAt
+    }
+
+    var isEmpty: Bool { analystName.isEmpty && signatureHypothesis.isEmpty && note.isEmpty && confidence == .unclassified }
+}
+
 struct VGAnalysisSavedSearch: Codable, Identifiable, Hashable {
     let id: String
     let recordID: String
@@ -354,7 +398,7 @@ struct VGAnalysisDelta: Codable, Hashable, Sendable {
 }
 
 struct VGAnalysisContinuityDocument: Codable {
-    var schema: Int = 5
+    var schema: Int = 7
     var pins: [VGAnalysisPin] = []
     var recent: [VGAnalysisVisit] = []
     var collections: [VGInvestigationCollection] = []
@@ -364,9 +408,11 @@ struct VGAnalysisContinuityDocument: Codable {
     var snapshots: [String: VGAnalysisSnapshot] = [:]
     var deltas: [String: VGAnalysisDelta] = [:]
     var annotations: [String: VGAnalysisAnnotation] = [:]
+    var decompilerFunctionOverrides: [String: VGDecompilerFunctionOverride] = [:]
+    var decompilerFunctionOverrideHistory: [String: [VGDecompilerFunctionOverrideRevision]] = [:]
     var savedSearches: [VGAnalysisSavedSearch] = []
 
-    enum CodingKeys: String, CodingKey { case schema, pins, recent, collections, reviewBaselines, reviewEntries, followUps, snapshots, deltas, annotations, savedSearches }
+    enum CodingKeys: String, CodingKey { case schema, pins, recent, collections, reviewBaselines, reviewEntries, followUps, snapshots, deltas, annotations, decompilerFunctionOverrides, decompilerFunctionOverrideHistory, savedSearches }
 
     init() {}
 
@@ -382,12 +428,14 @@ struct VGAnalysisContinuityDocument: Codable {
         snapshots = try container.decodeIfPresent([String: VGAnalysisSnapshot].self, forKey: .snapshots) ?? [:]
         deltas = try container.decodeIfPresent([String: VGAnalysisDelta].self, forKey: .deltas) ?? [:]
         annotations = try container.decodeIfPresent([String: VGAnalysisAnnotation].self, forKey: .annotations) ?? [:]
+        decompilerFunctionOverrides = try container.decodeIfPresent([String: VGDecompilerFunctionOverride].self, forKey: .decompilerFunctionOverrides) ?? [:]
+        decompilerFunctionOverrideHistory = try container.decodeIfPresent([String: [VGDecompilerFunctionOverrideRevision]].self, forKey: .decompilerFunctionOverrideHistory) ?? [:]
         savedSearches = try container.decodeIfPresent([VGAnalysisSavedSearch].self, forKey: .savedSearches) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(5, forKey: .schema)
+        try container.encode(7, forKey: .schema)
         try container.encode(pins, forKey: .pins)
         try container.encode(recent, forKey: .recent)
         try container.encode(collections, forKey: .collections)
@@ -397,6 +445,8 @@ struct VGAnalysisContinuityDocument: Codable {
         try container.encode(snapshots, forKey: .snapshots)
         try container.encode(deltas, forKey: .deltas)
         try container.encode(annotations, forKey: .annotations)
+        try container.encode(decompilerFunctionOverrides, forKey: .decompilerFunctionOverrides)
+        try container.encode(decompilerFunctionOverrideHistory, forKey: .decompilerFunctionOverrideHistory)
         try container.encode(savedSearches, forKey: .savedSearches)
     }
 
@@ -404,7 +454,7 @@ struct VGAnalysisContinuityDocument: Codable {
 }
 
 enum VGAnalysisContinuityStore {
-    static let engine = "arm64-analysis-v45-schema91"
+    static let engine = "arm64-analysis-v68-schema114"
     static let maximumBytes = 1 * 1024 * 1024
     static let maximumPins = 128
     static let maximumRecent = 96
@@ -420,6 +470,8 @@ enum VGAnalysisContinuityStore {
     static let maximumFollowUpNoteBytes = 1_024
     static let maximumFollowUpEvidenceIDs = 16
     static let maximumAnnotations = 512
+    static let maximumDecompilerFunctionOverrides = 32
+    static let maximumDecompilerFunctionOverrideHistory = 10
     static let maximumSavedSearches = 64
     private static let directoryName = ".vectorglass"
     private static let fileName = "analysis-continuity-v1.json"
@@ -435,8 +487,8 @@ enum VGAnalysisContinuityStore {
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             var document = try decoder.decode(VGAnalysisContinuityDocument.self, from: data)
-            guard [1, 2, 3, 4, 5].contains(document.schema) else { return .empty }
-            document.schema = 5
+            guard [1, 2, 3, 4, 5, 6, 7].contains(document.schema) else { return .empty }
+            document.schema = 7
             document.pins = Array(document.pins.filter(validPin).prefix(maximumPins))
             document.recent = Array(document.recent.filter(validVisit).prefix(maximumRecent))
             let validPinIDs = Set(document.pins.map(\.id))
@@ -484,6 +536,14 @@ enum VGAnalysisContinuityStore {
             document.annotations = Dictionary(uniqueKeysWithValues: document.annotations
                 .filter { validAnnotation(key: $0.key, value: $0.value) }
                 .prefix(maximumAnnotations)
+                .map { ($0.key, $0.value) })
+            document.decompilerFunctionOverrides = Dictionary(uniqueKeysWithValues: document.decompilerFunctionOverrides
+                .filter { validDecompilerOverride(key: $0.key, value: $0.value) }
+                .prefix(maximumDecompilerFunctionOverrides)
+                .map { ($0.key, $0.value) })
+            document.decompilerFunctionOverrideHistory = Dictionary(uniqueKeysWithValues: document.decompilerFunctionOverrideHistory
+                .filter { $0.key.utf8.count <= 320 && $0.value.count <= maximumDecompilerFunctionOverrideHistory && $0.value.allSatisfy(validDecompilerOverrideRevision) }
+                .prefix(maximumDecompilerFunctionOverrides * 2)
                 .map { ($0.key, $0.value) })
             document.savedSearches = Array(document.savedSearches.filter(validSavedSearch).prefix(maximumSavedSearches))
             return document
@@ -634,6 +694,16 @@ enum VGAnalysisContinuityStore {
             value.note.utf8.count <= 2_048 &&
             value.tags.count <= 16 &&
             value.tags.allSatisfy { $0.utf8.count <= 64 }
+    }
+
+    private static func validDecompilerOverride(key: String, value: VGDecompilerFunctionOverride) -> Bool {
+        key == value.id && key.utf8.count <= 320 && value.recordID.utf8.count <= 256 && value.address != 0
+            && value.analystName.utf8.count <= 128 && value.signatureHypothesis.utf8.count <= 512
+            && value.note.utf8.count <= 1_024
+    }
+
+    private static func validDecompilerOverrideRevision(_ value: VGDecompilerFunctionOverrideRevision) -> Bool {
+        value.analystName.utf8.count <= 128 && value.signatureHypothesis.utf8.count <= 512 && value.note.utf8.count <= 1_024
     }
 
     private static func validSavedSearch(_ value: VGAnalysisSavedSearch) -> Bool {
@@ -1204,5 +1274,60 @@ extension WorkbenchModel {
     func persistAnalysisContinuity(projectPath: String) {
         do { try VGAnalysisContinuityStore.save(analysisContinuityDocument, projectPath: projectPath) }
         catch { status = "Analysis continuity state was not saved: \(error.localizedDescription)" }
+    }
+
+    func decompilerFunctionOverrides(for recordID: String) -> [UInt64: VGDecompilerFunctionOverride] {
+        Dictionary(uniqueKeysWithValues: analysisContinuityDocument.decompilerFunctionOverrides.values
+            .filter { $0.recordID == recordID }
+            .map { ($0.address, $0) })
+    }
+
+    func saveDecompilerFunctionOverride(recordID: String, address: UInt64, analystName: String, signatureHypothesis: String, note: String, confidence: VGAnalysisConfidence) {
+        guard selectedID == recordID, let projectPath = project?.path, address != 0 else { return }
+        let value = VGDecompilerFunctionOverride(recordID: recordID, address: address, analystName: analystName, signatureHypothesis: signatureHypothesis, note: note, confidence: confidence)
+        let existing = analysisContinuityDocument.decompilerFunctionOverrides[value.id]
+        if existing == nil && VGDecompilerFunctionOverrideRevision(value).isEmpty { return }
+        guard existing?.analystName != value.analystName || existing?.signatureHypothesis != value.signatureHypothesis
+            || existing?.note != value.note || existing?.confidence != value.confidence else { return }
+        guard existing != nil || analysisContinuityDocument.decompilerFunctionOverrides.count < VGAnalysisContinuityStore.maximumDecompilerFunctionOverrides else {
+            status = "Function override limit reached for this project."
+            return
+        }
+        var history = analysisContinuityDocument.decompilerFunctionOverrideHistory[value.id, default: []]
+        history.append(existing.map(VGDecompilerFunctionOverrideRevision.init) ?? VGDecompilerFunctionOverrideRevision(analystName: "", signatureHypothesis: "", note: "", confidence: .unclassified, updatedAt: Date()))
+        if history.count > VGAnalysisContinuityStore.maximumDecompilerFunctionOverrideHistory { history.removeFirst(history.count - VGAnalysisContinuityStore.maximumDecompilerFunctionOverrideHistory) }
+        analysisContinuityDocument.decompilerFunctionOverrideHistory[value.id] = history
+        if VGDecompilerFunctionOverrideRevision(value).isEmpty {
+            analysisContinuityDocument.decompilerFunctionOverrides.removeValue(forKey: value.id)
+            status = "Removed function override; the previous revision can be restored with Undo."
+        } else {
+            analysisContinuityDocument.decompilerFunctionOverrides[value.id] = value
+            status = "Saved function override with analyst provenance."
+        }
+        persistAnalysisContinuity(projectPath: projectPath)
+    }
+
+    func undoDecompilerFunctionOverride(recordID: String, address: UInt64) {
+        guard selectedID == recordID, let projectPath = project?.path, address != 0 else { return }
+        let key = "\(recordID)|function|\(String(address, radix: 16))"
+        guard var history = analysisContinuityDocument.decompilerFunctionOverrideHistory[key], let previous = history.popLast() else { return }
+        if previous.isEmpty {
+            analysisContinuityDocument.decompilerFunctionOverrides.removeValue(forKey: key)
+        } else {
+            analysisContinuityDocument.decompilerFunctionOverrides[key] = VGDecompilerFunctionOverride(recordID: recordID, address: address, analystName: previous.analystName, signatureHypothesis: previous.signatureHypothesis, note: previous.note, confidence: previous.confidence, updatedAt: previous.updatedAt)
+        }
+        if history.isEmpty { analysisContinuityDocument.decompilerFunctionOverrideHistory.removeValue(forKey: key) }
+        else { analysisContinuityDocument.decompilerFunctionOverrideHistory[key] = history }
+        status = "Restored the previous function override revision."
+        persistAnalysisContinuity(projectPath: projectPath)
+    }
+
+    func decompilerFunctionOverrideUndoCounts(for recordID: String) -> [UInt64: Int] {
+        let prefix = "\(recordID)|function|"
+        return Dictionary(uniqueKeysWithValues: analysisContinuityDocument.decompilerFunctionOverrideHistory.compactMap { entry in
+            let (key, history) = entry
+            guard key.hasPrefix(prefix), let address = UInt64(key.dropFirst(prefix.count), radix: 16), !history.isEmpty else { return nil }
+            return (address, history.count)
+        })
     }
 }

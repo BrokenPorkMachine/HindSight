@@ -29,6 +29,12 @@ struct VGLiftedLine: Identifiable, Hashable {
     var addressText: String { String(format: "0x%016llx", address) }
 }
 
+struct VGBinaryCFGLine: Identifiable, Hashable {
+    let address: UInt64?
+    let text: String
+    var id: String { "\(address.map { String($0) } ?? "-"):\(text)" }
+}
+
 struct VGInstructionData: Hashable {
     let address: UInt64
     let word: UInt32
@@ -124,6 +130,23 @@ enum VGBinaryWorkspaceParser {
             if let function, !function.contains(pc) { return nil }
             return (pc, String(fields[1]).trimmingCharacters(in: .whitespaces), String(fields[2]).trimmingCharacters(in: .whitespaces))
         }
+    }
+
+    static func cfgLines(_ text: String, in function: VGFunctionRecord?) -> [VGBinaryCFGLine] {
+        var result: [VGBinaryCFGLine] = []
+        var currentBlockMatches = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = String(raw)
+            if line.hasPrefix("block B") {
+                let blockStart = allAddresses(in: line).first
+                currentBlockMatches = blockStart.map { function?.contains($0) ?? true } ?? false
+                if currentBlockMatches { result.append(VGBinaryCFGLine(address: blockStart, text: line)) }
+            } else if currentBlockMatches {
+                let address = allAddresses(in: line).first
+                result.append(VGBinaryCFGLine(address: address, text: line))
+            }
+        }
+        return result
     }
 
     static func lifted(_ text: String, in function: VGFunctionRecord?) -> [VGLiftedLine] {

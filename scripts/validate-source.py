@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-import hashlib, json, os, pathlib, plistlib, re, subprocess, sys, tomllib
+import fnmatch, hashlib, json, os, pathlib, plistlib, re, subprocess, sys, tomllib
 import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 from openstep import load_project
 R=pathlib.Path(__file__).resolve().parents[1]
-for path in R.rglob('*.json'):
-    if 'build' not in path.relative_to(R).parts: json.loads(path.read_text())
-for path in R.rglob('*.plist'): plistlib.loads(path.read_bytes())
+def source_files(pattern):
+    for root, dirs, files in os.walk(R):
+        dirs[:] = [name for name in dirs if name not in {'.git', 'build', 'iphemeral-latest'}]
+        for name in files:
+            if fnmatch.fnmatch(name, pattern): yield pathlib.Path(root) / name
+
+for path in source_files('*.json'): json.loads(path.read_text())
+for path in source_files('*.plist'):
+    plistlib.loads(path.read_bytes())
 for path in (R/'rust').rglob('Cargo.toml'): tomllib.loads(path.read_text())
 tomllib.loads((R/'rust/Cargo.lock').read_text())
 vector_emu = R/'Engines/VectorEmu'
@@ -14,7 +20,7 @@ for path in vector_emu.rglob('Cargo.toml'): tomllib.loads(path.read_text())
 tomllib.loads((vector_emu/'Cargo.lock').read_text())
 subprocess.run([sys.executable, str(R/'scripts/check-lockfiles.py')], check=True)
 for suffix in ['*.xcscheme','*.xcworkspacedata']:
-    for path in R.rglob(suffix): ET.parse(path)
+    for path in source_files(suffix): ET.parse(path)
 topology=json.loads((R/'Config/project-topology.json').read_text())
 for path in topology['files']: assert (R/path).is_file(),path
 pbx=(R/'HindSight.xcodeproj/project.pbxproj').read_bytes()
@@ -356,7 +362,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v45-schema91"', 'analysisCacheProducerVersion = "0.5.11"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v68-schema114"', 'analysisCacheProducerVersion = "0.5.11"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -507,7 +513,7 @@ assert (R/'docs/ANALYSIS_NAVIGATION_0.4.3.md').is_file()
 analysis_continuity=(R/'App/AnalysisContinuity.swift').read_text()
 for token in ['struct VGAnalysisPin', 'struct VGAnalysisVisit', 'struct VGAnalysisSnapshot', 'struct VGAnalysisDelta',
               'maximumBytes = 1 * 1024 * 1024', 'maximumPins = 128', 'maximumRecent = 96',
-              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v45-schema91']:
+              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v68-schema114']:
     assert token in analysis_continuity, token
 for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'Text("Changes").tag("Changes")',
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:
@@ -563,8 +569,8 @@ assert (R/'docs/COLLECTION_REVIEW_0.4.7.md').is_file()
 # v0.4.8 review-journal and handoff contract. Journal state is bounded, project-local,
 # analyst-authored context; handoff generation preserves exact evidence identity without semantic scoring.
 journal_contract=(R/'App/AnalysisContinuity.swift').read_text() + (R/'App/AnalysisNavigation.swift').read_text()
-for token in ['struct VGInvestigationReviewEntry', 'enum VGInvestigationReviewState', 'var schema: Int = 5',
-              '[1, 2, 3, 4, 5].contains(document.schema)', 'appendAnalysisReviewEntry',
+for token in ['struct VGInvestigationReviewEntry', 'enum VGInvestigationReviewState', 'var schema: Int = 7',
+              '[1, 2, 3, 4, 5, 6, 7].contains(document.schema)', 'appendAnalysisReviewEntry',
               'analysisCollectionHandoff', 'Copy Handoff', 'Review Journal & Handoff']:
     assert token in journal_contract, token
 for capability in ['collection_review_journal','collection_workflow_state','investigation_handoff','review_timeline']:
@@ -576,8 +582,8 @@ assert (R/'docs/REVIEW_JOURNAL_0.4.8.md').is_file()
 # v0.4.9 explicit review follow-up contract. Follow-ups are bounded analyst-authored
 # workflow tasks tied to exact evidence identities; they are not evidence or severity scores.
 followup_contract=(R/'App/AnalysisContinuity.swift').read_text() + (R/'App/AnalysisNavigation.swift').read_text()
-for token in ['struct VGInvestigationFollowUp', 'enum VGInvestigationFollowUpState', 'var schema: Int = 5',
-              '[1, 2, 3, 4, 5].contains(document.schema)', 'createAnalysisFollowUp',
+for token in ['struct VGInvestigationFollowUp', 'enum VGInvestigationFollowUpState', 'var schema: Int = 7',
+              '[1, 2, 3, 4, 5, 6, 7].contains(document.schema)', 'createAnalysisFollowUp',
               'toggleAnalysisFollowUpCompleted', 'Follow-Up Queue', 'Follow-ups are analyst-authored workflow tasks']:
     assert token in followup_contract, token
 for capability in ['review_follow_up_queue','follow_up_evidence_binding','collection_review_summary','handoff_follow_up_context']:
@@ -962,7 +968,7 @@ subprocess.run([sys.executable,'-m','unittest','discover','-s',str(R/'python/tes
 import shutil, tempfile
 swiftc=shutil.which('swiftc')
 if swiftc:
-    swift_sources=[str(p) for p in sorted(R.rglob('*.swift')) if 'build' not in p.relative_to(R).parts]
+    swift_sources=[str(p) for p in sorted(source_files('*.swift'))]
     for source in swift_sources:
         subprocess.run([swiftc,'-frontend','-parse',source],check=True)
     # Full type-check of the portable virtualization service surface. Unlike parse-only

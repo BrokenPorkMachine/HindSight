@@ -10,8 +10,8 @@ BRIDGE = (ROOT / "rust/crates/bridge/src/lib.rs").read_text()
 
 def test_collections_are_bounded_and_migrate_from_continuity_v1():
     assert 'struct VGInvestigationCollection' in CONT
-    assert 'var schema: Int = 5' in CONT
-    assert '[1, 2, 3, 4, 5].contains(document.schema)' in CONT
+    assert 'var schema: Int = 7' in CONT
+    assert '[1, 2, 3, 4, 5, 6, 7].contains(document.schema)' in CONT
     assert 'decodeIfPresent([VGInvestigationCollection].self' in CONT
     assert 'maximumCollections = 32' in CONT
     assert 'maximumPinsPerCollection = 64' in CONT

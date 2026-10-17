@@ -11,6 +11,7 @@ private enum VGBinarySemanticMode: String, CaseIterable, Identifiable {
     case pseudocode = "Pseudocode"
     case lifted = "Lifted"
     case ir = "IR"
+    case cfg = "CFG"
     var id: String { rawValue }
 }
 
@@ -26,14 +27,19 @@ struct VGBinaryWorkspace: View {
     let symbolResolverText: String
     let objcClassesText: String
     let disassemblyText: String
+    let cfgText: String
     let irText: String
     let dataflowText: String
     let semanticPreviewText: String?
     let xrefsText: String
     let callGraphText: String
+    let functionOverrides: [UInt64: VGDecompilerFunctionOverride]
+    let functionOverrideUndoCounts: [UInt64: Int]
     let selectedAddress: String
     let debugPC: String?
     let onSelectAddress: (String) -> Void
+    let onSaveFunctionOverride: (UInt64, String, String, String, VGAnalysisConfidence) -> Void
+    let onUndoFunctionOverride: (UInt64) -> Void
 
     @State private var functionQuery = ""
     @State private var selectedFunctionStart: UInt64?
@@ -44,8 +50,18 @@ struct VGBinaryWorkspace: View {
     @State private var centerMode: VGBinaryCenterMode = .split
     @State private var semanticMode: VGBinarySemanticMode = .pseudocode
     @State private var rightMode: VGBinaryRightMode = .references
+    @State private var showFunctionOverride = false
+    @State private var overrideName = ""
+    @State private var overrideSignature = ""
+    @State private var overrideNote = ""
+    @State private var overrideConfidence: VGAnalysisConfidence = .unclassified
 
-    private var functions: [VGFunctionRecord] { VGGraphParser.functions(functionsText, symbolResolver: symbolResolverText, objcClasses: objcClassesText) }
+    private var functions: [VGFunctionRecord] {
+        VGGraphParser.functions(functionsText, symbolResolver: symbolResolverText, objcClasses: objcClassesText).map { function in
+            guard let name = functionOverrides[function.start]?.analystName, !name.isEmpty else { return function }
+            return VGFunctionRecord(start: function.start, end: function.end, byteCount: function.byteCount, name: name)
+        }
+    }
     private var rows: [VGDisassemblyRow] { VGDisassemblyParser.parse(disassemblyText) }
     private var references: [VGBinaryReference] { VGBinaryWorkspaceParser.references(xrefs: xrefsText, callGraph: callGraphText) }
     private var selectedAddressValue: UInt64? { VGBinaryWorkspaceParser.address(selectedAddress) }
@@ -87,8 +103,22 @@ struct VGBinaryWorkspace: View {
         VGBinaryWorkspaceParser.irLines(irText, in: selectedFunction)
     }
 
+    private var functionCFGLines: [VGBinaryCFGLine] {
+        VGBinaryWorkspaceParser.cfgLines(cfgText, in: selectedFunction)
+    }
+
     private var functionPseudocode: String? {
-        VGBinaryWorkspaceParser.pseudocode(semanticPreviewText, in: selectedFunction)
+        guard let pseudocode = VGBinaryWorkspaceParser.pseudocode(semanticPreviewText, in: selectedFunction) else { return nil }
+        guard let function = selectedFunction, let override = functionOverrides[function.start] else { return pseudocode }
+        var provenance = ["// Analyst override; binary evidence is unchanged."]
+        if !override.analystName.isEmpty { provenance.append("// Analyst function name: \(commentSafe(override.analystName))") }
+        if !override.signatureHypothesis.isEmpty { provenance.append("// Analyst signature hypothesis [\(override.confidence.rawValue)]: \(commentSafe(override.signatureHypothesis))") }
+        if !override.note.isEmpty { provenance.append("// Analyst note: \(commentSafe(override.note))") }
+        return (provenance + [pseudocode]).joined(separator: "\n")
+    }
+
+    private func commentSafe(_ value: String) -> String {
+        value.split(whereSeparator: \.isNewline).joined(separator: " ").replacingOccurrences(of: "*/", with: "* /")
     }
 
     private var functionReferences: [VGBinaryReference] {
@@ -124,6 +154,46 @@ struct VGBinaryWorkspace: View {
         .onChange(of: followPC) { _, enabled in
             if enabled { synchronizeExternalSelection() }
         }
+        .sheet(isPresented: $showFunctionOverride) { functionOverrideEditor }
+    }
+
+    private var functionOverrideEditor: some View {
+        NavigationStack {
+            Form {
+                Section("Function at \(selectedFunction?.startText ?? "unavailable")") {
+                    TextField("Analyst function name", text: $overrideName)
+                    TextField("Signature hypothesis", text: $overrideSignature)
+                    Picker("Confidence", selection: $overrideConfidence) {
+                        ForEach(VGAnalysisConfidence.allCases) { confidence in Text(confidence.rawValue).tag(confidence) }
+                    }
+                    TextEditor(text: $overrideNote).frame(minHeight: 100)
+                    Text("These project-local annotations are shown as analyst hypotheses. They do not alter decoded instructions or recovered binary evidence.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Function Override")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showFunctionOverride = false } }
+                ToolbarItem(placement: .automatic) {
+                    if let function = selectedFunction, (functionOverrideUndoCounts[function.start] ?? 0) > 0 {
+                        Button("Undo Last Edit") {
+                            onUndoFunctionOverride(function.start)
+                            showFunctionOverride = false
+                        }
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        if let function = selectedFunction {
+                            onSaveFunctionOverride(function.start, overrideName, overrideSignature, overrideNote, overrideConfidence)
+                        }
+                        showFunctionOverride = false
+                    }
+                }
+            }
+            .frame(minWidth: 480, minHeight: 360)
+        }
     }
 
     private var toolbar: some View {
@@ -158,6 +228,18 @@ struct VGBinaryWorkspace: View {
                 Button { showRightPane.toggle() } label: { Label("Context", systemImage: "sidebar.right") }
                     .buttonStyle(.borderless)
                     .help(showRightPane ? "Hide context pane" : "Show context pane")
+                if let function = selectedFunction {
+                    Button {
+                        let existing = functionOverrides[function.start]
+                        overrideName = existing?.analystName ?? ""
+                        overrideSignature = existing?.signatureHypothesis ?? ""
+                        overrideNote = existing?.note ?? ""
+                        overrideConfidence = existing?.confidence ?? .unclassified
+                        showFunctionOverride = true
+                    } label: { Label("Function Override", systemImage: "pencil.and.outline") }
+                    .buttonStyle(.borderless)
+                    .help("Record a project-local analyst name, signature hypothesis, confidence, and note")
+                }
                 Picker("Center", selection: $centerMode) {
                     ForEach(VGBinaryCenterMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                 }
@@ -287,7 +369,7 @@ struct VGBinaryWorkspace: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 260)
+                .frame(width: 320)
                 .padding(.trailing, 8)
             }
             Divider()
@@ -296,8 +378,10 @@ struct VGBinaryWorkspace: View {
                     pseudocodeContent
                 } else if semanticMode == .lifted {
                     liftedContent
-                } else {
+                } else if semanticMode == .ir {
                     irContent
+                } else {
+                    cfgContent
                 }
             }
         }
@@ -307,10 +391,29 @@ struct VGBinaryWorkspace: View {
     private var pseudocodeContent: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let functionPseudocode {
-                Text(functionPseudocode)
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                LazyVStack(alignment: .leading, spacing: 1) {
+                    ForEach(Array(functionPseudocode.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { item in
+                        let line = String(item.element)
+                        if let address = VGBinaryWorkspaceParser.allAddresses(in: line).first {
+                            Button { selectAddress(address) } label: {
+                                Text(line)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.vertical, 1)
+                                    .background(activeAddress == address ? Color.accentColor.opacity(0.14) : Color.clear)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(String(format: "Select instruction at 0x%016llx", address))
+                        } else {
+                            Text(line)
+                                .font(.system(size: 11, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text("No reconstructed sketch for this function in the bounded preview. Analyze again to refresh cached results, or use Lifted and IR for instruction evidence.")
                     .font(.caption)
@@ -386,6 +489,39 @@ struct VGBinaryWorkspace: View {
                         .background(selectionBackground(item.0))
                     }
                     .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .frame(minWidth: 760, alignment: .leading)
+    }
+
+    private var cfgContent: some View {
+        LazyVStack(alignment: .leading, spacing: 0) {
+            if functionCFGLines.isEmpty {
+                Text("No CFG blocks intersect this function in the bounded analysis.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(12)
+            } else {
+                ForEach(functionCFGLines) { line in
+                    if let address = line.address {
+                        Button { selectAddress(address) } label: {
+                            Text(line.text)
+                                .font(.system(size: 10, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .contentShape(Rectangle())
+                                .background(selectionBackground(address))
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Text(line.text)
+                            .font(.system(size: 10, design: .monospaced))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                    }
                 }
             }
         }

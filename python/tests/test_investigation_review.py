@@ -8,8 +8,8 @@ BRIDGE = (ROOT / "rust/crates/bridge/src/lib.rs").read_text()
 
 
 def test_continuity_schema4_keeps_schema3_compatibility_and_bounds_review_baselines():
-    assert "var schema: Int = 5" in CONT
-    assert "[1, 2, 3, 4, 5].contains(document.schema)" in CONT
+    assert "var schema: Int = 7" in CONT
+    assert "[1, 2, 3, 4, 5, 6, 7].contains(document.schema)" in CONT
     assert "decodeIfPresent([String: VGInvestigationReviewBaseline].self" in CONT
     assert "maximumReviewBaselines = 256" in CONT
     assert "validReviewBaseline" in CONT

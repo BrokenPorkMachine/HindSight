@@ -8,8 +8,8 @@ BRIDGE = (ROOT / "rust/crates/bridge/src/lib.rs").read_text()
 
 
 def test_continuity_schema5_migrates_prior_state_and_bounds_followups():
-    assert "var schema: Int = 5" in CONT
-    assert "[1, 2, 3, 4, 5].contains(document.schema)" in CONT
+    assert "var schema: Int = 7" in CONT
+    assert "[1, 2, 3, 4, 5, 6, 7].contains(document.schema)" in CONT
     assert "decodeIfPresent([VGInvestigationFollowUp].self" in CONT
     assert "maximumFollowUps = 128" in CONT
     assert "maximumFollowUpsPerCollection = 32" in CONT

@@ -8,8 +8,8 @@ BRIDGE = (ROOT / "rust/crates/bridge/src/lib.rs").read_text()
 
 
 def test_continuity_schema4_migrates_prior_state_and_bounds_review_journal():
-    assert "var schema: Int = 5" in CONT
-    assert "[1, 2, 3, 4, 5].contains(document.schema)" in CONT
+    assert "var schema: Int = 7" in CONT
+    assert "[1, 2, 3, 4, 5, 6, 7].contains(document.schema)" in CONT
     assert "decodeIfPresent([VGInvestigationReviewEntry].self" in CONT
     assert "maximumReviewEntries = 256" in CONT
     assert "maximumReviewEntriesPerCollection = 64" in CONT

@@ -364,10 +364,10 @@ with tempfile.TemporaryDirectory() as directory:
     report = json.loads(read_frame(io.BytesIO(process.stdout)))
     semantic = report['semantic_preview']
     assert 'AArch64 register semantics v38' in semantic
-    assert 'x0 = ldxr(x1);' in semantic
-    assert 'w2 = stxr(x1, x0);' in semantic
-    assert 'x0 = ldar(x1);' in semantic
-    assert 'stlr(x1, x0);' in semantic
+    assert 'x0 = exclusive_load_relaxed(x1);' in semantic
+    assert 'w2 = exclusive_store_relaxed(x1, x0);' in semantic
+    assert 'x0 = atomic_load_acquire(x1);' in semantic
+    assert 'atomic_store_release(x1, x0);' in semantic
     assert 'word=c85f7c20' in semantic
 print('ARM64 exclusive and acquire/release load/store passed through worker analysis')
 
@@ -465,8 +465,8 @@ with tempfile.TemporaryDirectory() as directory:
     semantic = report['semantic_preview']
     assert 'AArch64 register semantics v38' in semantic
     assert '/* ccmp x4, x5, #0x0, eq */' in semantic
-    assert '/* ccmp x4, #0x3, #0x0, eq */' in semantic
-    assert '/* ccmn x4, #0x9, #0x0, gt */' in semantic
+    assert '/* ccmp x4, 0x3, #0x0, eq */' in semantic
+    assert '/* ccmn x4, 0x9, #0x0, gt */' in semantic
     assert '/* ccmp w2, w3, #0xf, ne */' in semantic
     assert 'word=fa450080' in semantic
 print('ARM64 conditional comparisons passed through worker analysis')

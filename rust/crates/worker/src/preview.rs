@@ -136,8 +136,8 @@ fn branch_target(w:u32,pc:u64)->Option<(u64,&'static str,bool)>{
 }
 fn is_terminal(w:u32)->bool{(w&0xfffffc1f)==0xd65f0000||(w&0xfffffc1f)==0xd61f0000||(w&0x7c000000)==0x14000000&&w>>31==0}
 fn is_conditional(w:u32)->bool{(w&0xff000010)==0x54000000||(w&0x7e000000)==0x34000000||(w&0x7e000000)==0x36000000}
-fn parse_metadata(file:&mut File,window:&[u8],map:&Mapping,size:u64)->io::Result<(Vec<(u64,String)>,Vec<u64>)>{
- if window.len()<32||&window[..4]!=[0xcf,0xfa,0xed,0xfe]{return Ok((vec![],vec![]));}
+fn parse_metadata(file:&mut File,window:&[u8],map:&Mapping,size:u64)->io::Result<(Vec<(u64,String)>,Vec<u64>,Vec<u64>)>{
+ if window.len()<32||&window[..4]!=[0xcf,0xfa,0xed,0xfe]{return Ok((vec![],vec![],vec![]));}
  let ncmd=le32(&window[16..20]);let mut at=32usize;let mut text_vm=0u64;let mut fstarts=None;let mut symtab=None;
  for _ in 0..ncmd{
   if at+8>window.len(){break} let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8]) as usize;
@@ -147,17 +147,17 @@ fn parse_metadata(file:&mut File,window:&[u8],map:&Mapping,size:u64)->io::Result
   else if cmd==0x2&&cs>=24{symtab=Some((le32(&window[at+8..at+12]) as u64,le32(&window[at+12..at+16]) as usize,le32(&window[at+16..at+20]) as u64,le32(&window[at+20..at+24]) as usize));}
   at+=cs;
  }
- let mut starts=Vec::new();
+ let mut starts=Vec::new();let mut function_starts=Vec::new();
  if let Some((off,len))=fstarts{if len<=8*1024*1024&&off<=size&&len as u64<=size-off{
   let data=read_exact_range(file,off,len)?;let mut i=0usize;let mut addr=text_vm;
-  while i<data.len()&&starts.len()<200_000{let mut shift=0u32;let mut delta=0u64;loop{if i>=data.len()||shift>=64{break}let b=data[i];i+=1;delta|=((b&0x7f)as u64)<<shift;if b&0x80==0{break}shift+=7;}if delta==0{break}addr=addr.saturating_add(delta);if addr>=map.address&&addr<map.address+map.bytes{starts.push(addr);}}
+  while i<data.len()&&starts.len()<200_000{let mut shift=0u32;let mut delta=0u64;loop{if i>=data.len()||shift>=64{break}let b=data[i];i+=1;delta|=((b&0x7f)as u64)<<shift;if b&0x80==0{break}shift+=7;}if delta==0{break}addr=addr.saturating_add(delta);if addr>=map.address&&addr<map.address+map.bytes&&(addr-map.address)%4==0{starts.push(addr);function_starts.push(addr);}}
  }}
  let mut symbols=Vec::new();
  if let Some((so,n,stro,strlen))=symtab{let n=n.min(200_000);let bytes=n.saturating_mul(16);if bytes<=16*1024*1024&&strlen<=16*1024*1024&&so<=size&&bytes as u64<=size-so&&stro<=size&&strlen as u64<=size-stro{
   let syms=read_exact_range(file,so,bytes)?;let strs=read_exact_range(file,stro,strlen)?;
-  for i in 0..n{let p=&syms[i*16..i*16+16];let strx=le32(p) as usize;let typ=p[4];let val=le64(&p[8..16]);if typ&0xe0!=0||(typ&0x0e)!=0x0e||val<map.address||val>=map.address+map.bytes||strx==0||strx>=strs.len(){continue}let end=strs[strx..].iter().position(|&b|b==0).map(|x|strx+x).unwrap_or(strs.len());if end<=strx{continue}let name=String::from_utf8_lossy(&strs[strx..end]).into_owned();if name.len()<=256{symbols.push((val,name));starts.push(val);}}
+  for i in 0..n{let p=&syms[i*16..i*16+16];let strx=le32(p) as usize;let typ=p[4];let val=le64(&p[8..16]);if typ&0xe0!=0||(typ&0x0e)!=0x0e||val<map.address||val>=map.address+map.bytes||(val-map.address)%4!=0||strx==0||strx>=strs.len(){continue}let end=strs[strx..].iter().position(|&b|b==0).map(|x|strx+x).unwrap_or(strs.len());if end<=strx{continue}let name=String::from_utf8_lossy(&strs[strx..end]).into_owned();if name.len()<=256{symbols.push((val,name));starts.push(val);}}
  }}
- starts.push(map.address);starts.sort_unstable();starts.dedup();symbols.sort_by_key(|x|x.0);symbols.dedup_by(|a,b|a.0==b.0&&a.1==b.1);Ok((symbols,starts))
+ starts.push(map.address);starts.sort_unstable();starts.dedup();function_starts.sort_unstable();function_starts.dedup();symbols.sort_by_key(|x|x.0);symbols.dedup_by(|a,b|a.0==b.0&&a.1==b.1);Ok((symbols,starts,function_starts))
 }
 fn symbol_name_at(symbols:&[(u64,String)],address:u64)->Option<&str>{
  let index=symbols.partition_point(|(value,_)|*value<address);
@@ -185,6 +185,17 @@ fn export_function_names(exports:&str,window:&[u8],starts:&[u64],scan_end:u64)->
   if address<scan_end&&admitted.contains(&address){names.entry(address).or_insert_with(||name.to_string());}
  }
  names
+}
+fn export_function_starts(exports:&str,window:&[u8],code_start:u64,scan_end:u64)->Vec<u64>{
+ let Some(base)=dyld_segments(window).into_iter().find(|segment|segment.name=="__TEXT").map(|segment|segment.vmaddr) else{return Vec::new()};
+ exports.lines().filter_map(|line|{
+  let (_,fields)=line.strip_prefix("export ")?.split_once(" address=")?;
+  let offset=fields.split_whitespace().next().and_then(|value|u64::from_str_radix(value.trim_start_matches("0x"),16).ok())?;
+  let flags=fields.split(" flags=").nth(1).and_then(|value|value.split_whitespace().next()).and_then(|value|u64::from_str_radix(value.trim_start_matches("0x"),16).ok())?;
+  if flags&8!=0{return None}
+  let address=if flags&3==2{offset}else if flags&3==0{base.checked_add(offset)?}else{return None};
+  (address>=code_start&&address<scan_end&&(address-code_start)%4==0).then_some(address)
+ }).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
 }
 fn resolved_function_name<'a>(address:u64,symbols:&'a[(u64,String)],objc:&'a std::collections::BTreeMap<u64,String>,exports:&'a std::collections::BTreeMap<u64,String>,stubs:&'a std::collections::BTreeMap<u64,String>)->Option<&'a str>{
  symbol_name_at(symbols,address).or_else(||objc.get(&address).map(String::as_str)).or_else(||exports.get(&address).map(String::as_str)).or_else(||stubs.get(&address).map(String::as_str))
@@ -389,6 +400,48 @@ fn runtime_reference_graph(file:&mut File,window:&[u8],size:u64)->io::Result<Str
  }
  if edges==0{out.push_str("No validated Objective-C selector/class/super reference edges were recovered.\n");}Ok(out)
 }
+fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],base:u64,calls:&[(u64,u64,u64)],symbols:&[(u64,String)])->io::Result<std::collections::BTreeMap<u64,String>>{
+ let mut result=std::collections::BTreeMap::new();
+ let section_list=sections(window);
+ for &(_,site,target) in calls{
+  let direct_symbol=symbol_name_at(symbols,target).is_some_and(|name|name.contains("objc_msgSend"));
+  let mut selector=None;
+  if let Some(stub_section)=section_for_va(&section_list,target).filter(|section|section.sect=="__objc_stubs"){
+   let relative=target-stub_section.addr;
+   if relative.checked_add(20).is_some_and(|end|end<=stub_section.size){
+    if let Some(bytes)=read_va(file,&section_list,size,target,20)?{
+     let first=le32(&bytes[0..4]);let second=le32(&bytes[4..8]);let third=le32(&bytes[8..12]);let fourth=le32(&bytes[12..16]);let fifth=le32(&bytes[16..20]);
+     let load_fields=|word:u32|->Option<(u32,u32,u64)>{if word&0x3b00_0000!=0x3900_0000||(word>>22)&3!=1||word>>30!=3{return None}Some((word&31,(word>>5)&31,(((word>>10)&0xfff)as u64)*8))};
+     if let (Some((base_register,page)),Some((loaded,load_base,offset)),Some((dispatch_register,_dispatch_page)),Some((dispatch_loaded,dispatch_base,_)))=(
+      arm64_address_value(first,target),load_fields(second),arm64_address_value(third,target+8),load_fields(fourth)){
+      let is_dispatch=fifth&0xffff_fc1f==0xd61f_0000&&(fifth>>5)&31==dispatch_register;
+      if base_register==1&&first>>31!=0&&loaded==1&&load_base==1&&dispatch_register==16&&third>>31!=0&&dispatch_loaded==16&&dispatch_base==16&&is_dispatch{
+       if let Some(reference)=page.checked_add(offset){selector=objc_selector_name(file,&section_list,size,reference)?;}
+      }
+     }
+    }
+   }
+  }
+  if selector.is_none()&&direct_symbol&&site>=base+4&&(site-base)%4==0{
+   let call_index=((site-base)/4)as usize;let load_index=call_index-1;let load_offset=load_index*4;
+   if let Some(word_bytes)=code.get(load_offset..load_offset+4){let word=le32(word_bytes);
+    if word&0x3b00_0000==0x3900_0000&&(word>>22)&3==1&&word>>30==3&&word&31==1{
+     let base_register=(word>>5)&31;let displacement=((word>>10)&0xfff)as u64*8;let mut reference=None;
+     for address_index in load_index.saturating_sub(2)..load_index{
+      let address_pc=base+address_index as u64*4;let address_word=le32(&code[address_index*4..address_index*4+4]);
+      if let Some((register,page))=arm64_address_value(address_word,address_pc){if register==base_register&&address_word>>31!=0{
+       let mut address=page.checked_add(displacement);if address_index+1==load_index{reference=address;}
+       if address_index+2==load_index{let add_word=le32(&code[(address_index+1)*4..(address_index+2)*4]);if let Some((destination,source,immediate))=arm64_add_immediate(add_word){if destination==base_register&&source==base_register{address=address.and_then(|value|value.checked_add(immediate));reference=address;}}}
+      }}
+     }
+     if let Some(address)=reference{selector=objc_selector_name(file,&section_list,size,address)?;}
+    }
+   }
+  }
+  if let Some(selector)=selector{result.insert(site,selector);}
+ }
+ Ok(result)
+}
 fn selector_call_xrefs(relocations:&[(u64,String,u32,bool,u32,Option<u64>)],calls:&[(u64,u64,u64)],symbols:&[(u64,String)])->String{
  let mut out=String::new();let mut count=0usize;
  for (site,name,_,_,_,target) in relocations.iter(){let lower=name.to_ascii_lowercase();if !(lower.contains("objc_msgsend")||lower.contains("objc_msgsend$super")||lower.contains("selref")||lower.contains("selector")){continue}out.push_str(&format!("{site:#018x}  relocation -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}out.push('\n');count+=1;if out.len()>60_000{return out}}
@@ -408,6 +461,15 @@ fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
 fn read_va(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,len:usize)->io::Result<Option<Vec<u8>>>{
  let Some(sec)=section_for_va(secs,va) else{return Ok(None)};let rel=va-sec.addr;if rel.saturating_add(len as u64)>sec.size||sec.offset.saturating_add(rel).saturating_add(len as u64)>size{return Ok(None)}Ok(Some(read_exact_range(file,sec.offset+rel,len)?))
 }
+fn objc_selector_name(file:&mut File,secs:&[SectionInfo],size:u64,va:u64)->io::Result<Option<String>>{
+ let Some(section)=section_for_va(secs,va)else{return Ok(None)};
+ if ["__objc_methname","__cstring"].contains(&section.sect.as_str()){return read_cstr_at(file,section,va,512)}
+ if section.sect!="__objc_selrefs"{return Ok(None)}
+ let Some(bytes)=read_va(file,secs,size,va,8)?else{return Ok(None)};let target=le64(&bytes);
+ let Some(name_section)=section_for_va(secs,target)else{return Ok(None)};
+ if !["__objc_methname","__cstring"].contains(&name_section.sect.as_str()){return Ok(None)}
+ read_cstr_at(file,name_section,target,512)
+}
 fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,kind:&str,owner:Option<&str>,out:&mut String,limit:&mut usize)->io::Result<()> {
  if va==0||section_for_va(secs,va).is_none(){return Ok(())}
  let Some(h)=read_va(file,secs,size,va,8)? else{return Ok(())};
@@ -415,13 +477,17 @@ fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,kind:&str
  let entry_size=(flags&0xffff) as usize;let stride=if relative{entry_size.max(12)}else{entry_size.max(24)};
  if stride>256{return Ok(())}
  for i in 0..count {let entry=va.saturating_add(8).saturating_add((i*stride) as u64);let need=if relative{12}else{24};let Some(m)=read_va(file,secs,size,entry,need)? else{break};
-  let resolve_rel=|off:usize|->Option<u64>{let rel=i32::from_le_bytes(m[off..off+4].try_into().ok()?) as i64;let site=entry.checked_add(off as u64)?;if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)}};
-  let (sel,ty,imp)=if relative{(resolve_rel(0),resolve_rel(4),resolve_rel(8))}else{(Some(le64(&m[0..8])),Some(le64(&m[8..16])),Some(le64(&m[16..24])))};
-  let selector=sel.and_then(|v|section_for_va(secs,v)).map(|s|read_cstr_at(file,s,sel.unwrap(),512)).transpose()?.flatten().unwrap_or_else(||"<selector unresolved>".into());
+  let resolve_rel=|off:usize,raw:u32|->Option<u64>{let rel=(raw as i32) as i64;let site=entry.checked_add(off as u64)?;if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)}};
+  let (sel,ty,imp)=if relative{
+   let selector_word=le32(&m[0..4]);let selector_direct=selector_word&1!=0;
+   let selector_relative=if selector_direct{selector_word&!1}else{selector_word};
+   (resolve_rel(0,selector_relative).map(|address|(address,selector_direct)),resolve_rel(4,le32(&m[4..8])),resolve_rel(8,le32(&m[8..12])).map(|address|(address,false)))
+  }else{(Some((le64(&m[0..8]),false)),Some(le64(&m[8..16])),Some((le64(&m[16..24]),false)))};
+  let selector=if let Some((address,_direct))=sel{objc_selector_name(file,secs,size,address)?.unwrap_or_else(||"<selector unresolved>".into())}else{"<selector unresolved>".into()};
   let types=ty.and_then(|v|section_for_va(secs,v)).map(|s|read_cstr_at(file,s,ty.unwrap(),512)).transpose()?.flatten().unwrap_or_else(||"<types unresolved>".into());
   let confidence=if selector.starts_with('<'){"candidate"}else{"validated"};
   let resolved=owner.filter(|_| confidence=="validated").map(|class|match kind {"class"|"category-class"=>format!("+[{} {}]",class,selector),_=>format!("-[{} {}]",class,selector)});
-  out.push_str(&format!("  {kind} method {entry:#018x}  name={selector}  types={types}  imp={:#018x}{} confidence={confidence}\n",imp.unwrap_or(0),resolved.map(|name|format!(" resolved={name}")).unwrap_or_default()));
+  out.push_str(&format!("  {kind} method {entry:#018x}  name={selector}  types={types}  imp={:#018x}{} confidence={confidence}\n",imp.map(|(address,_)|address).unwrap_or(0),resolved.map(|name|format!(" resolved={name}")).unwrap_or_default()));
   *limit+=1;if out.len()>60_000{return Ok(())}
  }
  Ok(())
@@ -454,7 +520,9 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
   for (idx,p) in data.chunks_exact(8).enumerate().take(20_000){let class_va=le64(p);if class_va==0||section_for_va(&secs,class_va).is_none(){continue}let Some(cls)=read_va(file,&secs,size,class_va,40)? else{continue};
    let super_va=le64(&cls[8..16]);let data_bits=le64(&cls[32..40]);let mut ro_va=data_bits&!7u64;
    if section_for_va(&secs,ro_va).is_some(){if let Some(rw)=read_va(file,&secs,size,ro_va,16)?{let nested=le64(&rw[8..16]);if nested!=0&&section_for_va(&secs,nested).is_some(){ro_va=nested&!7u64;}}}
-   let Some(ro)=read_va(file,&secs,size,ro_va,80)? else{out.push_str(&format!("candidate class[{idx}] {class_va:#018x} super={super_va:#018x} ro={ro_va:#018x} (RO record unresolved)\n"));continue};
+   // class_ro_t is 72 bytes on 64-bit Darwin: four 32-bit fields followed
+   // by five pointers. Keep this read within the mapped section.
+   let Some(ro)=read_va(file,&secs,size,ro_va,72)? else{out.push_str(&format!("candidate class[{idx}] {class_va:#018x} super={super_va:#018x} ro={ro_va:#018x} (RO record unresolved)\n"));continue};
    // Current 64-bit class_ro_t places name/methods/protocols/ivars/properties at 0x20..0x50.
    // Keep the older layout as a fallback for pre-modern runtime records.
    let candidates=[(32usize,40usize,48usize,56usize,64usize),(24usize,32usize,40usize,48usize,56usize)];
@@ -464,7 +532,7 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
    let before=methods;objc_method_list(file,&secs,size,methods_va,"instance",Some(&name),&mut out,&mut methods)?; // class methods are discovered from metaclass records below.
    let _=before;
    // A class's isa points at its metaclass. Its class_ro_t carries the class-method list.
-   let isa=le64(&cls[0..8]);if isa!=0{if let Some(meta)=read_va(file,&secs,size,isa,40)?{let bits=le64(&meta[32..40]);let mut mro=bits&!7u64;if let Some(rw)=read_va(file,&secs,size,mro,16)?{let nested=le64(&rw[8..16]);if nested!=0&&section_for_va(&secs,nested).is_some(){mro=nested&!7u64;}}if let Some(mro_bytes)=read_va(file,&secs,size,mro,80)?{let mmethods=le64(&mro_bytes[40..48]);objc_method_list(file,&secs,size,mmethods,"class",Some(&name),&mut out,&mut methods)?;}}
+   let isa=le64(&cls[0..8]);if isa!=0{if let Some(meta)=read_va(file,&secs,size,isa,40)?{let bits=le64(&meta[32..40]);let mut mro=bits&!7u64;if let Some(rw)=read_va(file,&secs,size,mro,16)?{let nested=le64(&rw[8..16]);if nested!=0&&section_for_va(&secs,nested).is_some(){mro=nested&!7u64;}}if let Some(mro_bytes)=read_va(file,&secs,size,mro,72)?{let mmethods=le64(&mro_bytes[40..48]);objc_method_list(file,&secs,size,mmethods,"class",Some(&name),&mut out,&mut methods)?;}}
    }
    objc_ivar_list(file,&secs,size,ivars_va,&mut out,&mut ivars)?;objc_protocol_list(file,&secs,size,protocols_va,&mut out,&mut protocols)?;objc_property_list(file,&secs,size,properties_va,&mut out,&mut properties)?;
    if out.len()>60_000{return Ok(out)}
@@ -562,6 +630,76 @@ fn annotated_disassembly(code:&[u8],base:u64,symbols:&[(u64,String)],relocations
 
 fn classify_jump_candidate(code:&[u8],base:u64,pc:u64,reg:u32)->&'static str{
  let idx=pc.saturating_sub(base) as usize;if idx<4{return "unresolved indirect branch"}let mut strong=false;for back in [4usize,8,12,16]{if idx<back{continue}let w=le32(&code[idx-back..idx-back+4]);let rd=w&31;let is_load=(w&0x3f000000)==0x39000000&&((w>>22)&3)!=0;if is_load&&rd==reg{strong=true;break}}if strong{"strong jump-table candidate: branch register has a nearby modeled load definition; table provenance/bounds still unproven"}else{"unresolved indirect branch; insufficient local provenance for jump-table promotion"}
+}
+
+fn arm64_address_value(word:u32,pc:u64)->Option<(u32,u64)>{
+ if word&0x1f00_0000!=0x1000_0000{return None}
+ let immlo=(word>>29)&3;let immhi=(word>>5)&0x7ffff;let raw=((immhi<<2)|immlo)as i64;
+ let signed=if raw&(1<<20)!=0{raw-(1<<21)}else{raw};let page=word>>31!=0;
+ let origin=if page{pc&!0xfff}else{pc};let displacement=if page{signed.checked_mul(4096)?}else{signed};
+ Some((word&31,origin.wrapping_add_signed(displacement)))
+}
+
+fn arm64_add_immediate(word:u32)->Option<(u32,u32,u64)>{
+ if word&0x7f00_0000!=0x1100_0000||word&(1<<29)!=0{return None}
+ let mut immediate=((word>>10)&0xfff)as u64;if word&(1<<22)!=0{immediate=immediate.checked_shl(12)?;}
+ Some((word&31,(word>>5)&31,immediate))
+}
+
+fn arm64_indexed_jump_load(word:u32)->Option<(u32,u32,u32,bool)>{
+ if word&0x3f20_0c00!=0x3820_0800||word&(1<<12)==0{return None}
+ let size=(word>>30)&3;let opc=(word>>22)&3;let option=(word>>13)&7;
+ if option!=2&&option!=3{return None}
+ let (width,signed)=match(size,opc){(3,1)=>(8,false),(2,2)=>(4,true),_=>return None};
+ Some((word&31,(word>>5)&31,width,signed))
+}
+
+/// Recover a tightly bounded ARM64 indexed table only when a scaled indexed
+/// load feeds BR directly or through `ADD base, base, loaded-offset`. Every
+/// emitted target must land in the admitted executable mapping.
+fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],base:u64,pc:u64,branch_reg:u32,scan_end:u64)->io::Result<Option<String>>{
+ let index=pc.saturating_sub(base)as usize/4;if index>=code.len()/4{return Ok(None)}
+ let mut load_index=None;let mut relative_base=None;
+ for candidate in (index.saturating_sub(4)..index).rev(){
+  let word=le32(&code[candidate*4..candidate*4+4]);let Some((rd,rn,rm,wide))=shifted_add_register(word)else{continue};
+  if rd==branch_reg&&rn!=31&&rm!=31&&wide{
+   for load in (candidate.saturating_sub(3)..candidate).rev(){let Some((loaded,table_reg,width,signed))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&width==4&&signed{load_index=Some(load);relative_base=Some(table_reg);break}}
+   if load_index.is_some(){break}
+  }
+ }
+ let (load_index,table_reg,width,signed)=if let Some(load_index)=load_index{
+  (load_index,relative_base.unwrap(),4,true)
+ }else{
+  let mut found=None;for load in (index.saturating_sub(3)..index).rev(){if let Some((loaded,table_reg,width,signed))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4])){if loaded==branch_reg{found=Some((load,table_reg,width,signed));break}}}let Some(found)=found else{return Ok(None)};found
+ };
+ let mut table_address=None;
+ let search_start=load_index.saturating_sub(6);
+ for add_index in (search_start..load_index).rev(){
+  let add_word=le32(&code[add_index*4..add_index*4+4]);let Some((rd,rn,immediate))=arm64_add_immediate(add_word)else{continue};if rd!=table_reg{continue}
+  for address_index in (add_index.saturating_sub(5)..add_index).rev(){let address_word=le32(&code[address_index*4..address_index*4+4]);let Some((dest,value))=arm64_address_value(address_word,base+address_index as u64*4)else{continue};if dest==rn{table_address=value.checked_add(immediate);break}}
+  if table_address.is_some(){break}
+ }
+ if table_address.is_none(){for address_index in (search_start..load_index).rev(){let word=le32(&code[address_index*4..address_index*4+4]);if let Some((dest,value))=arm64_address_value(word,base+address_index as u64*4){if dest==table_reg{table_address=Some(value);break}}}}
+ let Some(table_address)=table_address else{return Ok(None)};
+ let Some(section)=section_for_va(secs,table_address)else{return Ok(None)};if section.offset>size||section.size>size-section.offset{return Ok(None)}
+ let table_offset=table_address.checked_sub(section.addr).and_then(|rel|section.offset.checked_add(rel));let Some(table_offset)=table_offset else{return Ok(None)};
+ if table_offset>=size{return Ok(None)}
+ let section_entries=((section.addr+section.size).saturating_sub(table_address)/(width as u64))as usize;let count=section_entries.min(32);
+ if count==0{return Ok(None)}
+ let index_register=(le32(&code[load_index*4..load_index*4+4])>>16)&31;
+ let mut out=format!("table={table_address:#018x} format={} entry_width={width} table_index=x{index_register} scan_limit=32 confidence=candidate\n",if signed{"table-relative signed offsets"}else{"absolute pointers"});let mut valid=0usize;let mut stopped=None;
+ for case in 0..count{let Some(offset)=table_offset.checked_add(case as u64*width as u64)else{stopped=Some((case,"file offset overflow"));break};if offset>size||width as u64>size-offset{stopped=Some((case,"entry exceeds file"));break}let entry=read_exact_range(file,offset,width as usize)?;let raw=if width==8{le64(&entry)}else{le32(&entry)as u64};let target=if signed{table_address.checked_add_signed((raw as u32 as i32)as i64)}else{Some(raw)};
+  let Some(target)=target.filter(|target|*target>=base&&*target<scan_end&&(*target-base)%4==0)else{stopped=Some((case,"entry target is outside admitted executable bytes or is unaligned"));break};valid+=1;out.push_str(&format!("  case-index={case} entry={offset:#x} target={target:#018x} validation=executable-aligned\n"));
+ }
+ if valid==0{return Ok(None)}
+ if let Some((case,reason))=stopped{out.push_str(&format!("unresolved-entry case-index={case} reason={reason}\n"));}else if section_entries>32{out.push_str("unresolved-entry case-index=32 reason=32-entry analysis cap reached\n");}else{out.push_str("enumeration stopped at containing-section boundary\n");}
+ out.push_str(&format!("validated_entries={valid}; table extent is bounded by its containing section and 32-entry scan cap; case mapping and original source switch remain unproven."));
+ Ok(Some(out))
+}
+
+fn shifted_add_register(word:u32)->Option<(u32,u32,u32,bool)>{
+ if word&0x7f20_0000!=0x0b00_0000||word&(1<<29)!=0||(word>>10)&0x3f!=0{return None}
+ Some((word&31,(word>>5)&31,(word>>16)&31,word>>31!=0))
 }
 
 
@@ -808,6 +946,31 @@ fn macho_uuid(window:&[u8])->Option<String>{
  for _ in 0..n{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8])as usize;if cs<8||at+cs>window.len(){break}if cmd==0x1b&&cs>=24{let u=&window[at+8..at+24];return Some(format!("{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",u[0],u[1],u[2],u[3],u[4],u[5],u[6],u[7],u[8],u[9],u[10],u[11],u[12],u[13],u[14],u[15]));}at+=cs;}None
 }
 fn has_function_starts(window:&[u8])->bool{if window.len()<32{return false}let n=le32(&window[16..20]);let mut at=32usize;for _ in 0..n{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8])as usize;if cs<8||at+cs>window.len(){break}if cmd==0x26{return true}at+=cs;}false}
+fn unwind_info_function_starts(file:&mut File,window:&[u8],size:u64,code_start:u64,scan_end:u64)->io::Result<Vec<u64>>{
+ let Some(sec)=sections(window).into_iter().find(|section|section.sect=="__unwind_info") else{return Ok(Vec::new())};
+ if sec.size<28||sec.size>16*1024*1024||sec.offset>size||sec.size>size-sec.offset{return Ok(Vec::new())}
+ let Some(image_base)=dyld_segments(window).into_iter().find(|segment|segment.name=="__TEXT").map(|segment|segment.vmaddr) else{return Ok(Vec::new())};
+ let data=read_exact_range(file,sec.offset,sec.size as usize)?;
+ Ok(unwind_info_starts_from_bytes(&data,image_base,code_start,scan_end))
+}
+fn unwind_info_starts_from_bytes(data:&[u8],image_base:u64,code_start:u64,scan_end:u64)->Vec<u64>{
+ if data.len()<28{return Vec::new()}
+ if le32(&data[0..4])!=1{return Vec::new()}
+ let index_offset=le32(&data[20..24]) as usize;let index_count=le32(&data[24..28]) as usize;
+ if index_count<2||index_count>200_000||index_offset>data.len()||index_count.checked_mul(12).map_or(true,|bytes|bytes>data.len()-index_offset){return Vec::new()}
+ let mut starts=std::collections::BTreeSet::new();
+ let mut add_offset=|offset:u32|{if let Some(address)=image_base.checked_add(offset as u64){if address>=code_start&&address<scan_end&&(address-code_start)%4==0{starts.insert(address);}}};
+ for index in 0..index_count-1{
+  let row=index_offset+index*12;let function_offset=le32(&data[row..row+4]);let page_offset=le32(&data[row+4..row+8]) as usize;
+  add_offset(function_offset);
+  if page_offset==0||page_offset.checked_add(8).map_or(true,|end|end>data.len()){continue}
+  let page_end=page_offset.saturating_add(4096).min(data.len());
+  let kind=le32(&data[page_offset..page_offset+4]);let entries_offset=u16::from_le_bytes(data[page_offset+4..page_offset+6].try_into().unwrap()) as usize;let count=u16::from_le_bytes(data[page_offset+6..page_offset+8].try_into().unwrap()) as usize;
+  let stride=match kind{2=>8,3=>4,_=>continue};let Some(entries_start)=page_offset.checked_add(entries_offset) else{continue};let Some(bytes)=count.checked_mul(stride) else{continue};if entries_start>page_end||bytes>page_end-entries_start{continue}
+  for item in 0..count{let at=entries_start+item*stride;let raw=le32(&data[at..at+4]);let offset=if kind==3{function_offset.checked_add(raw&0x00ff_ffff)}else{Some(raw)};if let Some(offset)=offset{add_offset(offset);}}
+ }
+ starts.into_iter().collect()
+}
 fn compact_unwind_records(file:&mut File,secs:&[SectionInfo],size:u64)->io::Result<String>{
  let Some(sec)=secs.iter().find(|s|s.sect=="__compact_unwind") else{return Ok("compact-unwind=<section absent>\n".into())};
  if sec.size==0{return Ok("compact-unwind=<empty section>\n".into())}
@@ -998,8 +1161,8 @@ fn stack_slot_value_shape(mnemonic:&str,assembly:&str)->&'static str{
  else{"u64-or-pointer-width"}
 }
 fn stack_slot_candidates(ir:&str)->String{
- let mut out=String::from("Bounded stack-slot candidates (decoded stack-relative operands; source names, lifetimes, layouts, and types remain unresolved)\n");
- let mut count=0usize;
+ let mut out=String::from("Bounded stack-slot candidates grouped by signed SP-relative offset (SP movement, source names, lifetimes, aggregate layouts, and source types remain unresolved)\n");
+ let mut slots=std::collections::BTreeMap::<i64,(std::collections::BTreeSet<&'static str>,std::collections::BTreeSet<&'static str>,usize,Vec<String>)>::new();
  for line in ir.lines().take(20_000){
   let mut fields=line.split_whitespace();
   let Some(address)=fields.next() else{continue};
@@ -1007,14 +1170,13 @@ fn stack_slot_candidates(ir:&str)->String{
   if kind!="op"{continue}
   let assembly=fields.collect::<Vec<_>>().join(" ");
   let mnemonic=assembly.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-  if !matches!(mnemonic.as_str(),"ldr"|"ldrb"|"ldrh"|"ldrsw"|"ldp"|"str"|"strb"|"strh"|"stp")||!assembly.contains("sp")||!assembly.contains('#'){continue}
-  if out.len()>58_000{break}
-  let value_shape=stack_slot_value_shape(&mnemonic,&assembly);
-  out.push_str(&format!("  {address} {assembly}  classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown value-shape={value_shape}\n"));
-  count+=1;
+  if !matches!(mnemonic.as_str(),"ldr"|"ldrb"|"ldrh"|"ldrsw"|"ldp"|"str"|"strb"|"strh"|"stp")||!assembly.contains("[sp,")||!assembly.contains('#'){continue}
+  let Some(offset_text)=assembly.split("[sp,").nth(1).and_then(|tail|tail.split('#').nth(1)).map(|tail|tail.split(|ch:char|ch==']'||ch==','||ch.is_whitespace()).next().unwrap_or("")) else{continue};
+  let offset=if let Some(hex)=offset_text.strip_prefix("-0x"){i64::from_str_radix(hex,16).ok().and_then(i64::checked_neg)}else if let Some(hex)=offset_text.strip_prefix("0x"){i64::from_str_radix(hex,16).ok()}else{offset_text.parse::<i64>().ok()};let Some(offset)=offset else{continue};
+  let role=if mnemonic.starts_with("ldr"){"read"}else{"write"};let shape=stack_slot_value_shape(&mnemonic,&assembly);let slot=slots.entry(offset).or_default();slot.0.insert(shape);slot.1.insert(role);slot.2+=1;if slot.3.len()<8{slot.3.push(format!("{address}:{role}:{shape}"));}
  }
- if count==0{out.push_str("No decoded stack-relative load/store candidates were recovered.\n");}
- else{out.push_str(&format!("Candidates recovered: {count}. Value shape is operand-derived; source variable identity and type recovery remain unresolved.\n"));}
+ if slots.is_empty(){out.push_str("No decoded stack-relative load/store candidates were recovered.\n");}
+ else{for (offset,(shapes,roles,count,sites)) in slots{let name=if offset<0{format!("stack_slot_sp_m{:x}",offset.unsigned_abs())}else{format!("stack_slot_sp_p{offset:x}")};out.push_str(&format!("  {name} offset={offset:+#x} accesses={count} roles={} value-shape={} examples={} classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown\n",roles.into_iter().collect::<Vec<_>>().join(","),shapes.into_iter().collect::<Vec<_>>().join(","),sites.join(",")));if out.len()>58_000{break}}out.push_str("Names are stable labels for observed SP-relative offsets only; a stack adjustment may change the absolute slot represented by a label.\n");}
  out
 }
 fn analysis_quality_report(map_bytes:u64,scan_bytes:u64,encrypted:bool,truncated:bool,instructions:usize,decoded:usize,data_words:usize,functions:usize,blocks:usize,calls:usize,tails:usize,relocations:usize,data_refs:&str,dominators:&str)->String{
@@ -1057,16 +1219,38 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let size:u64=size.parse().map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"Invalid source size"))?;let cpath=CString::new(path)?;let hash=CString::new(digest)?;let fd=unsafe{re_open_source(cpath.as_ptr())};if fd<0{return Err(io::Error::new(io::ErrorKind::InvalidInput,"Cannot open captured source"));}
  let mut file=unsafe{File::from_raw_fd(fd)};let before=file.metadata()?;let mut error=[0 as c_char;512];if unsafe{re_verify_fd(file.as_raw_fd(),hash.as_ptr(),size,error.as_mut_ptr(),error.len())}!=0{return Err(io::Error::new(io::ErrorKind::InvalidData,unsafe{CStr::from_ptr(error.as_ptr())}.to_string_lossy().into_owned()));}
  analysis_progress(8,"mapping","Source hash verified; reading bounded Mach-O layout and metadata.");
- let window=read_window(&mut file,size)?;let map=mapping(&window,size).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;let(symbols,mut starts)=parse_metadata(&mut file,&window,&map,size)?;let relocations=parse_text_relocations(&mut file,&window,size)?;let metadata=platform_metadata(&window);let runtime_records=runtime_records(&mut file,&window,size)?;let swift_types=swift_nominal_types(&mut file,&window,size)?;let runtime_graph=runtime_reference_graph(&mut file,&window,size)?;let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
+ let window=read_window(&mut file,size)?;let map=mapping(&window,size).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;let(symbols,mut starts,lc_function_starts)=parse_metadata(&mut file,&window,&map,size)?;let relocations=parse_text_relocations(&mut file,&window,size)?;let metadata=platform_metadata(&window);let runtime_records=runtime_records(&mut file,&window,size)?;let swift_types=swift_nominal_types(&mut file,&window,size)?;let runtime_graph=runtime_reference_graph(&mut file,&window,size)?;let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  analysis_progress(20,"metadata","Mach-O, symbol, runtime, relocation, and data-in-code metadata recovered.");
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
+ let parsed_sections=sections(&window);
  if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
+ let mut direct_call_starts=std::collections::BTreeSet::new();
+ if !map.encrypted{for (index,chunk) in code.chunks_exact(4).enumerate(){let pc=map.address+(index as u64)*4;let file_position=map.offset+(index as u64)*4;if data_ranges.iter().any(|(start,end,_)|file_position<*end&&file_position.saturating_add(4)>*start){continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}}}
+ starts.extend(direct_call_starts.iter().copied());
+ let unwind_starts=if map.encrypted{Vec::new()}else{unwind_info_function_starts(&mut file,&window,size,map.address,scan_end)?};
+ starts.extend(unwind_starts.iter().copied());
  let objc_classes=objc_class_graph(&mut file,&window,size)?;
  let objc_function_names=objc_imp_names(&objc_classes);
+ let objc_starts=objc_function_names.keys().copied().filter(|address|*address>=map.address&&*address<scan_end&&(*address-map.address)%4==0).collect::<Vec<_>>();
+ if !map.encrypted{
+  starts.extend(objc_starts.iter().copied());
+ }
+ let export_trie=export_trie_records(&mut file,&window,size)?;
+ let export_starts=if map.encrypted{Vec::new()}else{export_function_starts(&export_trie,&window,map.address,scan_end)};
+ starts.extend(export_starts.iter().copied());
+ starts.sort_unstable();starts.dedup();
+ let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
+ for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
+ for address in &unwind_starts{boundary_sources.entry(*address).or_default().insert("__unwind_info");}
+ for address in &direct_call_starts{boundary_sources.entry(*address).or_default().insert("direct BL target");}
+ for (address,_) in &symbols{boundary_sources.entry(*address).or_default().insert("nlist");}
+ for address in objc_starts{boundary_sources.entry(address).or_default().insert("Objective-C IMP");}
+ for address in export_starts{boundary_sources.entry(address).or_default().insert("export");}
+ if boundary_sources.get(&map.address).map_or(true,std::collections::BTreeSet::is_empty){boundary_sources.entry(map.address).or_default().insert("section-start fallback");}
  let mut functions=String::new();
  let mut leaders=starts.clone();let mut edges:Vec<(u64,u64,&str)>=Vec::new();let mut calls:Vec<(u64,u64,u64)>=Vec::new();let mut ir=String::new();let mut dataflow=String::new();let mut ssa=String::new();let mut jump_tables=String::new();let mut decoded=0usize;let mut data_words=0usize;let mut versions=[0u32;32];let mut data_index=0usize;
  for (i,ch) in code.chunks_exact(4).enumerate(){let pc=map.address+(i as u64)*4;let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));}
-  if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if jump_tables.len()<60_000{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}
+  if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if jump_tables.len()<60_000{if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end)?{jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  bounded indexed-table evidence\n{entries}\n"));}else{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}}
   if let Some((target,k,split))=branch_target(w,pc){if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&pc+4<scan_end{leaders.push(pc+4);edges.push((pc,pc+4,"fallthrough"));}}
   else if is_terminal(w)&&pc+4<scan_end{leaders.push(pc+4);}
  }
@@ -1080,10 +1264,10 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(69,"runtime","Objective-C, Swift, chained-fixup, and annotated-code evidence completed.");
  let interblock_values=interblock_value_flow(&calls,&code,map.address,&leaders,&symbols);let predecessor_values=predecessor_value_flow(&code,map.address,&leaders,&edges,scan_end);let propagated_values=iterative_value_flow(&code,map.address,&leaders,&edges,scan_end);let indirect_calls=indirect_call_resolution(&code,map.address,&leaders,&relocations,&symbols);
  analysis_progress(75,"value-flow","Bounded inter-block value flow and indirect-call evidence completed.");
- let dyld_imports=dyld_import_records(&mut file,&window,size)?;let dyld_linking=dyld_linking_records(&mut file,&window,size)?;let softlinking=softlinking_records(&mut file,&window,size)?;let symbolication=symbolication_records(&mut file,&window,size,&symbols,&starts,scan_end)?;let apple_symbolication=apple_symbolication_records(&mut file,&window,size)?;let arm64e_bind_symbols=arm64e_bind_symbol_records(&mut file,&window,size)?;let dylib_ordinals=dylib_ordinal_records(&window);let resolved_imports=resolved_dyld_import_records(&mut file,&window,size)?;let authenticated_bind_targets=authenticated_bind_targets(&mut file,&window,size)?;let (indirect_symbols,pointer_slots,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;let export_trie=export_trie_records(&mut file,&window,size)?;
+ let dyld_imports=dyld_import_records(&mut file,&window,size)?;let dyld_linking=dyld_linking_records(&mut file,&window,size)?;let softlinking=softlinking_records(&mut file,&window,size)?;let symbolication=symbolication_records(&mut file,&window,size,&symbols,&starts,scan_end)?;let apple_symbolication=apple_symbolication_records(&mut file,&window,size)?;let arm64e_bind_symbols=arm64e_bind_symbol_records(&mut file,&window,size)?;let dylib_ordinals=dylib_ordinal_records(&window);let resolved_imports=resolved_dyld_import_records(&mut file,&window,size)?;let authenticated_bind_targets=authenticated_bind_targets(&mut file,&window,size)?;let (indirect_symbols,pointer_slots,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;
  let export_names=export_function_names(&export_trie,&window,&starts,scan_end);
  let stub_names=indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())).collect::<std::collections::BTreeMap<_,_>>();
- for (idx,&start) in starts.iter().take(2000).enumerate(){let end=starts.get(idx+1).copied().unwrap_or(scan_end);let name=resolved_function_name(start,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<discovered>");let row=format!("{start:#018x}  {end:#018x}  {:>8} bytes  {name}\n",end.saturating_sub(start));if functions.len()+row.len()>60_000{break}functions.push_str(&row);}
+ for (idx,&start) in starts.iter().take(2000).enumerate(){let end=starts.get(idx+1).copied().unwrap_or(scan_end);let name=resolved_function_name(start,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<discovered>");let sources=boundary_sources.get(&start).map(|set|set.iter().copied().collect::<Vec<_>>().join(",")).unwrap_or_else(||"validated control-flow discovery".into());let source_set=boundary_sources.get(&start);let metadata_backed=source_set.is_some_and(|set|set.iter().any(|source|!matches!(*source,"direct BL target"|"section-start fallback")));let confidence=if metadata_backed{"metadata-backed"}else if source_set.is_some_and(|set|set.contains("direct BL target")){"candidate"}else{"bounded"};let row=format!("{start:#018x}  {end:#018x}  {:>8} bytes  {name}  source={sources} confidence={confidence}\n",end.saturating_sub(start));if functions.len()+row.len()>60_000{break}functions.push_str(&row);}
  let symbol_resolver=unified_symbol_records(&symbols,&starts,scan_end,&indirect_facts,&export_trie,&dyld_imports,&export_names);let symbol_provenance=symbol_provenance_records(&indirect_facts);let linkage_records=joined_linkage_records(&mut file,&window,size,&indirect_facts)?;let symbol_callers=symbol_caller_records(&indirect_facts,&calls);let got_auth_slots=got_auth_slot_records(&pointer_slots);let import_export_collisions=import_export_collision_records(&mut file,&window,size)?;
  analysis_progress(82,"linkage","Dyld, soft-linking, symbolication, unified-symbol, indirect-symbol, and joined-linkage evidence completed.");
  let mut function_intelligence=function_intelligence(&starts,&leaders,&calls,&edges,&symbols,&objc_function_names,scan_end);let patterns=super::binary::arm64_patterns(&code,map.address,map.offset,&data_ranges);if function_intelligence.len()+patterns.len()<65536{function_intelligence.push_str(&patterns);}let data_references=pc_relative_data_references(&mut file,&window,&code,map.address)?;let (tail_call_candidates,tail_call_facts)=cross_function_transfer_candidates(&starts,&edges,&symbols,scan_end);let function_neighborhoods=function_neighborhood_report(&starts,&calls,&tail_call_facts,&symbols,&objc_function_names,scan_end);let instruction_words=(code.len()/4).saturating_sub(data_words);let analysis_quality=analysis_quality_report(map.bytes,scan_bytes,map.encrypted,truncated,instruction_words,decoded,data_words,starts.len(),block_count,calls.len(),tail_call_facts.len(),relocations.len(),&data_references,&dominators);let analysis_insights=analysis_insights_report(&function_intelligence,&data_references,&analysis_quality,&calls,&tail_call_facts,&relocations,&jump_tables);
@@ -1097,7 +1281,8 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let mut signature_symbols=symbols.clone();
  signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
- let (signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts);
+ let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols)?;
+ let (signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls);
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
  for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
@@ -1155,7 +1340,23 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
 
 #[cfg(test)]
 mod tests {
- use super::{explicit_integer_cast,function_parameter_candidates,objc_imp_names,export_function_names,resolved_function_name,unified_symbol_records};
+ use super::{explicit_integer_cast,function_parameter_candidates,objc_imp_names,export_function_names,resolved_function_name,unified_symbol_records,unwind_info_starts_from_bytes};
+
+ #[test]
+ fn compressed_unwind_page_entries_are_relative_to_index_base() {
+  let mut data=vec![0u8;68];
+  data[0..4].copy_from_slice(&1u32.to_le_bytes());
+  data[20..24].copy_from_slice(&28u32.to_le_bytes());
+  data[24..28].copy_from_slice(&2u32.to_le_bytes());
+  data[28..32].copy_from_slice(&0x100u32.to_le_bytes());
+  data[32..36].copy_from_slice(&52u32.to_le_bytes());
+  data[40..44].copy_from_slice(&0x200u32.to_le_bytes());
+  data[52..56].copy_from_slice(&3u32.to_le_bytes());
+  data[56..58].copy_from_slice(&12u16.to_le_bytes());
+  data[58..60].copy_from_slice(&1u16.to_le_bytes());
+  data[64..68].copy_from_slice(&0x0100_0020u32.to_le_bytes());
+  assert_eq!(unwind_info_starts_from_bytes(&data,0x1000,0x1000,0x1300),vec![0x1100,0x1120]);
+ }
 
  #[test]
  fn function_names_join_validated_objc_and_dyld_exports() {

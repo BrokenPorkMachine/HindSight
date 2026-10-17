@@ -173,9 +173,27 @@ fn api(name: &str) -> Option<(&'static str, &'static str)> {
         "_objc_lookUpClass" => ("Class objc_lookUpClass(const char *name);", "Objective-C runtime"),
         "_NSGetExecutablePath" => ("int _NSGetExecutablePath(char *buf, uint32_t *bufsize);", "Foundation / dyld"),
         "_malloc" => ("void *malloc(size_t size);", "C library"),
+        "_calloc" => ("void *calloc(size_t count, size_t size);", "C library"),
+        "_realloc" => ("void *realloc(void *ptr, size_t size);", "C library"),
         "_free" => ("void free(void *ptr);", "C library"),
         "_memcpy" => ("void *memcpy(void *restrict dest, const void *restrict src, size_t n);", "C library"),
+        "_memmove" => ("void *memmove(void *dest, const void *src, size_t n);", "C library"),
+        "_memset" => ("void *memset(void *dest, int value, size_t n);", "C library"),
+        "_memcmp" => ("int memcmp(const void *left, const void *right, size_t n);", "C library"),
+        "_bzero" => ("void bzero(void *dest, size_t n);", "C library"),
         "_strlen" => ("size_t strlen(const char *s);", "C library"),
+        "_strnlen" => ("size_t strnlen(const char *s, size_t maxlen);", "C library"),
+        "_strcmp" => ("int strcmp(const char *left, const char *right);", "C library"),
+        "_strncmp" => ("int strncmp(const char *left, const char *right, size_t n);", "C library"),
+        "_strdup" => ("char *strdup(const char *s);", "C library"),
+        "_abort" => ("void abort(void);", "C library"),
+        "_exit" => ("void _exit(int status);", "C library"),
+        "_dispatch_async" => ("void dispatch_async(dispatch_queue_t queue, dispatch_block_t block);", "libdispatch"),
+        "_dispatch_sync" => ("void dispatch_sync(dispatch_queue_t queue, dispatch_block_t block);", "libdispatch"),
+        "_dispatch_once" => ("void dispatch_once(dispatch_once_t *predicate, dispatch_block_t block);", "libdispatch"),
+        "_objc_retain" => ("id objc_retain(id object);", "Objective-C runtime"),
+        "_objc_release" => ("void objc_release(id object);", "Objective-C runtime"),
+        "_objc_autoreleaseReturnValue" => ("id objc_autoreleaseReturnValue(id object);", "Objective-C runtime"),
         _ => return None,
     })
 }
@@ -234,14 +252,59 @@ pub fn recover(starts: &[u64], symbols: &[(u64, String)], objc_records: &str, ca
     recover_internal(starts, symbols, objc_records, calls, scan_end, None)
 }
 
+struct Arm64RenderContext<'a> {
+    code: &'a [u8],
+    base: u64,
+    file_offset: u64,
+    data_ranges: &'a [(u64,u64,u16)],
+    parameter_evidence: &'a str,
+    tail_calls: &'a [(u64,u64,u64)],
+    jump_tables: &'a str,
+    objc_selectors: &'a BTreeMap<u64,String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn recover_arm64(
     starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
     calls: &[(u64,u64,u64)], scan_end: u64, code: &[u8], base: u64,
     file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
-    tail_calls: &[(u64,u64,u64)],
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>,
 ) -> (String, String) {
     recover_internal(starts, symbols, objc_records, calls, scan_end,
-        Some((code, base, file_offset, data_ranges, parameter_evidence, tail_calls)))
+        Some(Arm64RenderContext { code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors }))
+}
+
+#[derive(Default)]
+struct SwitchEvidence { branch_register: u8, index_register: Option<u8>, cases: Vec<(u64,u64)> }
+
+fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
+    let mut result=BTreeMap::new();
+    let mut current=None;
+    for line in report.lines() {
+        if line.contains(" BR x") && line.contains("bounded indexed-table evidence") {
+            let mut fields=line.split_whitespace();
+            let address=fields.next().and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
+            let register=fields.clone().collect::<Vec<_>>().windows(2).find_map(|pair|{
+                (pair[0]=="BR").then(||pair[1].strip_prefix('x').and_then(|n|n.parse::<u8>().ok())).flatten()
+            });
+            current=address.zip(register).map(|(address,register)|{
+                result.insert(address,SwitchEvidence{branch_register:register,..SwitchEvidence::default()});address
+            });
+            continue;
+        }
+        let Some(address)=current else{continue};
+        if let Some(register)=line.split("table_index=x").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<u8>().ok()) {
+            if let Some(evidence)=result.get_mut(&address){evidence.index_register=Some(register);}
+        }
+        if line.trim_start().starts_with("case-index=") {
+            let case=line.split("case-index=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|s.parse::<u64>().ok());
+            let target=line.split("target=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
+            if let (Some(case),Some(target))=(case,target){if let Some(evidence)=result.get_mut(&address){evidence.cases.push((case,target));}}
+        }
+        if line.starts_with("validated_entries=") { current=None; }
+    }
+    result.retain(|_,evidence|evidence.index_register.is_some()&&!evidence.cases.is_empty());
+    result
 }
 
 fn callable_name(name: &str, signature: Option<&Signature>) -> String {
@@ -251,7 +314,7 @@ fn callable_name(name: &str, signature: Option<&Signature>) -> String {
     }
     if let Some(sig) = signature {
         if let Some((head, _)) = sig.declaration.split_once('(') {
-            let candidate = head.trim().trim_end_matches('*').trim().split_whitespace().last().unwrap_or("");
+            let candidate = head.trim().trim_end_matches('*').split_whitespace().last().unwrap_or("");
             if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') {
                 return candidate.into();
             }
@@ -286,6 +349,10 @@ fn call_arguments(signature: Option<&Signature>, name: &str) -> Vec<String> {
     Vec::new()
 }
 
+fn argument_register(argument: &str) -> Option<u8> {
+    match argument { "self" => Some(0), "_cmd" => Some(1), _ => argument.strip_prefix('x')?.parse::<u8>().ok().filter(|register|*register<8) }
+}
+
 fn incoming_parameter_candidates(report: &str, address: u64) -> Vec<String> {
     let prefix = format!("function {address:#018x} ");
     report.lines().find_map(|line| {
@@ -295,17 +362,134 @@ fn incoming_parameter_candidates(report: &str, address: u64) -> Vec<String> {
     }).unwrap_or_default()
 }
 
+fn branch_target_statement(statement:&str)->Option<u64>{
+    let target=statement.strip_prefix("goto 0x")
+        .or_else(||statement.strip_prefix("if (").and_then(|rest|rest.split_once(") goto 0x").map(|(_,target)|target)))?;
+    u64::from_str_radix(target.trim_end_matches(';'),16).ok()
+}
+
+fn is_linear_statement(statement:&str)->bool{
+    !statement.starts_with("if (")
+        && !statement.starts_with("goto 0x")
+        && !statement.starts_with("return ")
+}
+
+fn stack_slot_name(offset:i64)->String{
+    if offset<0{format!("stack_slot_sp_m{:x}",offset.unsigned_abs())}else{format!("stack_slot_sp_p{offset:x}")}
+}
+
+fn localize_stack_slot_accesses(statement:&str)->String{
+    let mut output=String::with_capacity(statement.len());
+    let mut cursor=0usize;
+    while let Some(relative)=statement[cursor..].find("sp"){
+        let sp=cursor+relative;
+        let prior=statement[..sp].chars().next_back();
+        let after=statement[sp+2..].chars().next();
+        if prior.is_some_and(|ch|ch.is_ascii_alphanumeric()||ch=='_')||after.is_some_and(|ch|ch.is_ascii_alphanumeric()||ch=='_'){
+            output.push_str(&statement[cursor..sp+2]);cursor=sp+2;continue;
+        }
+        let Some(access_start)=statement[..sp].rfind("*(") else{
+            output.push_str(&statement[cursor..sp+2]);cursor=sp+2;continue;
+        };
+        let prefix=&statement[access_start+2..sp];
+        if !prefix.is_empty()&&!prefix.ends_with(")("){
+            output.push_str(&statement[cursor..sp+2]);cursor=sp+2;continue;
+        }
+        let Some(relative_end)=statement[sp..].find(')') else{
+            output.push_str(&statement[cursor..]);return output;
+        };
+        let expression_end=sp+relative_end;
+        let expression=&statement[sp..expression_end];
+        let offset_text=expression.strip_prefix("sp").unwrap_or("");
+        let offset=if offset_text.is_empty(){Some(0)}else if let Some(value)=offset_text.strip_prefix(" + 0x"){
+            i64::from_str_radix(value,16).ok()
+        }else if let Some(value)=offset_text.strip_prefix(" - 0x"){
+            i64::from_str_radix(value,16).ok().and_then(i64::checked_neg)
+        }else{None};
+        let Some(offset)=offset else{
+            output.push_str(&statement[cursor..sp+2]);cursor=sp+2;continue;
+        };
+        output.push_str(&statement[cursor..access_start]);
+        let name=stack_slot_name(offset);
+        if prefix.is_empty(){output.push_str(&name)}else{
+            let access_type=prefix.strip_suffix(")(").unwrap_or(prefix).trim().trim_end_matches('*').trim();
+            output.push_str(&format!("{name} /* stack access as {access_type}; type unresolved */"));
+        }
+        cursor=expression_end+1;
+    }
+    output.push_str(&statement[cursor..]);
+    output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_linear_statement(
+    statement:&str,address:u64,start:u64,
+    symbols:&[(u64,String)],signatures:&BTreeMap<u64,(String,Signature)>,
+    signature:Option<&Signature>,code:&[u8],base:u64,stable_stack:bool,objc_selectors:&BTreeMap<u64,String>,
+)->String{
+    if let Some(rest)=statement.strip_prefix("call(0x"){
+        if let Some((hex,_))=rest.split_once(')'){
+            if let Ok(target)=u64::from_str_radix(hex,16){
+                let target_name=signatures.get(&target).map(|(name,_)|name.as_str())
+                    .or_else(||symbols.iter().find(|(candidate,_)|*candidate==target).map(|(_,name)|name.as_str()));
+                let known=super::semantic::known_call_argument_values(code,base,start,address);
+                if let Some(selector)=objc_selectors.get(&address){
+                    let parts=selector.split(':').collect::<Vec<_>>();
+                    let argument_count=parts.len().saturating_sub(1);
+                    if parts.iter().all(|part|part.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_'))
+                        &&(argument_count==0||selector.ends_with(':'))
+                        &&parts.iter().take(argument_count).all(|part|!part.is_empty())&&argument_count<=6{
+                        let values=known.iter().map(|(register,value,_)|(*register,*value)).collect::<BTreeMap<_,_>>();
+                        let receiver=values.get(&0).map(|value|format!("{value:#x}")).unwrap_or_else(||"x0".into());
+                        let mut message=format!("[{receiver}");
+                        if argument_count==0{message.push(' ');message.push_str(selector);}
+                        else{for (index,part) in parts.iter().take(argument_count).enumerate(){let argument_register=index as u8+2;let argument=values.get(&argument_register).map(|value|format!("{value:#x}")).unwrap_or_else(||format!("x{argument_register}"));message.push(' ');message.push_str(part);message.push(':');message.push_str(&argument);}}
+                        message.push(']');
+                        return format!("{message}; /* objc_msgSend selector validated through __objc_selrefs at {address:#x}; receiver and argument types unresolved */");
+                    }
+                }
+                let known_values=known.iter().map(|(register,value,provenance)|format!("x{register}={value:#x} {provenance}")).collect::<Vec<_>>();
+                return if let Some(name)=target_name{
+                    let target_signature=signatures.get(&target).map(|(_,signature)|signature);
+                    let values=known.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
+                    let args=call_arguments(target_signature,name);
+                    let mut evidence=Vec::new();
+                    let rendered=args.iter().map(|argument|{
+                        let Some(register)=argument_register(argument) else{return argument.clone()};
+                        if let Some((value,provenance))=values.get(&register){
+                            evidence.push(format!("x{register}={value:#x} {provenance}"));format!("{value:#x}")
+                        }else{argument.clone()}
+                    }).collect::<Vec<_>>();
+                    let arguments=if args.is_empty()&&target_signature.is_none(){if known_values.is_empty(){"/* prototype and ABI arguments unresolved */".into()}else{format!("/* prototype unresolved; known ABI register values: {} */",known_values.join(", "))}}else{rendered.join(", ")};
+                    let resolved=evidence.join(", ");
+                    format!("{}({}); /* direct call target {target:#x}; {}; {} */",callable_name(name,target_signature),arguments,if target_signature.is_some(){"arguments follow recovered prototype arity"}else{"callee prototype unavailable"},if resolved.is_empty(){"no argument constants proven in the straight-line call block".to_string()}else{format!("argument evidence: {resolved}")})
+                }else{format!("call(/* unresolved target {target:#x}; direct BL; {} */);",if known_values.is_empty(){"arguments unresolved".to_string()}else{format!("known ABI register values: {}",known_values.join(", "))})};
+            }
+        }
+    }
+    if statement.starts_with("return /* ABI result register x0"){
+        if signature.is_some_and(|sig|sig.declaration.starts_with("- (void)")||sig.declaration.starts_with("+ (void)")||sig.declaration.starts_with("void ")){
+            return "return; /* void return supported by recovered signature */".into();
+        }
+        return "return x0; /* inferred ABI result; source return type unresolved */".into();
+    }
+    let _=(address,start);
+    if stable_stack{localize_stack_slot_accesses(statement)}else{statement.to_string()}
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_arm64_body(
     start: u64, end: u64, display_name: &str, signature: Option<&Signature>,
     symbols: &[(u64,String)], signatures: &BTreeMap<u64,(String,Signature)>,
     code: &[u8], base: u64, file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
-    tail_calls: &[(u64,u64,u64)],
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>,
 ) -> Option<String> {
     if start < base || start >= end || (start - base) % 4 != 0 { return None; }
     let lo = usize::try_from(start - base).ok()?;
     let hi = usize::try_from(end.min(base.saturating_add(code.len() as u64)) - base).ok()?;
     if lo >= hi || hi > code.len() { return None; }
     let body_code = &code[lo..hi];
+    let stable_stack=super::semantic::stack_pointer_is_stable(code,base,start,end);
     let machine = super::semantic::render(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges);
     let mut instructions = Vec::<(u64,String)>::new();
     for line in machine.lines() {
@@ -316,16 +500,21 @@ fn render_arm64_body(
         if !statement.is_empty() { instructions.push((address, statement.into())); }
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
-    let labels = instructions.iter().filter_map(|(_,statement)| {
-        let target = if let Some(rest) = statement.strip_prefix("goto 0x") { Some(rest) }
-            else if let Some(rest) = statement.strip_prefix("if (").and_then(|rest| rest.split_once(") goto 0x").map(|(_,target)|target)) { Some(rest) }
-            else { None }?;
+    let switch_evidence=parse_switch_evidence(jump_tables);
+    let mut labels = instructions.iter().filter_map(|(_,statement)| {
+        let target = statement.strip_prefix("goto 0x")
+            .or_else(|| statement.strip_prefix("if (").and_then(|rest| rest.split_once(") goto 0x").map(|(_,target)|target)))?;
         let digits = target.split(|c: char| !c.is_ascii_hexdigit()).next()?;
         u64::from_str_radix(digits,16).ok().filter(|target| instruction_addresses.contains(target))
     }).collect::<std::collections::BTreeSet<_>>();
+    for evidence in switch_evidence.values(){for &(_,target) in &evidence.cases{if instruction_addresses.contains(&target){labels.insert(target);}}}
+    let incoming_branches=instructions.iter().filter_map(|(source,statement)|branch_target_statement(statement).map(|target|(target,*source))).collect::<Vec<_>>();
 
     let mut out = String::new();
     out.push_str(&format!("// {start:#018x}..{end:#018x}; decoded machine operations translated to C-like statements\n"));
+    if !stable_stack && instructions.iter().any(|(_, statement)| statement.contains("(sp")) {
+        out.push_str("// SP-relative accesses keep machine expressions because this function does not prove an unchanged stack pointer.\n");
+    }
     let mut opened_body = false;
     if let Some(signature) = signature {
         if signature.language == "Objective-C / Objective-C++" {
@@ -353,6 +542,120 @@ fn render_arm64_body(
     let mut instruction_index = 0usize;
     while instruction_index < instructions.len() {
         let (address, statement) = &instructions[instruction_index];
+        if let Some(evidence)=switch_evidence.get(address).filter(|evidence|statement.starts_with("goto x")&&!evidence.cases.is_empty()){
+            let index_register=evidence.index_register?;
+            out.push_str(&format!("    {address:#018x}: switch (x{index_register}) {{ /* bounded jump-table candidate; index interpretation and case range unresolved */\n"));
+            for &(case,target) in &evidence.cases {
+                let destination=if instruction_addresses.contains(&target){format!("goto loc_{target:x};")}else{format!("goto {target:#x}; /* target outside this recovered function */")};
+                out.push_str(&format!("        case {case}: {destination} /* table target {target:#x} */\n"));
+            }
+            out.push_str(&format!("        default: goto x{}; /* unresolved indirect target */\n    }}\n",evidence.branch_register));
+            instruction_index+=1;
+            continue;
+        }
+        // Structure a header-tested loop only when its false exit is the
+        // instruction after one explicit backedge and the body is linear.
+        if let Some(rest)=statement.strip_prefix("if ("){
+            if let Some((condition,exit_text))=rest.split_once(") goto 0x"){
+                if let Ok(exit)=u64::from_str_radix(exit_text.trim_end_matches(';'),16){
+                    let header=*address;
+                    let backedge=(instruction_index+1..instructions.len()).find(|&index|{
+                        instructions[index].1.starts_with("goto 0x")&&branch_target_statement(&instructions[index].1)==Some(header)
+                    });
+                    if let Some(backedge)=backedge{
+                        let tail_address=instructions[backedge].0;
+                        let exit_follows_backedge=tail_address.checked_add(4)==Some(exit)
+                            &&(instructions.get(backedge+1).is_some_and(|(pc,_)|*pc==exit)||exit==end);
+                        let no_body_entries=incoming_branches.iter().all(|(target,_)|! (header<*target&&*target<tail_address));
+                        let incoming_to_header=incoming_branches.iter().filter(|(target,_)|*target==header).collect::<Vec<_>>();
+                        let single_backedge=incoming_to_header.len()==1&&incoming_to_header[0].1==tail_address;
+                        if exit_follows_backedge&&no_body_entries&&single_backedge
+                            &&(instruction_index+1..backedge).all(|index|is_linear_statement(&instructions[index].1)){
+                            out.push_str(&format!("    {header:#018x}: while (!({condition})) {{ /* natural loop */\n"));
+                            for (body_address,body_statement) in &instructions[instruction_index+1..backedge]{
+                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
+                            }
+                            out.push_str(&format!("    }} /* backedge at {tail_address:#x}; exit at {exit:#x} */\n"));
+                            instruction_index=backedge+1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        // A conditional backedge at the end of a straight-line region proves a
+        // natural do/while loop. Require this branch to be the sole explicit
+        // edge into the header and reject any edge into the loop interior.
+        if !statement.starts_with("if ("){
+            let loop_tail=(instruction_index+1..instructions.len()).find(|&index|{
+                instructions[index].1.starts_with("if (")&&branch_target_statement(&instructions[index].1)==Some(*address)
+            });
+            if let Some(loop_tail)=loop_tail{
+                let tail_statement=instructions[loop_tail].1.as_str();
+                let condition=tail_statement.strip_prefix("if (").and_then(|rest|rest.split_once(") goto 0x").map(|(condition,_)|condition));
+                let loop_header=*address;
+                let incoming_to_header=incoming_branches.iter().filter(|(target,_)|*target==loop_header).collect::<Vec<_>>();
+                let single_backedge=incoming_to_header.len()==1&&incoming_to_header[0].1==instructions[loop_tail].0;
+                let no_interior_entries=incoming_branches.iter().all(|(target,_)|! (loop_header<*target&&*target<instructions[loop_tail].0));
+                let linear_body=(instruction_index..loop_tail).all(|index|is_linear_statement(&instructions[index].1));
+                if let Some(condition)=condition.filter(|_|single_backedge&&no_interior_entries&&linear_body){
+                    out.push_str(&format!("    {loop_header:#018x}: do {{ /* natural loop */\n"));
+                    for (body_address,body_statement) in &instructions[instruction_index..loop_tail]{
+                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                        out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
+                    }
+                    out.push_str(&format!("    }} while ({condition}); /* backedge at {:#x} */\n",instructions[loop_tail].0));
+                    instruction_index=loop_tail+1;
+                    continue;
+                }
+            }
+        }
+        // Structure only a closed diamond whose arms contain no control-flow
+        // transfers and whose entry has no competing branch into its middle.
+        if let Some(rest)=statement.strip_prefix("if ("){
+            if let Some((condition,target_text))=rest.split_once(") goto 0x"){
+                if let Ok(else_start)=u64::from_str_radix(target_text.trim_end_matches(';'),16){
+                    let else_index=instructions.iter().position(|(pc,_)|*pc==else_start);
+                    if let Some(else_index)=else_index.filter(|index|*index>instruction_index+1){
+                        let then_branch=else_index.checked_sub(1).filter(|index|instructions[*index].1.starts_with("goto 0x"));
+                        if let Some(then_branch)=then_branch{
+                            if let Some(join)=branch_target_statement(&instructions[then_branch].1){
+                                let join_index=instructions.iter().position(|(pc,_)|*pc==join);
+                                if let Some(join_index)=join_index.filter(|index|*index>else_index){
+                                    let arm_is_linear=|range:std::ops::Range<usize>|range.into_iter().all(|index|is_linear_statement(&instructions[index].1));
+                                    let branch_enters_else_once=incoming_branches.iter().filter(|(target,_)|*target==else_start).all(|(_,source)|*source==*address)
+                                        &&incoming_branches.iter().any(|(target,source)|*target==else_start&&*source==*address);
+                                    let branch_skips_then=incoming_branches.iter().any(|(target,source)|*target==join&&*source==instructions[then_branch].0);
+                                    let no_mid_arm_entries=incoming_branches.iter().all(|(target,source)|{
+                                        let then_middle=instructions[instruction_index+1].0<*target&&*target<instructions[then_branch].0;
+                                        let else_middle=else_start<*target&&*target<join;
+                                        (!then_middle&&!else_middle)||(*source==*address&&*target==else_start)
+                                    });
+                                    if branch_enters_else_once&&branch_skips_then&&no_mid_arm_entries
+                                        &&arm_is_linear(instruction_index+1..then_branch)
+                                        &&arm_is_linear(else_index..join_index){
+                                        out.push_str(&format!("    {address:#018x}: if (!({condition})) {{ /* structured diamond; else={else_start:#x}, join={join:#x} */\n"));
+                                        for (arm_address,arm_statement) in &instructions[instruction_index+1..then_branch]{
+                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                            out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
+                                        }
+                                        out.push_str("    } else {\n");
+                                        for (arm_address,arm_statement) in &instructions[else_index..join_index]{
+                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                            out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
+                                        }
+                                        out.push_str("    }\n");
+                                        instruction_index=join_index;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // A common compiler shape is `if (condition) goto after; return value;`.
         // The branch skips the return, so express the fallthrough return as a
         // structured conditional. Keep both source instruction addresses in
@@ -379,32 +682,18 @@ fn render_arm64_body(
         }
         let (address, statement) = (*address, statement.as_str());
         if labels.contains(&address) { out.push_str(&format!("loc_{address:x}:\n")); }
-        let statement = if let Some(rest) = statement.strip_prefix("call(0x") {
-            if let Some((hex, _)) = rest.split_once(')') {
-                if let Ok(target) = u64::from_str_radix(hex,16) {
-                    let target_name = signatures.get(&target).map(|(name,_)| name.as_str())
-                        .or_else(|| symbols.iter().find(|(candidate,_)| *candidate == target).map(|(_,name)| name.as_str()));
-                    if let Some(name) = target_name {
-                        let target_signature = signatures.get(&target).map(|(_,signature)| signature);
-                        let callee = callable_name(name, target_signature);
-                        let args = call_arguments(target_signature, name);
-                        let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers x0-x7 unresolved */".into() } else { args.join(", ") };
-                        format!("{}({}); /* direct call target {target:#x}; {} */", callee, arguments, if target_signature.is_some() { "arguments follow recovered prototype arity" } else { "callee prototype unavailable" })
-                    } else {
-                        format!("call(/* unresolved target {target:#x} */); /* direct BL */")
-                    }
-                } else { statement.to_string() }
-            } else { statement.to_string() }
+        let statement = if statement.starts_with("call(0x") {
+            render_linear_statement(statement,address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors)
         } else if let Some(rest) = statement.strip_prefix("if (") {
             if let Some((condition,target)) = rest.split_once(") goto 0x") {
                 if let Ok(target) = u64::from_str_radix(target.trim_end_matches(';'),16) {
-                    if labels.contains(&target) { format!("if ({condition}) goto loc_{target:x};") }
+                    if labels.contains(&target) { format!("if ({condition}) goto loc_{target:x}; /* retained as a branch; no supported structured region was proven */") }
                     else { format!("if ({condition}) goto {target:#x}; /* target outside this recovered function */") }
                 } else { statement.to_string() }
             } else { statement.to_string() }
         } else if let Some(target) = statement.strip_prefix("goto 0x") {
             if let Ok(target) = u64::from_str_radix(target.trim_end_matches(';'),16) {
-                if labels.contains(&target) { format!("goto loc_{target:x};") }
+                if labels.contains(&target) { format!("goto loc_{target:x}; /* retained as a branch; no supported structured region was proven */") }
                 else if tail_calls.contains(&(start, address, target)) {
                     let target_name = signatures.get(&target).map(|(name,_)| name.as_str())
                         .or_else(|| symbols.iter().find(|(candidate,_)| *candidate == target).map(|(_,name)| name.as_str()));
@@ -422,6 +711,8 @@ fn render_arm64_body(
                 }
                 else { format!("goto {target:#x}; /* target outside this recovered function */") }
             } else { statement.to_string() }
+        } else if statement.starts_with("goto x") {
+            format!("{} /* indirect target unresolved; no bounded table evidence proved a structured target set */",statement.split(" /*").next().unwrap_or(statement))
         } else if statement.starts_with("return /* ABI result register x0") {
             if signature.is_some_and(|sig| sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)") || sig.declaration.starts_with("void ")) {
                 "return; /* void return supported by recovered signature */".into()
@@ -429,6 +720,7 @@ fn render_arm64_body(
                 "return x0; /* inferred ABI result; source return type unresolved */".into()
             }
         } else { statement.to_string() };
+        let statement=if stable_stack{localize_stack_slot_accesses(&statement)}else{statement};
         out.push_str(&format!("    {address:#018x}: {statement}\n"));
         instruction_index += 1;
     }
@@ -444,7 +736,7 @@ fn instructions_truncated(machine: &str) -> bool {
 fn recover_internal(
     starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
     calls: &[(u64,u64,u64)], scan_end: u64,
-    arm64: Option<(&[u8],u64,u64,&[(u64,u64,u16)],&str,&[(u64,u64,u64)])>,
+    arm64: Option<Arm64RenderContext<'_>>,
 ) -> (String, String) {
     let mut by_address = BTreeMap::<u64,(String,Signature)>::new();
     let mut name_only = BTreeMap::<String,Signature>::new();
@@ -476,9 +768,9 @@ fn recover_internal(
         let named = by_address.get(&start);
         let name = named.map(|(name,_)| name.as_str()).or_else(||symbols.iter().find(|(address,_)| *address == start).map(|(_,name)|name.as_str())).unwrap_or("<unnamed>");
         let signature = named.map(|(_,signature)| signature);
-        if let Some((code,base,file_offset,data_ranges,parameter_evidence,tail_calls)) = arm64 {
+        if let Some(context) = &arm64 {
             let end = starts.get(i+1).copied().unwrap_or(scan_end);
-            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, code, base, file_offset, data_ranges, parameter_evidence, tail_calls) {
+            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors) {
                 if pseudo.len() + body.len() > 58_000 { break; }
                 pseudo.push_str(&body);
                 pseudo.push('\n');
@@ -505,9 +797,15 @@ fn recover_internal(
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn terminal_statements_cannot_be_folded_into_structured_regions() {
+        assert!(is_linear_statement("x0 = x0 + 1;"));
+        assert!(!is_linear_statement("return x0;"));
+        assert!(!is_linear_statement("goto 0x1000;"));
+        assert!(!is_linear_statement("if (x0 == 0) goto 0x1000;"));
+    }
     #[test] fn objc_encoding() {
         let s=objc_method("-[NSString substringFromIndex:]", "@\"NSString\"24@0:8Q16").unwrap();
-        assert_eq!(s.declaration,"- (NSString *)substringFromIndex:(unsigned long long)arg0;");
+        assert_eq!(s.declaration,"- (NSString *)substringFromIndex:(NSUInteger)from;");
         assert!(objc_method("-[A x:]", "v24@0:8").is_none());
         assert!(objc_method("-[A rect:]", "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").is_none());
     }

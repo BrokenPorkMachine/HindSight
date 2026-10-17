@@ -1061,17 +1061,26 @@ struct ContentView: View {
                         symbolResolverText: analysis.symbol_resolver,
                         objcClassesText: analysis.objc_classes,
                         disassemblyText: analysis.annotated_disassembly,
+                        cfgText: analysis.cfg,
                         irText: analysis.ir,
                         dataflowText: analysis.dataflow,
                         semanticPreviewText: analysis.semantic_preview,
                         xrefsText: analysis.xrefs,
                         callGraphText: analysis.call_graph,
+                        functionOverrides: model.decompilerFunctionOverrides(for: record.id),
+                        functionOverrideUndoCounts: model.decompilerFunctionOverrideUndoCounts(for: record.id),
                         selectedAddress: model.addressText,
                         debugPC: model.debugSnapshot?.pc,
                         onSelectAddress: { value in
                             model.addressText = value
                             model.analysisSearch = value
                             model.selectEvidence("binary workspace address=\(value)")
+                        },
+                        onSaveFunctionOverride: { address, name, signature, note, confidence in
+                            model.saveDecompilerFunctionOverride(recordID: record.id, address: address, analystName: name, signatureHypothesis: signature, note: note, confidence: confidence)
+                        },
+                        onUndoFunctionOverride: { address in
+                            model.undoDecompilerFunctionOverride(recordID: record.id, address: address)
                         }
                     )
                     .frame(minHeight: 640)
