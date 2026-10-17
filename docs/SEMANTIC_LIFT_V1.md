@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v30` banner identifies the statement set that
+`AArch64 register semantics v34` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -144,7 +144,10 @@ from its `(op0, op1, CRn, CRm, op2)` fields, using the architectural name
 (`TPIDR_EL0`, `TPIDRRO_EL0`, `CNTVCT_EL0`, `NZCV`, `FPCR`, `FPSR`, `DAIF`,
 `CTR_EL0`, `DCZID_EL0`, ...) when known and the `S<op0>_<op1>_C<CRn>_C<CRm>_<op2>`
 form otherwise (matching the disassembler). The op0=2 system instructions
-(`DC`/`IC`/`TLBI`/`AT`) and unallocated forms stay opaque. Conditional
+(`DC`/`IC`/`TLBI`/`AT`) and unallocated forms stay opaque. Flag-setting
+arithmetic and logical forms that also write a general-purpose register
+(`ADDS`/`SUBS`/`ANDS`/`BICS` with `Rd != 31`) are now modeled like their
+flag-neutral counterparts, ignoring the untracked PSTATE side effect. Conditional
 comparisons are modeled as markers: `CCMP`/`CCMN` render
 `/* ccmp x4, x5, #0x0, eq */` (register or immediate second operand, with the
 `nzcv` value and the condition named), preserving value flow because the result

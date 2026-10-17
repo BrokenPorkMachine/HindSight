@@ -51,6 +51,10 @@
 
 - Extend the ARM64 semantic preview to the LSE atomic memory operations (`LDAPR`/`LDADD`/`SWP`/`CAS`): `LDAPR`/`LDADD`/`SWP` render `dst = ldapr(base);` / `dst = ldadd(base, src);` / `dst = swp(base, src);` with the destination as an unknown barrier, and `CAS` renders `/* casal expected, desired, base */` preserving value flow. The size (byte/half/word/doubleword) and ordering (acquire/release/acquire-release) suffixes are carried in the mnemonic, the base address register is always 64-bit, and unallocated forms stay opaque. Identified by bits 27-24 == 1000 and bit 21 == 1 (0 false positives / 0 false negatives over 6.5M real arm64 instructions). No report field or engine-identity change (banner advances to v32).
 
+# 0.5.11 — Flag-setting arithmetic and logical forms in the preview
+
+- Extend the ARM64 semantic preview to the flag-setting arithmetic and logical forms (`ADDS`/`SUBS`/`ANDS`/`BICS` with a general-purpose destination), modeled like their flag-neutral counterparts (`dst = src +/- imm`, `dst = left &/|/^ right`) while ignoring the untracked PSTATE side effect, since nothing in the preview consumes flags to define a general-purpose value. `ADCS`/`SBCS` (carry-dependent) and the conditional compares' flag effects remain unmodeled. No report field or engine-identity change (banner advances to v34).
+
 # 0.5.11 — Cross-basic-block value propagation in the preview
 
 - Add bounded cross-basic-block value propagation to the ARM64 semantic preview: constants now survive unconditional and conditional branches (propagating to both the taken and fall-through successors) and sequential fall-through, with flows merged at joins by intersecting agreed constants. Calls, returns, indirect branches and data barriers still clear tracked values. Implemented as a worklist over basic blocks (split at branch targets and control-flow instructions) with bounded fixpoint iteration; no report field or engine-identity change (banner advances to v33).

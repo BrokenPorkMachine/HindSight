@@ -1135,34 +1135,34 @@ fn decode(word: u32, pc: u64) -> Operation {
             let rn = (word >> 5) & 31;
             let imm = ((word >> 10) & 0xfff) << if shift == 1 { 12 } else { 0 };
             let subtract = word & (1 << 30) != 0;
-            if word & (1 << 29) != 0 {
-                if rd == 31 {
-                    return Operation::Compare {
-                        mnemonic: if subtract { "cmp" } else { "cmn" },
-                        left: Register {
-                            index: rn,
-                            wide,
-                            stack_pointer: true,
-                        },
-                        right: CompareOperand::Immediate(imm as u64),
-                    };
-                }
-            } else {
-                return Operation::AddImmediate {
-                    dst: Register {
-                        index: rd,
-                        wide,
-                        stack_pointer: true,
-                    },
-                    src: Register {
+            if word & (1 << 29) != 0 && rd == 31 {
+                return Operation::Compare {
+                    mnemonic: if subtract { "cmp" } else { "cmn" },
+                    left: Register {
                         index: rn,
                         wide,
                         stack_pointer: true,
                     },
-                    value: imm as u64,
-                    subtract,
+                    right: CompareOperand::Immediate(imm as u64),
                 };
             }
+            // Flag-setting forms that write a general-purpose register (SUBS/ADDS
+            // with Rd != 31) are modeled like their flag-neutral counterparts,
+            // ignoring the untracked PSTATE side effect.
+            return Operation::AddImmediate {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: true,
+                },
+                src: Register {
+                    index: rn,
+                    wide,
+                    stack_pointer: true,
+                },
+                value: imm as u64,
+                subtract,
+            };
         }
     }
     // ADD/SUB (shifted register), including the flag-only CMP/CMN aliases. The
@@ -1179,49 +1179,46 @@ fn decode(word: u32, pc: u64) -> Operation {
             let rm = (word >> 16) & 31;
             let subtract = word & (1 << 30) != 0;
             let operand = operand_shift(shift, amount);
-            if word & (1 << 29) != 0 {
-                if rd == 31 {
-                    return Operation::Compare {
-                        mnemonic: if subtract { "cmp" } else { "cmn" },
-                        left: Register {
-                            index: rn,
-                            wide,
-                            stack_pointer: false,
-                        },
-                        right: CompareOperand::Register {
-                            reg: Register {
-                                index: rm,
-                                wide,
-                                stack_pointer: false,
-                            },
-                            shift: operand,
-                        },
-                    };
-                }
-            } else {
-                if rd == 31 {
-                    return Operation::Discard("arithmetic result discarded in zero register");
-                }
-                return Operation::AddRegister {
-                    dst: Register {
-                        index: rd,
-                        wide,
-                        stack_pointer: false,
-                    },
+            if word & (1 << 29) != 0 && rd == 31 {
+                return Operation::Compare {
+                    mnemonic: if subtract { "cmp" } else { "cmn" },
                     left: Register {
                         index: rn,
                         wide,
                         stack_pointer: false,
                     },
-                    right: Register {
-                        index: rm,
-                        wide,
-                        stack_pointer: false,
+                    right: CompareOperand::Register {
+                        reg: Register {
+                            index: rm,
+                            wide,
+                            stack_pointer: false,
+                        },
+                        shift: operand,
                     },
-                    subtract,
-                    shift: operand,
                 };
             }
+            if rd == 31 && word & (1 << 29) == 0 {
+                return Operation::Discard("arithmetic result discarded in zero register");
+            }
+            return Operation::AddRegister {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: false,
+                },
+                left: Register {
+                    index: rn,
+                    wide,
+                    stack_pointer: false,
+                },
+                right: Register {
+                    index: rm,
+                    wide,
+                    stack_pointer: false,
+                },
+                subtract,
+                shift: operand,
+            };
         }
     }
     // Add/subtract (extended register): `sf op S 01011 00 1 Rm option
@@ -1260,40 +1257,37 @@ fn decode(word: u32, pc: u64) -> Operation {
             } else {
                 Some((ShiftKind::Left, shift))
             };
-            if word & (1 << 29) != 0 {
-                if rd == 31 {
-                    return Operation::Compare {
-                        mnemonic: if subtract { "cmp" } else { "cmn" },
-                        left: Register {
-                            index: rn,
-                            wide,
-                            stack_pointer: rn == 31,
-                        },
-                        right: CompareOperand::Extended {
-                            reg: right,
-                            extend,
-                            shift: shift_operand,
-                        },
-                    };
-                }
-            } else {
-                return Operation::AddExtended {
-                    dst: Register {
-                        index: rd,
-                        wide,
-                        stack_pointer: rd == 31,
-                    },
+            if word & (1 << 29) != 0 && rd == 31 {
+                return Operation::Compare {
+                    mnemonic: if subtract { "cmp" } else { "cmn" },
                     left: Register {
                         index: rn,
                         wide,
                         stack_pointer: rn == 31,
                     },
-                    right,
-                    subtract,
-                    extend,
-                    shift,
+                    right: CompareOperand::Extended {
+                        reg: right,
+                        extend,
+                        shift: shift_operand,
+                    },
                 };
             }
+            return Operation::AddExtended {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: rd == 31,
+                },
+                left: Register {
+                    index: rn,
+                    wide,
+                    stack_pointer: rn == 31,
+                },
+                right,
+                subtract,
+                extend,
+                shift,
+            };
         }
     }
     // Add/subtract (with carry): `sf op S 11010000 Rm op2 00000 Rn Rd`. With
@@ -1346,33 +1340,34 @@ fn decode(word: u32, pc: u64) -> Operation {
                 wide,
                 stack_pointer: false,
             };
-            if opc == 3 {
-                if rd == 31 {
-                    return Operation::Compare {
-                        mnemonic: "tst",
-                        left: src,
-                        right: CompareOperand::Immediate(mask),
-                    };
-                }
-            } else {
-                if rd == 31 {
-                    return Operation::Discard("logical result discarded in zero register");
-                }
-                return Operation::LogicalImmediate {
-                    dst: Register {
-                        index: rd,
-                        wide,
-                        stack_pointer: false,
-                    },
-                    src,
-                    op: match opc {
+            if opc == 3 && rd == 31 {
+                return Operation::Compare {
+                    mnemonic: "tst",
+                    left: src,
+                    right: CompareOperand::Immediate(mask),
+                };
+            }
+            if rd == 31 && opc != 3 {
+                return Operation::Discard("logical result discarded in zero register");
+            }
+            return Operation::LogicalImmediate {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: false,
+                },
+                src,
+                op: if opc == 3 {
+                    LogicalOp::And
+                } else {
+                    match opc {
                         0 => LogicalOp::And,
                         1 => LogicalOp::Orr,
                         _ => LogicalOp::Eor,
-                    },
-                    mask,
-                };
-            }
+                    }
+                },
+                mask,
+            };
         }
     }
     // Logical (shifted register): flag-neutral AND/ORR/EOR and their negated
@@ -1398,21 +1393,22 @@ fn decode(word: u32, pc: u64) -> Operation {
                 stack_pointer: false,
             };
             let operand = operand_shift(shift, amount);
-            if opc == 3 {
-                if rd == 31 && !negate_right {
-                    return Operation::Compare {
-                        mnemonic: "tst",
-                        left,
-                        right: CompareOperand::Register {
-                            reg: right,
-                            shift: operand,
-                        },
-                    };
-                }
+            if opc == 3 && rd == 31 && !negate_right {
+                return Operation::Compare {
+                    mnemonic: "tst",
+                    left,
+                    right: CompareOperand::Register {
+                        reg: right,
+                        shift: operand,
+                    },
+                };
+            }
+            if rd == 31 && opc != 3 {
+                return Operation::Discard("logical result discarded in zero register");
+            }
+            if rd == 31 && opc == 3 && negate_right {
+                // BICS with a discarded result sets only flags; stays opaque.
             } else {
-                if rd == 31 {
-                    return Operation::Discard("logical result discarded in zero register");
-                }
                 return Operation::LogicalRegister {
                     dst: Register {
                         index: rd,
@@ -1421,10 +1417,14 @@ fn decode(word: u32, pc: u64) -> Operation {
                     },
                     left,
                     right,
-                    op: match opc {
-                        0 => LogicalOp::And,
-                        1 => LogicalOp::Orr,
-                        _ => LogicalOp::Eor,
+                    op: if opc == 3 {
+                        LogicalOp::And
+                    } else {
+                        match opc {
+                            0 => LogicalOp::And,
+                            1 => LogicalOp::Orr,
+                            _ => LogicalOp::Eor,
+                        }
                     },
                     negate_right,
                     shift: operand,
@@ -3953,7 +3953,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v33; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v34; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -4200,7 +4200,7 @@ mod tests {
     #[test]
     fn unsupported_words_and_data_ranges_are_barriers() {
         assert!(lift(0xffff_ffff, 0x1000).contains("opaque instruction"));
-        assert!(lift(0x3100_0400, 0x1000).contains("opaque instruction"));
+        assert!(lift(0x0000_0000, 0x1000).contains("opaque instruction"));
         let code = 0x5280_0020u32.to_le_bytes();
         assert!(
             render(&code, 0x1000, 0x200, &[0x1000], &[(0x200, 0x204, 1)])
@@ -4344,8 +4344,9 @@ mod tests {
 
     #[test]
     fn flag_setting_and_rotated_logical_forms_remain_opaque() {
-        // ANDS sets flags, which are not modeled.
-        assert!(lift(0x6a01_0000, 0x1000).contains("opaque instruction"));
+        // ANDS/BICS flag-setting forms with a real destination are now modeled
+        // like their flag-neutral counterparts (ignoring the untracked PSTATE
+        // side effect).
         // A ROR-shifted register operand is out of scope.
         assert!(lift(0x0ac2_0c20, 0x1000).contains("opaque instruction"));
         assert!(lift(0x8ac2_1420, 0x1000).contains("opaque instruction"));
@@ -4982,11 +4983,6 @@ mod tests {
 
     #[test]
     fn flag_setting_extended_register_forms_stay_opaque() {
-        // ADDS/SUBS (extended register) set flags (S == 1), like ADDS/SUBS.
-        // adds x0, x1, w2, uxtb = 0x2b220020
-        assert!(lift(0x2b22_0020, 0x1000).contains("opaque instruction"));
-        // subs x0, x1, w2, uxtw = 0x6b224020
-        assert!(lift(0x6b22_4020, 0x1000).contains("opaque instruction"));
         // The `imm3` shift is bounded to 0..4; imm3 = 5 stays opaque.
         // add x0, x1, w2, uxtb #5 = 0x8b221420
         assert!(lift(0x8b22_1420, 0x1000).contains("opaque instruction"));
@@ -5822,13 +5818,12 @@ mod tests {
 
     #[test]
     fn flag_setting_forms_with_a_destination_stay_opaque() {
-        // ADDS/SUBS/ANDS with a real destination, BICS, and CCMP all set PSTATE
-        // and (for the arithmetic/logical forms) write a register; the flag
-        // effect is not modeled, so these stay opaque. clang encodings.
-        assert!(lift(0xab02_0020, 0x1000).contains("opaque instruction")); // adds x0, x1, x2
-        assert!(lift(0xf100_0420, 0x1000).contains("opaque instruction")); // subs x0, x1, #1
-        assert!(lift(0xea02_0020, 0x1000).contains("opaque instruction")); // ands x0, x1, x2
-        assert!(lift(0xea21_001f, 0x1000).contains("opaque instruction")); // bics xzr, x0, x1
+        // ADCS/SBCS set flags and depend on the untracked carry (PSTATE.C), so
+        // they stay opaque. The flag-setting ADDS/SUBS/ANDS/BICS forms are now
+        // modeled like their flag-neutral counterparts, ignoring the untracked
+        // PSTATE side effect.
+        assert!(lift(0xba02_0020, 0x1000).contains("opaque instruction")); // adcs x0, x1, x2
+        assert!(lift(0xfa02_0020, 0x1000).contains("opaque instruction")); // sbcs x0, x1, x2
     }
 
     #[test]
