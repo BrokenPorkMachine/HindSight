@@ -1,15 +1,15 @@
-# HindSight 0.5.11 — Release readiness
+# HindSight 0.5.12 — Release readiness
 
-HindSight 0.5.11 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
+HindSight 0.5.12 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
 
 ## Source invariants already enforced
 
-- Product/service/worker identity is exactly `0.5.11`; release channel is `stable`; bundle build is `5911`.
+- Product/service/worker identity is exactly `0.5.12`; release channel is `stable`; bundle build is `5912`.
 - App and Coordinator require the same version, release channel, ABI, and required capabilities before project actions are enabled.
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
 - Analysis Quality distinguishes coverage from negative evidence; candidate control-flow remains labelled candidate evidence.
-- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 2, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. The only schema-1 legacy compatibility admitted remains validated 0.4.1 analysis-v11/schema66 data; schema-2 cache reuse is governed by the unchanged analysis-engine identity, so valid 0.4.2 results are reusable.
+- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v79-schema122` prevents reuse of results from earlier semantic lifts.
 - Existing schema-v1 projects require no database migration for the cache feature.
 - Worker progress records must remain separate from framed stdout and real stderr diagnostics; final evidence publication remains atomic.
 - App and Coordinator macOS Swift type-check source sets are derived directly from `Config/project-topology.json`; `AnalysisNavigation.swift`, `AnalysisContinuity.swift`, and future generated-target Swift files cannot be omitted by stale hand-maintained shell lists.
@@ -82,7 +82,7 @@ contract are supplied.
 
 ## Manual distribution matrix
 
-Before distributing 0.5.11, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
+Before distributing 0.5.12, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
 
 1. Re-run the large firmware image that exposed the beta.12 pressure failure; record peak RSS and confirm bounded dominator behavior.
 2. Analyze several real arm64 Mach-O inputs: stripped, symbol-rich, data-in-code, and encrypted-metadata cases.

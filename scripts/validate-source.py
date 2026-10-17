@@ -351,7 +351,7 @@ assert (R/'docs/ANALYSIS_QUALITY_BETA14.md').is_file()
 
 # v0.4.2 staged-analysis execution and patch-compatible analysis-cache contract.
 target_model=(R/'Shared/TargetModel.swift').read_text()
-assert 'static let version = "0.5.11"' in target_model
+assert 'static let version = "0.5.12"' in target_model
 assert 'static let releaseChannel = "stable"' in target_model
 assert 'static let isPrerelease = false' in target_model
 assert r'\"release_channel\":\"stable\"' in bridge_caps
@@ -362,7 +362,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v78-schema121"', 'analysisCacheProducerVersion = "0.5.11"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v79-schema122"', 'analysisCacheProducerVersion = "0.5.12"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -408,7 +408,7 @@ for path in ['App/BinaryWorkspace.swift','App/GraphWorkspace.swift','App/TraceEx
 assert 'VGHorizontalOverflowBar' in (R/'App/BinaryDiffWorkspace.swift').read_text()
 assert (R/'python/tests/test_ui_density.py').is_file()
 assert (R/'docs/UI_POLISH_0.4.2.md').is_file()
-# v0.5.11 SwiftUI List crash mitigation: the workbench must not reintroduce
+# v0.5.12 SwiftUI List crash mitigation: the workbench must not reintroduce
 # NSOutlineView-backed List/OutlineGroup/Form in resizable surfaces.
 assert (R/'docs/SWIFTUI_LIST_CRASH.md').is_file()
 for path in (R/'App').glob('*.swift'):
@@ -418,7 +418,7 @@ for path in (R/'App').glob('*.swift'):
 settings_app=(R/'App/HindSightApp.swift').read_text()
 assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.formStyle(' not in settings_app
 
-# v0.5.11 ARM64 semantic-preview extension: the bounded preview models the whole
+# v0.5.12 ARM64 semantic-preview extension: the bounded preview models the whole
 # move-wide immediate family (MOVN/MOVZ/MOVK), flag-neutral logical operations
 # (AND/ORR/EOR bitmask immediates and unshifted register AND/ORR/EOR/BIC/ORN/EON),
 # PC-relative ADR/ADRP address materialization, conditional/indirect control
@@ -437,7 +437,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v44', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v45', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -513,7 +513,7 @@ assert (R/'docs/ANALYSIS_NAVIGATION_0.4.3.md').is_file()
 analysis_continuity=(R/'App/AnalysisContinuity.swift').read_text()
 for token in ['struct VGAnalysisPin', 'struct VGAnalysisVisit', 'struct VGAnalysisSnapshot', 'struct VGAnalysisDelta',
               'maximumBytes = 1 * 1024 * 1024', 'maximumPins = 128', 'maximumRecent = 96',
-              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v78-schema121']:
+              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v79-schema122']:
     assert token in analysis_continuity, token
 for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'Text("Changes").tag("Changes")',
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:
@@ -719,9 +719,9 @@ for capability in ['modern_macho_metadata_admission','encrypted_metadata_analysi
 assert (R/'docs/ANALYSIS_ADMISSION_BETA7.md').is_file()
 
 # Release metadata must agree across every shipped component.
-release = "0.5.11"
-bundle_release = "0.5.11"
-bundle_build = "5911"
+release = "0.5.12"
+bundle_release = "0.5.12"
+bundle_build = "5912"
 app_info = plistlib.loads((R/'Config/App-Info.plist').read_bytes())
 coordinator_info = plistlib.loads((R/'Config/Coordinator-Info.plist').read_bytes())
 assert app_info['CFBundleShortVersionString'] == bundle_release
@@ -934,8 +934,8 @@ status_doc=(R/'docs/STATUS.md').read_text()
 validation_doc=(R/'docs/VALIDATION.md').read_text()
 macos_doc=(R/'docs/MACOS_VALIDATION.md').read_text()
 readiness_doc=(R/'docs/RELEASE_READINESS.md').read_text()
-assert status_doc.startswith('# HindSight 0.5.11 Status')
-assert validation_doc.startswith('# Validation — HindSight 0.5.11')
+assert status_doc.startswith('# HindSight 0.5.12 Status')
+assert validation_doc.startswith('# Validation — HindSight 0.5.12')
 for token in ['Hotfix 3', 'Function Neighborhoods', 'topology-derived']:
     assert token in status_doc or token in validation_doc, token
 for token in ['Function Neighborhoods', 'AnalysisNavigation.swift', 'AnalysisContinuity.swift', 'objects', 'analysis-cache', 'staging']:

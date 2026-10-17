@@ -431,7 +431,7 @@ fn render_fp_argument(prefix: u8, bits: u128) -> String {
         let raw = bits as u32;
         let value = f32::from_bits(raw);
         if value.is_finite() {
-            if raw & 0x7fff_ffff == 0 { if raw >> 31 == 0 { "0.0".into() } else { "-0.0".into() } } else { value.to_string() }
+            if raw & 0x7fff_ffff == 0 { if raw >> 31 == 0 { "0.0".into() } else { "-0.0".into() } } else { let text=value.to_string(); if text.contains('.')||text.contains('e')||text.contains('E'){text}else{format!("{text}.0")} }
         } else {
             format!("bitcast<float>(0x{raw:08x})")
         }
@@ -439,7 +439,7 @@ fn render_fp_argument(prefix: u8, bits: u128) -> String {
         let raw = bits as u64;
         let value = f64::from_bits(raw);
         if value.is_finite() {
-            if raw & 0x7fff_ffff_ffff_ffff == 0 { if raw >> 63 == 0 { "0.0".into() } else { "-0.0".into() } } else { value.to_string() }
+            if raw & 0x7fff_ffff_ffff_ffff == 0 { if raw >> 63 == 0 { "0.0".into() } else { "-0.0".into() } } else { let text=value.to_string(); if text.contains('.')||text.contains('e')||text.contains('E'){text}else{format!("{text}.0")} }
         } else {
             format!("bitcast<double>(0x{raw:016x})")
         }
@@ -1159,6 +1159,15 @@ fn recover_internal(
         let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
         assert!(call.starts_with("take_copy(0.0, 0.0);"), "{call}");
         assert!(call.contains("value(d1)=0.0 proven_by=[0x1000,0x1004,0x1008]"), "{call}");
+    }
+    #[test] fn direct_calls_recover_scalar_fmov_immediates() {
+        let signature = Signature { language: "C", declaration: "void take_literals(float single, double wide);".into(), source: "test prototype" };
+        let signatures = BTreeMap::from([(0x2000, ("_take_literals".into(), signature))]);
+        let instructions = [0x1e2e_1000u32, 0x1e6e_1001u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("take_literals(1.0, 1.0);"), "{call}");
+        assert!(call.contains("single(s0)=1.0 proven_by=[0x1000]"), "{call}");
+        assert!(call.contains("wide(d1)=1.0 proven_by=[0x1004]"), "{call}");
     }
     #[test] fn resolved_indirect_calls_use_only_function_signature_evidence() {
         let signature = symbol("_CFRelease").unwrap();

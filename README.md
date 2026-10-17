@@ -26,11 +26,13 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.11)
+## Current baseline (0.5.12)
 
-## 0.5.11 — Evidence graph navigation and cache control
+## 0.5.12 — Evidence graph navigation and cache control
 
 The current release aligns Evidence Graph and Flow Graph navigation: minimaps show the same viewport rectangle, support click-to-jump and drag navigation, and preserve graph geometry while panning. Function and symbol names are used consistently in function-oriented evidence and runtime surfaces. Analysis results can be cleared from the analysis toolbar with bounded project-local cache removal. The Settings surface and the remaining list-based workspaces no longer use SwiftUI `List`/`Form`, removing the `NSOutlineView` live-resize AttributeGraph crash documented in [`docs/SWIFTUI_LIST_CRASH.md`](docs/SWIFTUI_LIST_CRASH.md). The ARM64 semantic preview now models the full move-wide immediate family (`MOVN`/`MOVZ`/`MOVK`), flag-neutral logical operations (`AND`/`ORR`/`EOR` bitmask immediates and register `AND`/`ORR`/`EOR`/`BIC`/`ORN`/`EON` with an optional `LSL`/`LSR`/`ASR`-shifted register operand, and the same shifted register operands for `ADD`/`SUB`), PC-relative `ADR`/`ADRP` address materialization, and conditional/indirect control flow (`B.cond`/`CBZ`/`CBNZ`/`TBZ`/`TBNZ`/`BR`/`BLR`), resolved indirect targets from proven constants, immediate shifts (`LSL`/`LSR`/`ASR`), multiply-add (`MADD`/`MSUB`/`MUL`), sign/zero extends (`UXTB`/`UXTH`/`SXTB`/`SXTH`/`SXTW`), general bitfield extracts (`UBFX`/`SBFX`), and general-register loads and stores (`LDR`/`STR`/`STRB`/`STRH`/`LDRB`/`LDRH`/`LDRSB`/`LDRSH`/`LDRSW` with scaled unsigned immediate or register-offset addressing), so proven constant materialization, masks, pointer addresses, and control-flow tests carry instruction provenance; see [`docs/SEMANTIC_LIFT_V1.md`](docs/SEMANTIC_LIFT_V1.md).
+
+This update improves Objective-C/C call reconstruction by preserving scalar floating-point arguments through immediate materialization, general-purpose to floating-point transfers, and floating-point register copies. Recovered prototypes now consume those proven values with instruction provenance; unresolved argument positions remain explicit. See the [decompiler roadmap](docs/DECOMPILER_GAP_ROADMAP.md).
 
 ## 0.5.8 — Scheduler, Demangling, Structural Pseudocode
 

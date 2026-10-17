@@ -5,7 +5,7 @@ enum VGProduct {
     static let name = "HindSight"
     static let displayName = "HindSight Research Tool"
     static let bundleName = "HindSight.app"
-    static let version = "0.5.11"
+    static let version = "0.5.12"
     static let releaseChannel = "stable"
     static let isPrerelease = false
 }

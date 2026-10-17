@@ -7,6 +7,13 @@
 - Bound SwiftUI workspace type expansion to fix the reproduced Swift 6.4 SIL-generation crash in ContentView.
 - Regenerate consistent build settings and add clean, commit-based source recreation without Git metadata, DerivedData, or Xcode user state.
 
+# 0.5.12 — Objective-C/C Argument Reconstruction
+
+- Improve call parameter resolution for Objective-C and C using recovered prototypes and proven argument values.
+- Preserve scalar single/double values through FMOV immediates, GP/FP transfers, and FP register copies, including instruction provenance.
+- Advance the analysis engine and cache identity to `arm64-analysis-v79-schema122` so older results are recomputed with the updated semantic lifting.
+- Continue marking uncertain arity, stack arguments, and unsupported call effects as unresolved in pseudocode.
+
 # 0.5.11 — Evidence Graph Navigation and Analysis Cache Control
 
 - Make Evidence Graph minimap navigation match Flow Graph with a draggable viewport rectangle and click-to-jump behavior.

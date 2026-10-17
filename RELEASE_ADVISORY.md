@@ -1,8 +1,10 @@
-# Release Advisory: HindSight v0.5.11
+# Release Advisory: HindSight v0.5.12 Release Candidate
+
+This prerelease provides the source package for review. It is not a notarized macOS download. Stable distribution still requires the Developer ID signing and notarization gate and the Intel and Apple Silicon host qualification matrix described in [release readiness](docs/RELEASE_READINESS.md).
 
 ## Code Signing Requirements
 
-This release contains signed code and requires proper code signing to run:
+Stable non-source builds require proper code signing to run:
 
 ### For Non-Source Builds (Installer/Download):
 - **Download only from official HindSight sources** to avoid quarantine
