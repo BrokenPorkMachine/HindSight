@@ -328,7 +328,10 @@ and 0 false positives / 0 false negatives over the real dylibs. Cross-basic-bloc
 value propagation now carries constants through unconditional and conditional
 branches (both successors) and sequential fall-through, merging flows at joins
 by intersecting agreed constants; calls, returns, indirect branches and data
-barriers still clear tracked values. LSE atomic
+barriers still clear tracked values. The first SIMD/FP instruction is modeled:
+`MOVI.2D` renders `/* movi.2d v0, #0x00 */` as a marker preserving GP value
+flow, with V0-V31 (128-bit) added to the flow for future SIMD value tracking.
+LSE atomic
 memory operations are modeled: `LDAPR`/`LDADD`/`SWP` render
 `dst = ldapr(base);` / `dst = ldadd(base, src);` / `dst = swp(base, src);`
 with the destination as an unknown barrier, and `CAS` renders

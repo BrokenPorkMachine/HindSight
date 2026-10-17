@@ -986,6 +986,14 @@ enum Operation {
         order: LseOrder,
         size: u8,
     },
+    /// A SIMD move-immediate (`MOVI.2D`) that defines a V register with a
+    /// 128-bit constant (the 8-bit immediate replicated to both 64-bit lanes).
+    /// V registers are tracked separately from the general-purpose registers;
+    /// GP value flow is preserved.
+    VMoveImm {
+        vd: u8,
+        value: u128,
+    },
     /// A flag-only comparison alias whose destination is the zero register:
     /// `CMP`/`CMN` (`SUBS`/`ADDS` with `Rd == 31`) and `TST` (`ANDS` with
     /// `Rd == 31`). The result lives only in PSTATE, which the preview does not
@@ -2560,6 +2568,21 @@ fn decode(word: u32, pc: u64) -> Operation {
             };
         }
     }
+    // SIMD move-immediate (foundation): `MOVI.2D` moves an 8-bit immediate
+    // into both 64-bit lanes of a V register. Only the all-zeros and all-0xff
+    // byte forms are encodable for `.2d`; the immediate is decoded from bit 5.
+    if word & 0xffff_ffc0 == 0x6f00_e400 {
+        let vd = (word & 0x1f) as u8;
+        // movi.2d #0 -> 0 in both 64-bit lanes; #255 -> 0x000000000000ff
+        // in both 64-bit lanes (the 8-bit immediate is zero-extended).
+        let lane = if word & 0x20 != 0 {
+            0x0000_0000_0000_00ffu128
+        } else {
+            0u128
+        };
+        let value = (lane << 64) | lane;
+        return Operation::VMoveImm { vd, value };
+    }
     Operation::Opaque
 }
 
@@ -2570,19 +2593,30 @@ struct KnownValue {
 }
 
 #[derive(Clone)]
+struct VKnownValue {
+    /// 128-bit vector value (both lanes combined; little-endian lane 0 in the
+    /// low 64 bits). Tracked only for the simple `MOVI` immediate forms so far.
+    value: u128,
+    origins: Vec<u64>,
+}
+
+#[derive(Clone)]
 struct Flow {
     registers: [Option<KnownValue>; 31],
+    v_registers: [Option<VKnownValue>; 32],
 }
 
 impl Flow {
     fn new() -> Self {
         Self {
             registers: std::array::from_fn(|_| None),
+            v_registers: std::array::from_fn(|_| None),
         }
     }
 
     fn clear(&mut self) {
         self.registers.fill(None);
+        self.v_registers.fill(None);
     }
 
     fn read(&self, reg: Register) -> Option<KnownValue> {
@@ -2598,6 +2632,21 @@ impl Flow {
                 value: reg.mask(v.value),
                 origins: v.origins.clone(),
             })
+    }
+
+    #[allow(dead_code)]
+    fn read_v(&self, index: u32) -> Option<VKnownValue> {
+        if index < 32 {
+            self.v_registers[index as usize].clone()
+        } else {
+            None
+        }
+    }
+
+    fn write_v(&mut self, index: u32, value: Option<VKnownValue>) {
+        if index < 32 {
+            self.v_registers[index as usize] = value;
+        }
     }
 
     fn write(&mut self, reg: Register, value: Option<KnownValue>) {
@@ -3847,6 +3896,20 @@ impl Operation {
                     base.name()
                 )
             }
+            Self::VMoveImm { vd, value } => {
+                flow.write_v(
+                    vd as u32,
+                    Some(VKnownValue {
+                        value,
+                        origins: vec![pc],
+                    }),
+                );
+                format!(
+                    "/* movi.2d v{}, #0x{:02x} */",
+                    vd,
+                    if value == 0 { 0u8 } else { 0xffu8 }
+                )
+            }
             Self::Exception { mnemonic, imm } => {
                 flow.clear();
                 format!("/* {mnemonic}({imm}): exception; value flow stops here */")
@@ -3924,12 +3987,29 @@ fn merge_flow(a: &Flow, b: &Flow) -> Flow {
             _ => None,
         };
     }
+    for i in 0..32 {
+        r.v_registers[i] = match (&a.v_registers[i], &b.v_registers[i]) {
+            (Some(x), Some(y)) if x.value == y.value && x.origins == y.origins => Some(x.clone()),
+            _ => None,
+        };
+    }
     r
 }
 
 fn flows_equal(a: &Flow, b: &Flow) -> bool {
     for i in 0..31 {
         match (&a.registers[i], &b.registers[i]) {
+            (Some(x), Some(y)) => {
+                if x.value != y.value || x.origins != y.origins {
+                    return false;
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+    }
+    for i in 0..32 {
+        match (&a.v_registers[i], &b.v_registers[i]) {
             (Some(x), Some(y)) => {
                 if x.value != y.value || x.origins != y.origins {
                     return false;
@@ -3953,7 +4033,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v34; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v35; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
