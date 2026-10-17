@@ -331,6 +331,9 @@ by intersecting agreed constants; calls, returns, indirect branches and data
 barriers still clear tracked values. The first SIMD/FP instruction is modeled:
 `MOVI.2D` renders `/* movi.2d v0, #0x00 */` as a marker preserving GP value
 flow, with V0-V31 (128-bit) added to the flow for future SIMD value tracking.
+`FMov` (register form) renders `xD = fmov(dS);` and propagates the V register's
+low 64 bits into the general-purpose destination when tracked; the immediate
+forms render as markers.
 LSE atomic
 memory operations are modeled: `LDAPR`/`LDADD`/`SWP` render
 `dst = ldapr(base);` / `dst = ldadd(base, src);` / `dst = swp(base, src);`

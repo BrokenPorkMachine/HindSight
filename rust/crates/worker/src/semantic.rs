@@ -994,6 +994,20 @@ enum Operation {
         vd: u8,
         value: u128,
     },
+    /// `FMov` from a V register to a general-purpose register: the destination
+    /// becomes the low 64 bits of the V register (a barrier when the V value is
+    /// untracked), preserving the other tracked registers.
+    FmovReg {
+        dst: Register,
+        src_v: u8,
+    },
+    /// `FMov` immediate into a V register. The V register becomes an unknown
+    /// value (a barrier) for now, since the FP modified-immediate is not decoded
+    /// into a tracked constant yet; GP value flow is preserved.
+    FmovImm {
+        vd: u8,
+        arrangement: &'static str,
+    },
     /// A flag-only comparison alias whose destination is the zero register:
     /// `CMP`/`CMN` (`SUBS`/`ADDS` with `Rd == 31`) and `TST` (`ANDS` with
     /// `Rd == 31`). The result lives only in PSTATE, which the preview does not
@@ -2583,6 +2597,39 @@ fn decode(word: u32, pc: u64) -> Operation {
         let value = (lane << 64) | lane;
         return Operation::VMoveImm { vd, value };
     }
+    // FMov from a V register to a general-purpose register:
+    // `fmov xD, dS` (V -> GP). The destination becomes the low 64 bits of the
+    // V register (a barrier when untracked); other registers are preserved.
+    if word & 0xffff_fc00 == 0x9e66_0000 {
+        let vd = ((word >> 5) & 0x1f) as u8;
+        return Operation::FmovReg {
+            dst: Register {
+                index: word & 0x1f,
+                wide: true,
+                stack_pointer: false,
+            },
+            src_v: vd,
+        };
+    }
+    // FMov immediate into a V register (marker form; GP flow preserved).
+    if word & 0xffff_ffe0 == 0x6f03_f600 {
+        return Operation::FmovImm {
+            vd: (word & 0x1f) as u8,
+            arrangement: "2d",
+        };
+    }
+    if word & 0xffff_ffe0 == 0x0f07_f600 {
+        return Operation::FmovImm {
+            vd: (word & 0x1f) as u8,
+            arrangement: "2s",
+        };
+    }
+    if word & 0xffff_ffe0 == 0x4f07_f600 {
+        return Operation::FmovImm {
+            vd: (word & 0x1f) as u8,
+            arrangement: "4s",
+        };
+    }
     Operation::Opaque
 }
 
@@ -3910,6 +3957,27 @@ impl Operation {
                     if value == 0 { 0u8 } else { 0xffu8 }
                 )
             }
+            Self::FmovReg { dst, src_v } => {
+                let vval = flow.read_v(src_v as u32);
+                let known = vval.and_then(|vv| {
+                    Some(KnownValue {
+                        value: dst.mask(vv.value as u64),
+                        origins: combine_origins(&vv.origins, &[], pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                format!(
+                    "{} = fmov(d{});{}",
+                    dst.name(),
+                    src_v,
+                    resolved_suffix(known.as_ref())
+                )
+            }
+            Self::FmovImm { vd, arrangement } => {
+                // V register becomes an unknown value (barrier) for now.
+                flow.write_v(vd as u32, None);
+                format!("/* fmov.{} v{}, #imm */", arrangement, vd)
+            }
             Self::Exception { mnemonic, imm } => {
                 flow.clear();
                 format!("/* {mnemonic}({imm}): exception; value flow stops here */")
@@ -4033,7 +4101,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v35; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v36; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);

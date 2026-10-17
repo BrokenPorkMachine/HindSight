@@ -431,7 +431,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v35', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v36', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -478,6 +478,8 @@ for token in ['AArch64 register semantics v35', 'AddExtended', '0x0b20_0000', 'M
               '/* casal x8, x24, x9 */',
               'VMoveImm', 'VKnownValue', 'v_registers', '0x6f00_e400',
               '/* movi.2d v{}, #0x{:02x} */',
+              'FmovReg', 'FmovImm', '0x9e66_0000', '0x6f03_f600',
+              'x24 = fmov(d0);', '/* fmov.2d v0, #imm */',
               'merge_flow', 'flows_equal', 'block_starts', 'entry: std::collections::HashMap']:
     assert token in semantic_source, token
 
