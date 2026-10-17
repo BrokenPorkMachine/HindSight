@@ -4478,4 +4478,69 @@ mod tests {
         // csel-like with bit 11 set = 0x9a950a8a
         assert!(lift(0x9a95_0a8a, 0x1000).contains("opaque instruction"));
     }
+
+    // Hardening: the encodings adjacent to the recently modeled forms must stay
+    // opaque, and the shared class masks must not claim a neighbouring family's
+    // words. Each block pairs a positive control with its unallocated
+    // neighbours so a future mask change cannot silently widen a family.
+
+    #[test]
+    fn extended_register_reserved_imm3_values_stay_opaque() {
+        // ADD/SUB (extended register) allocates `imm3` only in 0..=4.
+        // add x0, x1, w2, uxtb #0 = 0x8b220020; imm3 = 5/6/7 is unallocated.
+        assert_eq!(lift(0x8b22_0020, 0x1000), "x0 = x1 + zext(w2, 8);");
+        assert!(lift(0x8b22_1420, 0x1000).contains("opaque instruction"));
+        assert!(lift(0x8b22_1820, 0x1000).contains("opaque instruction"));
+        assert!(lift(0x8b22_1c20, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn extended_register_mask_does_not_claim_shifted_register_forms() {
+        // ADD/SUB (shifted register) shares `... 1011 00 ...` but has bit 21
+        // clear and no extension field; it must stay in its own family.
+        assert_eq!(lift(0x8b02_0020, 0x1000), "x0 = x1 + x2;");
+        assert_eq!(lift(0x8b02_0820, 0x1000), "x0 = x1 + (x2 << 2);");
+    }
+
+    #[test]
+    fn register_offset_unallocated_option_values_stay_opaque() {
+        // Load/store (register offset) allocates the option field only for 010
+        // (UXTW), 011 (LSL), 110 (SXTW) and 111 (SXTX). ldr x0, [x1, x2] uses
+        // option 011 (0xf8626820); the other values share the class mask but
+        // must remain opaque.
+        assert_eq!(lift(0xf862_6820, 0x1000), "x0 = *(x1 + x2);");
+        assert!(lift(0xf862_0820, 0x1000).contains("opaque instruction"));
+        assert!(lift(0xf862_2820, 0x1000).contains("opaque instruction"));
+        assert!(lift(0xf862_8820, 0x1000).contains("opaque instruction"));
+        assert!(lift(0xf862_a820, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn conditional_select_reserved_opcode_bit_stays_opaque() {
+        // The conditional-select group fixes bit 29 to 0. csel with bit 29 set
+        // (0xba95028a) lies outside the group and must not decode as one.
+        assert!(lift(0xba95_028a, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn bitfield_width_bit_must_match_the_register_width() {
+        // SBFM/BFM/UBFM require N == sf; a mismatched width bit is unallocated.
+        // ubfm x0, x1, #0, #7 = uxtb x0, w1 = 0xd3401c20; clear N -> 0xd3001c20.
+        assert_eq!(lift(0xd340_1c20, 0x1000), "x0 = zext(w1, 8);");
+        assert!(lift(0xd300_1c20, 0x1000).contains("opaque instruction"));
+        // ubfm w0, w1, #0, #7 = 0x53001c20; set N -> 0x53401c20.
+        assert_eq!(lift(0x5300_1c20, 0x1000), "w0 = zext(w1, 8);");
+        assert!(lift(0x5340_1c20, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn newly_modeled_groups_do_not_collide_across_masks() {
+        // One representative word per recently added family, so a mask added
+        // later cannot silently swallow a neighbouring family's encoding.
+        assert_eq!(lift(0x8b22_0020, 0x1000), "x0 = x1 + zext(w2, 8);"); // ADD extended register
+        assert_eq!(lift(0x8b02_0820, 0x1000), "x0 = x1 + (x2 << 2);"); // ADD shifted register
+        assert_eq!(lift(0x9a95_028a, 0x1000), "x10 = eq ? x20 : x21;"); // conditional select
+        assert_eq!(lift(0xf862_6820, 0x1000), "x0 = *(x1 + x2);"); // register-offset load
+        assert_eq!(lift(0x93c2_1020, 0x1000), "x0 = extr(x1, x2, 4);"); // concatenated extract
+    }
 }
