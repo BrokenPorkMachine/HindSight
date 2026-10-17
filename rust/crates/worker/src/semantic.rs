@@ -570,6 +570,16 @@ enum Operation {
         src: Register,
         kind: OneSourceKind,
     },
+    /// Extract (`EXTR`) and its same-register `ROR` alias. The two sources are
+    /// concatenated as `left:right` and the field starting at `lsb` is taken.
+    /// A same-register pair renders as `dst = ror(src, lsb);`, otherwise as
+    /// `dst = extr(left, right, lsb);`.
+    ExtractConcat {
+        dst: Register,
+        left: Register,
+        right: Register,
+        lsb: u8,
+    },
     /// Widening and high-half multiply from the 3-source group:
     /// `SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` (with their `SMULL`/`UMULL`
     /// zero-addend aliases, which multiply two 32-bit sources into a 64-bit
@@ -1410,6 +1420,41 @@ fn decode(word: u32, pc: u64) -> Operation {
                     };
                 }
                 _ => {}
+            }
+        }
+    }
+    // Extract (`EXTR`): `sf op21 100111 N o0 Rm imms Rn Rd`, concatenating
+    // `Rn:Rm` and taking the `datasize`-bit field at `imms`. `op21 == 00`,
+    // `N` must equal `sf`, and `o0 == 0`; the same-register `ROR` immediate
+    // alias shares the encoding. For a 32-bit register `imms` is bounded to
+    // 0..31, so a set bit 15 there stays opaque.
+    {
+        let sf = word >> 31 != 0;
+        let extract_class = if sf { 0x13c0_0000 } else { 0x1380_0000 };
+        if word & 0x7fe0_0000 == extract_class {
+            let lsb = ((word >> 10) & 0x3f) as u8;
+            if sf || lsb < 32 {
+                if word & 31 == 31 {
+                    return Operation::Discard("extract result discarded in zero register");
+                }
+                return Operation::ExtractConcat {
+                    dst: Register {
+                        index: word & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    left: Register {
+                        index: (word >> 5) & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    right: Register {
+                        index: (word >> 16) & 31,
+                        wide: sf,
+                        stack_pointer: false,
+                    },
+                    lsb,
+                };
             }
         }
     }
@@ -2409,6 +2454,45 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::ExtractConcat {
+                dst,
+                left,
+                right,
+                lsb,
+            } => {
+                let width: u32 = if dst.wide { 64 } else { 32 };
+                let known = flow.read(right).and_then(|low| {
+                    if lsb == 0 {
+                        // The field starts at bit 0, so the whole result is the
+                        // low source (`Rm`) and the high source is irrelevant.
+                        Some(KnownValue {
+                            value: dst.mask(low.value),
+                            origins: combine_origins(&low.origins, &[], pc)?,
+                        })
+                    } else {
+                        flow.read(left).and_then(|high| {
+                            let value = (low.value >> lsb) | (high.value << (width - lsb as u32));
+                            Some(KnownValue {
+                                value: dst.mask(value),
+                                origins: combine_origins(&high.origins, &low.origins, pc)?,
+                            })
+                        })
+                    }
+                });
+                flow.write(dst, known.clone());
+                // A single source register makes the field extract a rotate,
+                // matching the `ROR` immediate alias.
+                let mnemonic = if left.index == right.index {
+                    format!("ror({}, {lsb})", left.name())
+                } else {
+                    format!("extr({}, {}, {lsb})", left.name(), right.name())
+                };
+                format!(
+                    "{} = {mnemonic};{}",
+                    dst.name(),
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::WideningMultiply {
                 dst,
                 left,
@@ -2795,7 +2879,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v23; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v24; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3468,6 +3552,75 @@ mod tests {
         // A nonzero register-pointer-auth selector (bits 20-16) leaves the group.
         // rbit-family with bit 16 set = 0x5ac10020
         assert!(lift(0x5ac1_0020, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_extract_forms() {
+        // Encodings produced by clang for ARM64. `extr x0, x1, x2, #imm`.
+        // extr x0, x1, x2, #0 = 0x93c20020
+        assert_eq!(lift(0x93c2_0020, 0x1000), "x0 = extr(x1, x2, 0);");
+        // extr x0, x1, x2, #4 = 0x93c21020
+        assert_eq!(lift(0x93c2_1020, 0x1000), "x0 = extr(x1, x2, 4);");
+        // extr x0, x1, x2, #63 = 0x93c2fc20
+        assert_eq!(lift(0x93c2_fc20, 0x1000), "x0 = extr(x1, x2, 63);");
+        // extr w0, w1, w2, #4 = 0x13821020
+        assert_eq!(lift(0x1382_1020, 0x1000), "w0 = extr(w1, w2, 4);");
+        // extr w0, w1, w2, #31 = 0x13827c20
+        assert_eq!(lift(0x1382_7c20, 0x1000), "w0 = extr(w1, w2, 31);");
+        // Independent operand fields: extr x9, x10, x11, #1 = 0x93cb0549
+        assert_eq!(lift(0x93cb_0549, 0x1000), "x9 = extr(x10, x11, 1);");
+    }
+
+    #[test]
+    fn renders_the_ror_immediate_alias() {
+        // `ror Rd, Rn, #imm` == `extr Rd, Rn, Rn, #imm`.
+        // ror x3, x4, #5 = 0x93c41483
+        assert_eq!(lift(0x93c4_1483, 0x1000), "x3 = ror(x4, 5);");
+        // ror w5, w6, #7 = 0x13861cc5
+        assert_eq!(lift(0x1386_1cc5, 0x1000), "w5 = ror(w6, 7);");
+    }
+
+    #[test]
+    fn extract_into_the_zero_register_is_discarded() {
+        // extr xzr, x1, x2, #4 = 0x93c2103f
+        assert!(lift(0x93c2_103f, 0x1000).contains("discarded"));
+    }
+
+    #[test]
+    fn folds_extract_into_constants() {
+        // movz x1, #0 ; movz x2, #0x42 ; extr x0, x1, x2, #0 -> 0x42.
+        // With `lsb == 0` the result is the low source alone, so provenance
+        // names only the movz of x2 (plus the extract itself).
+        let words = [0xd280_0001u32, 0xd280_0842, 0x93c2_0020];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(
+            report.contains("x0 = extr(x1, x2, 0); /* constant=0x42 proven_by=[0x1004,0x1008] */")
+        );
+
+        // movz x1, #1 ; movz x2, #0 ; extr x0, x1, x2, #4 -> (1 << 60).
+        let words = [0xd280_0021u32, 0xd280_0002, 0x93c2_1020];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = extr(x1, x2, 4); /* constant=0x1000000000000000 proven_by=[0x1000,0x1004,0x1008] */"));
+
+        // movz x4, #1 ; ror x3, x4, #1 -> rotate right one == 0x8000000000000000
+        let words = [0xd280_0024u32, 0x93c4_0483];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains(
+            "x3 = ror(x4, 1); /* constant=0x8000000000000000 proven_by=[0x1000,0x1004] */"
+        ));
+    }
+
+    #[test]
+    fn words_outside_the_extract_group_stay_opaque() {
+        // `N` must equal `sf`; a 64-bit form with N == 0 stays opaque.
+        // extr-family with bit 22 cleared = 0x93821020
+        assert!(lift(0x9382_1020, 0x1000).contains("opaque instruction"));
+        // 32-bit `imms` is bounded to 0..31; imms = 32 stays opaque.
+        // extr w0, w1, w2, #32 = 0x13828020
+        assert!(lift(0x1382_8020, 0x1000).contains("opaque instruction"));
     }
 
     #[test]
