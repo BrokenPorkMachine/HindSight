@@ -1,9 +1,73 @@
 //! Bounded, instruction-derived AArch64 register semantics. This is a
 //! machine-level preview, not recovered source or a general decompiler.
 
+use std::fmt::Write as _;
+
 const MAX_FUNCTIONS: usize = 8;
 const MAX_WORDS_PER_FUNCTION: usize = 128;
 const MAX_OUTPUT: usize = 48_000;
+
+#[derive(Clone, Debug)]
+struct BasicBlock {
+    start: u64,
+    instructions: Vec<u64>,
+    successors: Vec<usize>,
+    predecessors: Vec<usize>,
+    reachable: bool,
+    dominators: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct FunctionCfg {
+    blocks: Vec<BasicBlock>,
+}
+
+impl FunctionCfg {
+    fn analyze(blocks: &mut [BasicBlock]) {
+        if blocks.is_empty() { return; }
+        let mut pending = std::collections::VecDeque::from([0usize]);
+        blocks[0].reachable = true;
+        while let Some(block) = pending.pop_front() {
+            for &successor in &blocks[block].successors {
+                if !blocks[successor].reachable {
+                    blocks[successor].reachable = true;
+                    pending.push_back(successor);
+                }
+            }
+        }
+
+        let all_reachable = blocks.iter().enumerate()
+            .filter_map(|(index, block)| block.reachable.then_some(index))
+            .collect::<Vec<_>>();
+        for (index, block) in blocks.iter_mut().enumerate() {
+            block.dominators = if index == 0 { vec![0] }
+                else if block.reachable { all_reachable.clone() }
+                else { vec![index] };
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for index in 1..blocks.len() {
+                if !blocks[index].reachable { continue; }
+                let mut incoming = blocks[index].predecessors.iter()
+                    .copied().filter(|&pred| blocks[pred].reachable);
+                let mut next = if let Some(first) = incoming.next() {
+                    blocks[first].dominators.clone()
+                } else { Vec::new() };
+                for pred in incoming {
+                    next.retain(|dominator| blocks[pred].dominators.contains(dominator));
+                }
+                next.push(index);
+                next.sort_unstable();
+                next.dedup();
+                if next != blocks[index].dominators {
+                    blocks[index].dominators = next;
+                    changed = true;
+                }
+            }
+        }
+    }
+}
 
 fn register(index: u32, wide: bool, stack_pointer: bool) -> String {
     if index == 31 {
@@ -4193,7 +4257,7 @@ pub fn render(
         block_starts.dedup();
 
         // Build blocks: (start, list of pcs).
-        let mut blocks: Vec<(u64, Vec<u64>)> = Vec::new();
+        let mut blocks: Vec<BasicBlock> = Vec::new();
         for (bi, &bs) in block_starts.iter().enumerate() {
             let be = block_starts.get(bi + 1).copied().unwrap_or(function_end);
             let bpcs: Vec<u64> = pcs
@@ -4204,7 +4268,14 @@ pub fn render(
             if bpcs.is_empty() {
                 continue;
             }
-            blocks.push((bs, bpcs));
+            blocks.push(BasicBlock {
+                start: bs,
+                instructions: bpcs,
+                successors: Vec::new(),
+                predecessors: Vec::new(),
+                reachable: false,
+                dominators: Vec::new(),
+            });
         }
         if blocks.is_empty() {
             out.push_str("}\n");
@@ -4217,52 +4288,68 @@ pub fn render(
         // pc -> block index
         let mut pc_to_block: std::collections::HashMap<u64, usize> =
             std::collections::HashMap::new();
-        for (bi, (_, bpcs)) in blocks.iter().enumerate() {
-            for &p in bpcs {
+        for (bi, block) in blocks.iter().enumerate() {
+            for &p in &block.instructions {
                 pc_to_block.insert(p, bi);
             }
         }
 
         let block_of = |p: u64| -> Option<usize> { pc_to_block.get(&p).copied() };
 
-        let successors = |bi: usize| -> Vec<usize> {
-            let (_, bpcs) = &blocks[bi];
-            let last_pc = *bpcs.last().unwrap();
+        for bi in 0..blocks.len() {
+            let last_pc = *blocks[bi].instructions.last().unwrap();
             let last_idx = pcs.iter().position(|&p| p == last_pc).unwrap();
             let last_op = &ops[last_idx];
-            let mut succs: Vec<usize> = Vec::new();
+            let mut successors: Vec<usize> = Vec::new();
             match last_op {
                 Operation::Branch(t) => {
-                    if let Some(bi) = block_of(*t) {
-                        succs.push(bi);
+                    if let Some(target) = block_of(*t) {
+                        successors.push(target);
                     }
                 }
                 Operation::ConditionalBranch { target, .. } => {
-                    if let Some(bi) = block_of(*target) {
-                        succs.push(bi);
+                    if let Some(target) = block_of(*target) {
+                        successors.push(target);
                     }
                     let nt = last_pc + 4;
-                    if let Some(bi) = block_of(nt) {
-                        succs.push(bi);
+                    if let Some(fallthrough) = block_of(nt) {
+                        successors.push(fallthrough);
                     }
                 }
                 Operation::IndirectBranch { .. } => {}
                 Operation::Call(_) | Operation::IndirectCall { .. } => {
                     let nt = last_pc + 4;
-                    if let Some(bi) = block_of(nt) {
-                        succs.push(bi);
+                    if let Some(fallthrough) = block_of(nt) {
+                        successors.push(fallthrough);
                     }
                 }
                 Operation::Return(_) => {}
                 _ => {
                     let nt = last_pc + 4;
-                    if let Some(bi) = block_of(nt) {
-                        succs.push(bi);
+                    if let Some(fallthrough) = block_of(nt) {
+                        successors.push(fallthrough);
                     }
                 }
             }
-            succs
-        };
+            successors.sort_unstable();
+            successors.dedup();
+            blocks[bi].successors = successors;
+        }
+        for bi in 0..blocks.len() {
+            for successor in blocks[bi].successors.clone() {
+                blocks[successor].predecessors.push(bi);
+            }
+        }
+        for block in &mut blocks { block.predecessors.sort_unstable(); }
+        let mut cfg = FunctionCfg { blocks };
+        FunctionCfg::analyze(&mut cfg.blocks);
+        let blocks = &cfg.blocks;
+
+        out.push_str("  // CFG blocks: block, predecessor/successor indices, reachability, dominators\n");
+        for (index, block) in blocks.iter().enumerate() {
+            let _ = writeln!(out, "  // cfg B{index} start={:#x} preds={:?} succs={:?} reachable={} dom={:?}",
+                block.start, block.predecessors, block.successors, block.reachable, block.dominators);
+        }
 
         // Dataflow: compute entry flow per block (worklist, bounded).
         let mut entry: std::collections::HashMap<usize, Flow> = std::collections::HashMap::new();
@@ -4276,7 +4363,7 @@ pub fn render(
             }
             iters += 1;
             let flow0 = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
-            let (_, bpcs) = &blocks[bi];
+            let bpcs = &blocks[bi].instructions;
             let mut flow = flow0;
             for &p in bpcs {
                 if is_data(p) {
@@ -4287,7 +4374,7 @@ pub fn render(
                 }
             }
             let exit_flow = flow;
-            for &s in &successors(bi) {
+            for &s in &blocks[bi].successors {
                 let merged = if let Some(old) = entry.get(&s) {
                     merge_flow(old, &exit_flow)
                 } else {
@@ -4305,9 +4392,9 @@ pub fn render(
         }
 
         // Render phase: render each block in address order using final entry flows.
-        for (bi, (_bs, bpcs)) in blocks.iter().enumerate() {
+        for (bi, block) in blocks.iter().enumerate() {
             let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
-            for &p in bpcs {
+            for &p in &block.instructions {
                 let word = word_at(p);
                 let statement = if is_data(p) {
                     flow.clear();

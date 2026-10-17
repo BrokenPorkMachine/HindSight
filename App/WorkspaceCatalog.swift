@@ -81,12 +81,13 @@ enum VGWorkspaceCatalog {
             ])
 
         add(.staticAnalysis,
-            ["Binary Workspace", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Annotated Code", "Functions", "Function Intelligence", "Function Neighborhoods", "Tail-Call Candidates", "CFG", "Dominators", "Dominance Frontiers", "Phi Nodes", "IR", "SSA", "SSA Rename", "Strings", "Xrefs", "Data References", "Relocations", "Jump Tables", "Call Graph", "Data Flow", "Metadata", "Runtime Records", "Runtime Graph", "ObjC Classes", "Swift Types", "Swift Contexts", "Selector Xrefs", "Call Values", "Chained Fixups", "Chained Starts", "ObjC Protocols", "Swift Fields", "Swift Field Records", "Inter-block Values", "Predecessor Values", "Chained Pointers", "Multi-Start Chains", "ARM64e Pointers", "Swift Ownership", "Propagated Values", "Indirect Calls", "Dyld Imports", "Dyld Linking", "Soft Linking", "Symbolication", "Symbol Resolver", "Apple Symbolication", "Dylib Ordinals", "Resolved Imports", "ARM64e Bind Symbols", "Authenticated Targets", "Indirect Symbols", "Pointer Slots", "Exports", "Symbol Provenance", "Linkage Records", "Symbol Callers", "GOT/Auth-GOT", "Import/Export Collisions"],
-            sidebar: ["Binary Workspace", "Binary Diff", "Analysis Triage", "Navigator", "CFG"],
+            ["Binary Workspace", "Pseudocode", "Binary Diff", "Analysis Triage", "Analysis Insights", "Analysis Quality", "Navigator", "Disassembly", "Annotated Code", "Functions", "Function Intelligence", "Function Neighborhoods", "Tail-Call Candidates", "CFG", "Dominators", "Dominance Frontiers", "Phi Nodes", "IR", "SSA", "SSA Rename", "Strings", "Xrefs", "Data References", "Relocations", "Jump Tables", "Call Graph", "Data Flow", "Metadata", "Runtime Records", "Runtime Graph", "ObjC Classes", "Swift Types", "Swift Contexts", "Selector Xrefs", "Call Values", "Chained Fixups", "Chained Starts", "ObjC Protocols", "Swift Fields", "Swift Field Records", "Inter-block Values", "Predecessor Values", "Chained Pointers", "Multi-Start Chains", "ARM64e Pointers", "Swift Ownership", "Propagated Values", "Indirect Calls", "Dyld Imports", "Dyld Linking", "Soft Linking", "Symbolication", "Symbol Resolver", "Apple Symbolication", "Dylib Ordinals", "Resolved Imports", "ARM64e Bind Symbols", "Authenticated Targets", "Indirect Symbols", "Pointer Slots", "Exports", "Symbol Provenance", "Linkage Records", "Symbol Callers", "GOT/Auth-GOT", "Import/Export Collisions"],
+            sidebar: ["Binary Workspace", "Pseudocode", "Binary Diff", "Analysis Triage", "Navigator", "CFG"],
             subtitle: "Understand code, control flow, data, symbols, and Apple runtime evidence.",
             icon: "doc.text.magnifyingglass",
             overrides: [
                 "Binary Workspace": ("Binary Workspace", "rectangle.3.group"),
+                "Pseudocode": ("Pseudocode", "curlybraces.square"),
                 "Binary Diff": ("Binary Diff", "arrow.left.arrow.right.square"),
                 "Analysis Triage": ("Analysis Triage", "scope"),
                 "Analysis Insights": ("Analysis Insights", "sparkles.rectangle.stack"),

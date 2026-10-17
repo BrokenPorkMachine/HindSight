@@ -60,6 +60,7 @@ final class FirmwareRuntimeHost {
         switch r.command {
         case "dyld_inspect": return inspectDyldCache(r.path)
         case "dyld_read": return readDyldCache(r.path, address:r.address, count:r.count)
+        case "dyld_validate_image": return validateDyldImageSource(cachePath:r.path, imagePath:r.query, address:r.address)
         case "ipsw_devices": return fetchDevices(soc: r.soc)
         case "ipsw_releases": return fetchFirmwares(device: r.device)
         case "ipsw_download": return downloadIPSW(device:r.device, build:r.build, destination:r.destination)
@@ -111,6 +112,87 @@ final class FirmwareRuntimeHost {
             let summary=DyldCacheSummary(ok:true,message:"Loaded \(images.count) cached images. Framework/dylib selection is available without extracting the whole cache.",path:path,magic:magic,mappingCount:mappings.count,imageCount:images.count,mappings:mappings,images:images)
             return encode(.init(ok:true,message:summary.message,dyld:summary))
         } catch { return encode(.init(ok:false,message:error.localizedDescription)) }
+    }
+
+    private func validateDyldImageSource(cachePath: String?, imagePath: String?, address: String?) -> String {
+        guard let cachePath, cachePath.hasPrefix("/"), let imagePath,
+              imagePath.hasPrefix("/System/Library/") || imagePath.hasPrefix("/usr/lib/"),
+              let address, let loadAddress = UInt64(address.hasPrefix("0x") ? String(address.dropFirst(2)) : address, radix: 16) else {
+            return encode(.init(ok:false, message:"The selected cache image does not have a supported local system image path."))
+        }
+        do {
+            let cacheURL = URL(fileURLWithPath: cachePath).standardizedFileURL
+            let imageURL = URL(fileURLWithPath: imagePath).standardizedFileURL.resolvingSymlinksInPath()
+            guard imageURL.path.hasPrefix("/System/Library/") || imageURL.path.hasPrefix("/usr/lib/") else {
+                throw HostError("The cache image path resolves outside supported system image directories.")
+            }
+            let cache = try Data(contentsOf: cacheURL, options:[.mappedIfSafe])
+            guard cache.count >= 152 else { throw HostError("The selected file is too small to be a dyld shared cache.") }
+            guard ascii(cache, 0, 16).hasPrefix("dyld_v") else { throw HostError("The selected file is not a dyld shared cache.") }
+            let imageTableOffset = Int(u64(cache, 136)), imageCount = Int(u64(cache, 144))
+            guard imageCount >= 0, imageCount <= 200_000, imageTableOffset >= 0,
+                  imageTableOffset <= cache.count, imageCount <= (cache.count - imageTableOffset) / 32 else {
+                throw HostError("The cache image table failed bounds validation.")
+            }
+            var imageMatched = false
+            for index in 0..<imageCount {
+                let row = imageTableOffset + index * 32
+                let rowAddress = u64(cache, row + 16)
+                let pathOffset = Int(u32(cache, row + 28))
+                guard pathOffset >= 0, pathOffset < cache.count else { continue }
+                if rowAddress == loadAddress && cString(cache, pathOffset, 4096) == imagePath {
+                    imageMatched = true
+                    break
+                }
+            }
+            guard imageMatched else { throw HostError("The selected path and load address do not identify the same image in this cache.") }
+
+            let mappingOffset = Int(u32(cache, 16)), mappingCount = Int(u32(cache, 20))
+            guard mappingCount >= 0, mappingCount <= 4096, mappingOffset >= 0,
+                  mappingOffset <= cache.count, mappingCount <= (cache.count - mappingOffset) / 32 else {
+                throw HostError("The cache mapping table failed bounds validation.")
+            }
+            var headerOffset: Int?
+            var available = 0
+            for index in 0..<mappingCount {
+                let row = mappingOffset + index * 32
+                let vm = u64(cache, row), span = u64(cache, row + 8), fileOffset = u64(cache, row + 16)
+                guard loadAddress >= vm, loadAddress - vm < span else { continue }
+                let delta = loadAddress - vm
+                guard fileOffset <= UInt64(cache.count), delta <= UInt64(cache.count) - fileOffset else { continue }
+                headerOffset = Int(fileOffset + delta)
+                available = Int(min(span - delta, min(UInt64(cache.count) - fileOffset - delta, 65_536)))
+                break
+            }
+            guard let headerOffset, available >= 32 else { throw HostError("The image header is not backed by the selected primary cache file; it may be in a subcache.") }
+            let cacheHeader = cache.subdata(in: headerOffset..<(headerOffset + available))
+            let local = try Data(contentsOf: imageURL, options:[.mappedIfSafe])
+            guard let cacheUUID = machoUUID(cacheHeader), let localUUID = machoUUID(local.prefix(65_536)), cacheUUID == localUUID else {
+                throw HostError("The installed image UUID does not match the selected cache image. Import the matching system image before analysis.")
+            }
+            return encode(.init(ok:true, message:"Matched the selected dyld cache image to its installed Mach-O UUID.", outputPath:imageURL.path))
+        } catch { return encode(.init(ok:false, message:error.localizedDescription)) }
+    }
+
+    private func machoUUID(_ data: Data) -> Data? {
+        guard data.count >= 32 else { return nil }
+        let magic = u32(data, 0)
+        guard magic == 0xfeedfacf || magic == 0xfeedface else { return nil }
+        let commandCount = Int(u32(data, 16))
+        guard commandCount <= 8192 else { return nil }
+        let headerSize = magic == 0xfeedfacf ? 32 : 28
+        var offset = headerSize
+        for _ in 0..<commandCount {
+            guard offset <= data.count, data.count - offset >= 8 else { return nil }
+            let command = u32(data, offset), size = Int(u32(data, offset + 4))
+            guard size >= 8, size <= data.count - offset else { return nil }
+            if command == 0x1b {
+                guard size >= 24 else { return nil }
+                return data.subdata(in:(offset + 8)..<(offset + 24))
+            }
+            offset += size
+        }
+        return nil
     }
 
     private func readDyldCache(_ path: String?, address: String?, count: Int?) -> String {

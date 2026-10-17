@@ -1,0 +1,529 @@
+//! Source signature evidence recovered from names and Objective-C runtime type encodings.
+//! A declaration is emitted only when metadata or an exact API catalog entry supplies it.
+use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    pub language: &'static str,
+    pub declaration: String,
+    pub source: &'static str,
+}
+
+fn clean(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 1024 && !text.chars().any(|c| c.is_control() || matches!(c, '\\' | ';' | '{' | '}'))
+}
+
+fn objc_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
+    if depth > 8 { return None }
+    while *at < bytes.len() && b"rnNoORV".contains(&bytes[*at]) { *at += 1; }
+    let code = *bytes.get(*at)?; *at += 1;
+    let ty = match code {
+        b'v' => "void".into(), b'c' => "char".into(), b'C' => "unsigned char".into(),
+        b's' => "short".into(), b'S' => "unsigned short".into(),
+        b'i' => "int".into(), b'I' => "unsigned int".into(),
+        b'l' => "long".into(), b'L' => "unsigned long".into(),
+        b'q' => "long long".into(), b'Q' => "unsigned long long".into(),
+        b'f' => "float".into(), b'd' => "double".into(), b'B' => "bool".into(),
+        b'@' => {
+            if bytes.get(*at) == Some(&b'?') { *at += 1; "id /* block */".into() }
+            else if bytes.get(*at) == Some(&b'"') {
+                *at += 1; let start = *at;
+                while bytes.get(*at).is_some_and(|b| *b != b'"') { *at += 1; }
+                if bytes.get(*at) != Some(&b'"') { return None }
+                let name = std::str::from_utf8(&bytes[start..*at]).ok()?; *at += 1;
+                if !clean(name) { return None } format!("{name} *")
+            } else { "id".into() }
+        }
+        b'#' => "Class".into(), b':' => "SEL".into(), b'*' => "char *".into(),
+        b'^' => format!("{} *", objc_type(bytes, at, depth + 1)?),
+        // Aggregates and unknown encodings cannot safely be rendered as a
+        // pointer: their ABI passing convention may be different.
+        b'?' | b'{' | b'(' | b'[' => return None,
+        _ => return None,
+    };
+    Some(ty)
+}
+
+fn skip_number(bytes: &[u8], at: &mut usize) {
+    if bytes.get(*at) == Some(&b'-') { *at += 1 }
+    while bytes.get(*at).is_some_and(u8::is_ascii_digit) { *at += 1 }
+}
+
+fn foundation_method(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "-[NSObject class]" => "- (Class)class;",
+        "-[NSObject superclass]" => "- (Class)superclass;",
+        "-[NSObject description]" => "- (NSString *)description;",
+        "-[NSObject respondsToSelector:]" => "- (BOOL)respondsToSelector:(SEL)aSelector;",
+        "-[NSObject isKindOfClass:]" => "- (BOOL)isKindOfClass:(Class)aClass;",
+        "-[NSString length]" => "- (NSUInteger)length;",
+        "-[NSString UTF8String]" => "- (const char *)UTF8String;",
+        "-[NSString characterAtIndex:]" => "- (unichar)characterAtIndex:(NSUInteger)index;",
+        "-[NSString isEqualToString:]" => "- (BOOL)isEqualToString:(NSString *)aString;",
+        "-[NSString substringFromIndex:]" => "- (NSString *)substringFromIndex:(NSUInteger)from;",
+        "-[NSString substringToIndex:]" => "- (NSString *)substringToIndex:(NSUInteger)to;",
+        "-[NSString stringByAppendingString:]" => "- (NSString *)stringByAppendingString:(NSString *)aString;",
+        "+[NSString stringWithUTF8String:]" => "+ (instancetype)stringWithUTF8String:(const char *)bytes;",
+        "-[NSArray count]" => "- (NSUInteger)count;",
+        "-[NSArray objectAtIndex:]" => "- (id)objectAtIndex:(NSUInteger)index;",
+        "-[NSArray containsObject:]" => "- (BOOL)containsObject:(id)anObject;",
+        "-[NSArray indexOfObject:]" => "- (NSUInteger)indexOfObject:(id)anObject;",
+        "+[NSArray array]" => "+ (instancetype)array;",
+        "-[NSDictionary count]" => "- (NSUInteger)count;",
+        "-[NSDictionary objectForKey:]" => "- (id)objectForKey:(id)aKey;",
+        "-[NSDictionary allKeys]" => "- (NSArray *)allKeys;",
+        "-[NSDictionary allValues]" => "- (NSArray *)allValues;",
+        "+[NSDictionary dictionary]" => "+ (instancetype)dictionary;",
+        "-[NSData length]" => "- (NSUInteger)length;",
+        "-[NSData bytes]" => "- (const void *)bytes;",
+        "-[NSURL absoluteString]" => "- (NSString *)absoluteString;",
+        "-[NSURL path]" => "- (NSString *)path;",
+        "-[NSBundle bundleIdentifier]" => "- (NSString *)bundleIdentifier;",
+        "-[NSBundle pathForResource:ofType:]" => "- (NSString *)pathForResource:(NSString *)name ofType:(NSString *)extension;",
+        "-[NSBundle URLForResource:withExtension:]" => "- (NSURL *)URLForResource:(NSString *)name withExtension:(NSString *)extension;",
+        "-[NSError code]" => "- (NSInteger)code;",
+        "-[NSError domain]" => "- (NSString *)domain;",
+        "-[NSError userInfo]" => "- (NSDictionary *)userInfo;",
+        "-[NSNumber boolValue]" => "- (BOOL)boolValue;",
+        "-[NSNumber integerValue]" => "- (NSInteger)integerValue;",
+        "-[NSNumber doubleValue]" => "- (double)doubleValue;",
+        "+[NSNumber numberWithBool:]" => "+ (NSNumber *)numberWithBool:(BOOL)value;",
+        "-[NSSet count]" => "- (NSUInteger)count;",
+        "-[NSSet containsObject:]" => "- (BOOL)containsObject:(id)anObject;",
+        "-[NSFileManager fileExistsAtPath:]" => "- (BOOL)fileExistsAtPath:(NSString *)path;",
+        "-[NSFileManager contentsAtPath:]" => "- (NSData *)contentsAtPath:(NSString *)path;",
+        "-[NSUserDefaults objectForKey:]" => "- (id)objectForKey:(NSString *)defaultName;",
+        "-[NSUserDefaults setObject:forKey:]" => "- (void)setObject:(id)value forKey:(NSString *)defaultName;",
+        _ => return None,
+    })
+}
+
+pub fn objc_method(name: &str, encoding: &str) -> Option<Signature> {
+    if !clean(name) || encoding.is_empty() || encoding.len() > 1024 || !encoding.is_ascii() || encoding.bytes().any(|b| b.is_ascii_control()) || !(name.starts_with("-[") || name.starts_with("+[")) || !name.ends_with(']') { return None }
+    let bytes = encoding.as_bytes(); let mut at = 0;
+    let result = objc_type(bytes, &mut at, 0)?; skip_number(bytes, &mut at);
+    let self_type = objc_type(bytes, &mut at, 0)?; skip_number(bytes, &mut at);
+    let selector_type = objc_type(bytes, &mut at, 0)?; skip_number(bytes, &mut at);
+    if !matches!(self_type.as_str(), "id" | "Class") || selector_type != "SEL" { return None }
+    let body = &name[2..name.len()-1]; let (_, selector) = body.split_once(' ')?;
+    let count = selector.bytes().filter(|b| *b == b':').count();
+    let mut args = Vec::new();
+    for _ in 0..count { args.push(objc_type(bytes, &mut at, 0)?); skip_number(bytes, &mut at); }
+    if at != bytes.len() { return None }
+    let mut declaration = format!("{} ({result})", &name[..1]);
+    if count == 0 { declaration.push_str(selector); }
+    else {
+        let labels = selector.split(':').take(count);
+        for (i, (label, ty)) in labels.zip(args).enumerate() {
+            if i > 0 { declaration.push(' '); }
+            declaration.push_str(&format!("{label}:({ty})arg{i}"));
+        }
+    }
+    declaration.push(';');
+    if let Some(declaration) = foundation_method(name) {
+        return Some(Signature { language: "Objective-C / Objective-C++", declaration: declaration.into(), source: "exact Foundation SDK method declaration; encoding arity validated" });
+    }
+    Some(Signature { language: "Objective-C / Objective-C++", declaration, source: "validated Objective-C method type encoding" })
+}
+
+// Exact SDK ABI declarations. No prefix or substring matching: unknown APIs stay unknown.
+fn api(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        "_CFRelease" => ("void CFRelease(CFTypeRef cf);", "CoreFoundation"),
+        "_CFRetain" => ("CFTypeRef CFRetain(CFTypeRef cf);", "CoreFoundation"),
+        "_CFGetTypeID" => ("CFTypeID CFGetTypeID(CFTypeRef cf);", "CoreFoundation"),
+        "_CFStringGetLength" => ("CFIndex CFStringGetLength(CFStringRef theString);", "CoreFoundation"),
+        "_CFStringGetTypeID" => ("CFTypeID CFStringGetTypeID(void);", "CoreFoundation"),
+        "_CFStringCreateWithCString" => ("CFStringRef CFStringCreateWithCString(CFAllocatorRef alloc, const char *cStr, CFStringEncoding encoding);", "CoreFoundation"),
+        "_CFStringCreateWithBytes" => ("CFStringRef CFStringCreateWithBytes(CFAllocatorRef alloc, const UInt8 *bytes, CFIndex numBytes, CFStringEncoding encoding, Boolean isExternalRepresentation);", "CoreFoundation"),
+        "_CFStringGetCString" => ("Boolean CFStringGetCString(CFStringRef theString, char *buffer, CFIndex bufferSize, CFStringEncoding encoding);", "CoreFoundation"),
+        "_CFStringGetCStringPtr" => ("const char *CFStringGetCStringPtr(CFStringRef theString, CFStringEncoding encoding);", "CoreFoundation"),
+        "_CFStringCompare" => ("CFComparisonResult CFStringCompare(CFStringRef theString1, CFStringRef theString2, CFStringCompareFlags compareOptions);", "CoreFoundation"),
+        "_CFStringGetCharacterAtIndex" => ("UniChar CFStringGetCharacterAtIndex(CFStringRef theString, CFIndex idx);", "CoreFoundation"),
+        "_CFArrayCreate" => ("CFArrayRef CFArrayCreate(CFAllocatorRef allocator, const void **values, CFIndex numValues, const CFArrayCallBacks *callBacks);", "CoreFoundation"),
+        "_CFArrayGetTypeID" => ("CFTypeID CFArrayGetTypeID(void);", "CoreFoundation"),
+        "_CFArrayGetCount" => ("CFIndex CFArrayGetCount(CFArrayRef theArray);", "CoreFoundation"),
+        "_CFArrayGetValueAtIndex" => ("const void *CFArrayGetValueAtIndex(CFArrayRef theArray, CFIndex idx);", "CoreFoundation"),
+        "_CFArrayContainsValue" => ("Boolean CFArrayContainsValue(CFArrayRef theArray, CFRange range, const void *value);", "CoreFoundation"),
+        "_CFDictionaryCreate" => ("CFDictionaryRef CFDictionaryCreate(CFAllocatorRef allocator, const void **keys, const void **values, CFIndex numValues, const CFDictionaryKeyCallBacks *keyCallBacks, const CFDictionaryValueCallBacks *valueCallBacks);", "CoreFoundation"),
+        "_CFDictionaryGetTypeID" => ("CFTypeID CFDictionaryGetTypeID(void);", "CoreFoundation"),
+        "_CFDictionaryGetCount" => ("CFIndex CFDictionaryGetCount(CFDictionaryRef theDict);", "CoreFoundation"),
+        "_CFDictionaryGetValue" => ("const void *CFDictionaryGetValue(CFDictionaryRef theDict, const void *key);", "CoreFoundation"),
+        "_CFDictionaryGetValueIfPresent" => ("Boolean CFDictionaryGetValueIfPresent(CFDictionaryRef theDict, const void *key, const void **value);", "CoreFoundation"),
+        "_CFBooleanGetValue" => ("Boolean CFBooleanGetValue(CFBooleanRef boolean);", "CoreFoundation"),
+        "_CFNumberGetValue" => ("Boolean CFNumberGetValue(CFNumberRef number, CFNumberType theType, void *valuePtr);", "CoreFoundation"),
+        "_CFNumberCreate" => ("CFNumberRef CFNumberCreate(CFAllocatorRef allocator, CFNumberType theType, const void *valuePtr);", "CoreFoundation"),
+        "_CFDataCreate" => ("CFDataRef CFDataCreate(CFAllocatorRef allocator, const UInt8 *bytes, CFIndex length);", "CoreFoundation"),
+        "_CFDataGetTypeID" => ("CFTypeID CFDataGetTypeID(void);", "CoreFoundation"),
+        "_CFDataGetLength" => ("CFIndex CFDataGetLength(CFDataRef theData);", "CoreFoundation"),
+        "_CFDataGetBytePtr" => ("const UInt8 *CFDataGetBytePtr(CFDataRef theData);", "CoreFoundation"),
+        "_CFDataGetBytes" => ("void CFDataGetBytes(CFDataRef theData, CFRange range, UInt8 *buffer);", "CoreFoundation"),
+        "_CFBundleGetMainBundle" => ("CFBundleRef CFBundleGetMainBundle(void);", "CoreFoundation"),
+        "_CFBundleGetValueForInfoDictionaryKey" => ("CFTypeRef CFBundleGetValueForInfoDictionaryKey(CFBundleRef bundle, CFStringRef key);", "CoreFoundation"),
+        "_CFURLCreateWithString" => ("CFURLRef CFURLCreateWithString(CFAllocatorRef allocator, CFStringRef URLString, CFURLRef baseURL);", "CoreFoundation"),
+        "_CFURLCopyFileSystemPath" => ("CFStringRef CFURLCopyFileSystemPath(CFURLRef anURL, CFURLPathStyle pathStyle);", "CoreFoundation"),
+        "_CFPropertyListCreateWithData" => ("CFPropertyListRef CFPropertyListCreateWithData(CFAllocatorRef allocator, CFDataRef data, CFOptionFlags options, CFPropertyListFormat *format, CFErrorRef *error);", "CoreFoundation"),
+        "_CFErrorCreate" => ("CFErrorRef CFErrorCreate(CFAllocatorRef allocator, CFStringRef domain, CFIndex code, CFDictionaryRef userInfo);", "CoreFoundation"),
+        "_CFErrorGetDomain" => ("CFStringRef CFErrorGetDomain(CFErrorRef err);", "CoreFoundation"),
+        "_CFErrorGetCode" => ("CFIndex CFErrorGetCode(CFErrorRef err);", "CoreFoundation"),
+        "_CFRunLoopGetCurrent" => ("CFRunLoopRef CFRunLoopGetCurrent(void);", "CoreFoundation"),
+        "_CFRunLoopRun" => ("void CFRunLoopRun(void);", "CoreFoundation"),
+        "_objc_getClass" => ("Class objc_getClass(const char *name);", "Objective-C runtime"),
+        "_objc_getMetaClass" => ("Class objc_getMetaClass(const char *name);", "Objective-C runtime"),
+        "_objc_lookUpClass" => ("Class objc_lookUpClass(const char *name);", "Objective-C runtime"),
+        "_NSGetExecutablePath" => ("int _NSGetExecutablePath(char *buf, uint32_t *bufsize);", "Foundation / dyld"),
+        "_malloc" => ("void *malloc(size_t size);", "C library"),
+        "_free" => ("void free(void *ptr);", "C library"),
+        "_memcpy" => ("void *memcpy(void *restrict dest, const void *restrict src, size_t n);", "C library"),
+        "_strlen" => ("size_t strlen(const char *s);", "C library"),
+        _ => return None,
+    })
+}
+
+fn cpp_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
+    if depth > 8 { return None }
+    let code = *bytes.get(*at)?; *at += 1;
+    Some(match code {
+        b'v' => "void".into(), b'b' => "bool".into(), b'c' => "char".into(),
+        b'a' => "signed char".into(), b'h' => "unsigned char".into(),
+        b's' => "short".into(), b't' => "unsigned short".into(),
+        b'i' => "int".into(), b'j' => "unsigned int".into(),
+        b'l' => "long".into(), b'm' => "unsigned long".into(),
+        b'x' => "long long".into(), b'y' => "unsigned long long".into(),
+        b'f' => "float".into(), b'd' => "double".into(),
+        b'P' => format!("{} *", cpp_type(bytes, at, depth + 1)?),
+        b'R' => format!("{} &", cpp_type(bytes, at, depth + 1)?),
+        b'O' => format!("{} &&", cpp_type(bytes, at, depth + 1)?),
+        b'K' => format!("const {}", cpp_type(bytes, at, depth + 1)?),
+        _ => return None,
+    })
+}
+
+fn cpp_component(bytes: &[u8], at: &mut usize) -> Option<String> {
+    let start = *at;
+    while bytes.get(*at).is_some_and(u8::is_ascii_digit) { *at += 1 }
+    if start == *at { return None }
+    let len = std::str::from_utf8(&bytes[start..*at]).ok()?.parse::<usize>().ok()?;
+    if len == 0 || len > 256 || *at + len > bytes.len() { return None }
+    let value = std::str::from_utf8(&bytes[*at..*at+len]).ok()?; *at += len;
+    if !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') { return None }
+    Some(value.into())
+}
+
+pub fn symbol(name: &str) -> Option<Signature> {
+    if !clean(name) { return None }
+    if let Some((declaration, language)) = api(name) {
+        return Some(Signature { language, declaration: declaration.into(), source: "exact SDK ABI catalog" });
+    }
+    let mangled = name.strip_prefix("__Z").or_else(|| name.strip_prefix("_Z"))?;
+    let bytes = mangled.as_bytes(); let mut at = 0; let mut names = Vec::new();
+    if bytes.first() == Some(&b'N') {
+        at += 1;
+        while bytes.get(at) != Some(&b'E') { names.push(cpp_component(bytes, &mut at)?); if names.len() > 16 { return None } }
+        at += 1;
+    } else { names.push(cpp_component(bytes, &mut at)?); }
+    let mut args = Vec::new();
+    if bytes.get(at) == Some(&b'v') && at + 1 == bytes.len() { at += 1; }
+    else { while at < bytes.len() { args.push(cpp_type(bytes, &mut at, 0)?); if args.len() > 32 { return None } } }
+    if at != bytes.len() { return None }
+    let declaration = format!("/* return type unresolved */ {}({});", names.join("::"), args.iter().enumerate().map(|(i,t)| format!("{t} arg{i}")).collect::<Vec<_>>().join(", "));
+    Some(Signature { language: "C++ / Objective-C++", declaration, source: "Itanium mangled parameter types; return type absent" })
+}
+
+pub fn recover(starts: &[u64], symbols: &[(u64, String)], objc_records: &str, calls: &[(u64,u64,u64)], scan_end: u64) -> (String, String) {
+    recover_internal(starts, symbols, objc_records, calls, scan_end, None)
+}
+
+pub fn recover_arm64(
+    starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
+    calls: &[(u64,u64,u64)], scan_end: u64, code: &[u8], base: u64,
+    file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
+    tail_calls: &[(u64,u64,u64)],
+) -> (String, String) {
+    recover_internal(starts, symbols, objc_records, calls, scan_end,
+        Some((code, base, file_offset, data_ranges, parameter_evidence, tail_calls)))
+}
+
+fn callable_name(name: &str, signature: Option<&Signature>) -> String {
+    if signature.is_some_and(|sig| sig.language == "Objective-C / Objective-C++") {
+        let safe = name.chars().map(|c| if matches!(c, '[' | ']' | ' ' | ':' | '+' | '-') { '_' } else { c }).collect::<String>();
+        return format!("objc_imp_{}", safe.trim_matches('_'));
+    }
+    if let Some(sig) = signature {
+        if let Some((head, _)) = sig.declaration.split_once('(') {
+            let candidate = head.trim().trim_end_matches('*').trim().split_whitespace().last().unwrap_or("");
+            if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') {
+                return candidate.into();
+            }
+        }
+    }
+    let mut candidate = name.strip_prefix('_').unwrap_or(name);
+    if let Some(stripped) = candidate.strip_prefix('_') { candidate = stripped; }
+    if candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') && !candidate.is_empty() {
+        candidate.into()
+    } else {
+        format!("sub_{}", name.bytes().fold(String::new(), |mut out, byte| { use std::fmt::Write; let _ = write!(out, "{byte:02x}"); out }))
+    }
+}
+
+fn call_arguments(signature: Option<&Signature>, name: &str) -> Vec<String> {
+    if let Some(sig) = signature {
+        if sig.language == "Objective-C / Objective-C++" {
+            let selector = sig.declaration.split(')').nth(1).unwrap_or("");
+            let count = selector.bytes().filter(|byte| *byte == b':').count();
+            return (0..count + 2).map(|index| match index { 0 => "self".into(), 1 => "_cmd".into(), n => format!("x{n}") }).collect();
+        }
+        if let Some((_, tail)) = sig.declaration.split_once('(') {
+            if let Some((args, _)) = tail.split_once(')') {
+                let args = args.trim();
+                if args.is_empty() || args == "void" { return Vec::new(); }
+                let count = args.split(',').count();
+                return (0..count).map(|index| format!("x{index}")).collect();
+            }
+        }
+    }
+    let _ = name;
+    Vec::new()
+}
+
+fn incoming_parameter_candidates(report: &str, address: u64) -> Vec<String> {
+    let prefix = format!("function {address:#018x} ");
+    report.lines().find_map(|line| {
+        let line = line.strip_prefix(&prefix)?;
+        let registers = line.split("parameter-registers=[").nth(1)?.split(']').next()?;
+        Some(registers.split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_string).collect())
+    }).unwrap_or_default()
+}
+
+fn render_arm64_body(
+    start: u64, end: u64, display_name: &str, signature: Option<&Signature>,
+    symbols: &[(u64,String)], signatures: &BTreeMap<u64,(String,Signature)>,
+    code: &[u8], base: u64, file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
+    tail_calls: &[(u64,u64,u64)],
+) -> Option<String> {
+    if start < base || start >= end || (start - base) % 4 != 0 { return None; }
+    let lo = usize::try_from(start - base).ok()?;
+    let hi = usize::try_from(end.min(base.saturating_add(code.len() as u64)) - base).ok()?;
+    if lo >= hi || hi > code.len() { return None; }
+    let body_code = &code[lo..hi];
+    let machine = super::semantic::render(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges);
+    let mut instructions = Vec::<(u64,String)>::new();
+    for line in machine.lines() {
+        let Some(line) = line.trim_start().strip_prefix("0x") else { continue };
+        let Some((address, rest)) = line.split_once("  ") else { continue };
+        let Ok(address) = u64::from_str_radix(address, 16) else { continue };
+        let statement = rest.split(" // word=").next().unwrap_or(rest).trim();
+        if !statement.is_empty() { instructions.push((address, statement.into())); }
+    }
+    let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
+    let labels = instructions.iter().filter_map(|(_,statement)| {
+        let target = if let Some(rest) = statement.strip_prefix("goto 0x") { Some(rest) }
+            else if let Some(rest) = statement.strip_prefix("if (").and_then(|rest| rest.split_once(") goto 0x").map(|(_,target)|target)) { Some(rest) }
+            else { None }?;
+        let digits = target.split(|c: char| !c.is_ascii_hexdigit()).next()?;
+        u64::from_str_radix(digits,16).ok().filter(|target| instruction_addresses.contains(target))
+    }).collect::<std::collections::BTreeSet<_>>();
+
+    let mut out = String::new();
+    out.push_str(&format!("// {start:#018x}..{end:#018x}; decoded machine operations translated to C-like statements\n"));
+    let mut opened_body = false;
+    if let Some(signature) = signature {
+        if signature.language == "Objective-C / Objective-C++" {
+            let class = display_name.split_once('[').and_then(|(_,tail)| tail.split_once(' ').map(|(class,_)|class)).unwrap_or("UnknownClass");
+            out.push_str(&format!("// @implementation {class}; Objective-C IMP ABI: x0=self, x1=_cmd\n"));
+            out.push_str(signature.declaration.trim_end_matches(';'));
+            out.push_str(" {\n");
+            opened_body = true;
+        } else if signature.source == "exact SDK ABI catalog" {
+            out.push_str(signature.declaration.trim_end_matches(';'));
+            out.push_str(" {\n");
+            opened_body = true;
+        } else {
+            out.push_str(&format!("// {} [{}]\n", signature.declaration.trim_end_matches(';'), signature.source));
+            out.push_str(&format!("/* body for {} */\n", callable_name(display_name, Some(signature))));
+        }
+    } else {
+        out.push_str(&format!("/* {}: source signature unresolved; ABI arguments remain machine registers */\n", callable_name(display_name, None)));
+    }
+    let parameters = incoming_parameter_candidates(parameter_evidence, start);
+    if !parameters.is_empty() {
+        out.push_str(&format!("/* incoming parameter candidates: {}; types unresolved */\n", parameters.join(", ")));
+    }
+    if !opened_body { out.push_str("{\n"); }
+    let mut instruction_index = 0usize;
+    while instruction_index < instructions.len() {
+        let (address, statement) = &instructions[instruction_index];
+        // A common compiler shape is `if (condition) goto after; return value;`.
+        // The branch skips the return, so express the fallthrough return as a
+        // structured conditional. Keep both source instruction addresses in
+        // the comment so the higher-level form remains auditable.
+        if let Some(rest) = statement.strip_prefix("if (") {
+            if let Some((condition, target)) = rest.split_once(") goto 0x") {
+                let target = target.trim_end_matches(';');
+                let next_index = instruction_index + 1;
+                if let (Ok(target), Some((return_address, return_statement))) =
+                    (u64::from_str_radix(target, 16), instructions.get(next_index))
+                {
+                    let after_return = return_address.saturating_add(4);
+                    if target == after_return && return_statement.starts_with("return ") {
+                        let return_statement = if return_statement.starts_with("return /* ABI result register x0")
+                            && signature.is_some_and(|sig| sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)") || sig.declaration.starts_with("void "))
+                        { "return;" }
+                        else { return_statement.trim_end_matches(';') };
+                        out.push_str(&format!("    if (!({condition})) {return_statement}; /* structured from {address:#x} and {return_address:#x} */\n"));
+                        instruction_index += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        let (address, statement) = (*address, statement.as_str());
+        if labels.contains(&address) { out.push_str(&format!("loc_{address:x}:\n")); }
+        let statement = if let Some(rest) = statement.strip_prefix("call(0x") {
+            if let Some((hex, _)) = rest.split_once(')') {
+                if let Ok(target) = u64::from_str_radix(hex,16) {
+                    let target_name = signatures.get(&target).map(|(name,_)| name.as_str())
+                        .or_else(|| symbols.iter().find(|(candidate,_)| *candidate == target).map(|(_,name)| name.as_str()));
+                    if let Some(name) = target_name {
+                        let target_signature = signatures.get(&target).map(|(_,signature)| signature);
+                        let callee = callable_name(name, target_signature);
+                        let args = call_arguments(target_signature, name);
+                        let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers x0-x7 unresolved */".into() } else { args.join(", ") };
+                        format!("{}({}); /* direct call target {target:#x}; {} */", callee, arguments, if target_signature.is_some() { "arguments follow recovered prototype arity" } else { "callee prototype unavailable" })
+                    } else {
+                        format!("call(/* unresolved target {target:#x} */); /* direct BL */")
+                    }
+                } else { statement.to_string() }
+            } else { statement.to_string() }
+        } else if let Some(rest) = statement.strip_prefix("if (") {
+            if let Some((condition,target)) = rest.split_once(") goto 0x") {
+                if let Ok(target) = u64::from_str_radix(target.trim_end_matches(';'),16) {
+                    if labels.contains(&target) { format!("if ({condition}) goto loc_{target:x};") }
+                    else { format!("if ({condition}) goto {target:#x}; /* target outside this recovered function */") }
+                } else { statement.to_string() }
+            } else { statement.to_string() }
+        } else if let Some(target) = statement.strip_prefix("goto 0x") {
+            if let Ok(target) = u64::from_str_radix(target.trim_end_matches(';'),16) {
+                if labels.contains(&target) { format!("goto loc_{target:x};") }
+                else if tail_calls.contains(&(start, address, target)) {
+                    let target_name = signatures.get(&target).map(|(name,_)| name.as_str())
+                        .or_else(|| symbols.iter().find(|(candidate,_)| *candidate == target).map(|(_,name)| name.as_str()));
+                    if let Some(name) = target_name {
+                        let target_signature = signatures.get(&target).map(|(_,signature)| signature);
+                        let args = call_arguments(target_signature, name);
+                        let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers unresolved */".into() } else { args.join(", ") };
+                        let callee = callable_name(name,target_signature);
+                        if target_signature.is_some_and(|sig| sig.declaration.starts_with("void ") || sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)")) {
+                            format!("{callee}({arguments}); return; /* cross-function B tail-call candidate */")
+                        } else {
+                            format!("return {callee}({arguments}); /* cross-function B tail-call candidate; return compatibility unresolved */")
+                        }
+                    } else { format!("goto {target:#x}; /* tail-call candidate; target name unresolved */") }
+                }
+                else { format!("goto {target:#x}; /* target outside this recovered function */") }
+            } else { statement.to_string() }
+        } else if statement.starts_with("return /* ABI result register x0") {
+            if signature.is_some_and(|sig| sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)") || sig.declaration.starts_with("void ")) {
+                "return; /* void return supported by recovered signature */".into()
+            } else {
+                "return x0; /* inferred ABI result; source return type unresolved */".into()
+            }
+        } else { statement.to_string() };
+        out.push_str(&format!("    {address:#018x}: {statement}\n"));
+        instruction_index += 1;
+    }
+    if instructions_truncated(&machine) { out.push_str("    /* instruction listing truncated by the semantic preview budget */\n"); }
+    out.push_str("}\n");
+    Some(out)
+}
+
+fn instructions_truncated(machine: &str) -> bool {
+    machine.contains("function preview truncated at instruction budget")
+}
+
+fn recover_internal(
+    starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
+    calls: &[(u64,u64,u64)], scan_end: u64,
+    arm64: Option<(&[u8],u64,u64,&[(u64,u64,u16)],&str,&[(u64,u64,u64)])>,
+) -> (String, String) {
+    let mut by_address = BTreeMap::<u64,(String,Signature)>::new();
+    let mut name_only = BTreeMap::<String,Signature>::new();
+    for (address,name) in symbols { if let Some(sig) = symbol(name) {
+        if *address == 0 { name_only.insert(name.clone(),sig); }
+        else { by_address.insert(*address,(name.clone(),sig)); }
+    } }
+    for line in objc_records.lines().filter(|line| line.contains(" method ") && line.contains("confidence=validated")) {
+        let Some(imp) = line.split(" imp=").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"),16).ok()) else { continue };
+        if imp == 0 { continue }
+        let Some(name) = line.split(" resolved=").nth(1).and_then(|s| s.split(" confidence=").next()) else { continue };
+        let Some(encoding) = line.split(" types=").nth(1).and_then(|s| s.split(" imp=").next()) else { continue };
+        if let Some(sig) = objc_method(name.trim(),encoding.trim()) { by_address.insert(imp,(name.trim().into(),sig)); }
+    }
+    let mut signatures = String::from("Signature evidence: exact SDK ABI declarations, validated Objective-C type encodings, and supported Itanium mangled parameter types. Unknown source types remain unresolved.\n");
+    for (address,(name,sig)) in by_address.iter().take(700) {
+        let row = format!("{address:#018x} {name} language={} source={} declaration={}\n",sig.language,sig.source,sig.declaration);
+        if signatures.len()+row.len() > 60_000 { break } signatures.push_str(&row);
+    }
+    for (name,sig) in name_only.iter().take(200) {
+        let row = format!("name-only {name} language={} source={} declaration={}\n",sig.language,sig.source,sig.declaration);
+        if signatures.len()+row.len() > 60_000 { break } signatures.push_str(&row);
+    }
+    if by_address.is_empty() && name_only.is_empty() { signatures.push_str("No source-level signatures were supported by available metadata or the exact API catalog.\n"); }
+    let mut pseudo = String::from("// Bounded C-like reconstruction. Statements come from decoded AArch64 operations; declarations use validated runtime metadata or exact symbol prototypes. Unknown types, values, and effects stay marked.\n");
+    for (i,&start) in starts.iter().take(200).enumerate() {
+        let end = starts.get(i+1).copied().unwrap_or(scan_end);
+        if pseudo.len() > 55_000 { break }
+        let named = by_address.get(&start);
+        let name = named.map(|(name,_)| name.as_str()).or_else(||symbols.iter().find(|(address,_)| *address == start).map(|(_,name)|name.as_str())).unwrap_or("<unnamed>");
+        let signature = named.map(|(_,signature)| signature);
+        if let Some((code,base,file_offset,data_ranges,parameter_evidence,tail_calls)) = arm64 {
+            let end = starts.get(i+1).copied().unwrap_or(scan_end);
+            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, code, base, file_offset, data_ranges, parameter_evidence, tail_calls) {
+                if pseudo.len() + body.len() > 58_000 { break; }
+                pseudo.push_str(&body);
+                pseudo.push('\n');
+                continue;
+            }
+        }
+        if let Some((name,sig)) = named {
+            pseudo.push_str(&format!("// {start:#018x} {name}; {}\n{}\n",sig.source,sig.declaration.trim_end_matches(';')));
+        } else {
+            let name = symbols.iter().find(|(address,_)| *address == start).map(|(_,name)| name.as_str()).unwrap_or("<unnamed>");
+            pseudo.push_str(&format!("// {start:#018x} {name}; signature unresolved\n/* return type unresolved */ function_{start:x}(/* parameters unresolved */)\n"));
+        }
+        pseudo.push_str("{\n");
+        for &(_,site,target) in calls.iter().filter(|&&(caller,site,_)| caller == start && site >= start && site < end).take(24) {
+            let callee = by_address.get(&target).map(|(name,_)| name.as_str()).or_else(||symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.as_str())).unwrap_or("<unresolved>");
+            let row=format!("    call_target({target:#018x}); /* BL @ {site:#018x} {callee}; arguments and result unresolved */\n");
+            if pseudo.len()+row.len()>58_000 {pseudo.push_str("    /* call listing truncated */\n");break}
+            pseudo.push_str(&row);
+        }
+        pseudo.push_str("    /* remaining machine operations and return value unresolved */\n}\n\n");
+    }
+    (signatures,pseudo)
+}
+
+#[cfg(test)] mod tests {
+    use super::*;
+    #[test] fn objc_encoding() {
+        let s=objc_method("-[NSString substringFromIndex:]", "@\"NSString\"24@0:8Q16").unwrap();
+        assert_eq!(s.declaration,"- (NSString *)substringFromIndex:(unsigned long long)arg0;");
+        assert!(objc_method("-[A x:]", "v24@0:8").is_none());
+        assert!(objc_method("-[A rect:]", "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").is_none());
+    }
+    #[test] fn exact_catalog_and_cpp() {
+        assert_eq!(symbol("_CFRelease").unwrap().declaration,"void CFRelease(CFTypeRef cf);");
+        assert!(symbol("_CFReleaseExtra").is_none());
+        assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
+        assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
+    }
+    #[test] fn joins_method_encoding_and_cf_stub_with_direct_call() {
+        let symbols=[(0x2000,"_CFRelease".into())];
+        let objc="  instance method 0x3000  name=x  types=v24@0:8@16  imp=0x0000000000001000 resolved=-[Widget setObject:] confidence=validated\n";
+        assert!(objc_method("-[Widget setObject:]","v24@0:8@16").is_some());
+        let (report,pseudo)=recover(&[0x1000],&symbols,objc,&[(0x1000,0x1004,0x2000)],0x1100);
+        assert!(report.contains("- (void)setObject:(id)arg0;"),"{report}");
+        assert!(report.contains("void CFRelease(CFTypeRef cf);"));
+        assert!(pseudo.contains("call_target(0x0000000000002000);"));
+    }
+}

@@ -57,13 +57,14 @@ class AnalysisScalabilityContract(unittest.TestCase):
         self.assertNotIn("relocations.iter().find", disassembly)
         self.assertNotIn("relocations.iter().find", indirect)
 
-    def test_top_level_symbol_lookup_borrows_owned_symbol_vector(self):
-        # The top-level analysis function owns `symbols` as a Vec. Free-function
-        # calls do not auto-borrow Vec -> slice, so these sites must pass &symbols.
+    def test_top_level_name_resolution_borrows_owned_symbol_vector(self):
+        # The top-level analysis function owns `symbols` as a Vec. The joined
+        # resolver borrows it for exact-address lookup at each display site.
         analyze = self.worker.split('pub fn analyze', 1)[1]
-        self.assertIn('symbol_name_at(&symbols,start)', analyze)
-        self.assertIn('symbol_name_at(&symbols,func)', analyze)
-        self.assertIn('symbol_name_at(&symbols,target)', analyze)
+        self.assertIn('resolved_function_name(start,&symbols,', analyze)
+        self.assertIn('resolved_function_name(func,&symbols,', analyze)
+        self.assertIn('resolved_function_name(target,&symbols,', analyze)
+        self.assertIn('symbol_name_at(symbols,address)', self.worker)
         self.assertNotIn('let name=symbol_name_at(symbols,start)', analyze)
         self.assertNotIn('let caller=symbol_name_at(symbols,func)', analyze)
         self.assertNotIn('let callee=symbol_name_at(symbols,target)', analyze)

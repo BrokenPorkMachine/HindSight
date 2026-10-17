@@ -1057,9 +1057,13 @@ struct ContentView: View {
                 if let analysis = model.currentAnalysis {
                     VGBinaryWorkspace(
                         functionsText: analysis.functions,
+                        dyldImageIdentity: model.dyldAnalysisImageByRecordID[record.id],
+                        symbolResolverText: analysis.symbol_resolver,
+                        objcClassesText: analysis.objc_classes,
                         disassemblyText: analysis.annotated_disassembly,
                         irText: analysis.ir,
                         dataflowText: analysis.dataflow,
+                        semanticPreviewText: analysis.semantic_preview,
                         xrefsText: analysis.xrefs,
                         callGraphText: analysis.call_graph,
                         selectedAddress: model.addressText,
@@ -1436,9 +1440,9 @@ struct ContentView: View {
                         Text("Conservative first-stage IR: op, branch, conditional branch, terminal, or opaque. This is the substrate for later SSA and pseudocode.")
                             .font(.caption).foregroundStyle(.secondary)
                         monospaced(model.currentAnalysis?.ir ?? "Run Analyze binary to generate IR.")
-                        if let semantic = model.currentAnalysis?.semantic_preview, !semantic.isEmpty {
+                        if let semantic = model.currentAnalysis?.semantic_preview, semantic.hasPrefix("AArch64 register semantics") {
                             DisclosureGroup("Instruction-derived ARM64 semantics (bounded)") {
-                                Text("Machine-register statements with instruction provenance. Opaque instructions stop value flow; source types and call signatures remain unresolved.")
+                                Text("Machine-register statements with instruction provenance. Opaque instructions stop value flow.")
                                     .font(.caption).foregroundStyle(.secondary)
                                 clickableEvidence(semantic)
                             }
@@ -1446,6 +1450,24 @@ struct ContentView: View {
                         DisclosureGroup("Structural pseudocode preview (bounded, experimental)") {
                             Text("Control-flow sketch only; unknown machine semantics are never reconstructed as C statements.").font(.caption).foregroundStyle(.secondary)
                             monospaced(vgStructuralPseudocode(model.currentAnalysis?.ir ?? "No IR available"))
+                        }
+                        if let pseudo = VGBinaryWorkspaceParser.reconstructedPseudocode(model.currentAnalysis?.semantic_preview) {
+                            DisclosureGroup("Reconstructed pseudocode with signatures (bounded)") {
+                                Text("Function headers use validated metadata or exact API declarations. Direct calls retain instruction addresses; unknown arguments and effects remain explicit.").font(.caption).foregroundStyle(.secondary)
+                                monospaced(pseudo)
+                            }
+                        }
+                    }.padding(8)
+                }
+            case "Pseudocode":
+                GroupBox("Reconstructed pseudocode") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        analysisToolbar(record)
+                        Text("Select a function in Binary Workspace for its local sketch. Declarations come from validated Objective-C metadata, supported C++ mangling, or exact C/CoreFoundation API names; unresolved source details stay marked.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        monospaced(VGBinaryWorkspaceParser.reconstructedPseudocode(model.currentAnalysis?.semantic_preview) ?? "Analyze binary to reconstruct bounded function sketches.")
+                        if let signatures = VGBinaryWorkspaceParser.signatureEvidence(model.currentAnalysis?.call_values ?? "") {
+                            DisclosureGroup("Recovered function signatures") { monospaced(signatures) }
                         }
                     }.padding(8)
                 }
@@ -1599,7 +1621,7 @@ struct ContentView: View {
                 GroupBox("Arguments, parameters, and casts") {
                     VStack(alignment: .leading, spacing: 10) {
                         analysisToolbar(record)
-                        Text("Detects incoming x0–x7 parameter candidates, nearby outgoing call arguments, operand-width value shapes, and architecturally explicit integer extensions. Source-level types and prototypes remain unresolved.")
+                        Text("Shows AArch64 argument evidence and source signatures recovered from validated Objective-C type encodings, supported C++ mangling, and exact C/CoreFoundation API declarations. Unknown types remain unresolved.")
                             .font(.caption).foregroundStyle(.secondary)
                         monospaced(model.currentAnalysis?.call_values ?? "Run Analyze binary to detect argument, parameter, and explicit-cast evidence.")
                     }.padding(8)
@@ -2198,6 +2220,9 @@ struct ContentView: View {
                         Divider()
                         Text("Bounded cache read").font(.headline)
                         Text("Translates a cache virtual address through the primary mapping table and reads only validated file-backed bytes. Addresses in subcaches remain explicitly unresolved until that subcache is opened.").font(.caption).foregroundStyle(.secondary)
+                        Button("Analyze Selected Image") { model.analyzeSelectedDyldImage() }
+                            .disabled(model.busy || model.selectedDyldImageID.isEmpty || model.project == nil)
+                        Text("Imports the matching installed image only after its Mach-O UUID is verified against the selected cache entry.").font(.caption).foregroundStyle(.secondary)
                         ViewThatFits(in:.horizontal) {
                             HStack(spacing:8) { TextField("VM address",text:$model.dyldReadAddress).textFieldStyle(.roundedBorder); Stepper("\(model.dyldReadCount) bytes",value:$model.dyldReadCount,in:16...65536,step:16); Button("Read",action:model.readDyldCacheBytes); Button("Selected Header",action:model.readSelectedDyldImageHeader).disabled(model.selectedDyldImageID.isEmpty) }
                             VStack(alignment:.leading,spacing:8) { TextField("VM address",text:$model.dyldReadAddress).textFieldStyle(.roundedBorder); Stepper("\(model.dyldReadCount) bytes",value:$model.dyldReadCount,in:16...65536,step:16); HStack { Button("Read",action:model.readDyldCacheBytes); Button("Selected Header",action:model.readSelectedDyldImageHeader).disabled(model.selectedDyldImageID.isEmpty) } }

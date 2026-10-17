@@ -46,6 +46,34 @@ struct VGInstructionData: Hashable {
 }
 
 enum VGBinaryWorkspaceParser {
+    static func reconstructedPseudocode(_ semantic: String?) -> String? {
+        let marker = "Reconstructed pseudocode\n========================\n"
+        guard let semantic, let range = semantic.range(of: marker) else { return nil }
+        let result = String(semantic[range.upperBound...])
+        return result.isEmpty ? nil : result
+    }
+
+    static func signatureEvidence(_ callValues: String) -> String? {
+        guard let range = callValues.range(of: "Signature evidence:") else { return nil }
+        return String(callValues[range.lowerBound...])
+    }
+
+    static func pseudocode(_ semantic: String?, in function: VGFunctionRecord?) -> String? {
+        guard let function, let text = reconstructedPseudocode(semantic) else { return nil }
+        var result: [String] = []
+        var matching = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            if line.hasPrefix("// 0x") {
+                let address = line.dropFirst(3).split(separator: " ").first.flatMap { self.address(String($0)) }
+                if matching { break }
+                matching = address == function.start
+            }
+            if matching { result.append(line) }
+        }
+        return result.isEmpty ? nil : result.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func address(_ text: String) -> UInt64? {
         VGGraphParser.address(from: text)
     }

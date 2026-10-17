@@ -163,6 +163,32 @@ fn symbol_name_at(symbols:&[(u64,String)],address:u64)->Option<&str>{
  let index=symbols.partition_point(|(value,_)|*value<address);
  symbols.get(index).filter(|(value,_)|*value==address).map(|(_,name)|name.as_str())
 }
+fn objc_imp_names(records:&str)->std::collections::BTreeMap<u64,String>{
+ let mut names=std::collections::BTreeMap::new();
+ for line in records.lines().filter(|line|line.contains(" method ")&&line.contains("confidence=validated")){
+  let Some(address)=line.split(" imp=").nth(1).and_then(|tail|tail.split_whitespace().next()).and_then(|value|u64::from_str_radix(value.trim_start_matches("0x"),16).ok()) else{continue};
+  let Some(name)=line.split(" resolved=").nth(1).and_then(|tail|tail.split(" confidence=").next()).map(str::trim) else{continue};
+  if address!=0&&name.len()<=512&&(name.starts_with("-[")||name.starts_with("+["))&&name.ends_with(']'){names.entry(address).or_insert_with(||name.to_string());}
+ }
+ names
+}
+fn export_function_names(exports:&str,window:&[u8],starts:&[u64],scan_end:u64)->std::collections::BTreeMap<u64,String>{
+ let Some(base)=dyld_segments(window).into_iter().find(|segment|segment.name=="__TEXT").map(|segment|segment.vmaddr) else{return Default::default()};
+ let admitted=starts.iter().copied().collect::<std::collections::BTreeSet<_>>();let mut names=std::collections::BTreeMap::new();
+ for line in exports.lines().filter_map(|line|line.strip_prefix("export ")){
+  let Some((name,fields))=line.split_once(" address=") else{continue};
+  if name.is_empty()||name.len()>1024||name.chars().any(char::is_whitespace){continue}
+  let Some(offset)=fields.split_whitespace().next().and_then(|value|u64::from_str_radix(value.trim_start_matches("0x"),16).ok()) else{continue};
+  let Some(flags)=fields.split(" flags=").nth(1).and_then(|value|value.split_whitespace().next()).and_then(|value|u64::from_str_radix(value.trim_start_matches("0x"),16).ok()) else{continue};
+  if flags&8!=0{continue}
+  let address=if flags&3==2{offset}else if flags&3==0{let Some(value)=base.checked_add(offset) else{continue};value}else{continue};
+  if address<scan_end&&admitted.contains(&address){names.entry(address).or_insert_with(||name.to_string());}
+ }
+ names
+}
+fn resolved_function_name<'a>(address:u64,symbols:&'a[(u64,String)],objc:&'a std::collections::BTreeMap<u64,String>,exports:&'a std::collections::BTreeMap<u64,String>,stubs:&'a std::collections::BTreeMap<u64,String>)->Option<&'a str>{
+ symbol_name_at(symbols,address).or_else(||objc.get(&address).map(String::as_str)).or_else(||exports.get(&address).map(String::as_str)).or_else(||stubs.get(&address).map(String::as_str))
+}
 fn function_for(starts:&[u64], address:u64)->u64{
  let idx=starts.partition_point(|&x|x<=address);if idx==0{starts[0]}else{starts[idx-1]}
 }
@@ -771,8 +797,8 @@ fn weak_load_commands(window:&[u8])->Vec<String>{let mut out=Vec::new();if windo
 fn softlinking_records(file:&mut File,window:&[u8],size:u64)->io::Result<String>{let mut out=String::new();for l in weak_load_commands(window){if l.starts_with("weak-load ")||l.to_ascii_lowercase().contains("softlinking.framework"){out.push_str(&format!("framework {l}\n"));}}let imports=dyld_import_entries(file,window,size)?;for (_,name,add,lib,weak) in imports{let low=name.to_ascii_lowercase();if weak||low.contains("softlink")||matches!(name.as_str(),"_dlopen"|"_dlsym"|"_NSClassFromString"|"_NSProtocolFromString"|"_NSSelectorFromString"){out.push_str(&format!("chained-import symbol={name} lib_ordinal={lib} weak={} addend={add} classification={}\n",if weak{"yes"}else{"no"},if weak{"weak-import"}else{"dynamic-softlink-helper"}));if out.len()>60_000{break}}}if let Some(r)=dyld_info_ranges(window){for(i,(off,len))in r.into_iter().enumerate().skip(1){if len==0||len>16*1024*1024||off>size||len as u64>size-off{continue}let txt=dyld_bind_stream(&read_exact_range(file,off,len)?,&dyld_segments(window),["","bind","weak-bind","lazy-bind"][i],i==2);for line in txt.lines(){let low=line.to_ascii_lowercase();if line.contains("weak=yes")||i==2||low.contains("softlink")||low.contains("_dlopen")||low.contains("_dlsym")||low.contains("nsclassfromstring"){out.push_str("opcode-");out.push_str(line);out.push('\n');if out.len()>60_000{break}}}}}if out.is_empty(){out.push_str("No explicit weak-framework, weak-import, SoftLinking.framework, or common runtime soft-link helper evidence was recovered. Absence is not proof that higher-level availability checks are unused.\n");}Ok(out)}
 fn export_trie_records(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
  let ncmd=if window.len()>=20{le32(&window[16..20])}else{0};let mut at=32usize;let mut payload=None;
- for _ in 0..ncmd{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8]) as usize;if cs<8||at+cs>window.len(){break}if cmd==0x80000033&&cs>=16{payload=Some((le32(&window[at+8..at+12]) as u64,le32(&window[at+12..at+16]) as usize));break}at+=cs;}
- let Some((off,len))=payload else{return Ok("No LC_DYLD_EXPORTS_TRIE load command was found.\n".into())};if len==0||len>16*1024*1024||off>size||len as u64>size-off{return Ok("LC_DYLD_EXPORTS_TRIE payload failed bounds validation.\n".into())}let data=read_exact_range(file,off,len)?;let mut out=String::new();let mut stack=vec![(0usize,String::new(),0usize)];let mut seen=std::collections::HashSet::<(usize,String)>::new();let mut count=0usize;
+ for _ in 0..ncmd{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8]) as usize;if cs<8||at+cs>window.len(){break}if cmd==0x80000033&&cs>=16{payload=Some((le32(&window[at+8..at+12]) as u64,le32(&window[at+12..at+16]) as usize));break}else if matches!(cmd,0x22|0x80000022)&&cs>=48{payload=Some((le32(&window[at+40..at+44]) as u64,le32(&window[at+44..at+48]) as usize));}at+=cs;}
+ let Some((off,len))=payload else{return Ok("No dyld export trie load command was found.\n".into())};if len==0||len>16*1024*1024||off>size||len as u64>size-off{return Ok("Dyld export trie payload failed bounds validation.\n".into())}let data=read_exact_range(file,off,len)?;let mut out=String::new();let mut stack=vec![(0usize,String::new(),0usize)];let mut seen=std::collections::HashSet::<(usize,String)>::new();let mut count=0usize;
  while let Some((node,prefix,depth))=stack.pop(){if depth>128||node>=data.len()||!seen.insert((node,prefix.clone())){continue}let mut p=node;let Some(term_size)=read_uleb(&data,&mut p) else{continue};let term_end=p.saturating_add(term_size as usize);if term_end>data.len(){continue}if term_size>0{let mut t=p;if let Some(flags)=read_uleb(&data,&mut t){if flags&0x08!=0{let ord=read_uleb(&data,&mut t).unwrap_or(0);let start=t;while t<term_end&&data[t]!=0{t+=1}let imported=if t>start{String::from_utf8_lossy(&data[start..t]).into_owned()}else{prefix.clone()};out.push_str(&format!("export {prefix} reexport ordinal={ord} import={imported}\n"));}else if let Some(addr)=read_uleb(&data,&mut t){out.push_str(&format!("export {prefix} address={addr:#x} flags={flags:#x}"));if flags&0x10!=0{let resolver=read_uleb(&data,&mut t).unwrap_or(0);out.push_str(&format!(" resolver={resolver:#x}"));}out.push('\n');}count+=1;if out.len()>60_000||count>100_000{break}}}p=term_end;if p>=data.len(){continue}let children=data[p] as usize;p+=1;for _ in 0..children{let start=p;while p<data.len()&&data[p]!=0{p+=1}if p>=data.len(){break}let edge=String::from_utf8_lossy(&data[start..p]).into_owned();p+=1;let Some(child)=read_uleb(&data,&mut p) else{break};if (child as usize) < data.len()&&prefix.len()+edge.len()<=4096{stack.push((child as usize,format!("{prefix}{edge}"),depth+1));}}}
  if out.is_empty(){out.push_str("Export trie was present but no bounded export terminals were recovered.\n");}Ok(out)
 }
@@ -821,7 +847,7 @@ fn apple_symbolication_records(file:&mut File,window:&[u8],size:u64)->io::Result
 }
 
 
-fn unified_symbol_records(symbols:&[(u64,String)],starts:&[u64],scan_end:u64,facts:&[(String,String,u64)],exports:&str,imports:&str)->String{
+fn unified_symbol_records(symbols:&[(u64,String)],starts:&[u64],scan_end:u64,facts:&[(String,String,u64)],exports:&str,imports:&str,export_names:&std::collections::BTreeMap<u64,String>)->String{
  use std::collections::{BTreeMap,BTreeSet};
  let mut direct=BTreeMap::<u64,Vec<&str>>::new();
  for (address,name) in symbols{if !name.is_empty(){direct.entry(*address).or_default().push(name.as_str());}}
@@ -831,13 +857,15 @@ fn unified_symbol_records(symbols:&[(u64,String)],starts:&[u64],scan_end:u64,fac
  for rows in linkage.values_mut(){rows.sort_unstable();rows.dedup();}
  let function_entries=starts.iter().copied().collect::<BTreeSet<_>>();
  let mut out=String::from("Unified symbol resolver\n=======================\n");
- out.push_str("Precedence: exact nlist code symbol > exact indirect-symbol stub/pointer name > validated function-start boundary. Export/import entries without a validated address remain name-only evidence. No dSYM, DWARF line, Objective-C method address, or Swift demangling result is invented.\n\n");
+ out.push_str("Precedence: exact nlist code symbol > validated dyld export at an admitted function entry > exact indirect-symbol stub/pointer name > validated function-start boundary. Unmapped imports/exports remain name-only evidence. No dSYM or DWARF line is invented.\n\n");
  let mut emitted=0usize;
  for (index,&start) in starts.iter().enumerate(){
   if start>=scan_end{continue}
   let end=starts.get(index+1).copied().unwrap_or(scan_end).min(scan_end);
   let (name,source,aliases)=if let Some(names)=direct.get(&start){
    (names[0].to_string(),"nlist",if names.len()>1{names[1..].join(" | ")}else{String::new()})
+  }else if let Some(name)=export_names.get(&start){
+   (name.clone(),"dyld-export",String::new())
   }else if let Some(rows)=linkage.get(&start){
    let preferred=rows.iter().find(|(_,kind)|*kind=="stub").copied().unwrap_or(rows[0]);
    let aliases=rows.iter().filter_map(|(symbol,_)|if *symbol!=preferred.0{Some((*symbol).to_string())}else{None}).collect::<Vec<_>>().join(" | ");
@@ -861,7 +889,7 @@ fn unified_symbol_records(symbols:&[(u64,String)],starts:&[u64],scan_end:u64,fac
    let name=if let Some(rest)=line.strip_prefix("export "){rest.split_whitespace().next()}
     else if let Some(pos)=line.find("symbol="){Some(line[pos+7..].split(|c:char|c.is_whitespace()||c==','||c==';').next().unwrap_or(""))}
     else{None};
-   let Some(name)=name else{continue};if name.is_empty()||name.starts_with('<')||!seen.insert(name.to_string()){continue}
+   let Some(name)=name else{continue};if name.is_empty()||name.starts_with('<')||export_names.values().any(|mapped|mapped==name)||!seen.insert(name.to_string()){continue}
    let source=if line.starts_with("export "){"export-trie"}else{"dyld-import"};out.push_str(&format!("name-only symbol={name} source={source}\n"));count+=1;if count>=1024||out.len()>60_000{break}
   }
   if count==0{out.push_str("<none>\n");}
@@ -1034,9 +1062,8 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
  let objc_classes=objc_class_graph(&mut file,&window,size)?;
- let mut objc_function_names=std::collections::BTreeMap::<u64,String>::new();
- for line in objc_classes.lines(){let Some((_,tail))=line.split_once(" imp=") else{continue};let Some((address,rest))=tail.split_once(' ') else{continue};let Ok(address)=u64::from_str_radix(address.trim_start_matches("0x"),16) else{continue};let Some((_,resolved))=rest.split_once("resolved=") else{continue};let name=resolved.split_whitespace().next().unwrap_or("");if !name.is_empty()&&!name.starts_with('<'){objc_function_names.entry(address).or_insert_with(||name.to_string());}}
- let mut functions=String::new();for (idx,&start) in starts.iter().take(2000).enumerate(){let end=starts.get(idx+1).copied().unwrap_or(scan_end);let name=symbol_name_at(&symbols,start).map(str::to_string).or_else(||objc_function_names.get(&start).cloned()).unwrap_or_else(||"<discovered>".into());if functions.len()>60_000{break}functions.push_str(&format!("{start:#018x}  {end:#018x}  {:>8} bytes  {name}\n",end.saturating_sub(start)));}
+ let objc_function_names=objc_imp_names(&objc_classes);
+ let mut functions=String::new();
  let mut leaders=starts.clone();let mut edges:Vec<(u64,u64,&str)>=Vec::new();let mut calls:Vec<(u64,u64,u64)>=Vec::new();let mut ir=String::new();let mut dataflow=String::new();let mut ssa=String::new();let mut jump_tables=String::new();let mut decoded=0usize;let mut data_words=0usize;let mut versions=[0u32;32];let mut data_index=0usize;
  for (i,ch) in code.chunks_exact(4).enumerate(){let pc=map.address+(i as u64)*4;let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));}
   if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if jump_tables.len()<60_000{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}
@@ -1049,21 +1076,37 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");
  let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end);
  analysis_progress(61,"structure","Bounded dominator, phi, and SSA structure completed.");
- let swift_contexts=swift_context_graph(&mut file,&window,size)?;let call_values=call_argument_provenance(&calls,&starts,&code,map.address,&symbols);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
+ let swift_contexts=swift_context_graph(&mut file,&window,size)?;let mut call_values=call_argument_provenance(&calls,&starts,&code,map.address,&symbols);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
  analysis_progress(69,"runtime","Objective-C, Swift, chained-fixup, and annotated-code evidence completed.");
  let interblock_values=interblock_value_flow(&calls,&code,map.address,&leaders,&symbols);let predecessor_values=predecessor_value_flow(&code,map.address,&leaders,&edges,scan_end);let propagated_values=iterative_value_flow(&code,map.address,&leaders,&edges,scan_end);let indirect_calls=indirect_call_resolution(&code,map.address,&leaders,&relocations,&symbols);
  analysis_progress(75,"value-flow","Bounded inter-block value flow and indirect-call evidence completed.");
- let dyld_imports=dyld_import_records(&mut file,&window,size)?;let dyld_linking=dyld_linking_records(&mut file,&window,size)?;let softlinking=softlinking_records(&mut file,&window,size)?;let symbolication=symbolication_records(&mut file,&window,size,&symbols,&starts,scan_end)?;let apple_symbolication=apple_symbolication_records(&mut file,&window,size)?;let arm64e_bind_symbols=arm64e_bind_symbol_records(&mut file,&window,size)?;let dylib_ordinals=dylib_ordinal_records(&window);let resolved_imports=resolved_dyld_import_records(&mut file,&window,size)?;let authenticated_bind_targets=authenticated_bind_targets(&mut file,&window,size)?;let (indirect_symbols,pointer_slots,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;let export_trie=export_trie_records(&mut file,&window,size)?;let symbol_resolver=unified_symbol_records(&symbols,&starts,scan_end,&indirect_facts,&export_trie,&dyld_imports);let symbol_provenance=symbol_provenance_records(&indirect_facts);let linkage_records=joined_linkage_records(&mut file,&window,size,&indirect_facts)?;let symbol_callers=symbol_caller_records(&indirect_facts,&calls);let got_auth_slots=got_auth_slot_records(&pointer_slots);let import_export_collisions=import_export_collision_records(&mut file,&window,size)?;
+ let dyld_imports=dyld_import_records(&mut file,&window,size)?;let dyld_linking=dyld_linking_records(&mut file,&window,size)?;let softlinking=softlinking_records(&mut file,&window,size)?;let symbolication=symbolication_records(&mut file,&window,size,&symbols,&starts,scan_end)?;let apple_symbolication=apple_symbolication_records(&mut file,&window,size)?;let arm64e_bind_symbols=arm64e_bind_symbol_records(&mut file,&window,size)?;let dylib_ordinals=dylib_ordinal_records(&window);let resolved_imports=resolved_dyld_import_records(&mut file,&window,size)?;let authenticated_bind_targets=authenticated_bind_targets(&mut file,&window,size)?;let (indirect_symbols,pointer_slots,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;let export_trie=export_trie_records(&mut file,&window,size)?;
+ let export_names=export_function_names(&export_trie,&window,&starts,scan_end);
+ let stub_names=indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())).collect::<std::collections::BTreeMap<_,_>>();
+ for (idx,&start) in starts.iter().take(2000).enumerate(){let end=starts.get(idx+1).copied().unwrap_or(scan_end);let name=resolved_function_name(start,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<discovered>");let row=format!("{start:#018x}  {end:#018x}  {:>8} bytes  {name}\n",end.saturating_sub(start));if functions.len()+row.len()>60_000{break}functions.push_str(&row);}
+ let symbol_resolver=unified_symbol_records(&symbols,&starts,scan_end,&indirect_facts,&export_trie,&dyld_imports,&export_names);let symbol_provenance=symbol_provenance_records(&indirect_facts);let linkage_records=joined_linkage_records(&mut file,&window,size,&indirect_facts)?;let symbol_callers=symbol_caller_records(&indirect_facts,&calls);let got_auth_slots=got_auth_slot_records(&pointer_slots);let import_export_collisions=import_export_collision_records(&mut file,&window,size)?;
  analysis_progress(82,"linkage","Dyld, soft-linking, symbolication, unified-symbol, indirect-symbol, and joined-linkage evidence completed.");
  let mut function_intelligence=function_intelligence(&starts,&leaders,&calls,&edges,&symbols,&objc_function_names,scan_end);let patterns=super::binary::arm64_patterns(&code,map.address,map.offset,&data_ranges);if function_intelligence.len()+patterns.len()<65536{function_intelligence.push_str(&patterns);}let data_references=pc_relative_data_references(&mut file,&window,&code,map.address)?;let (tail_call_candidates,tail_call_facts)=cross_function_transfer_candidates(&starts,&edges,&symbols,scan_end);let function_neighborhoods=function_neighborhood_report(&starts,&calls,&tail_call_facts,&symbols,&objc_function_names,scan_end);let instruction_words=(code.len()/4).saturating_sub(data_words);let analysis_quality=analysis_quality_report(map.bytes,scan_bytes,map.encrypted,truncated,instruction_words,decoded,data_words,starts.len(),block_count,calls.len(),tail_call_facts.len(),relocations.len(),&data_references,&dominators);let analysis_insights=analysis_insights_report(&function_intelligence,&data_references,&analysis_quality,&calls,&tail_call_facts,&relocations,&jump_tables);
  analysis_progress(86,"synthesis","Structural, language-runtime, linkage, value-flow, and evidence synthesis completed.");
  let mut xrefs=String::new();for &(from,to,k) in edges.iter().filter(|(_,_,k)|*k!="fallthrough").take(5000){if xrefs.len()>60_000{break}xrefs.push_str(&format!("{from:#018x}  --{k:<6}-->  {to:#018x}\n"));}
- let mut call_graph=String::new();for &(func,site,target) in calls.iter().take(5000){if call_graph.len()>60_000{break}let caller=symbol_name_at(&symbols,func).map(str::to_string).or_else(||objc_function_names.get(&func).cloned()).unwrap_or_else(||"<discovered>".into());let callee=symbol_name_at(&symbols,target).map(str::to_string).or_else(||objc_function_names.get(&target).cloned()).unwrap_or_else(||"<target>".into());call_graph.push_str(&format!("{func:#018x} {caller}  --BL@{site:#018x}-->  {target:#018x} {callee}\n"));}
+ let mut call_graph=String::new();for &(func,site,target) in calls.iter().take(5000){if call_graph.len()>60_000{break}let caller=resolved_function_name(func,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<discovered>");let callee=resolved_function_name(target,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<target>");call_graph.push_str(&format!("{func:#018x} {caller}  --BL@{site:#018x}-->  {target:#018x} {callee}\n"));}
  let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
  let selector_xrefs=selector_call_xrefs(&relocations,&calls,&symbols);
  analysis_progress(92,"evidence","Formatting xrefs, call evidence, relocations, selectors, and bounded strings.");
  let strings=printable_strings(&mut file,size)?;let object_detections=object_detections(&mut file,&window,size,&strings,&dyld_imports)?;let mut runtime_records=runtime_records;runtime_records.push_str("\n\nC / Apple object detections\n===========================\n");runtime_records.push_str(&object_detections);
- let semantic_preview=super::semantic::render(&code,map.address,map.offset,&starts,&data_ranges);
+ let mut signature_symbols=symbols.clone();
+ signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
+ signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
+ let (signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts);
+ call_values.push_str("\n\n");
+ let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
+ for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
+ let mut semantic_preview=super::semantic::render(&code,map.address,map.offset,&starts,&data_ranges);
+ const PSEUDO_MARKER:&str="\n\nReconstructed pseudocode\n========================\n";
+ if semantic_preview.len()>30_000 {semantic_preview=semantic_preview.chars().take(29_000).collect();semantic_preview.push_str("\n/* instruction preview truncated for pseudocode budget */\n");}
+ semantic_preview.push_str(PSEUDO_MARKER);
+ let mut pseudocode_budget=60_000usize.saturating_sub(semantic_preview.len()+1024);
+ for ch in reconstructed_pseudocode.chars(){if ch.len_utf8()>pseudocode_budget{break}semantic_preview.push(ch);pseudocode_budget-=ch.len_utf8();}
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;
  for (source,workspace,kind,text,priority) in [
@@ -1112,7 +1155,22 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
 
 #[cfg(test)]
 mod tests {
- use super::{explicit_integer_cast,function_parameter_candidates};
+ use super::{explicit_integer_cast,function_parameter_candidates,objc_imp_names,export_function_names,resolved_function_name,unified_symbol_records};
+
+ #[test]
+ fn function_names_join_validated_objc_and_dyld_exports() {
+  let objc=objc_imp_names("  instance method 0x3000 name=run: types=v24@0:8@16 imp=0x0000000000001100 resolved=-[Widget run:] confidence=validated\n");
+  assert_eq!(objc.get(&0x1100).map(String::as_str),Some("-[Widget run:]"));
+  let mut window=vec![0u8;104];window[16..20].copy_from_slice(&1u32.to_le_bytes());window[32..36].copy_from_slice(&0x19u32.to_le_bytes());window[36..40].copy_from_slice(&72u32.to_le_bytes());window[40..46].copy_from_slice(b"__TEXT");window[56..64].copy_from_slice(&0x1000u64.to_le_bytes());
+  let exports="export _dyldNamed address=0x104 flags=0x0\nexport _notFunction address=0x108 flags=0x0\nexport _reexport address=0x100 flags=0x8\n";
+  let names=export_function_names(exports,&window,&[0x1100,0x1104],0x1200);
+  assert_eq!(names.get(&0x1104).map(String::as_str),Some("_dyldNamed"));
+  assert_eq!(names.len(),1);
+  let symbols=vec![(0x1104,"_nlistName".into())];
+  assert_eq!(resolved_function_name(0x1104,&symbols,&objc,&names,&Default::default()),Some("_nlistName"));
+  let resolver=unified_symbol_records(&[],&[0x1100,0x1104],0x1200,&[],exports,"",&names);
+  assert!(resolver.contains("symbol=_dyldNamed source=dyld-export"));
+ }
 
  #[test]
  fn recognizes_exact_integer_extension_aliases() {

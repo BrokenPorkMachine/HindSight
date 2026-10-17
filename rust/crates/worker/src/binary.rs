@@ -2661,7 +2661,11 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             "No applicable records decoded by this structural backend.".into(),
         );
     }
-    values.insert("semantic_preview", String::new());
+    let signature_symbols: Vec<(u64,String)> = symbols.iter().filter(|s| !s.name.is_empty()).map(|s| (s.address,s.name.clone())).collect();
+    let signature_starts: Vec<u64> = functions.keys().copied().filter(|a| *a >= s.address && *a < scan_end).collect();
+    let (signature_report,pseudocode) = super::signatures::recover(&signature_starts,&signature_symbols,"",&[],scan_end);
+    values.insert("call_values", signature_report);
+    values.insert("semantic_preview", format!("Reconstructed pseudocode\n========================\n{pseudocode}"));
     for (key,value) in [("functions",function_text),("metadata",metadata),("strings",strings),("relocations",relocation_text),("indirect_symbols",indirect),("export_trie",export_text),("pointer_slots",pointers.clone()),("data_references",code_references),("jump_tables",tables),("xrefs",direct),("call_graph",calls),("cfg",cfg),("annotated_disassembly",annotated),("function_intelligence",intelligence),("symbolication",symbol_text.clone()),("symbol_provenance",symbol_text),("dyld_imports",imports),("analysis_quality",quality),("analysis_insights","Review metadata-backed names first, then prologue/call/table candidates. Unresolved indirect transfers and mixed-mode firmware require analyst review.".into()),("summary",summary)]{values.insert(key,value);}
     for key in [
         "ir",

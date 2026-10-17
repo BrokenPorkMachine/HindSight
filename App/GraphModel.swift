@@ -282,8 +282,37 @@ enum VGGraphParser {
         return UInt64(raw, radix: 16)
     }
 
-    static func functions(_ text: String) -> [VGFunctionRecord] {
-        text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { raw in
+    static func functions(_ text: String, symbolResolver: String = "", objcClasses: String = "") -> [VGFunctionRecord] {
+        var resolved: [UInt64: (priority: Int, name: String)] = [:]
+        func offer(_ address: UInt64, _ name: String, priority: Int) {
+            guard !name.isEmpty, !name.hasPrefix("<"), name.utf8.count <= 1024,
+                  priority > (resolved[address]?.priority ?? 0) else { return }
+            resolved[address] = (priority, name)
+        }
+        for raw in symbolResolver.split(separator: "\n") {
+            let line = String(raw)
+            guard line.hasPrefix("range start="),
+                  let startField = line.dropFirst("range start=".count).split(separator: " ").first,
+                  let address = hex(String(startField)),
+                  let symbolRange = line.range(of: " symbol="),
+                  let sourceRange = line.range(of: " source=", range: symbolRange.upperBound..<line.endIndex) else { continue }
+            let name = String(line[symbolRange.upperBound..<sourceRange.lowerBound])
+            let source = String(line[sourceRange.upperBound...].split(separator: " ").first ?? "")
+            let priority = source == "nlist" ? 4 : source == "dyld-export" ? 2 : source == "indirect-symbol" ? 1 : 0
+            offer(address, name, priority: priority)
+        }
+        for raw in objcClasses.split(separator: "\n") {
+            let line = String(raw)
+            guard line.contains(" method "), line.contains("confidence=validated"),
+                  let imp = line.range(of: " imp="),
+                  let address = hex(String(line[imp.upperBound...].split(separator: " ").first ?? "")),
+                  let nameStart = line.range(of: " resolved="),
+                  let confidence = line.range(of: " confidence=", range: nameStart.upperBound..<line.endIndex) else { continue }
+            let name = String(line[nameStart.upperBound..<confidence.lowerBound]).trimmingCharacters(in: .whitespaces)
+            guard (name.hasPrefix("-[") || name.hasPrefix("+[")), name.hasSuffix("]") else { continue }
+            offer(address, name, priority: 3)
+        }
+        return text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { raw in
             let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
             let parts = line.split(whereSeparator: { $0.isWhitespace })
             if let startToken = parts.first, let start = hex(String(startToken)),
@@ -291,14 +320,14 @@ enum VGGraphParser {
                 let tail = line[nameRange.upperBound...]
                 let name = tail.components(separatedBy: " source=").first?.trimmingCharacters(in: .whitespacesAndNewlines)
                     ?? "<candidate>"
-                return VGFunctionRecord(start: start, end: start, byteCount: 0, name: name)
+                return VGFunctionRecord(start: start, end: start, byteCount: 0, name: resolved[start]?.name ?? name)
             }
             guard parts.count >= 4,
                   let start = hex(String(parts[0])),
                   let end = hex(String(parts[1])),
                   let bytes = UInt64(parts[2]) else { return nil }
             let name = parts.dropFirst(4).map(String.init).joined(separator: " ")
-            return VGFunctionRecord(start: start, end: end, byteCount: bytes, name: name.isEmpty ? "<discovered>" : name)
+            return VGFunctionRecord(start: start, end: end, byteCount: bytes, name: resolved[start]?.name ?? (name.isEmpty ? "<discovered>" : name))
         }
     }
 

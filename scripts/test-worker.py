@@ -110,6 +110,9 @@ assert 'function 0x00000001000000b8' in semantic
 assert '0x00000001000000cc  x0 = x0 + x1;' in semantic
 assert 'word=8b010000' in semantic
 assert 'opaque instruction: semantics unavailable' in semantic
+assert 'Reconstructed pseudocode' in semantic
+assert 'signature unresolved' in semantic
+assert 'Signature evidence:' in report['call_values']
 assert b'"source":"Semantic Preview"' in process.stderr
 assert b'"address":"0x00000001000000cc"' in process.stderr
 print('ARM64 instruction-derived semantic preview and provenance passed')

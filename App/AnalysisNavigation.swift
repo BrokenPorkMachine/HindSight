@@ -74,6 +74,7 @@ enum VGAnalysisNavigation {
             .init(name: "Tail-Call Candidates", workspace: "Tail-Call Candidates", kind: .controlFlow, text: report.tail_call_candidates, focusPriority: 76, focusLimit: 28),
             .init(name: "Import/Export Collisions", workspace: "Import/Export Collisions", kind: .linkage, text: report.import_export_collisions, focusPriority: 74, focusLimit: 24),
             .init(name: "Functions", workspace: "Functions", kind: .function, text: report.functions, focusPriority: 62, focusLimit: 24),
+            .init(name: "Pseudocode", workspace: "Pseudocode", kind: .semantic, text: VGBinaryWorkspaceParser.reconstructedPseudocode(report.semantic_preview) ?? "", focusPriority: 62, focusLimit: 24),
             .init(name: "Xrefs", workspace: "Xrefs", kind: .controlFlow, text: report.xrefs, focusPriority: 64, focusLimit: 28),
             .init(name: "Calls", workspace: "Call Graph", kind: .controlFlow, text: report.call_graph, focusPriority: 64, focusLimit: 28),
             .init(name: "Arguments & Types", workspace: "Call Values", kind: .semantic, text: report.call_values, focusPriority: 68, focusLimit: 32),

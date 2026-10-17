@@ -218,6 +218,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var terminalRunning = false
     @Published var dyldCachePath = ""
     @Published var dyldCache: DyldCacheSummary?
+    @Published private(set) var dyldAnalysisImageByRecordID: [String: String] = [:]
     @Published var dyldFilter = ""
     @Published var selectedDyldImageID = ""
     @Published var dyldReadAddress = ""
@@ -1649,13 +1650,56 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     if let o=r.emulatorOutput { self.iphemeralOutput=o }
                 }
                 completion?(r)
-            } catch { self.firmwareStatus=error.localizedDescription }
+            } catch {
+                self.firmwareStatus=error.localizedDescription
+                completion?(.init(ok:false,message:error.localizedDescription))
+            }
         }
     }
     func chooseDyldCache() { let p=NSOpenPanel(); p.title="Choose dyld shared cache"; p.canChooseDirectories=false; p.allowsMultipleSelection=false; guard p.runModal() == .OK,let u=p.url else{return}; dyldCachePath=u.path; dyldReadText=""; firmwareRuntime(.init(command:"dyld_inspect",path:u.path)) }
     func useSelectedDyldImageAddress() { if let image=dyldCache?.images.first(where:{$0.id==selectedDyldImageID}) { dyldReadAddress=image.loadAddress } }
     func readDyldCacheBytes() { guard !dyldCachePath.isEmpty,!dyldReadAddress.isEmpty else { firmwareStatus="Open a cache and select an address first."; return }; firmwareRuntime(.init(command:"dyld_read",path:dyldCachePath,address:dyldReadAddress,count:dyldReadCount)) }
     func readSelectedDyldImageHeader() { useSelectedDyldImageAddress(); dyldReadCount=max(512,min(dyldReadCount,4096)); readDyldCacheBytes() }
+    func analyzeSelectedDyldImage() {
+        guard !busy, projectSessionReady, project != nil,
+              let image = dyldCache?.images.first(where: { $0.id == selectedDyldImageID }),
+              !dyldCachePath.isEmpty else {
+            status = "Open a project and select a dyld cache image first."
+            return
+        }
+        let requestID = UUID().uuidString
+        activeRequest = requestID
+        busy = true
+        status = "Matching selected cache image to an installed Mach-O…"
+        firmwareRuntime(.init(command:"dyld_validate_image", path:dyldCachePath, query:image.path, address:image.loadAddress)) { [weak self] reply in
+            guard let self, self.activeRequest == requestID else { return }
+            guard reply.ok, let sourcePath = reply.outputPath else {
+                self.activeRequest = nil
+                self.busy = false
+                self.status = reply.message
+                return
+            }
+            let optionsJSON = (try? JSONEncoder().encode(BinaryImportOptions.automatic)).flatMap { String(data:$0, encoding:.utf8) }
+            guard let optionsJSON else {
+                self.activeRequest = nil
+                self.busy = false
+                self.status = "Could not prepare the selected image for import."
+                return
+            }
+            self.status = "Capturing \(image.path) for analysis…"
+            self.client.request(timeout:150, operation:{ $0.importBinary(sourcePath, optionsJSON:optionsJSON, requestID:requestID, withReply:$1) }) { [weak self] result in
+                guard let self, self.activeRequest == requestID else { return }
+                self.activeRequest = nil
+                self.busy = false
+                if self.apply(result), let record = self.project?.records.first {
+                    self.selectedID = record.id
+                    self.dyldAnalysisImageByRecordID[record.id] = image.path
+                    self.status = "Captured the UUID-matched dyld image \(image.path); starting analysis."
+                    self.analyzeSelected()
+                }
+            }
+        }
+    }
     func refreshFirmwareDevices() { firmwareRuntime(.init(command:"ipsw_devices",soc:firmwareSoCFilter)) }
     func refreshFirmwareReleases() { guard !firmwareDeviceID.isEmpty else{return}; firmwareRuntime(.init(command:"ipsw_releases",device:firmwareDeviceID)) }
     func chooseIPSW() { let p=NSOpenPanel(); p.title="Import IPSW"; p.allowedContentTypes=[]; p.canChooseDirectories=false; guard p.runModal() == .OK,let u=p.url else{return}; ipswPath=u.path; firmwareRuntime(.init(command:"ipsw_import",path:u.path),timeout:60) }

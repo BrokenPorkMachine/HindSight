@@ -356,7 +356,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v19-schema72"', 'analysisCacheProducerVersion = "0.5.11"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v22-schema72"', 'analysisCacheProducerVersion = "0.5.11"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -479,7 +479,7 @@ for token in ['AArch64 register semantics v38', 'AddExtended', '0x0b20_0000', 'M
               'VMoveImm', 'VKnownValue', 'v_registers', '0x6f00_e400',
               '/* movi.2d v{}, #0x{:02x} */',
               'FmovReg', 'FmovImm', '0x9e66_0000', '0x6f03_f600',
-              'x24 = fmov(d0);', '/* fmov.2d v0, #imm */',
+              '{} = fmov(d{});{}', '/* fmov.{} v{}, #imm */',
               'merge_flow', 'flows_equal', 'block_starts', 'entry: std::collections::HashMap']:
     assert token in semantic_source, token
 
@@ -507,7 +507,7 @@ assert (R/'docs/ANALYSIS_NAVIGATION_0.4.3.md').is_file()
 analysis_continuity=(R/'App/AnalysisContinuity.swift').read_text()
 for token in ['struct VGAnalysisPin', 'struct VGAnalysisVisit', 'struct VGAnalysisSnapshot', 'struct VGAnalysisDelta',
               'maximumBytes = 1 * 1024 * 1024', 'maximumPins = 128', 'maximumRecent = 96',
-              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v19-schema72']:
+              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v22-schema72']:
     assert token in analysis_continuity, token
 for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'Text("Changes").tag("Changes")',
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:

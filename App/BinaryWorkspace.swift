@@ -8,6 +8,7 @@ private enum VGBinaryCenterMode: String, CaseIterable, Identifiable {
 }
 
 private enum VGBinarySemanticMode: String, CaseIterable, Identifiable {
+    case pseudocode = "Pseudocode"
     case lifted = "Lifted"
     case ir = "IR"
     var id: String { rawValue }
@@ -21,9 +22,13 @@ private enum VGBinaryRightMode: String, CaseIterable, Identifiable {
 
 struct VGBinaryWorkspace: View {
     let functionsText: String
+    let dyldImageIdentity: String?
+    let symbolResolverText: String
+    let objcClassesText: String
     let disassemblyText: String
     let irText: String
     let dataflowText: String
+    let semanticPreviewText: String?
     let xrefsText: String
     let callGraphText: String
     let selectedAddress: String
@@ -37,10 +42,10 @@ struct VGBinaryWorkspace: View {
     @State private var showRightPane = true
     @State private var followPC = true
     @State private var centerMode: VGBinaryCenterMode = .split
-    @State private var semanticMode: VGBinarySemanticMode = .lifted
+    @State private var semanticMode: VGBinarySemanticMode = .pseudocode
     @State private var rightMode: VGBinaryRightMode = .references
 
-    private var functions: [VGFunctionRecord] { VGGraphParser.functions(functionsText) }
+    private var functions: [VGFunctionRecord] { VGGraphParser.functions(functionsText, symbolResolver: symbolResolverText, objcClasses: objcClassesText) }
     private var rows: [VGDisassemblyRow] { VGDisassemblyParser.parse(disassemblyText) }
     private var references: [VGBinaryReference] { VGBinaryWorkspaceParser.references(xrefs: xrefsText, callGraph: callGraphText) }
     private var selectedAddressValue: UInt64? { VGBinaryWorkspaceParser.address(selectedAddress) }
@@ -80,6 +85,10 @@ struct VGBinaryWorkspace: View {
 
     private var rawIRLines: [(UInt64, String, String)] {
         VGBinaryWorkspaceParser.irLines(irText, in: selectedFunction)
+    }
+
+    private var functionPseudocode: String? {
+        VGBinaryWorkspaceParser.pseudocode(semanticPreviewText, in: selectedFunction)
     }
 
     private var functionReferences: [VGBinaryReference] {
@@ -122,6 +131,14 @@ struct VGBinaryWorkspace: View {
             HStack(spacing: 10) {
                 Label("Binary Workspace", systemImage: "rectangle.3.group")
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
+                if let dyldImageIdentity {
+                    Label(dyldImageIdentity, systemImage: "shippingbox")
+                        .font(.system(size: 10, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(dyldImageIdentity)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer(minLength: 8)
                 if let function = selectedFunction {
                     Text(function.name)
@@ -263,19 +280,21 @@ struct VGBinaryWorkspace: View {
     private var semanticPane: some View {
         VStack(spacing: 0) {
             HStack {
-                paneHeader("SEMANTIC VIEW", detail: semanticMode == .lifted ? "conservative lift" : "worker IR", icon: "curlybraces")
+                paneHeader("SEMANTIC VIEW", detail: semanticMode == .pseudocode ? "reconstructed sketch" : semanticMode == .lifted ? "conservative lift" : "worker IR", icon: "curlybraces")
                 Spacer()
                 Picker("Semantic", selection: $semanticMode) {
                     ForEach(VGBinarySemanticMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 150)
+                .frame(width: 260)
                 .padding(.trailing, 8)
             }
             Divider()
             ScrollView([.horizontal, .vertical]) {
-                if semanticMode == .lifted {
+                if semanticMode == .pseudocode {
+                    pseudocodeContent
+                } else if semanticMode == .lifted {
                     liftedContent
                 } else {
                     irContent
@@ -283,6 +302,23 @@ struct VGBinaryWorkspace: View {
             }
         }
         .background(Color.primary.opacity(0.012))
+    }
+
+    private var pseudocodeContent: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let functionPseudocode {
+                Text(functionPseudocode)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text("No reconstructed sketch for this function in the bounded preview. Analyze again to refresh cached results, or use Lifted and IR for instruction evidence.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .frame(minWidth: 760, alignment: .leading)
     }
 
     private var liftedContent: some View {

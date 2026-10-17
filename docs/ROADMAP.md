@@ -36,6 +36,7 @@
 - Searchable trace index with bounded storage.
 - Extension API v3 around target/evidence abstractions.
 - Headless CLI for reproducible analysis pipelines.
+- Decompiler and reverse-engineering capability track: [feature gap checklist](DECOMPILER_GAP_ROADMAP.md).
 
 ## 0.5 — Broader Targets
 

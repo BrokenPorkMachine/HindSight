@@ -44,6 +44,8 @@ struct HindSightApp: App {
                     .keyboardShortcut("1", modifiers: .command)
                 Button("Targets") { model.workspace = "Targets" }
                     .keyboardShortcut("2", modifiers: .command)
+                Button("Binary Workspace") { model.workspace = "Binary Workspace" }
+                Button("Pseudocode") { model.workspace = "Pseudocode" }
                 Button("Analysis Triage") { model.workspace = "Analysis Triage" }
                 Button("Resume Latest Evidence", action: model.resumeMostRecentAnalysisVisit)
                     .keyboardShortcut("r", modifiers: [.command, .option])

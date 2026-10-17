@@ -2,7 +2,7 @@
 
 The app bundle and executable are **HindSight.app** and **HindSight**. Open `HindSight.xcodeproj`; the shared scheme and app target are `HindSight`. Existing project data, plugins, and protocol identities remain compatible. To recreate a clean source copy without local build caches, run `python3 scripts/package-source.py` after committing your changes. See [project recreation](docs/PROJECT_RECREATION.md).
 
-This source release extends the bounded pseudocode preview to distinguish ARM64 and Intel x86-64 instruction-effect categories without claiming source-level recovery.
+The analysis worker now builds bounded C-like function bodies from modeled ARM64 statements, branch labels, direct calls, tail-call candidates, and incoming parameter evidence. It attaches declarations from validated Objective-C method encodings, common Foundation method declarations, exact CoreFoundation/C API prototypes, and supported Itanium C++ mangling. Reconstructed code appears in the Pseudocode workspace, Workspace menu, and per-function Binary Workspace pane. The Functions navigator joins exact dyld export, Objective-C method, stub, and nlist names when their addresses validate. C++ return types, stripped C prototypes, unsupported mangling, and unknown machine effects remain explicitly unresolved.
 
 ## Build and launch
 
