@@ -36,6 +36,14 @@ class SchedulerDemanglePseudocodeContracts(unittest.TestCase):
         self.assertIn('orderedQueuedIndices(now: uptime)', status)
         self.assertIn('queue position \\(position + 1) of \\(queuedTasks.count)', status)
 
+    def test_worker_operation_priorities_keep_page_work_interactive(self):
+        code = (ROOT/'PlatformServices/CoordinatorService/WorkerSupervisor.swift').read_text()
+        policy = code.split('private static func priority(for operation: String)', 1)[1].split('private func updateQueuedPositions()', 1)[0]
+        self.assertIn('case "page": return .interactive', policy)
+        self.assertIn('case "analysis": return .userInitiated', policy)
+        self.assertIn('case "capture": return .utility', policy)
+        self.assertIn('default: return .background', policy)
+
     def test_ir_preview_is_bounded_and_explicitly_structural(self):
         code = (ROOT/'App/ContentView.swift').read_text()
         self.assertIn('vgStructuralPseudocode', code)

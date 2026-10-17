@@ -275,7 +275,7 @@ final class WorkerSupervisor {
             return
         }
         if job != nil || (!queuedTasks.isEmpty && !bypassQueue) {
-            let priority: TaskPriority = operation == "page" ? .interactive : .userInitiated
+            let priority = Self.priority(for: operation)
             let enqueued = enqueue(id: id, operation: operation, priority: priority,
                                    attempts: admissionAttempt,
                                    start: { [weak self] submittedDate, attempts in
@@ -516,6 +516,15 @@ final class WorkerSupervisor {
         return true
     }
 
+    private static func priority(for operation: String) -> TaskPriority {
+        switch operation {
+        case "page": return .interactive
+        case "analysis": return .userInitiated
+        case "capture": return .utility
+        default: return .background
+        }
+    }
+
     private func updateQueuedPositions() {
         let now = DispatchTime.now().uptimeNanoseconds
         let order = orderedQueuedIndices(now: now)
@@ -571,7 +580,7 @@ final class WorkerSupervisor {
                                 attempt: Int, submittedDate: Date?, evidenceSink: ((WorkerEvidenceBundle?) -> Void)?,
                                 completion: @escaping (Result<Data, Error>) -> Void, error: Error) {
         guard attempt < 20 else { completion(.failure(error)); return }
-        let priority: TaskPriority = operation == "page" ? .interactive : .userInitiated
+        let priority = Self.priority(for: operation)
         let nextAttempt = attempt + 1
         let accepted = enqueue(id: id, operation: operation, priority: priority,
                                attempts: nextAttempt, delayNanos: 250_000_000,

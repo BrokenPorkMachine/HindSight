@@ -2,7 +2,7 @@
 
 ## Scheduling behavior
 
-- Analysis, page, and capture work enters the queue-confined `WorkerSupervisor`. It has one active worker, a 16-request pending bound, page-first priority, FIFO order within equal aged priority, and a two-second aging step capped after three steps.
+- Analysis, page, and capture work enters the queue-confined `WorkerSupervisor`. It has one active worker, a 16-request pending bound, interactive priority for pages, user-initiated priority for analysis, utility priority for capture, FIFO order within equal aged priority, and a two-second aging step capped after three steps.
 - Queue admission retries for memory, worker leases, and the cross-process lock keep retry delays out of the active worker slot. Queued requests can be cancelled; active workers are terminated and their revoked leases prevent publication of stale results.
 - Queue order is calculated by one comparator for dispatch and status. A status read reports the current queue position, readiness state, and elapsed wait based on current aging and retry eligibility.
 - Scripting, firmware, and REA use separate bounded coordinator lanes. Firmware remains serial because its runtime host owns mutable state. Scripting and REA have their own concurrency and reservation limits.
