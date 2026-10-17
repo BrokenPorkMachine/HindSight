@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v29` banner identifies the statement set that
+`AArch64 register semantics v30` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -134,7 +134,17 @@ and `TST` (the `ANDS` form with `Rd == 31`, immediate or shifted register) rende
 `/* tst x0, 0xff */`. The flag-setting arithmetic and logical forms that also
 write a general-purpose register (`ADDS`/`SUBS`/`ANDS` with `Rd != 31`), `BICS`,
 the conditional compares (`CCMP`/`CCMN`), and the add-with-carry forms stay opaque
-because their PSTATE side effect is not modeled. The same `op31` group
+because their PSTATE side effect is not modeled. System-register reads and writes
+are modeled as `MRS`/`MSR`: `MRS` renders `dst = mrs(TPIDR_EL0);` and makes the
+destination an unknown value (a barrier) because the preview does not track
+system registers, while preserving the other tracked registers (unlike `Opaque`,
+which clears all of them); `MSR` renders `/* msr TPIDR_EL0, x0 */` as a
+no-tracked-effect marker preserving value flow. The system register is named
+from its `(op0, op1, CRn, CRm, op2)` fields, using the architectural name
+(`TPIDR_EL0`, `TPIDRRO_EL0`, `CNTVCT_EL0`, `NZCV`, `FPCR`, `FPSR`, `DAIF`,
+`CTR_EL0`, `DCZID_EL0`, ...) when known and the `S<op0>_<op1>_C<CRn>_C<CRm>_<op2>`
+form otherwise (matching the disassembler). The op0=2 system instructions
+(`DC`/`IC`/`TLBI`/`AT`) and unallocated forms stay opaque. The same `op31` group
 also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
@@ -301,4 +311,7 @@ literal stays opaque. A synthetic flag-only compare sequence asserts the
 extended-register operand renderings, the exact words verified against
 `clang -arch arm64`, that a constant folds through a compare (value flow is
 preserved), and that the flag-setting forms that write a general-purpose
-register, `BICS`, and `CCMP` stay opaque.
+register, `BICS`, and `CCMP` stay opaque. A synthetic system-register sequence
+asserts the `MRS` barrier rendering and name resolution (including the generic
+`S`-form fallback), that a constant folds through an `MRS` on the other
+registers, and that an `MSR` preserves value flow.

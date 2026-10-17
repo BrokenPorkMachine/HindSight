@@ -149,6 +149,26 @@ enum BranchTest {
     },
 }
 
+fn sysreg_name(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> String {
+    match (op0, op1, crn, crm, op2) {
+        (3, 3, 4, 0, 3) => "NZCV".to_string(),
+        (3, 3, 13, 0, 2) => "TPIDR_EL0".to_string(),
+        (3, 3, 13, 0, 3) => "TPIDRRO_EL0".to_string(),
+        (3, 3, 14, 0, 2) => "CNTVCT_EL0".to_string(),
+        (3, 3, 0, 0, 1) => "CTR_EL0".to_string(),
+        (3, 3, 0, 0, 2) => "DCZID_EL0".to_string(),
+        (3, 3, 4, 2, 0) => "FPCR".to_string(),
+        (3, 3, 4, 2, 1) => "FPSR".to_string(),
+        (3, 3, 4, 4, 0) => "DAIF".to_string(),
+        (3, 3, 4, 4, 1) => "CurrentEL".to_string(),
+        (3, 3, 4, 4, 2) => "PAN".to_string(),
+        (3, 3, 4, 4, 3) => "UAO".to_string(),
+        (3, 3, 4, 4, 4) => "DIT".to_string(),
+        (3, 0, 4, 1, 0) => "SP_EL0".to_string(),
+        _ => format!("S{}_{}_C{}_C{}_{}", op0, op1, crn, crm, op2),
+    }
+}
+
 fn condition_name(code: u8) -> &'static str {
     const NAMES: [&str; 16] = [
         "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
@@ -819,6 +839,31 @@ enum Operation {
     Exception {
         mnemonic: &'static str,
         imm: u32,
+    },
+    /// A read of an AArch64 system register (`MRS`): the destination becomes
+    /// an unknown value (a barrier) because the preview does not track system
+    /// registers, but the other tracked registers are preserved (unlike
+    /// `Opaque`, which clears all of them). The system register is named in the
+    /// statement for the analyst.
+    Mrs {
+        dst: Register,
+        op0: u8,
+        op1: u8,
+        crn: u8,
+        crm: u8,
+        op2: u8,
+    },
+    /// A write of an AArch64 system register (`MSR`): the source register is
+    /// consumed and the system register is untracked, so there is no tracked
+    /// register effect and value flow is preserved. Rendered as a marker
+    /// comment naming the system register and the source.
+    Msr {
+        op0: u8,
+        op1: u8,
+        crn: u8,
+        crm: u8,
+        op2: u8,
+        src: Register,
     },
     /// A flag-only comparison alias whose destination is the zero register:
     /// `CMP`/`CMN` (`SUBS`/`ADDS` with `Rd == 31`) and `TST` (`ANDS` with
@@ -2197,6 +2242,44 @@ fn decode(word: u32, pc: u64) -> Operation {
             domain: None,
         };
     }
+    // System register read: `MRS` (`11010101 0011 ...`, L=1). The destination
+    // becomes an unknown value (a barrier) because the preview does not track
+    // system registers; the other tracked registers are preserved. `Rt == 31`
+    // names the zero register and is left as a barrier write to it (ignored).
+    if word & 0xfff0_0000 == 0xd530_0000 {
+        let wide = word >> 31 != 0;
+        return Operation::Mrs {
+            dst: Register {
+                index: word & 31,
+                wide,
+                stack_pointer: false,
+            },
+            op0: (2 | ((word >> 19) & 1)) as u8,
+            op1: ((word >> 16) & 7) as u8,
+            crn: ((word >> 12) & 0xf) as u8,
+            crm: ((word >> 8) & 0xf) as u8,
+            op2: ((word >> 5) & 7) as u8,
+        };
+    }
+    // System register write: `MSR` (`11010101 0001 ...`, L=0). The source
+    // register is consumed and the system register is untracked, so there is no
+    // tracked register effect and value flow is preserved. `Rt == 31` names the
+    // zero register and is harmless.
+    if word & 0xfff0_0000 == 0xd510_0000 {
+        let wide = word >> 31 != 0;
+        return Operation::Msr {
+            op0: (2 | ((word >> 19) & 1)) as u8,
+            op1: ((word >> 16) & 7) as u8,
+            crn: ((word >> 12) & 0xf) as u8,
+            crm: ((word >> 8) & 0xf) as u8,
+            op2: ((word >> 5) & 7) as u8,
+            src: Register {
+                index: word & 31,
+                wide,
+                stack_pointer: false,
+            },
+        };
+    }
     // Exception generation: `SVC`/`BRK`/`HLT` (`opc` 000/001/010, imm16 at bits
     // 20..5). The failing opc values and the `DCPS` group stay opaque.
     if word & 0xffe0_001f == 0xd400_0001 {
@@ -3435,6 +3518,31 @@ impl Operation {
                 Some(domain) => format!("/* {mnemonic} {domain} */"),
                 None => format!("/* {mnemonic} */"),
             },
+            Self::Mrs {
+                dst,
+                op0,
+                op1,
+                crn,
+                crm,
+                op2,
+            } => {
+                let sysreg = sysreg_name(op0, op1, crn, crm, op2);
+                flow.write(dst, None);
+                format!("{} = mrs({});", dst.name(), sysreg)
+            }
+            Self::Msr {
+                op0,
+                op1,
+                crn,
+                crm,
+                op2,
+                src,
+            } => {
+                let sysreg = sysreg_name(op0, op1, crn, crm, op2);
+                // No tracked register effect; Rt is consumed but value tracking
+                // does not model liveness, so flow is preserved.
+                format!("/* msr {}, {} */", sysreg, src.name())
+            }
             Self::Exception { mnemonic, imm } => {
                 flow.clear();
                 format!("/* {mnemonic}({imm}): exception; value flow stops here */")
@@ -3482,7 +3590,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v29; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v30; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -5177,5 +5285,46 @@ mod tests {
         assert!(lift(0xea02_0020, 0x1000).contains("opaque instruction")); // ands x0, x1, x2
         assert!(lift(0xea21_001f, 0x1000).contains("opaque instruction")); // bics xzr, x0, x1
         assert!(lift(0xfa41_0000, 0x1000).contains("opaque instruction")); // ccmp x0, x1, #0, eq
+    }
+
+    #[test]
+    fn lifts_system_register_reads_and_writes() {
+        // clang-verified encodings: MRS writes an unknown value (a barrier) into
+        // the destination, named by the system register; MSR has no tracked
+        // register effect and is rendered as a marker.
+        assert_eq!(lift(0xd53b_d048, 0x1000), "x8 = mrs(TPIDR_EL0);");
+        assert_eq!(lift(0xd53b_d068, 0x1000), "x8 = mrs(TPIDRRO_EL0);");
+        assert_eq!(lift(0xd53b_e040, 0x1000), "x0 = mrs(CNTVCT_EL0);");
+        assert_eq!(lift(0xd53b_d049, 0x1000), "x9 = mrs(TPIDR_EL0);");
+        assert_eq!(lift(0xd53b_d040, 0x1000), "x0 = mrs(TPIDR_EL0);");
+        assert_eq!(lift(0xd51b_d040, 0x1000), "/* msr TPIDR_EL0, x0 */");
+        assert_eq!(lift(0xd51b_d061, 0x1000), "/* msr TPIDRRO_EL0, x1 */");
+        assert_eq!(lift(0xd51c_f1a2, 0x1000), "/* msr S3_4_C15_C1_5, x2 */");
+        // Generic system registers fall back to the S-form name.
+        assert_eq!(lift(0xd539_f1a9, 0x1000), "x9 = mrs(S3_1_C15_C1_5);");
+    }
+
+    #[test]
+    fn system_register_read_preserves_other_registers() {
+        // mov x1, #7 ; mrs x0, TPIDR_EL0 ; add x2, x1, #1 -- the MRS is a
+        // barrier on x0 only, so x1 survives and the constant folds through.
+        let words = [0xd280_00e1u32, 0xd53b_d040, 0x9100_0422];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x0 = mrs(TPIDR_EL0);"));
+        assert!(report.contains("x2 = x1 + 0x1;"));
+        assert!(report.contains("constant=0x8"));
+    }
+
+    #[test]
+    fn system_register_write_preserves_value_flow() {
+        // mov x0, #5 ; msr TPIDR_EL0, x0 ; add x1, x0, #1 -- the MSR has no
+        // tracked register effect, so x0 survives and the constant folds.
+        let words = [0xd280_00a0u32, 0xd51b_d040, 0x9100_0401];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("/* msr TPIDR_EL0, x0 */"));
+        assert!(report.contains("x1 = x0 + 0x1;"));
+        assert!(report.contains("constant=0x6"));
     }
 }
