@@ -875,6 +875,18 @@ enum Operation {
         left: Register,
         right: CompareOperand,
     },
+    /// A conditional comparison (`CCMP`/`CCMN`): the comparison is performed
+    /// only when `cond` holds, otherwise `PSTATE` is set to `nzcv`. The result
+    /// lives only in `PSTATE`, which the preview does not track, and no
+    /// general-purpose register is written, so value flow is preserved. Rendered
+    /// as a marker naming the operands, the `nzcv` value and the condition.
+    ConditionalCompare {
+        mnemonic: &'static str,
+        left: Register,
+        right: CompareOperand,
+        nzcv: u8,
+        cond: u8,
+    },
     Discard(&'static str),
     Opaque,
 }
@@ -2073,6 +2085,46 @@ fn decode(word: u32, pc: u64) -> Operation {
                 };
             }
         }
+    }
+    // Conditional comparison: `CCMP`/`CCMN`. The comparison runs only when
+    // `cond` holds; otherwise PSTATE is set to `nzcv`. The result lives only in
+    // PSTATE, which the preview does not track, and no general-purpose register
+    // is written, so value flow is preserved. `o2` (bit 11) selects the
+    // register (0) or immediate (1) form of the second operand; `Rm`/the
+    // immediate is bits 20..16, `Rn` is bits 9..5, `nzcv` is bits 3..0 and
+    // `cond` is bits 15..12. `sf` and `op` are not pinned (32/64-bit and
+    // ccmp/ccmn respectively).
+    if word & 0x3fe0_0410 == 0x3a40_0000 {
+        let sf = word >> 31 != 0;
+        let is_imm = (word >> 11) & 1 == 1;
+        let rm_imm = (word >> 16) & 0x1f;
+        let right = if is_imm {
+            CompareOperand::Immediate(rm_imm as u64)
+        } else {
+            CompareOperand::Register {
+                reg: Register {
+                    index: rm_imm,
+                    wide: sf,
+                    stack_pointer: false,
+                },
+                shift: None,
+            }
+        };
+        return Operation::ConditionalCompare {
+            mnemonic: if (word >> 30) & 1 == 1 {
+                "ccmp"
+            } else {
+                "ccmn"
+            },
+            left: Register {
+                index: (word >> 5) & 0x1f,
+                wide: sf,
+                stack_pointer: false,
+            },
+            right,
+            nzcv: (word & 0xf) as u8,
+            cond: ((word >> 12) & 0xf) as u8,
+        };
     }
     // Conditional select: `sf op:1 00110100 00 op2:1 cond:4 Rm:5 Rn:5 Rd:5`.
     // `op` (bit 30) selects inverting the false operand and `op2` (bit 10)
@@ -3571,6 +3623,39 @@ impl Operation {
                 // is preserved rather than cleared.
                 format!("/* {mnemonic} {}, {operand} */", left.name())
             }
+            Self::ConditionalCompare {
+                mnemonic,
+                left,
+                right,
+                nzcv,
+                cond,
+            } => {
+                let operand = match right {
+                    CompareOperand::Register { reg, shift } => render_shifted(&reg.name(), shift),
+                    CompareOperand::Immediate(value) => format!("#0x{:x}", value),
+                    CompareOperand::Extended { reg, extend, shift } => {
+                        let extended = match extend {
+                            Some((signed, from)) => format!(
+                                "{}({}, {from})",
+                                if signed { "sext" } else { "zext" },
+                                reg.name()
+                            ),
+                            None => reg.name(),
+                        };
+                        render_shifted(&extended, shift)
+                    }
+                };
+                // Only PSTATE changes (conditionally); no tracked register effect,
+                // so value flow is preserved rather than cleared.
+                format!(
+                    "/* {} {}, {}, #0x{:x}, {} */",
+                    mnemonic,
+                    left.name(),
+                    operand,
+                    nzcv,
+                    condition_name(cond)
+                )
+            }
             Self::Opaque => {
                 flow.clear();
                 "/* opaque instruction: semantics unavailable; value flow stops here */".into()
@@ -3590,7 +3675,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v30; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v31; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -4372,11 +4457,8 @@ mod tests {
         assert!(lift(0xba02_0020, 0x1000).contains("opaque instruction"));
         // sbcs x0, x1, x2 = 0xfa020020
         assert!(lift(0xfa02_0020, 0x1000).contains("opaque instruction"));
-        // Conditional compare shares the class but sets bits 28-21 = 11010010.
-        // ccmp x1, x2, #0, eq = 0xfa420020
-        assert!(lift(0xfa42_0020, 0x1000).contains("opaque instruction"));
-        // ccmn x1, x2, #0, eq = 0xba420020
-        assert!(lift(0xba42_0020, 0x1000).contains("opaque instruction"));
+        // Conditional compare (CCMP/CCMN) is now modeled as a marker (slice 34);
+        // see lifts_conditional_comparisons.
     }
 
     #[test]
@@ -5284,7 +5366,21 @@ mod tests {
         assert!(lift(0xf100_0420, 0x1000).contains("opaque instruction")); // subs x0, x1, #1
         assert!(lift(0xea02_0020, 0x1000).contains("opaque instruction")); // ands x0, x1, x2
         assert!(lift(0xea21_001f, 0x1000).contains("opaque instruction")); // bics xzr, x0, x1
-        assert!(lift(0xfa41_0000, 0x1000).contains("opaque instruction")); // ccmp x0, x1, #0, eq
+    }
+
+    #[test]
+    fn lifts_conditional_comparisons() {
+        // clang-verified encodings. CCMP/CCMN write no general-purpose register
+        // and change only PSTATE (conditionally), so they render as markers
+        // naming the operands, the nzcv value and the condition.
+        assert_eq!(lift(0xfa45_0080, 0x1000), "/* ccmp x4, x5, #0x0, eq */");
+        assert_eq!(lift(0xfa43_0880, 0x1000), "/* ccmp x4, #0x3, #0x0, eq */");
+        assert_eq!(lift(0xba49_c880, 0x1000), "/* ccmn x4, #0x9, #0x0, gt */");
+        assert_eq!(lift(0x7a43_104f, 0x1000), "/* ccmp w2, w3, #0xf, ne */");
+        assert_eq!(lift(0xfa46_c0a8, 0x1000), "/* ccmp x5, x6, #0x8, gt */");
+        assert_eq!(lift(0xfa41_0000, 0x1000), "/* ccmp x0, x1, #0x0, eq */");
+        assert_eq!(lift(0xba41_0000, 0x1000), "/* ccmn x0, x1, #0x0, eq */");
+        assert_eq!(lift(0x7a51_2804, 0x1000), "/* ccmp w0, #0x11, #0x4, hs */");
     }
 
     #[test]

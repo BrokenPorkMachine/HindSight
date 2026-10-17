@@ -42,6 +42,10 @@
 # 0.5.11 — ARM64 system register reads and writes in the preview
 
 - Extend the ARM64 semantic preview to system-register reads and writes (`MRS`/`MSR`): `MRS` renders `dst = mrs(TPIDR_EL0);` and makes the destination an unknown value (a barrier) because the preview does not track system registers, while preserving the other tracked registers (unlike `Opaque`, which clears all of them); `MSR` renders `/* msr TPIDR_EL0, x0 */` as a no-tracked-effect marker preserving value flow. The system register is named from its `(op0, op1, CRn, CRm, op2)` fields, using the architectural name when known and the `S<op0>_<op1>_C<CRn>_C<CRm>_<op2>` form otherwise (matching the disassembler). The op0=2 system instructions (`DC`/`IC`/`TLBI`/`AT`) and unallocated forms stay opaque. No report field or engine-identity change (banner advances to v30).
+
+# 0.5.11 — ARM64 conditional comparisons in the preview
+
+- Extend the ARM64 semantic preview to the conditional comparisons (`CCMP`/`CCMN`): the comparison runs only when `cond` holds, otherwise PSTATE is set to `nzcv`; the result lives only in PSTATE (untracked) and no general-purpose register is written, so value flow is preserved, rendering `/* ccmp x4, x5, #0x0, eq */` (register or immediate second operand, 32/64-bit, with the `nzcv` value and condition named). The op0=2 system instructions and unallocated forms stay opaque. No report field or engine-identity change (banner advances to v31).
 - Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses

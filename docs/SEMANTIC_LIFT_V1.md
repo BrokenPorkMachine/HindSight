@@ -144,7 +144,11 @@ from its `(op0, op1, CRn, CRm, op2)` fields, using the architectural name
 (`TPIDR_EL0`, `TPIDRRO_EL0`, `CNTVCT_EL0`, `NZCV`, `FPCR`, `FPSR`, `DAIF`,
 `CTR_EL0`, `DCZID_EL0`, ...) when known and the `S<op0>_<op1>_C<CRn>_C<CRm>_<op2>`
 form otherwise (matching the disassembler). The op0=2 system instructions
-(`DC`/`IC`/`TLBI`/`AT`) and unallocated forms stay opaque. The same `op31` group
+(`DC`/`IC`/`TLBI`/`AT`) and unallocated forms stay opaque. Conditional
+comparisons are modeled as markers: `CCMP`/`CCMN` render
+`/* ccmp x4, x5, #0x0, eq */` (register or immediate second operand, with the
+`nzcv` value and the condition named), preserving value flow because the result
+lives only in PSTATE and no general-purpose register is written. The same `op31` group
 also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
@@ -314,4 +318,7 @@ preserved), and that the flag-setting forms that write a general-purpose
 register, `BICS`, and `CCMP` stay opaque. A synthetic system-register sequence
 asserts the `MRS` barrier rendering and name resolution (including the generic
 `S`-form fallback), that a constant folds through an `MRS` on the other
-registers, and that an `MSR` preserves value flow.
+registers, and that an `MSR` preserves value flow. A synthetic conditional-comparison
+sequence asserts the `CCMP`/`CCMN` markers (register and immediate forms, 32/64-bit,
+with `nzcv` and condition), their exact words verified against `clang -arch arm64`,
+and 0 false positives / 0 false negatives over the real dylibs.
