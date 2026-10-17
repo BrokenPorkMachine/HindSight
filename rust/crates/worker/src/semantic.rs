@@ -311,11 +311,28 @@ enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrConversionRegister { Float { index: u8, precision: IrFloatPrecision }, Integer { index: u8, wide: bool } }
 
-fn render_int_float_conversion(destination: IrConversionRegister, source: IrConversionRegister, signed: bool) -> String {
+fn render_int_float_conversion(destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8>) -> String {
     let register = |value| match value {
         IrConversionRegister::Float { index, precision } => format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }),
         IrConversionRegister::Integer { index, wide } => format!("{}{index}", if wide { 'x' } else { 'w' }),
     };
+    if let Some(bits) = fractional_bits {
+        return match (destination, source) {
+            (IrConversionRegister::Float { precision, .. }, IrConversionRegister::Integer { wide, .. }) => {
+                let mnemonic = if signed { "scvtf" } else { "ucvtf" };
+                let width = if wide { 64 } else { 32 };
+                let precision_name = match precision { IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
+                format!("{} = {mnemonic}_fixed{width}({}, fractional_bits={bits}); /* {precision_name}; FPCR rounding mode applies */", register(destination), register(source))
+            }
+            (IrConversionRegister::Integer { wide, .. }, IrConversionRegister::Float { precision, .. }) => {
+                let mnemonic = if signed { "fcvtzs" } else { "fcvtzu" };
+                let width = if wide { 64 } else { 32 };
+                let precision_name = match precision { IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
+                format!("{} = {mnemonic}_fixed{width}({}, fractional_bits={bits}); /* {precision_name}; truncates toward zero; out-of-range result is architecture-specific */", register(destination), register(source))
+            }
+            _ => format!("{} = fixed_conversion({});", register(destination), register(source)),
+        };
+    }
     match (destination, source) {
         (IrConversionRegister::Float { precision, .. }, IrConversionRegister::Integer { wide, .. }) => {
             let destination_type = match precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" };
@@ -366,7 +383,7 @@ enum IrOperation {
     ScalarFloatBinary { destination: u8, left: u8, right: u8, precision: IrFloatPrecision, operator: IrFloatBinaryOperator },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
-    ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool },
+    ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
     FloatLoad { destination: IrFloatRegister, address: IrMemoryAddress, bytes: u8, writeback: Option<IrWriteback> },
     FloatStore { source: IrFloatRegister, address: IrMemoryAddress, bytes: u8, writeback: Option<IrWriteback> },
     DirectCall { target: u64 },
@@ -950,8 +967,8 @@ impl IrOperation {
                 let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 Some(format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source)))
             }
-            Self::ScalarIntFloatConvert { destination, source, signed } => {
-                Some(render_int_float_conversion(destination, source, signed))
+            Self::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
+                Some(render_int_float_conversion(destination, source, signed, fractional_bits))
             }
             Self::FloatLoad { destination, address, bytes, writeback } => {
                 let (expression, known) = match address {
@@ -2075,7 +2092,7 @@ enum Operation {
     },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
-    ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool },
+    ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
     /// A flag-only comparison alias whose destination is the zero register:
     /// `CMP`/`CMN` (`SUBS`/`ADDS` with `Rd == 31`) and `TST` (`ANDS` with
     /// `Rd == 31`). The result lives only in PSTATE, which the preview does not
@@ -2310,7 +2327,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::ScalarFloatBinary { destination, left, right, precision, operator } => IrOperation::ScalarFloatBinary { destination, left, right, precision, operator },
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
-        Operation::ScalarIntFloatConvert { destination, source, signed } => IrOperation::ScalarIntFloatConvert { destination, source, signed },
+        Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
         Operation::Call(target) => IrOperation::DirectCall { target },
         Operation::IndirectCall { target } => IrOperation::IndirectCall { target: reg(target) },
         Operation::Branch(target) => IrOperation::Branch { target },
@@ -4002,6 +4019,34 @@ fn decode(word: u32, pc: u64) -> Operation {
             source_precision,
         };
     }
+    // Scalar fixed-point integer/FP conversions. The encoded imm6 is 64-fbits;
+    // 32-bit forms additionally require fbits <= 32. Keep rounding and overflow
+    // behavior explicit in the rendered expression/comment.
+    let fixed_conversion = match word & 0xfff1_0000 {
+        0x1e00_0000 => Some((true, false, false)),
+        0x9e40_0000 => Some((true, false, true)),
+        0x1e01_0000 => Some((true, true, false)),
+        0x9e41_0000 => Some((true, true, true)),
+        0x1e10_0000 => Some((false, false, false)),
+        0x9e50_0000 => Some((false, false, true)),
+        0x1e11_0000 => Some((false, true, false)),
+        0x9e51_0000 => Some((false, true, true)),
+        _ => None,
+    };
+    if let Some((to_float, unsigned, wide)) = fixed_conversion {
+        let fractional_bits = 64 - ((word >> 10) & 0x3f);
+        if fractional_bits == 0 || (!wide && fractional_bits > 32) { return Operation::Opaque; }
+        let destination_index = (word & 31) as u8;
+        let source_index = ((word >> 5) & 31) as u8;
+        let precision = if wide { IrFloatPrecision::Double } else { IrFloatPrecision::Single };
+        let signed = !unsigned;
+        let (destination, source) = if to_float {
+            (IrConversionRegister::Float { index: destination_index, precision }, IrConversionRegister::Integer { index: source_index, wide })
+        } else {
+            (IrConversionRegister::Integer { index: destination_index, wide }, IrConversionRegister::Float { index: source_index, precision })
+        };
+        return Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits: Some(fractional_bits as u8) };
+    }
     // Integer-to-FP and FP-to-integer conversions without a fixed-point
     // fractional scale. Width, direction, and signedness come from the opcode.
     let integer_float_conversion = match word & 0xffff_fc00 {
@@ -4024,7 +4069,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         } else {
             (IrConversionRegister::Integer { index: destination_index, wide }, IrConversionRegister::Float { index: source_index, precision })
         };
-        return Operation::ScalarIntFloatConvert { destination, source, signed };
+        return Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits: None };
     }
     // Scalar single/double two-source arithmetic. Keep the whitelist narrow:
     // other FP data-processing encodings remain explicit target-specific IR.
@@ -5512,8 +5557,8 @@ impl Operation {
                 let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source))
             }
-            Self::ScalarIntFloatConvert { destination, source, signed } => {
-                render_int_float_conversion(destination, source, signed)
+            Self::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
+                render_int_float_conversion(destination, source, signed, fractional_bits)
             }
             Self::Exception { mnemonic, imm } => {
                 flow.clear();
@@ -6025,6 +6070,25 @@ mod tests {
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("target-specific"), "{report}");
         }
+    }
+
+    #[test]
+    fn fixed_point_integer_float_conversions_preserve_scale_and_width() {
+        let cases = [
+            (0x1e02_fc20, "s0 = scvtf_fixed32(w1, fractional_bits=1); /* single; FPCR rounding mode applies */"),
+            (0x9e43_0062, "d2 = ucvtf_fixed64(x3, fractional_bits=64); /* double; FPCR rounding mode applies */"),
+            (0x1e18_80a4, "w4 = fcvtzs_fixed32(s5, fractional_bits=32); /* single; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x9e59_fce6, "x6 = fcvtzu_fixed64(d7, fractional_bits=1); /* double; truncates toward zero; out-of-range result is architecture-specific */"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
+        // 32-bit fixed-point forms cannot encode more than 32 fractional bits.
+        assert_eq!(lift(0x1e00_0020, 0x1000), "/* opaque instruction: semantics unavailable; value flow stops here */");
     }
 
     #[test]
