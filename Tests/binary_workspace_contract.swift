@@ -24,7 +24,7 @@ struct BinaryWorkspaceContract {
         precondition(cachedNames.map(\.name) == ["_exported", "-[Widget run:]"])
 
         let semantic = """
-        AArch64 register semantics v38
+        AArch64 register semantics v39
         Reconstructed pseudocode
         ========================
         // 0x0000000100001000 _entry; exact symbol

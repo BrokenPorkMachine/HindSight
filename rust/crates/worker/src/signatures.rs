@@ -472,6 +472,36 @@ fn assigned_register(statement: &str) -> Option<String> {
     } else { None }
 }
 
+fn copied_register(statement: &str) -> Option<String> {
+    let (_, rhs) = statement.split_once('=')?;
+    let source = rhs.split_once(';').map_or(rhs, |(expression, _)| expression).trim();
+    let bytes = source.as_bytes();
+    if bytes.len() < 2 || !matches!(bytes[0], b'x' | b'w' | b's' | b'd' | b'v')
+        || !bytes[1..].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(source.to_string())
+}
+
+fn register_bank(register: &str) -> Option<u8> {
+    match register.as_bytes().first()? {
+        b'x' | b'w' => Some(0),
+        b's' | b'd' | b'v' => Some(1),
+        _ => None,
+    }
+}
+
+fn bind_register_name(names: &mut BTreeMap<String, String>, destination: &str, name: String) {
+    if let Some(index) = destination.strip_prefix('x').or_else(|| destination.strip_prefix('w')) {
+        names.insert(format!("x{index}"), name.clone());
+        names.insert(format!("w{index}"), name);
+    } else if let Some(index) = destination.strip_prefix('s').or_else(|| destination.strip_prefix('d')).or_else(|| destination.strip_prefix('v')) {
+        names.insert(format!("s{index}"), name.clone());
+        names.insert(format!("d{index}"), name.clone());
+        names.insert(format!("v{index}"), name);
+    }
+}
+
 fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) -> BTreeMap<String, String> {
     let parameters = signature.map(|signature| abi_parameters(Some(signature))).unwrap_or_else(|| {
         incoming_parameter_candidates(report, address).into_iter().filter_map(|register| {
@@ -506,7 +536,22 @@ fn parameter_aliases_by_instruction(
     let mut names = parameter_names(signature, report, address);
     let mut result = BTreeMap::new();
     for (pc, statement) in instructions {
-        result.insert(*pc, names.clone());
+        let copied_name = assigned_register(statement).and_then(|destination| {
+            copied_register(statement).and_then(|source| {
+                (register_bank(&source) == register_bank(&destination))
+                    .then(|| names.get(&source).map(|source_name| {
+                        let physical_destination = destination.strip_prefix('w')
+                            .map(|index| format!("x{index}"))
+                            .unwrap_or_else(|| destination.clone());
+                        format!("{source_name}_copy_{physical_destination}")
+                    })).flatten()
+            }).map(|name| (destination, name))
+        });
+        let mut instruction_names = names.clone();
+        if let Some((destination, copied_name)) = &copied_name {
+            bind_register_name(&mut instruction_names, destination, copied_name.clone());
+        }
+        result.insert(*pc, instruction_names);
         if statement.starts_with("call(") {
             names.clear(); // AAPCS64 caller-saved registers may be clobbered.
         } else if let Some(destination) = assigned_register(statement) {
@@ -515,6 +560,7 @@ fn parameter_aliases_by_instruction(
             } else if let Some(index) = destination.strip_prefix('s').or_else(|| destination.strip_prefix('d')).or_else(|| destination.strip_prefix('v')) {
                 names.remove(&format!("s{index}")); names.remove(&format!("d{index}")); names.remove(&format!("v{index}"));
             } else { names.remove(&destination); }
+            if let Some((_, name)) = copied_name { bind_register_name(&mut names, &destination, name); }
         }
     }
     result
@@ -1000,18 +1046,22 @@ fn recover_internal(
         assert_eq!(args.iter().map(|arg|arg.name.as_str()).collect::<Vec<_>>(), vec!["owner", "value", "count", "ratio"]);
     }
     #[test] fn parameter_names_flow_until_the_register_is_redefined() {
+        assert_eq!(copied_register("x6 = x4;"), Some("x4".into()));
+        assert_eq!(copied_register("x6 = x4 + 1;"), None);
         let signature = objc_method("-[Widget setObject:]", "v24@0:8@16").unwrap();
         let instructions = vec![
             (0x0ffc, "x4 = x2;".into()),
             (0x1000, "x2 = *(x0 + 0x10);".into()),
-            (0x1004, "x3 = x2;".into()),
-            (0x1008, "return x2;".into()),
+            (0x1004, "x5 = x4;".into()),
+            (0x1008, "x3 = x2;".into()),
+            (0x100c, "return x5;".into()),
         ];
         let aliases = parameter_aliases_by_instruction(&instructions, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names(&instructions[0].1, &aliases[&0x0ffc]), "x4 = arg0;");
+        assert_eq!(substitute_parameter_names(&instructions[0].1, &aliases[&0x0ffc]), "arg0_copy_x4 = arg0;");
         assert_eq!(substitute_parameter_names(&instructions[1].1, &aliases[&0x1000]), "arg0 = *(self + 0x10);");
-        assert_eq!(substitute_parameter_names(&instructions[2].1, &aliases[&0x1004]), "x3 = x2;");
-        assert_eq!(substitute_parameter_names(&instructions[3].1, &aliases[&0x1008]), "return x2;");
+        assert_eq!(substitute_parameter_names(&instructions[2].1, &aliases[&0x1004]), "arg0_copy_x4_copy_x5 = arg0_copy_x4;");
+        assert_eq!(substitute_parameter_names(&instructions[3].1, &aliases[&0x1008]), "x3 = x2;");
+        assert_eq!(substitute_parameter_names(&instructions[4].1, &aliases[&0x100c]), "return arg0_copy_x4_copy_x5;");
         assert_eq!(substitute_parameter_names("w2 = w2;", &parameter_names(Some(&signature), "", 0)), "arg0 = arg0;");
     }
     #[test] fn parameter_aliases_stop_at_control_flow_and_calls() {
