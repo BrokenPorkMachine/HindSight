@@ -27,6 +27,15 @@ class SchedulerDemanglePseudocodeContracts(unittest.TestCase):
         self.assertIn('supervisor.page(', page)
         self.assertIn('supervisor.analyze(', analysis)
 
+    def test_queue_dispatch_and_reported_position_share_the_aging_order(self):
+        code = (ROOT/'PlatformServices/CoordinatorService/WorkerSupervisor.swift').read_text()
+        self.assertIn('private func orderedQueuedIndices(now: UInt64)', code)
+        dispatch = code.split('private func startNextQueued()', 1)[1].split('private func scheduleRetryPump', 1)[0]
+        status = code.split('func status(id: String)', 1)[1].split('private func enqueue(', 1)[0]
+        self.assertIn('orderedQueuedIndices(now: now)', dispatch)
+        self.assertIn('orderedQueuedIndices(now: uptime)', status)
+        self.assertIn('queue position \\(position + 1) of \\(queuedTasks.count)', status)
+
     def test_ir_preview_is_bounded_and_explicitly_structural(self):
         code = (ROOT/'App/ContentView.swift').read_text()
         self.assertIn('vgStructuralPseudocode', code)

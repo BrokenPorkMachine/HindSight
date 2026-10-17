@@ -477,8 +477,19 @@ final class WorkerSupervisor {
         guard let current = recentStatuses[id] else { return nil }
         guard current.phase == .queued else { return current }
         let now = Date()
+        let uptime = DispatchTime.now().uptimeNanoseconds
         let nowMS = UInt64(max(0, now.timeIntervalSince1970 * 1000.0))
         let elapsed = nowMS >= current.started_at_ms ? nowMS - current.started_at_ms : current.elapsed_ms
+        if let queuedIndex = queuedTasks.firstIndex(where: { $0.id == id }),
+           let position = orderedQueuedIndices(now: uptime).firstIndex(of: queuedIndex) {
+            let task = queuedTasks[queuedIndex]
+            let readiness = task.notBefore > uptime ? "waiting for resource retry" : "waiting for worker slot"
+            return InspectionStatus(request_id: current.request_id, operation: current.operation, phase: .queued,
+                                    detail: "\(readiness) (queue position \(position + 1) of \(queuedTasks.count)).",
+                                    started_at_ms: current.started_at_ms, updated_at_ms: nowMS, elapsed_ms: elapsed,
+                                    progress_percent: current.progress_percent, progress_stage: current.progress_stage,
+                                    diagnostic: current.diagnostic)
+        }
         return InspectionStatus(request_id: current.request_id, operation: current.operation, phase: current.phase,
                                 detail: current.detail, started_at_ms: current.started_at_ms,
                                 updated_at_ms: nowMS, elapsed_ms: elapsed,
@@ -507,7 +518,19 @@ final class WorkerSupervisor {
 
     private func updateQueuedPositions() {
         let now = DispatchTime.now().uptimeNanoseconds
-        let order = queuedTasks.indices.sorted { lhs, rhs in
+        let order = orderedQueuedIndices(now: now)
+        for (offset, index) in order.enumerated() {
+            let task = queuedTasks[index]
+            let readiness = task.notBefore > now ? "Waiting for resource retry" : "Waiting for worker slot"
+            updateRecent(id: task.id, phase: .queued,
+                         detail: "\(readiness) (queue position \(offset + 1) of \(order.count)).",
+                         progressStage: "queue")
+        }
+    }
+
+    /// Keep dispatch selection and the position reported to clients on one ordering rule.
+    private func orderedQueuedIndices(now: UInt64) -> [Int] {
+        queuedTasks.indices.sorted { lhs, rhs in
             let a = queuedTasks[lhs], b = queuedTasks[rhs]
             let aReady = a.notBefore <= now, bReady = b.notBefore <= now
             if aReady != bReady { return aReady }
@@ -515,26 +538,13 @@ final class WorkerSupervisor {
             let bPriority = b.priority.rawValue + Int(min(3, (now - b.submittedAt) / 2_000_000_000))
             return aPriority == bPriority ? a.sequence < b.sequence : aPriority > bPriority
         }
-        for (offset, index) in order.enumerated() {
-            let task = queuedTasks[index]
-            updateRecent(id: task.id, phase: .queued,
-                         detail: "Waiting for worker slot (queue position \(offset + 1) of \(order.count)).",
-                         progressStage: "queue")
-        }
     }
 
     private func startNextQueued() {
         while job == nil && !queuedTasks.isEmpty {
             let now = DispatchTime.now().uptimeNanoseconds
-            let eligible = queuedTasks.indices.filter { queuedTasks[$0].notBefore <= now }
-            guard let index = eligible.max(by: { lhs, rhs in
-                let a = queuedTasks[lhs], b = queuedTasks[rhs]
-                let aAge = Int(min(3, (now - a.submittedAt) / 2_000_000_000))
-                let bAge = Int(min(3, (now - b.submittedAt) / 2_000_000_000))
-                let aPriority = a.priority.rawValue + aAge
-                let bPriority = b.priority.rawValue + bAge
-                return aPriority == bPriority ? a.sequence > b.sequence : aPriority < bPriority
-            }) else {
+            let order = orderedQueuedIndices(now: now)
+            guard let index = order.first(where: { queuedTasks[$0].notBefore <= now }) else {
                 scheduleRetryPump(after: queuedTasks.map { $0.notBefore }.min().map { $0 > now ? $0 - now : 0 } ?? 0)
                 return
             }

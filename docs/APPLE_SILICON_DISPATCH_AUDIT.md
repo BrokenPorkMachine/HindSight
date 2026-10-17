@@ -16,6 +16,8 @@ This audit records the current execution path and the correctness gaps found whi
 
 The page and analysis XPC entry points rejected work whenever any worker was active. That made the page-first priority queue unreachable for those request types. Both entry points now submit to the supervisor, so queue priority, status, and cancellation apply to real requests. Switching projects remains blocked while a worker is active or queued.
 
+Queue dispatch and queue-status reporting now use the same readiness, aging, priority, and FIFO ordering function. A status poll calculates the current position and distinguishes a resource retry delay from waiting for the worker slot, so the displayed position follows the same order used by the dispatcher as waiting time changes priority.
+
 The scripting lane can run four requests at once, while plugin execution and plugin settings, trust, enablement, and installation share persistent per-plugin files. Concurrent operations on one plugin could read the same old state and overwrite each other's updates. A per-plugin lock now serializes those operations while allowing different plugins and standalone scripts to proceed concurrently.
 
 ### Remaining performance limits
