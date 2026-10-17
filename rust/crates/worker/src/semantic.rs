@@ -2102,6 +2102,9 @@ enum Operation {
         dst: Register,
         src_v: u8,
     },
+    /// `FMOV Sd/Wn` or `FMOV Dd/Xn`: copy a proven GP value into a scalar FP
+    /// register. The scalar write clears the rest of the tracked V register.
+    FmovToVector { dst_v: u8, src: Register, precision: IrFloatPrecision },
     /// `FMov` immediate into a V register. The V register becomes an unknown
     /// value (a barrier) for now, since the FP modified-immediate is not decoded
     /// into a tracked constant yet; GP value flow is preserved.
@@ -4011,6 +4014,19 @@ fn decode(word: u32, pc: u64) -> Operation {
             src_v: vd,
         };
     }
+    // FMOV from a general-purpose register into a scalar FP register.
+    let fmov_to_vector = match word & 0xffff_fc00 {
+        0x1e27_0000 => Some((IrFloatPrecision::Single, false)), // FMOV Sd, Wn
+        0x9e67_0000 => Some((IrFloatPrecision::Double, true)),  // FMOV Dd, Xn
+        _ => None,
+    };
+    if let Some((precision, wide)) = fmov_to_vector {
+        return Operation::FmovToVector {
+            dst_v: (word & 31) as u8,
+            src: Register { index: (word >> 5) & 31, wide, stack_pointer: false },
+            precision,
+        };
+    }
     // FMov immediate into a V register (marker form; GP flow preserved).
     if word & 0xffff_ffe0 == 0x6f03_f600 {
         return Operation::FmovImm {
@@ -5568,6 +5584,16 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::FmovToVector { dst_v, src, precision } => {
+                let source = flow.read(src);
+                let known = source.and_then(|value| {
+                    let bits = match precision { IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value };
+                    Some(VKnownValue { value: bits as u128, origins: combine_origins(&value.origins, &[], pc)? })
+                });
+                flow.write_v(dst_v as u32, known.clone());
+                let name = match precision { IrFloatPrecision::Single => format!("s{dst_v}"), IrFloatPrecision::Double => format!("d{dst_v}") };
+                format!("{name} = fmov({});{}", src.name(), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default())
+            }
             Self::FmovImm { vd, arrangement } => {
                 // V register becomes an unknown value (barrier) for now.
                 flow.write_v(vd as u32, None);
@@ -5742,6 +5768,10 @@ fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -
             let _ = operation.render(&mut flow, pc);
             continue;
         }
+        if matches!(operation, Operation::FmovToVector { .. }) {
+            let _ = operation.render(&mut flow, pc);
+            continue;
+        }
         if portable == IrOperation::TargetSpecific || portable.render(&mut flow, pc).is_none() {
             flow.clear();
         }
@@ -5799,7 +5829,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v42; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v43; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
