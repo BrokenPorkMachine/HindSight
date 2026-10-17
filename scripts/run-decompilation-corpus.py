@@ -90,6 +90,11 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         "objc_method_records": (report.get("objc_classes") or "").count("confidence=validated"),
         "objc_selector_calls": (report.get("semantic_preview") or "").count("objc_msgSend selector validated through __objc_selrefs"),
         "abi_parameter_bindings": semantic.count("AAPCS64 parameter bindings:"),
+        "resolved_parameter_name_uses": sum(
+            len(re.findall(r"\b(?:self|_cmd|arg\d+)\b", line.split("/*", 1)[0]))
+            for line in semantic.splitlines()
+            if re.match(r"^\s+0x[0-9a-fA-F]+:", line)
+        ),
         "cpp_signature_records": (report.get("call_values") or "").count("Itanium mangled parameter types"),
         "function_rows": sum(1 for line in functions.splitlines() if "confidence=" in line),
         "cfg_blocks": sum(1 for line in cfg.splitlines() if line.startswith("block B")),
@@ -113,6 +118,8 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         raise RuntimeError(f"{source_type} fixture produced no validated selector message-send: {metrics}")
     if source_type in {"objective-c", "objective-cpp"} and ("self=x0" not in semantic or "_cmd=x1" not in semantic):
         raise RuntimeError(f"{source_type} fixture did not reconstruct the Objective-C hidden ABI parameters: {metrics}")
+    if source_type in {"c", "objective-c"} and metrics["resolved_parameter_name_uses"] < 1:
+        raise RuntimeError(f"{source_type} fixture did not use a recovered parameter name in pseudocode: {metrics}")
     return metrics
 
 

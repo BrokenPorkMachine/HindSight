@@ -50,7 +50,7 @@ This checklist compares HindSight's current analysis path with capabilities docu
 
 - [ ] **Add per-function analysis controls.** The Binary Workspace now filters CFG blocks to the selected function and lets users navigate from block/edge records to instruction addresses alongside assembly, lifted statements, IR, and pseudocode. Per-function reanalysis, analysis bounds, and simplification controls remain.
 - [ ] **Expose uncertainty and alternatives.** Let analysts inspect competing type, target, function-boundary, and control-flow hypotheses with the evidence that supports each.
-- [ ] **Add decompilation quality corpus.** Public-domain C, Objective-C, C++, and Objective-C++ fixtures compile at `-O0`/`-O2` with stripped and unstripped variants. The macOS runner scores function, CFG, IR, pseudocode, validated Objective-C method, and selector message-send evidence without exact source-text matching. Expression, call-target, type, source-mapping quality metrics and CI integration remain.
+- [ ] **Add decompilation quality corpus.** Public-domain C, Objective-C, C++, and Objective-C++ fixtures compile at `-O0`/`-O2` with stripped and unstripped variants. The macOS runner scores function, CFG, IR, pseudocode, validated Objective-C method, selector message-send, and address-bearing parameter-name-use evidence without exact source-text matching. Expression, call-target, type, source-mapping quality metrics and CI integration remain.
 - [ ] **Add resource and cancellation controls.** Bound work per function and project, expose progress, and allow cancellation without discarding completed analysis.
 - [ ] **Export standard artifacts.** Add function signatures, types, call graphs, and annotations to JSON and interoperable formats where practical.
 

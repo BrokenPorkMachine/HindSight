@@ -479,7 +479,20 @@ fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) ->
             (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index) })
         }).collect()
     });
-    parameters.into_iter().map(|parameter| (parameter.register, parameter.name)).collect()
+    let mut names = BTreeMap::new();
+    for parameter in parameters {
+        if let Some(index) = parameter.general_register {
+            names.insert(format!("x{index}"), parameter.name.clone());
+            names.insert(format!("w{index}"), parameter.name);
+        } else if let Some(index) = parameter.register.strip_prefix('s').or_else(|| parameter.register.strip_prefix('d')).and_then(|value| value.parse::<u8>().ok()) {
+            names.insert(format!("s{index}"), parameter.name.clone());
+            names.insert(format!("d{index}"), parameter.name.clone());
+            names.insert(format!("v{index}"), parameter.name);
+        } else {
+            names.insert(parameter.register, parameter.name);
+        }
+    }
+    names
 }
 
 fn parameter_aliases_by_instruction(
@@ -497,9 +510,11 @@ fn parameter_aliases_by_instruction(
         if statement.starts_with("call(") {
             names.clear(); // AAPCS64 caller-saved registers may be clobbered.
         } else if let Some(destination) = assigned_register(statement) {
-            names.remove(&destination);
-            if let Some(index) = destination.strip_prefix('w') { names.remove(&format!("x{index}")); }
-            if let Some(index) = destination.strip_prefix('s') { names.remove(&format!("d{index}")); }
+            if let Some(index) = destination.strip_prefix('x').or_else(|| destination.strip_prefix('w')) {
+                names.remove(&format!("x{index}")); names.remove(&format!("w{index}"));
+            } else if let Some(index) = destination.strip_prefix('s').or_else(|| destination.strip_prefix('d')).or_else(|| destination.strip_prefix('v')) {
+                names.remove(&format!("s{index}")); names.remove(&format!("d{index}")); names.remove(&format!("v{index}"));
+            } else { names.remove(&destination); }
         }
     }
     result
@@ -997,6 +1012,7 @@ fn recover_internal(
         assert_eq!(substitute_parameter_names(&instructions[1].1, &aliases[&0x1000]), "arg0 = *(self + 0x10);");
         assert_eq!(substitute_parameter_names(&instructions[2].1, &aliases[&0x1004]), "x3 = x2;");
         assert_eq!(substitute_parameter_names(&instructions[3].1, &aliases[&0x1008]), "return x2;");
+        assert_eq!(substitute_parameter_names("w2 = w2;", &parameter_names(Some(&signature), "", 0)), "arg0 = arg0;");
     }
     #[test] fn parameter_aliases_stop_at_control_flow_and_calls() {
         let signature = symbol("_CFRelease").unwrap();
@@ -1006,6 +1022,16 @@ fn recover_internal(
         let aliases = parameter_aliases_by_instruction(&called, Some(&signature), "", 0x1000);
         assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1000]), "return cf;");
         assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1004]), "return x0;");
+    }
+    #[test] fn scalar_fp_parameter_names_cover_single_and_double_register_views() {
+        let signature = symbol("_CFNumberGetValue").unwrap();
+        let names = parameter_names(Some(&signature), "", 0);
+        assert_eq!(names.get("x1").map(String::as_str), Some("theType"));
+        let float_signature = Signature { language: "C", declaration: "double scale(float factor, double value);".into(), source: "test prototype" };
+        let names = parameter_names(Some(&float_signature), "", 0);
+        assert_eq!(names.get("s0").map(String::as_str), Some("factor"));
+        assert_eq!(names.get("d0").map(String::as_str), Some("factor"));
+        assert_eq!(names.get("d1").map(String::as_str), Some("value"));
     }
     #[test] fn direct_calls_render_prototype_parameter_bindings() {
         let signature = symbol("_CFRelease").unwrap();
