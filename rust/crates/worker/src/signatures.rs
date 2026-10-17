@@ -638,8 +638,9 @@ fn render_linear_statement(
     if let Some(rest)=statement.strip_prefix("call(0x"){
         if let Some((hex,_))=rest.split_once(')'){
             if let Ok(target)=u64::from_str_radix(hex,16){
+                let indirect = statement.contains("indirect via");
                 let target_name=signatures.get(&target).map(|(name,_)|name.as_str())
-                    .or_else(||symbols.iter().find(|(candidate,_)|*candidate==target).map(|(_,name)|name.as_str()));
+                    .or_else(||(!indirect).then(||symbols.iter().find(|(candidate,_)|*candidate==target).map(|(_,name)|name.as_str())).flatten());
                 let known=super::semantic::known_call_argument_values(code,base,start,address);
                 if let Some(selector)=objc_selectors.get(&address){
                     let parts=selector.split(':').collect::<Vec<_>>();
@@ -675,8 +676,8 @@ fn render_linear_statement(
                     let resolved=evidence.join(", ");
                     let binding_note=if bindings.is_empty(){"argument register bindings unresolved".into()}else if target_signature.is_some(){format!("argument bindings: {bindings}")}else{format!("candidate ABI argument bindings: {bindings}; callee types unresolved")};
                     let evidence_note=if resolved.is_empty(){"no argument constants proven in the straight-line call block".to_string()}else{format!("constant argument evidence: {resolved}")};
-                    format!("{}({}); /* direct call target {target:#x}; {}; {binding_note}; {evidence_note} */",callable_name(name,target_signature),arguments,if target_signature.is_some(){"arguments follow recovered prototype arity"}else if args.is_empty(){"callee prototype and entry-use arity unavailable"}else{"arity candidate from callee entry-register uses"})
-                }else{format!("call(/* unresolved target {target:#x}; direct BL; {} */);",if known_values.is_empty(){"arguments unresolved".to_string()}else{format!("known ABI register values: {}",known_values.join(", "))})};
+                    format!("{}({}); /* {} {target:#x}; {}; {binding_note}; {evidence_note} */",callable_name(name,target_signature),arguments,if indirect{"indirect target resolved through a register"}else{"direct call target"},if target_signature.is_some(){"arguments follow recovered prototype arity"}else if args.is_empty(){"callee prototype and entry-use arity unavailable"}else{"arity candidate from callee entry-register uses"})
+                }else{format!("call(/* unresolved target {target:#x}; {}; {} */);",if indirect{"indirect target recovered from a register"}else{"direct BL"},if known_values.is_empty(){"arguments unresolved".to_string()}else{format!("known ABI register values: {}",known_values.join(", "))})};
             }
         }
     }
@@ -1089,6 +1090,23 @@ fn recover_internal(
         let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
         assert!(call.starts_with("CFRelease(x0);"), "{call}");
         assert!(call.contains("argument bindings: cf=x0"), "{call}");
+    }
+    #[test] fn resolved_indirect_calls_use_only_function_signature_evidence() {
+        let signature = symbol("_CFRelease").unwrap();
+        let signatures = BTreeMap::from([(0x2000, ("_CFRelease".into(), signature))]);
+        let call = render_linear_statement(
+            "call(0x2000); /* indirect via x9; proven_by=[0x1000]; signature, arguments, result and side effects unresolved */",
+            0x1004, 0x1000, &[(0x2000, "_CFRelease_data_symbol".into())], &signatures,
+            None, "", &[], 0x1000, false, &BTreeMap::new(),
+        );
+        assert!(call.starts_with("CFRelease(x0);"), "{call}");
+        assert!(call.contains("indirect target resolved through a register 0x2000"), "{call}");
+        let data_only = render_linear_statement(
+            "call(0x3000); /* indirect via x9; proven_by=[0x1000] */",
+            0x1004, 0x1000, &[(0x3000, "_CFRelease_data_symbol".into())], &BTreeMap::new(),
+            None, "", &[], 0x1000, false, &BTreeMap::new(),
+        );
+        assert!(data_only.contains("unresolved target 0x3000"), "{data_only}");
     }
     #[test] fn direct_calls_use_candidate_arity_without_prototype() {
         let symbols = [(0x2000, "_consume".into())];
