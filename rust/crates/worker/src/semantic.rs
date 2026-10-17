@@ -5715,35 +5715,54 @@ fn flows_equal(a: &Flow, b: &Flow) -> bool {
 /// same bounded straight-line region. A branch in the scan window rejects the
 /// entire result because its target could skip definitions; calls and opaque
 /// operations clear state so caller side effects are not carried forward.
-pub fn known_call_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u64, String)> {
-    if function_start < base || callsite < function_start || (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return Vec::new(); }
+fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Option<Flow> {
+    if function_start < base || callsite < function_start || (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return None; }
     let call_index = usize::try_from(callsite - base).ok().map(|offset| offset / 4);
-    let Some(call_index) = call_index.filter(|index| index.saturating_mul(4) <= code.len()) else { return Vec::new() };
+    let Some(call_index) = call_index.filter(|index| index.saturating_mul(4) <= code.len()) else { return None };
     let function_index = usize::try_from(function_start - base).ok().map(|offset|offset / 4);
-    let Some(function_index)=function_index else{return Vec::new()};
+    let Some(function_index)=function_index else{return None};
     let start_index = call_index.saturating_sub(64).max(function_index);
     let mut flow = Flow::new();
     for index in start_index..call_index {
         let pc = base.saturating_add(index as u64 * 4);
-        let Some(bytes) = code.get(index * 4..index * 4 + 4) else { return Vec::new() };
+        let Some(bytes) = code.get(index * 4..index * 4 + 4) else { return None };
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         let operation = decode(word, pc);
         let portable = lift_operation(operation, pc);
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) {
-            return Vec::new();
+            return None;
         }
         if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) {
             flow.clear();
+            continue;
+        }
+        // SIMD immediate moves are still target-specific in the portable IR,
+        // but their tracked low lane is needed to prove scalar FP call args.
+        if matches!(operation, Operation::VMoveImm { .. }) {
+            let _ = operation.render(&mut flow, pc);
             continue;
         }
         if portable == IrOperation::TargetSpecific || portable.render(&mut flow, pc).is_none() {
             flow.clear();
         }
     }
+    Some(flow)
+}
+
+pub fn known_call_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u64, String)> {
+    let Some(flow) = known_call_flow(code, base, function_start, callsite) else { return Vec::new() };
     (0..8u8).filter_map(|index| {
         let register = Register { index: index as u32, wide: true, stack_pointer: false };
         flow.read(register).map(|value| (index, value.value, proven_by(&value)))
     }).collect()
+}
+
+/// Recover only scalar float argument values whose low lane is known in the
+/// vector flow state. The callee prototype determines whether those bits are
+/// interpreted as `float` or `double` by the caller.
+pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u128, String)> {
+    let Some(flow) = known_call_flow(code, base, function_start, callsite) else { return Vec::new() };
+    (0..8u8).filter_map(|index| flow.read_v(index as u32).map(|value| (index, value.value, format!("proven_by=[{}]", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(",")) ))).collect()
 }
 
 /// Stack-relative slot names are safe only when every instruction in the
@@ -5780,7 +5799,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v41; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v42; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);

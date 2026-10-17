@@ -642,6 +642,7 @@ fn render_linear_statement(
                 let target_name=signatures.get(&target).map(|(name,_)|name.as_str())
                     .or_else(||(!indirect).then(||symbols.iter().find(|(candidate,_)|*candidate==target).map(|(_,name)|name.as_str())).flatten());
                 let known=super::semantic::known_call_argument_values(code,base,start,address);
+                let known_float=super::semantic::known_call_float_argument_values(code,base,start,address);
                 if let Some(selector)=objc_selectors.get(&address){
                     let parts=selector.split(':').collect::<Vec<_>>();
                     let argument_count=parts.len().saturating_sub(1);
@@ -661,6 +662,7 @@ fn render_linear_statement(
                 return if let Some(name)=target_name{
                     let target_signature=signatures.get(&target).map(|(_,signature)|signature);
                     let values=known.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
+                    let float_values=known_float.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
                     let args=target_signature.map(|signature|abi_parameters(Some(signature))).unwrap_or_else(||candidate_abi_parameters(parameter_evidence,target));
                     let bindings=args.iter().map(|argument|format!("{}={}",argument.name,argument.register)).collect::<Vec<_>>().join(", ");
                     let mut evidence=Vec::new();
@@ -668,6 +670,21 @@ fn render_linear_statement(
                         if let Some(register)=argument.general_register {
                             if let Some((value,provenance))=values.get(&register){
                                 evidence.push(format!("{}({})={value:#x} {provenance}",argument.name,argument.register));return format!("{value:#x}")
+                            }
+                        }
+                        if let Some((prefix, index)) = argument.register.as_bytes().split_first().and_then(|(prefix, rest)| std::str::from_utf8(rest).ok()?.parse::<u8>().ok().map(|index| (*prefix, index))) {
+                            if matches!(prefix, b's' | b'd') {
+                                if let Some((bits, provenance)) = float_values.get(&index) {
+                                    let value = if prefix == b's' {
+                                        let raw = *bits as u32;
+                                        if raw & 0x7fff_ffff == 0 { if raw >> 31 == 0 { "0.0".into() } else { "-0.0".into() } } else { f32::from_bits(raw).to_string() }
+                                    } else {
+                                        let raw = *bits as u64;
+                                        if raw & 0x7fff_ffff_ffff_ffff == 0 { if raw >> 63 == 0 { "0.0".into() } else { "-0.0".into() } } else { f64::from_bits(raw).to_string() }
+                                    };
+                                    evidence.push(format!("{}({})={value} {provenance}", argument.name, argument.register));
+                                    return value;
+                                }
                             }
                         }
                         argument.register.clone()
@@ -1090,6 +1107,19 @@ fn recover_internal(
         let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
         assert!(call.starts_with("CFRelease(x0);"), "{call}");
         assert!(call.contains("argument bindings: cf=x0"), "{call}");
+    }
+    #[test] fn direct_calls_render_only_proven_fp_argument_constants() {
+        let signature = Signature { language: "C", declaration: "void take_values(float ratio, double scale);".into(), source: "test prototype" };
+        let signatures = BTreeMap::from([(0x2000, ("_take_values".into(), signature))]);
+        let movi_v0_zero = 0x6f00_e400u32.to_le_bytes();
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &movi_v0_zero, 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("take_values(0.0, d1);"), "{call}");
+        assert!(call.contains("constant argument evidence: ratio(s0)=0.0 proven_by=[0x1000]"), "{call}");
+
+        let overwritten = [0x6f00_e400u32, 0x1e204000u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &overwritten, 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("take_values(s0, d1);"), "{call}");
+        assert!(call.contains("no argument constants proven"), "{call}");
     }
     #[test] fn resolved_indirect_calls_use_only_function_signature_evidence() {
         let signature = symbol("_CFRelease").unwrap();
