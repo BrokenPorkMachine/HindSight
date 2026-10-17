@@ -591,6 +591,20 @@ enum Operation {
         right: Register,
         subtract: bool,
     },
+    /// Add/subtract (extended register): `dst = left ± (extend(right) << shift)`.
+    ///
+    /// `extend` is the byte/halfword/word extension applied to the second
+    /// operand (`None` for the full-width `UXTX`/`SXTX` forms); `shift` is the
+    /// `imm3` left shift (0..4). In this class the destination and the first
+    /// source name the stack pointer when their field is 31.
+    AddExtended {
+        dst: Register,
+        left: Register,
+        right: Register,
+        subtract: bool,
+        extend: Option<(bool, u8)>,
+        shift: u8,
+    },
     /// Widening and high-half multiply from the 3-source group:
     /// `SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL` (with their `SMULL`/`UMULL`
     /// zero-addend aliases, which multiply two 32-bit sources into a 64-bit
@@ -851,6 +865,51 @@ fn decode(word: u32, pc: u64) -> Operation {
                 },
                 subtract: word & (1 << 30) != 0,
                 shift: operand_shift(shift, amount),
+            };
+        }
+    }
+    // Add/subtract (extended register): `sf op S 01011 00 1 Rm option
+    // imm3 Rn Rd`, flag-neutral only. The extended operand is
+    // `Extend(Rm, option) << imm3` (imm3 in 0..4); options 0..2 and 4..6 are
+    // the unsigned/signed byte/halfword/word extensions, and 3/7
+    // (`UXTX`/`SXTX`) use the operand unchanged. In this class `Rd` and `Rn`
+    // name SP when their field is 31 while `Rm` names ZR.
+    if word & 0x1f20_0000 == 0x0b20_0000 && word & (1 << 29) == 0 {
+        let wide = word >> 31 != 0;
+        let option = (word >> 13) & 7;
+        let shift = ((word >> 10) & 7) as u8;
+        if shift <= 4 {
+            let extend = match option {
+                0 => Some((false, 8u8)),
+                1 => Some((false, 16)),
+                2 => Some((false, 32)),
+                4 => Some((true, 8)),
+                5 => Some((true, 16)),
+                6 => Some((true, 32)),
+                _ => None,
+            };
+            let rd = word & 31;
+            let rn = (word >> 5) & 31;
+            let rm = (word >> 16) & 31;
+            return Operation::AddExtended {
+                dst: Register {
+                    index: rd,
+                    wide,
+                    stack_pointer: rd == 31,
+                },
+                left: Register {
+                    index: rn,
+                    wide,
+                    stack_pointer: rn == 31,
+                },
+                right: Register {
+                    index: rm,
+                    wide: wide && matches!(option, 3 | 7),
+                    stack_pointer: false,
+                },
+                subtract: word & (1 << 30) != 0,
+                extend,
+                shift,
             };
         }
     }
@@ -2537,6 +2596,53 @@ impl Operation {
                     resolved_suffix(known.as_ref())
                 )
             }
+            Self::AddExtended {
+                dst,
+                left,
+                right,
+                subtract,
+                extend,
+                shift,
+            } => {
+                let shift_opt = if shift == 0 {
+                    None
+                } else {
+                    Some((ShiftKind::Left, shift))
+                };
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let base = match extend {
+                        Some((signed, from)) => extend_value(b.value, signed, from, dst.wide),
+                        None => b.value,
+                    };
+                    let operand = shifted_value(base, shift_opt, dst.wide);
+                    Some(KnownValue {
+                        value: dst.mask(if subtract {
+                            a.value.wrapping_sub(operand)
+                        } else {
+                            a.value.wrapping_add(operand)
+                        }),
+                        origins: combine_origins(&a.origins, &b.origins, pc)?,
+                    })
+                });
+                flow.write(dst, known.clone());
+                let extended = match extend {
+                    Some((signed, from)) => format!(
+                        "{}({}, {from})",
+                        if signed { "sext" } else { "zext" },
+                        right.name()
+                    ),
+                    None => right.name(),
+                };
+                let operand = render_shifted(&extended, shift_opt);
+                format!(
+                    "{} = {} {} {};{}",
+                    dst.name(),
+                    left.name(),
+                    if subtract { "-" } else { "+" },
+                    operand,
+                    resolved_suffix(known.as_ref())
+                )
+            }
             Self::AddCarry {
                 dst,
                 left,
@@ -2943,7 +3049,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v25; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v26; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3730,6 +3836,76 @@ mod tests {
         assert!(lift(0xfa42_0020, 0x1000).contains("opaque instruction"));
         // ccmn x1, x2, #0, eq = 0xba420020
         assert!(lift(0xba42_0020, 0x1000).contains("opaque instruction"));
+    }
+
+    #[test]
+    fn lifts_add_subtract_extended_register_forms() {
+        // Encodings produced by clang for ARM64. The byte/halfword/word
+        // extensions read the narrow (32-bit) source view; only UXTX/SXTX use
+        // the full register.
+        // add x0, x1, w2, uxtb = 0x8b220020
+        assert_eq!(lift(0x8b22_0020, 0x1000), "x0 = x1 + zext(w2, 8);");
+        // add x0, x1, w2, uxth = 0x8b222020
+        assert_eq!(lift(0x8b22_2020, 0x1000), "x0 = x1 + zext(w2, 16);");
+        // add x0, x1, w2, uxtw = 0x8b224020
+        assert_eq!(lift(0x8b22_4020, 0x1000), "x0 = x1 + zext(w2, 32);");
+        // add x0, x1, x2, uxtx = 0x8b226020
+        assert_eq!(lift(0x8b22_6020, 0x1000), "x0 = x1 + x2;");
+        // add x0, x1, w2, sxtb = 0x8b228020
+        assert_eq!(lift(0x8b22_8020, 0x1000), "x0 = x1 + sext(w2, 8);");
+        // add x0, x1, w2, sxth = 0x8b22a020
+        assert_eq!(lift(0x8b22_a020, 0x1000), "x0 = x1 + sext(w2, 16);");
+        // add x0, x1, w2, sxtw = 0x8b22c020
+        assert_eq!(lift(0x8b22_c020, 0x1000), "x0 = x1 + sext(w2, 32);");
+        // add x0, x1, x2, sxtx = 0x8b22e020
+        assert_eq!(lift(0x8b22_e020, 0x1000), "x0 = x1 + x2;");
+        // sub x0, x1, w2, uxtw = 0xcb224020
+        assert_eq!(lift(0xcb22_4020, 0x1000), "x0 = x1 - zext(w2, 32);");
+    }
+
+    #[test]
+    fn lifts_extended_register_imm3_shift_and_widths() {
+        // add x0, x1, w2, uxtb #2 = 0x8b220820
+        assert_eq!(lift(0x8b22_0820, 0x1000), "x0 = x1 + (zext(w2, 8) << 2);");
+        // add x0, x1, w2, uxtb #4 = 0x8b221020
+        assert_eq!(lift(0x8b22_1020, 0x1000), "x0 = x1 + (zext(w2, 8) << 4);");
+        // add w0, w1, w2, uxtb = 0x0b220020 (32-bit destination)
+        assert_eq!(lift(0x0b22_0020, 0x1000), "w0 = w1 + zext(w2, 8);");
+        // sub w3, w4, w5, sxth = 0x4b25a083
+        assert_eq!(lift(0x4b25_a083, 0x1000), "w3 = w4 - sext(w5, 16);");
+    }
+
+    #[test]
+    fn extended_register_names_stack_pointer_for_rd_and_rn() {
+        // `Rd` and `Rn` name SP when their field is 31; `Rm` still names ZR.
+        // add x0, sp, x1 = 0x8b2163e0 (uxtx)
+        assert_eq!(lift(0x8b21_63e0, 0x1000), "x0 = sp + x1;");
+        // add sp, x1, x2 = 0x8b22603f (uxtx)
+        assert_eq!(lift(0x8b22_603f, 0x1000), "sp = x1 + x2;");
+        // add x0, x1, xzr, uxtx = 0x8b3f6020
+        assert_eq!(lift(0x8b3f_6020, 0x1000), "x0 = x1 + xzr;");
+    }
+
+    #[test]
+    fn folds_add_subtract_extended_register_into_constants() {
+        // movz w1, #5 ; movz w2, #3 ; add w0, w1, w2, uxtb #2
+        // -> 5 + (3 << 2) = 0x11
+        let words = [0x5280_00a1u32, 0x5280_0062, 0x0b22_0820];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("w0 = w1 + (zext(w2, 8) << 2); /* constant=0x11"));
+    }
+
+    #[test]
+    fn flag_setting_extended_register_forms_stay_opaque() {
+        // ADDS/SUBS (extended register) set flags (S == 1), like ADDS/SUBS.
+        // adds x0, x1, w2, uxtb = 0x2b220020
+        assert!(lift(0x2b22_0020, 0x1000).contains("opaque instruction"));
+        // subs x0, x1, w2, uxtw = 0x6b224020
+        assert!(lift(0x6b22_4020, 0x1000).contains("opaque instruction"));
+        // The `imm3` shift is bounded to 0..4; imm3 = 5 stays opaque.
+        // add x0, x1, w2, uxtb #5 = 0x8b221420
+        assert!(lift(0x8b22_1420, 0x1000).contains("opaque instruction"));
     }
 
     #[test]

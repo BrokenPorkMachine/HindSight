@@ -23,6 +23,8 @@ one-source bit/byte reversals and leading-bit counts
 (`RBIT`/`REV16`/`REV`/`REV32`/`CLZ`/`CLS`),
 concatenated field extract (`EXTR` with its same-register `ROR` immediate alias),
 flag-neutral add/subtract with carry (`ADC`/`SBC`),
+add/subtract (extended register) (`ADD`/`SUB` with
+`UXTB`/`UXTH`/`UXTW`/`UXTX`/`SXTB`/`SXTH`/`SXTW`/`SXTX` and the `imm3` shift),
 bitfield extracts (`UBFX`/`SBFX`), conditional select
 (`CSEL`/`CSINC`/`CSINV`/`CSNEG` and their `CSET`/`CSETM`/`CINC`/`CINV`/`CNEG`
 aliases), general-register loads and stores (`STR`/`LDR`
@@ -42,7 +44,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v25` banner identifies the statement set that
+`AArch64 register semantics v26` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -106,7 +108,16 @@ carry input is `PSTATE.C`, which the preview does not track, the destination is
 always an unknown barrier: the shape is rendered but no constant is ever folded,
 and the write invalidates any previously tracked value of the destination. The
 flag-setting `ADCS`/`SBCS` forms (`S == 1`), like `ADDS`/`SUBS`, stay opaque, as
-do the conditional compares that share the class. The same `op31` group
+do the conditional compares that share the class. The add/subtract (extended
+register) form applies an extension and then an `imm3` left shift to the second
+operand: `ADD` renders `dst = left + (zext(w2, 8) << 2);` and its signed and
+unshifted counterparts (`zext`/`sext` with the `8`/`16`/`32` source width, the
+`<< 2` omitted when `imm3` is zero), while `SUB` uses `-`. The `UXTX`/`SXTX`
+options use the operand unchanged (no wrapper), the byte/halfword/word options
+read the narrow source view, and the extension result folds into a constant with
+provenance. The destination and the first source name the stack pointer when
+their field is 31, while `Rm` still names `ZR`; the flag-setting `ADDS`/`SUBS`
+forms and the unallocated `imm3` values (5..7) stay opaque. The same `op31` group
 also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
