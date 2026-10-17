@@ -597,7 +597,7 @@ binary_model=(R/'App/BinaryWorkspaceModel.swift').read_text()
 binary_ui=(R/'App/BinaryWorkspace.swift').read_text()
 for token in ['struct VGBinaryReference','struct VGLiftedLine','struct VGInstructionData','enum VGBinaryWorkspaceParser','static func references','static func lifted','static func instructionData']:
     assert token in binary_model, token
-for token in ['struct VGBinaryWorkspace','functionNavigator','centerDesk','semanticPane','referencePane','dataPane','Follow PC']:
+for token in ['struct VGBinaryWorkspace','functionNavigator','centerDesk','semanticPane','referencePane','dataPane','Follow PC','ScrollViewReader','scrollAssembly(to: activeAddress','scrollPseudocode(to: activeAddress','pseudocodeSourceAddress(line)']:
     assert token in binary_ui, token
 assert 'case "Binary Workspace"' in content_ui
 assert 'workspace = "Binary Workspace"' in (R/'App/WorkbenchModel.swift').read_text()

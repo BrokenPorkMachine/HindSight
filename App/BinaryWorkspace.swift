@@ -345,14 +345,19 @@ struct VGBinaryWorkspace: View {
             if functionRows.isEmpty {
                 ContentUnavailableView("No function code", systemImage: "text.alignleft", description: Text("Select a discovered function after analysis."))
             } else {
-                ScrollView([.horizontal, .vertical]) {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(functionRows) { row in
-                            binaryCodeRow(row)
+                ScrollViewReader { proxy in
+                    ScrollView([.horizontal, .vertical]) {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(functionRows) { row in
+                                binaryCodeRow(row)
+                                    .id(assemblyScrollID(row))
+                            }
                         }
+                        .padding(.vertical, 5)
+                        .frame(minWidth: 760, alignment: .leading)
                     }
-                    .padding(.vertical, 5)
-                    .frame(minWidth: 760, alignment: .leading)
+                    .onAppear { scrollAssembly(to: activeAddress, using: proxy) }
+                    .onChange(of: activeAddress) { _, address in scrollAssembly(to: address, using: proxy) }
                 }
             }
         }
@@ -373,15 +378,22 @@ struct VGBinaryWorkspace: View {
                 .padding(.trailing, 8)
             }
             Divider()
-            ScrollView([.horizontal, .vertical]) {
-                if semanticMode == .pseudocode {
-                    pseudocodeContent
-                } else if semanticMode == .lifted {
-                    liftedContent
-                } else if semanticMode == .ir {
-                    irContent
-                } else {
-                    cfgContent
+            ScrollViewReader { proxy in
+                ScrollView([.horizontal, .vertical]) {
+                    if semanticMode == .pseudocode {
+                        pseudocodeContent
+                    } else if semanticMode == .lifted {
+                        liftedContent
+                    } else if semanticMode == .ir {
+                        irContent
+                    } else {
+                        cfgContent
+                    }
+                }
+                .onAppear { scrollPseudocode(to: activeAddress, using: proxy) }
+                .onChange(of: activeAddress) { _, address in scrollPseudocode(to: address, using: proxy) }
+                .onChange(of: semanticMode) { _, mode in
+                    if mode == .pseudocode { scrollPseudocode(to: activeAddress, using: proxy) }
                 }
             }
         }
@@ -403,6 +415,7 @@ struct VGBinaryWorkspace: View {
                                     .background(activeAddress == address ? Color.accentColor.opacity(0.14) : Color.clear)
                                     .contentShape(Rectangle())
                             }
+                            .id("pseudo-\(String(address, radix: 16))")
                             .buttonStyle(.plain)
                             .help(String(format: "Select instruction at 0x%016llx", address))
                         } else {
@@ -764,6 +777,23 @@ struct VGBinaryWorkspace: View {
         selectedInstruction = address
         if let function = functions.first(where: { $0.contains(address) }) { selectedFunctionStart = function.start }
         onSelectAddress(String(format: "0x%016llx", address))
+    }
+
+    private func scrollAssembly(to address: UInt64?, using proxy: ScrollViewProxy) {
+        guard let address else { return }
+        let text = String(format: "0x%016llx", address)
+        withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo("assembly-\(text)", anchor: .center) }
+    }
+
+    private func assemblyScrollID(_ row: VGDisassemblyRow) -> String {
+        if row.kind == .symbol { return "assembly-symbol-\(row.id)" }
+        guard let address = VGBinaryWorkspaceParser.address(row.address) else { return "assembly-\(row.address)" }
+        return "assembly-\(String(format: "0x%016llx", address))"
+    }
+
+    private func scrollPseudocode(to address: UInt64?, using proxy: ScrollViewProxy) {
+        guard semanticMode == .pseudocode, let address else { return }
+        withAnimation(.easeInOut(duration: 0.16)) { proxy.scrollTo("pseudo-\(String(address, radix: 16))", anchor: .center) }
     }
 
     private func synchronizeExternalSelection() {
