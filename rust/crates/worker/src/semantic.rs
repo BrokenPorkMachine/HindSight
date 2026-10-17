@@ -330,7 +330,7 @@ fn float_register_name(register: IrFloatRegister) -> String {
     format!("{}{index}", match register.precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }, index = register.index)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide }
+enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide, Max, Min, MaxNum, MinNum }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrConversionRegister { Float { index: u8, precision: IrFloatPrecision }, Integer { index: u8, wide: bool } }
 
@@ -406,6 +406,7 @@ enum IrOperation {
     ScalarFloatImmediate { destination: u8, precision: IrFloatPrecision, bits: u64, immediate: u8 },
     ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
     ScalarFloatBinary { destination: u8, left: u8, right: u8, precision: IrFloatPrecision, operator: IrFloatBinaryOperator },
+    ScalarFloatUnary { destination: u8, source: u8, precision: IrFloatPrecision, operator: IrFloatUnaryOperator },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -442,6 +443,7 @@ impl IrOperation {
             | Self::ScalarFloatImmediate { .. }
             | Self::ScalarFloatMove { .. }
             | Self::ScalarFloatBinary { .. }
+            | Self::ScalarFloatUnary { .. }
             | Self::FloatLoad { .. } | Self::FloatStore { .. }
         );
         let consumed_flags = if consumes_flags {
@@ -1002,8 +1004,23 @@ impl IrOperation {
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
                 flow.write_v(destination as u32, None);
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let symbol = match operator { IrFloatBinaryOperator::Add => "+", IrFloatBinaryOperator::Subtract => "-", IrFloatBinaryOperator::Multiply => "*", IrFloatBinaryOperator::Divide => "/" };
-                Some(format!("{} = {} {symbol} {};", register(destination), register(left), register(right)))
+                let expression = match operator {
+                    IrFloatBinaryOperator::Add => format!("{} + {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Subtract => format!("{} - {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Multiply => format!("{} * {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Divide => format!("{} / {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Max => format!("fmax({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::Min => format!("fmin({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::MaxNum => format!("fmaxnm({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::MinNum => format!("fminnm({}, {})", register(left), register(right)),
+                };
+                Some(format!("{} = {expression};", register(destination)))
+            }
+            Self::ScalarFloatUnary { destination, source, precision, operator } => {
+                flow.write_v(destination as u32, None);
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let function = match operator { IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint" };
+                Some(format!("{} = {function}({});", register(destination), register(source)))
             }
             Self::ScalarFloatCompare { left, right, precision } => {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
@@ -2429,7 +2446,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::ScalarFloatImmediate { destination, precision, bits, immediate } => IrOperation::ScalarFloatImmediate { destination, precision, bits, immediate },
         Operation::ScalarFloatBinary { destination, left, right, precision, operator } => IrOperation::ScalarFloatBinary { destination, left, right, precision, operator },
         Operation::ScalarFloatMove { destination, source, precision } => IrOperation::ScalarFloatMove { destination, source, precision },
-        Operation::ScalarFloatUnary { .. } => IrOperation::TargetSpecific,
+        Operation::ScalarFloatUnary { destination, source, precision, operator } => IrOperation::ScalarFloatUnary { destination, source, precision, operator },
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
         Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
@@ -4346,9 +4363,12 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
         return Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits: None };
     }
-    // Scalar single/double two-source arithmetic. Keep the whitelist narrow:
-    // other FP data-processing encodings remain explicit target-specific IR.
-    if matches!(word & 0xff20_fc00, 0x1e20_0800 | 0x1e20_1800 | 0x1e20_2800 | 0x1e20_3800) {
+    // Scalar single/double two-source arithmetic and minimum/maximum. Keep the
+    // whitelist narrow: other FP data-processing encodings (FCSel, the fused
+    // multiply-add group, and the estimate forms) remain explicit
+    // target-specific IR. FMAX/FMIN propagate NaN and raise the FP exception
+    // flags; FMAXNM/FMINNM implement the IEEE 754-2008 minNum/maxNum selection.
+    if matches!(word & 0xff20_fc00, 0x1e20_0800 | 0x1e20_1800 | 0x1e20_2800 | 0x1e20_3800 | 0x1e20_4800 | 0x1e20_5800 | 0x1e20_6800 | 0x1e20_7800) {
         let precision = match (word >> 22) & 3 {
             0 => IrFloatPrecision::Single,
             1 => IrFloatPrecision::Double,
@@ -4359,6 +4379,10 @@ fn decode(word: u32, pc: u64) -> Operation {
             0x1e20_1800 => IrFloatBinaryOperator::Divide,
             0x1e20_2800 => IrFloatBinaryOperator::Add,
             0x1e20_3800 => IrFloatBinaryOperator::Subtract,
+            0x1e20_4800 => IrFloatBinaryOperator::Max,
+            0x1e20_5800 => IrFloatBinaryOperator::Min,
+            0x1e20_6800 => IrFloatBinaryOperator::MaxNum,
+            0x1e20_7800 => IrFloatBinaryOperator::MinNum,
             _ => return Operation::Opaque,
         };
         return Operation::ScalarFloatBinary {
@@ -5923,8 +5947,17 @@ impl Operation {
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
                 flow.write_v(destination as u32, None);
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let symbol = match operator { IrFloatBinaryOperator::Add => "+", IrFloatBinaryOperator::Subtract => "-", IrFloatBinaryOperator::Multiply => "*", IrFloatBinaryOperator::Divide => "/" };
-                format!("{} = {} {symbol} {};", register(destination), register(left), register(right))
+                let expression = match operator {
+                    IrFloatBinaryOperator::Add => format!("{} + {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Subtract => format!("{} - {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Multiply => format!("{} * {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Divide => format!("{} / {}", register(left), register(right)),
+                    IrFloatBinaryOperator::Max => format!("fmax({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::Min => format!("fmin({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::MaxNum => format!("fmaxnm({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::MinNum => format!("fminnm({}, {})", register(left), register(right)),
+                };
+                format!("{} = {expression};", register(destination))
             }
             Self::ScalarFloatCompare { left, right, precision } => {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
@@ -6441,6 +6474,28 @@ mod tests {
             (0x1e23_3820, "s0 = s1 - s3;"),
             (0x1e64_0820, "d0 = d1 * d4;"),
             (0x1e65_1820, "d0 = d1 / d5;"),
+            (0x1e22_4820, "s0 = fmax(s1, s2);"),
+            (0x1e62_5820, "d0 = fmin(d1, d2);"),
+            (0x1e23_6820, "s0 = fmaxnm(s1, s3);"),
+            (0x1e64_7820, "d0 = fminnm(d1, d4);"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
+    }
+
+    #[test]
+    fn scalar_float_unary_operations_lift_to_shared_ir() {
+        let cases = [
+            (0x1e20_c020, "s0 = fabs(s1);"),
+            (0x1e61_4020, "d0 = fneg(d1);"),
+            (0x1e61_c020, "d0 = fsqrt(d1);"),
+            (0x1e25_c020, "s0 = frint(s1);"),
+            (0x1e66_4020, "d0 = frint(d1);"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
