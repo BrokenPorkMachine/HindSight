@@ -169,6 +169,87 @@ fn sysreg_name(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> String {
     }
 }
 
+fn lse_mnemonic(base: LseBase, order: LseOrder, size: u8) -> &'static str {
+    let sz = match size {
+        0 => "b",
+        1 => "h",
+        _ => "",
+    };
+    match base {
+        LseBase::Ldapr => match sz {
+            "b" => "ldaprb",
+            "h" => "ldaprh",
+            _ => "ldapr",
+        },
+        LseBase::Ldadd => match order {
+            LseOrder::Relaxed => match sz {
+                "b" => "ldaddb",
+                "h" => "ldaddh",
+                _ => "ldadd",
+            },
+            LseOrder::Acquire => match sz {
+                "b" => "ldaddab",
+                "h" => "ldaddah",
+                _ => "ldadda",
+            },
+            LseOrder::Release => match sz {
+                "b" => "ldaddlb",
+                "h" => "ldaddlh",
+                _ => "ldaddl",
+            },
+            LseOrder::AcqRel => match sz {
+                "b" => "ldaddalb",
+                "h" => "ldaddalh",
+                _ => "ldaddal",
+            },
+        },
+        LseBase::Swp => match order {
+            LseOrder::Relaxed => match sz {
+                "b" => "swpb",
+                "h" => "swph",
+                _ => "swp",
+            },
+            LseOrder::Acquire => match sz {
+                "b" => "swpab",
+                "h" => "swpah",
+                _ => "swpa",
+            },
+            LseOrder::Release => match sz {
+                "b" => "swplb",
+                "h" => "swplh",
+                _ => "swpl",
+            },
+            LseOrder::AcqRel => match sz {
+                "b" => "swpalb",
+                "h" => "swpalh",
+                _ => "swpal",
+            },
+        },
+        LseBase::Cas => match order {
+            LseOrder::Relaxed => match sz {
+                "b" => "casb",
+                "h" => "cash",
+                _ => "cas",
+            },
+            LseOrder::Acquire => match sz {
+                "b" => "casab",
+                "h" => "casah",
+                _ => "casa",
+            },
+            LseOrder::Release => match sz {
+                "b" => "caslb",
+                "h" => "caslh",
+                _ => "casl",
+            },
+            LseOrder::AcqRel => match sz {
+                "b" => "casalb",
+                "h" => "casalh",
+                _ => "casal",
+            },
+        },
+    }
+}
+
 fn condition_name(code: u8) -> &'static str {
     const NAMES: [&str; 16] = [
         "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
@@ -568,6 +649,23 @@ enum CompareOperand {
     Immediate(u64),
 }
 
+/// Base operation of an LSE atomic memory operation.
+#[derive(Clone, Copy)]
+enum LseBase {
+    Ldapr,
+    Ldadd,
+    Swp,
+    Cas,
+}
+/// Ordering suffix of an LSE atomic memory operation.
+#[derive(Clone, Copy)]
+enum LseOrder {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+}
+
 #[derive(Clone, Copy)]
 enum Operation {
     Nop,
@@ -864,6 +962,29 @@ enum Operation {
         crm: u8,
         op2: u8,
         src: Register,
+    },
+    /// An LSE atomic load-type operation (`LDAPR`/`LDADD`/`SWP`): the
+    /// destination becomes an unknown value (a barrier) because the preview does
+    /// not track memory, but the other tracked registers are preserved. The
+    /// mnemonic carries the size and ordering suffixes.
+    LseLoad {
+        dst: Register,
+        base: Register,
+        src: Option<Register>,
+        base_op: LseBase,
+        order: LseOrder,
+        size: u8,
+    },
+    /// An LSE compare-and-swap (`CAS`): no general-purpose register is written
+    /// (only PSTATE flags, which are untracked) and the memory write is
+    /// conditional, so value flow is preserved. Rendered as a marker naming the
+    /// expected, desired and base operands.
+    LseCas {
+        expected: Register,
+        desired: Register,
+        base: Register,
+        order: LseOrder,
+        size: u8,
     },
     /// A flag-only comparison alias whose destination is the zero register:
     /// `CMP`/`CMN` (`SUBS`/`ADDS` with `Rd == 31`) and `TST` (`ANDS` with
@@ -2352,6 +2473,93 @@ fn decode(word: u32, pc: u64) -> Operation {
             imm: (word >> 5) & 0xffff,
         };
     }
+    // LSE atomic memory operations: `size(2) 111...0 0 A R ...`. Identified by
+    // bits 27..24 == 1000 (0x0800_0000 in the top byte's low nibble). The
+    // operation and ordering come from bits 23..21, 15..12 and 11..10; the
+    // size comes from bits 31..30 (0=byte,1=half,2=word,3=doubleword). `Rs`
+    // is bits 20..16, `Rt` is bits 4..0 and `Rn` (base) is bits 9..5. CAS
+    // writes no general-purpose register; the load-type ops (LDAPR/LDADD/SWP)
+    // make their destination an unknown barrier. Unrecognised op/size combos
+    // stay opaque.
+    if (word & 0x0f20_0000) == 0x0820_0000 {
+        let size = ((word >> 30) & 3) as u8;
+        let bits23_21 = ((word >> 21) & 7) as u8;
+        let bits15_12 = ((word >> 12) & 0xf) as u8;
+        let bits11_10 = ((word >> 10) & 3) as u8;
+        let wide = size == 3;
+        let base_idx = (word >> 5) & 0x1f;
+        let rs_idx = (word >> 16) & 0x1f;
+        let rt_idx = word & 0x1f;
+        // Resolve (base op, ordering) from the op key.
+        let op_order: Option<(LseBase, LseOrder)> = match (bits23_21, bits15_12, bits11_10) {
+            (1, 0, 0) => Some((LseBase::Ldadd, LseOrder::Relaxed)),
+            (5, 0, 0) => Some((LseBase::Ldadd, LseOrder::Acquire)),
+            (3, 0, 0) => Some((LseBase::Ldadd, LseOrder::Release)),
+            (7, 0, 0) => Some((LseBase::Ldadd, LseOrder::AcqRel)),
+            (5, 12, 0) => Some((LseBase::Ldapr, LseOrder::Acquire)),
+            (1, 8, 0) => Some((LseBase::Swp, LseOrder::Relaxed)),
+            (5, 8, 0) => Some((LseBase::Swp, LseOrder::Acquire)),
+            (3, 8, 0) => Some((LseBase::Swp, LseOrder::Release)),
+            (7, 8, 0) => Some((LseBase::Swp, LseOrder::AcqRel)),
+            (1, 7, 3) => None, // CASP (pair) stays opaque
+            (5, 7, 3) => Some((LseBase::Cas, LseOrder::Relaxed)),
+            (7, 7, 3) => Some((LseBase::Cas, LseOrder::Acquire)),
+            (5, 15, 3) => Some((LseBase::Cas, LseOrder::Release)),
+            (7, 15, 3) => Some((LseBase::Cas, LseOrder::AcqRel)),
+            _ => None,
+        };
+        if let Some((base, order)) = op_order {
+            // CAS with bits15_12 == 15 and bits23_21 odd? already handled.
+            // Distinguish cas (no GP write) from load-type.
+            let is_cas = matches!(base, LseBase::Cas);
+            if is_cas {
+                return Operation::LseCas {
+                    expected: Register {
+                        index: rs_idx,
+                        wide,
+                        stack_pointer: false,
+                    },
+                    desired: Register {
+                        index: rt_idx,
+                        wide,
+                        stack_pointer: false,
+                    },
+                    base: Register {
+                        index: base_idx,
+                        wide: true,
+                        stack_pointer: false,
+                    },
+                    order,
+                    size,
+                };
+            }
+            let src = if matches!(base, LseBase::Ldapr) {
+                None
+            } else {
+                Some(Register {
+                    index: rs_idx,
+                    wide,
+                    stack_pointer: false,
+                })
+            };
+            return Operation::LseLoad {
+                dst: Register {
+                    index: rt_idx,
+                    wide,
+                    stack_pointer: false,
+                },
+                base: Register {
+                    index: base_idx,
+                    wide: true,
+                    stack_pointer: false,
+                },
+                src,
+                base_op: base,
+                order,
+                size,
+            };
+        }
+    }
     Operation::Opaque
 }
 
@@ -3595,6 +3803,45 @@ impl Operation {
                 // does not model liveness, so flow is preserved.
                 format!("/* msr {}, {} */", sysreg, src.name())
             }
+            Self::LseLoad {
+                dst,
+                base,
+                src,
+                base_op,
+                order,
+                size,
+            } => {
+                let mnemonic = lse_mnemonic(base_op, order, size);
+                flow.write(dst, None);
+                match src {
+                    Some(src) => format!(
+                        "{} = {}({}, {});",
+                        dst.name(),
+                        mnemonic,
+                        base.name(),
+                        src.name()
+                    ),
+                    None => format!("{} = {}({});", dst.name(), mnemonic, base.name()),
+                }
+            }
+            Self::LseCas {
+                expected,
+                desired,
+                base,
+                order,
+                size,
+            } => {
+                let mnemonic = lse_mnemonic(LseBase::Cas, order, size);
+                // No general-purpose register is written; memory write is
+                // conditional. Value flow is preserved.
+                format!(
+                    "/* {} {}, {}, {} */",
+                    mnemonic,
+                    expected.name(),
+                    desired.name(),
+                    base.name()
+                )
+            }
             Self::Exception { mnemonic, imm } => {
                 flow.clear();
                 format!("/* {mnemonic}({imm}): exception; value flow stops here */")
@@ -3675,7 +3922,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v31; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v32; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -5381,6 +5628,49 @@ mod tests {
         assert_eq!(lift(0xfa41_0000, 0x1000), "/* ccmp x0, x1, #0x0, eq */");
         assert_eq!(lift(0xba41_0000, 0x1000), "/* ccmn x0, x1, #0x0, eq */");
         assert_eq!(lift(0x7a51_2804, 0x1000), "/* ccmp w0, #0x11, #0x4, hs */");
+    }
+
+    #[test]
+    fn lifts_lse_atomics() {
+        // clang-verified encodings from the real iOS runtime libs.
+        assert_eq!(lift(0xf8bf_c108, 0x1000), "x8 = ldapr(x8);");
+        assert_eq!(lift(0x38bf_c108, 0x1000), "w8 = ldaprb(x8);");
+        assert_eq!(lift(0xf829_0108, 0x1000), "x8 = ldadd(x8, x9);");
+        assert_eq!(lift(0xb8e9_0108, 0x1000), "w8 = ldaddal(x8, w9);");
+        assert_eq!(lift(0x38bc_8108, 0x1000), "w8 = swpab(x8, w28);");
+        assert_eq!(lift(0xc8e8_fd38, 0x1000), "/* casal x8, x24, x9 */");
+        assert_eq!(lift(0xf8ff_8108, 0x1000), "x8 = swpal(x8, xzr);");
+        assert_eq!(lift(0xb828_82c8, 0x1000), "w8 = swp(x22, w8);");
+        assert_eq!(lift(0x88aa_7ec9, 0x1000), "/* cas w10, w9, x22 */");
+        assert_eq!(lift(0xf8a9_0108, 0x1000), "x8 = ldadda(x8, x9);");
+        assert_eq!(lift(0xb869_0108, 0x1000), "w8 = ldaddl(x8, w9);");
+        assert_eq!(lift(0xf87f_8108, 0x1000), "x8 = swpl(x8, xzr);");
+        assert_eq!(lift(0xc8aa_fd21, 0x1000), "/* casl x10, x1, x9 */");
+        assert_eq!(lift(0x08a8_7d2a, 0x1000), "/* casb w8, w10, x9 */");
+    }
+
+    #[test]
+    fn lse_load_preserves_other_registers() {
+        // mov x1, #7 ; ldapr x8, [x8] ; add x2, x1, #1 -- the LSE load is a
+        // barrier on x8 only, so x1 survives and the constant folds through.
+        let words = [0xd280_00e1u32, 0xf8bf_c108, 0x9100_0422];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("x8 = ldapr(x8);"));
+        assert!(report.contains("x2 = x1 + 0x1;"));
+        assert!(report.contains("constant=0x8"));
+    }
+
+    #[test]
+    fn lse_cas_preserves_value_flow() {
+        // mov x0, #5 ; casal x8, x24, [x9] ; add x3, x0, #1 -- CAS has no
+        // tracked register effect, so x0 survives and the constant folds.
+        let words = [0xd280_00a0u32, 0xc8e8_fd38, 0x9100_0403];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("/* casal x8, x24, x9 */"));
+        assert!(report.contains("x3 = x0 + 0x1;"));
+        assert!(report.contains("constant=0x6"));
     }
 
     #[test]

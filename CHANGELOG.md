@@ -46,6 +46,10 @@
 # 0.5.11 — ARM64 conditional comparisons in the preview
 
 - Extend the ARM64 semantic preview to the conditional comparisons (`CCMP`/`CCMN`): the comparison runs only when `cond` holds, otherwise PSTATE is set to `nzcv`; the result lives only in PSTATE (untracked) and no general-purpose register is written, so value flow is preserved, rendering `/* ccmp x4, x5, #0x0, eq */` (register or immediate second operand, 32/64-bit, with the `nzcv` value and condition named). The op0=2 system instructions and unallocated forms stay opaque. No report field or engine-identity change (banner advances to v31).
+
+# 0.5.11 — ARM64 LSE atomics in the preview
+
+- Extend the ARM64 semantic preview to the LSE atomic memory operations (`LDAPR`/`LDADD`/`SWP`/`CAS`): `LDAPR`/`LDADD`/`SWP` render `dst = ldapr(base);` / `dst = ldadd(base, src);` / `dst = swp(base, src);` with the destination as an unknown barrier, and `CAS` renders `/* casal expected, desired, base */` preserving value flow. The size (byte/half/word/doubleword) and ordering (acquire/release/acquire-release) suffixes are carried in the mnemonic, the base address register is always 64-bit, and unallocated forms stay opaque. Identified by bits 27-24 == 1000 and bit 21 == 1 (0 false positives / 0 false negatives over 6.5M real arm64 instructions). No report field or engine-identity change (banner advances to v32).
 - Complete the 0.5.11 product/build identity across the app, Coordinator, Rust bridge/worker, VectorEmu server, packaging scripts, tests, and docs.
 
 # 0.5.9 — Apple Firmware Decoding and Kernel Name Guesses
