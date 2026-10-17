@@ -321,6 +321,8 @@ enum IrExtension { Zero(u8), Sign(u8) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrAtomicOrdering { Relaxed, Acquire, Release }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatPrecision { Single, Double }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct IrFloatRegister { index: u8, precision: IrFloatPrecision }
@@ -1709,8 +1711,8 @@ enum Writeback {
     Pre,
     /// Post-index `[Rn], #imm`: address is `base`, base is updated to `base + offset`.
     Post,
-    /// Unprivileged `LDTR`/`STTR`: not modeled.
-    Unprivileged,
+    /// Reserved addressing-mode encoding; it has no shared-IR representation.
+    Reserved,
 }
 
 #[derive(Clone, Copy)]
@@ -2049,6 +2051,29 @@ enum Operation {
         exclusive: bool,
         acquire: bool,
     },
+    /// An exclusive load of a register pair (`LDXP`/`LDAXP`): two registers
+    /// are loaded from consecutive addresses. Both destinations become unknown
+    /// barriers because the preview does not track memory.
+    LoadAtomicPair {
+        first: Register,
+        second: Register,
+        base: Register,
+        size: u32,
+        exclusive: bool,
+        acquire: bool,
+    },
+    /// An exclusive store of a register pair (`STXP`/`STLXP`): two registers
+    /// are stored to consecutive addresses. The status register (when present)
+    /// becomes an unknown barrier; the source registers are consumed.
+    StoreAtomicPair {
+        base: Register,
+        status: Option<Register>,
+        first: Register,
+        second: Register,
+        size: u32,
+        exclusive: bool,
+        acquire: bool,
+    },
     /// A modeled system instruction with no tracked register effect: a memory or
     /// instruction barrier, or a HINT (`YIELD`/`WFE`/`WFI`/`SEV`/`SEVL`/`ESB`/
     /// `CSDB`). Rendered as a marker comment so the analyst can see it without
@@ -2115,6 +2140,20 @@ enum Operation {
         order: LseOrder,
         size: u8,
     },
+    /// A pair compare-and-swap (`CASP`/`CASPA`/`CASPAL`/`CASPL`): two
+    /// registers are compared and conditionally swapped as a pair. No
+    /// general-purpose register is written on the success path; value flow is
+    /// preserved. Rendered as a marker naming the expected, desired and base
+    /// operands.
+    LseCasPair {
+        expected1: Register,
+        expected2: Register,
+        desired1: Register,
+        desired2: Register,
+        base: Register,
+        order: LseOrder,
+        size: u8,
+    },
     /// A SIMD move-immediate (`MOVI.2D`) that defines a V register with a
     /// 128-bit constant (the 8-bit immediate replicated to both 64-bit lanes).
     /// V registers are tracked separately from the general-purpose registers;
@@ -2149,6 +2188,7 @@ enum Operation {
         operator: IrFloatBinaryOperator,
     },
     ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
+    ScalarFloatUnary { destination: u8, source: u8, precision: IrFloatPrecision, operator: IrFloatUnaryOperator },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -2353,7 +2393,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
                 Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
                 Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-                Writeback::Unprivileged => return IrOperation::TargetSpecific,
+                Writeback::Reserved => return IrOperation::TargetSpecific,
             };
             if update.is_some() && [dst1, dst2].iter().any(|dst| dst.index == base.index && dst.stack_pointer == base.stack_pointer) {
                 IrOperation::TargetSpecific
@@ -2366,7 +2406,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
                 Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
                 Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-                Writeback::Unprivileged => return IrOperation::TargetSpecific,
+                Writeback::Reserved => return IrOperation::TargetSpecific,
             };
             if update.is_some() && [src1, src2].iter().any(|src| src.index == base.index && src.stack_pointer == base.stack_pointer) {
                 IrOperation::TargetSpecific
@@ -2383,9 +2423,13 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
             bytes: 1u8.checked_shl(size).unwrap_or(0),
             ordering: if exclusive { if acquire { IrAtomicOrdering::Release } else { IrAtomicOrdering::Relaxed } } else { IrAtomicOrdering::Release }, exclusive,
         },
+        Operation::LoadAtomicPair { .. } => IrOperation::TargetSpecific,
+        Operation::StoreAtomicPair { .. } => IrOperation::TargetSpecific,
+        Operation::LseCasPair { .. } => IrOperation::TargetSpecific,
         Operation::ScalarFloatImmediate { destination, precision, bits, immediate } => IrOperation::ScalarFloatImmediate { destination, precision, bits, immediate },
         Operation::ScalarFloatBinary { destination, left, right, precision, operator } => IrOperation::ScalarFloatBinary { destination, left, right, precision, operator },
         Operation::ScalarFloatMove { destination, source, precision } => IrOperation::ScalarFloatMove { destination, source, precision },
+        Operation::ScalarFloatUnary { .. } => IrOperation::TargetSpecific,
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
         Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
@@ -3093,6 +3137,53 @@ fn decode(word: u32, pc: u64) -> Operation {
             acquire,
         };
     }
+    // Exclusive load/store of a register pair (`LDXP`/`STXP`/`LDAXP`/
+    // `STLXP`): distinguished from the single-register form by Rt2 (bits 14:10)
+    // not being all ones. Both destinations become unknown barriers.
+    if word & 0x3fa00000 == 0x08000000 && ((word >> 10) & 31) != 31 {
+        let size = (word >> 30) & 3;
+        let wide = size == 3;
+        let load = word & 0x0040_0000 != 0;
+        let acquire = word & 0x0000_8000 != 0;
+        let base = Register {
+            index: (word >> 5) & 31,
+            wide: true,
+            stack_pointer: false,
+        };
+        let first = Register {
+            index: word & 31,
+            wide,
+            stack_pointer: false,
+        };
+        let second = Register {
+            index: (word >> 10) & 31,
+            wide,
+            stack_pointer: false,
+        };
+        if load {
+            return Operation::LoadAtomicPair {
+                first,
+                second,
+                base,
+                size,
+                exclusive: true,
+                acquire,
+            };
+        }
+        return Operation::StoreAtomicPair {
+            base,
+            status: Some(Register {
+                index: (word >> 16) & 31,
+                wide: false,
+                stack_pointer: false,
+            }),
+            first,
+            second,
+            size,
+            exclusive: true,
+            acquire,
+        };
+    }
     // Scalar single/double FP load/store with unsigned immediate offset (V=1).
     // The smaller vector-element forms remain on the SIMD marker path.
     if word & 0x3f00_0000 == 0x3d00_0000 {
@@ -3131,20 +3222,25 @@ fn decode(word: u32, pc: u64) -> Operation {
             };
         }
     }
-    // Scalar FP unscaled, pre-indexed, and post-indexed forms. Unprivileged
-    // mode and vector element widths remain on the conservative fallback path.
+    // Scalar FP unscaled, pre-indexed, post-indexed, and unprivileged forms.
+    // The unprivileged `LDTR`/`STTR` form (mode 2) uses the same address
+    // computation as the unscaled form, since the address expression
+    // `[Rn, #imm9]` is identical;
+    // only the translation regime differs and it does not affect the shared IR.
+    // Vector element widths remain on the
+    // conservative fallback path.
     if word & 0x3f20_0000 == 0x3c00_0000 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
         let mode = (word >> 10) & 3;
-        if (size == 2 || size == 3) && (opc == 0 || opc == 1) && mode != 2 {
+        if (size == 2 || size == 3) && (opc == 0 || opc == 1) && (mode == 0 || mode == 1 || mode == 2 || mode == 3) {
             let precision = if size == 2 { IrFloatPrecision::Single } else { IrFloatPrecision::Double };
             let register = IrFloatRegister { index: (word & 31) as u8, precision };
             let base_index = (word >> 5) & 31;
             let base = Register { index: base_index, wide: true, stack_pointer: base_index == 31 };
             let immediate = (word >> 12) & 0x1ff;
             let offset = (((immediate << 23) as i32) >> 23) as i64;
-            let writeback = match mode { 0 => Writeback::None, 1 => Writeback::Post, 3 => Writeback::Pre, _ => unreachable!() };
+            let writeback = match mode { 0 => Writeback::None, 1 => Writeback::Post, 2 => Writeback::None, 3 => Writeback::Pre, _ => unreachable!() };
             let address = AddressForm::ImmediateSigned(offset, writeback);
             return if opc == 0 {
                 Operation::FloatStore { source: register, base, address, size }
@@ -3312,8 +3408,9 @@ fn decode(word: u32, pc: u64) -> Operation {
     // family as the unsigned-immediate form, but with a signed 9-bit unscaled
     // offset. `mode` selects the addressing mode: `00` unscaled (`LDUR`/`STUR`),
     // `01` post-index (`[Rn], #imm`), `11` pre-index (`[Rn, #imm]!`); `10` is the
-    // unprivileged `LDTR`/`STTR` form, which stays opaque. Prefetch and the
-    // unallocated `opc 3` forms are opaque as in the unsigned-immediate class.
+    // unprivileged `LDTR`/`STTR` form. Its translation regime has no effect on
+    // the shared IR address expression. Prefetch and the unallocated `opc 3`
+    // forms are opaque as in the unsigned-immediate class.
     if word & 0x3f20_0000 == 0x3800_0000 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
@@ -3325,60 +3422,59 @@ fn decode(word: u32, pc: u64) -> Operation {
         let writeback = match mode {
             0 => Writeback::None,
             1 => Writeback::Post,
+            2 => Writeback::None,
             3 => Writeback::Pre,
-            _ => Writeback::Unprivileged,
+            _ => unreachable!(),
         };
-        if !matches!(writeback, Writeback::Unprivileged) {
-            let base = Register {
-                index: rn,
-                wide: true,
-                stack_pointer: rn == 31,
-            };
-            let rt = word & 31;
-            let data = |wide: bool| Register {
-                index: rt,
-                wide,
-                stack_pointer: false,
-            };
-            let address = AddressForm::ImmediateSigned(offset, writeback);
-            match (size, opc) {
-                (_, 0) => {
-                    return Operation::Store {
-                        base,
-                        address,
-                        src: data(size == 3),
-                        size,
-                    };
-                }
-                (_, 1) => {
-                    return Operation::Load {
-                        dst: data(size == 3),
-                        base,
-                        address,
-                        size,
-                        signed: false,
-                    };
-                }
-                (0..=2, 2) => {
-                    return Operation::Load {
-                        dst: data(true),
-                        base,
-                        address,
-                        size,
-                        signed: true,
-                    };
-                }
-                (0..=1, 3) => {
-                    return Operation::Load {
-                        dst: data(false),
-                        base,
-                        address,
-                        size,
-                        signed: true,
-                    };
-                }
-                _ => {}
+        let base = Register {
+            index: rn,
+            wide: true,
+            stack_pointer: rn == 31,
+        };
+        let rt = word & 31;
+        let data = |wide: bool| Register {
+            index: rt,
+            wide,
+            stack_pointer: false,
+        };
+        let address = AddressForm::ImmediateSigned(offset, writeback);
+        match (size, opc) {
+            (_, 0) => {
+                return Operation::Store {
+                    base,
+                    address,
+                    src: data(size == 3),
+                    size,
+                };
             }
+            (_, 1) => {
+                return Operation::Load {
+                    dst: data(size == 3),
+                    base,
+                    address,
+                    size,
+                    signed: false,
+                };
+            }
+            (0..=2, 2) => {
+                return Operation::Load {
+                    dst: data(true),
+                    base,
+                    address,
+                    size,
+                    signed: true,
+                };
+            }
+            (0..=1, 3) => {
+                return Operation::Load {
+                    dst: data(false),
+                    base,
+                    address,
+                    size,
+                    signed: true,
+                };
+            }
+            _ => {}
         }
     }
     // Load/store register pair (LDP/STP), V=0:
@@ -3400,9 +3496,9 @@ fn decode(word: u32, pc: u64) -> Operation {
             0 => Writeback::None,
             1 => Writeback::Post,
             3 => Writeback::Pre,
-            _ => Writeback::Unprivileged, // 2 is invalid/reserved
+            _ => Writeback::Reserved, // 2 is invalid/reserved
         };
-        if !matches!(writeback, Writeback::Unprivileged) {
+        if !matches!(writeback, Writeback::Reserved) {
             let base = Register {
                 index: rn,
                 wide: true,
@@ -3734,6 +3830,30 @@ fn decode(word: u32, pc: u64) -> Operation {
             else_op,
         };
     }
+    // Scalar FP load register (literal, PC-relative), V=1:
+    // `opc:2 011 V:1 00 imm19:19 Rt:5`. `opc` 0 and 1 are scalar single and
+    // double loads; the vector-Q form remains target-specific.
+    if word & 0x3f00_0000 == 0x1c00_0000 {
+        let opc = (word >> 30) & 3;
+        if opc == 0 || opc == 1 {
+            let imm19 = (word >> 5) & 0x7ffff;
+            let offset = (((imm19 << 13) as i32) >> 13) as i64 * 4;
+            let precision = if opc == 0 {
+                IrFloatPrecision::Single
+            } else {
+                IrFloatPrecision::Double
+            };
+            return Operation::FloatLoad {
+                destination: IrFloatRegister {
+                    index: (word & 31) as u8,
+                    precision,
+                },
+                base: Register::pc(),
+                address: AddressForm::Literal(offset),
+                size: if opc == 0 { 2 } else { 3 },
+            };
+        }
+    }
     // Load register (literal, PC-relative), V=0:
     // `opc:2 011 V:1 00 imm19:19 Rt:5`, i.e. bits 29-24 == 011000 with V=0.
     // The address is `PC + (sign_extend(imm19) << 2)`.
@@ -3947,6 +4067,27 @@ fn decode(word: u32, pc: u64) -> Operation {
         let base_idx = (word >> 5) & 0x1f;
         let rs_idx = (word >> 16) & 0x1f;
         let rt_idx = word & 0x1f;
+        // Pair compare-and-swap (`CASP`/`CASPA`/`CASPAL`/`CASPL`): the
+        // expected and desired operands are consecutive register pairs. Model
+        // as a marker naming all four operands; value flow is preserved.
+        if bits11_10 == 3 && (bits15_12 == 7 || bits15_12 == 15) && (bits23_21 == 1 || bits23_21 == 3) {
+            let order = match (bits23_21, bits15_12) {
+                (1, 7) => LseOrder::Relaxed,
+                (3, 7) => LseOrder::Acquire,
+                (1, 15) => LseOrder::Release,
+                (3, 15) => LseOrder::AcqRel,
+                _ => LseOrder::Relaxed,
+            };
+            return Operation::LseCasPair {
+                expected1: Register { index: rs_idx, wide: true, stack_pointer: false },
+                expected2: Register { index: rs_idx.wrapping_add(1) & 31, wide: true, stack_pointer: false },
+                desired1: Register { index: rt_idx, wide: true, stack_pointer: false },
+                desired2: Register { index: rt_idx.wrapping_add(1) & 31, wide: true, stack_pointer: false },
+                base: Register { index: base_idx, wide: true, stack_pointer: false },
+                order,
+                size,
+            };
+        }
         // Resolve (base op, ordering) from the op key.
         let op_order: Option<(LseBase, LseOrder)> = match (bits23_21, bits15_12, bits11_10) {
             (1, 0, 0) => Some((LseBase::Ldadd, LseOrder::Relaxed)),
@@ -3958,7 +4099,7 @@ fn decode(word: u32, pc: u64) -> Operation {
             (5, 8, 0) => Some((LseBase::Swp, LseOrder::Acquire)),
             (3, 8, 0) => Some((LseBase::Swp, LseOrder::Release)),
             (7, 8, 0) => Some((LseBase::Swp, LseOrder::AcqRel)),
-            (1, 7, 3) => None, // CASP (pair) stays opaque
+            (1, 7, 3) => None, // handled above
             (5, 7, 3) => Some((LseBase::Cas, LseOrder::Relaxed)),
             (7, 7, 3) => Some((LseBase::Cas, LseOrder::Acquire)),
             (5, 15, 3) => Some((LseBase::Cas, LseOrder::Release)),
@@ -4130,6 +4271,25 @@ fn decode(word: u32, pc: u64) -> Operation {
             destination: (word & 31) as u8,
             source: ((word >> 5) & 31) as u8,
             precision,
+        };
+    }
+    // Scalar floating-point unary operations (FABS/FNEG/FSQRT). The
+    // destination V register becomes an unknown barrier; GP flow is preserved.
+    let scalar_float_unary = match word & 0xffff_fc00 {
+        0x1e20_c000 => Some((IrFloatPrecision::Single, IrFloatUnaryOperator::Abs)),
+        0x1e60_c000 => Some((IrFloatPrecision::Double, IrFloatUnaryOperator::Abs)),
+        0x1e21_4000 => Some((IrFloatPrecision::Single, IrFloatUnaryOperator::Neg)),
+        0x1e61_4000 => Some((IrFloatPrecision::Double, IrFloatUnaryOperator::Neg)),
+        0x1e21_c000 => Some((IrFloatPrecision::Single, IrFloatUnaryOperator::Sqrt)),
+        0x1e61_c000 => Some((IrFloatPrecision::Double, IrFloatUnaryOperator::Sqrt)),
+        _ => None,
+    };
+    if let Some((precision, operator)) = scalar_float_unary {
+        return Operation::ScalarFloatUnary {
+            destination: (word & 31) as u8,
+            source: ((word >> 5) & 31) as u8,
+            precision,
+            operator,
         };
     }
     // Scalar fixed-point integer/FP conversions. The encoded imm6 is 64-fbits;
@@ -5554,6 +5714,48 @@ impl Operation {
                     format!("{op}({}, {});", base.name(), src.name())
                 }
             }
+            Self::LoadAtomicPair {
+                first,
+                second,
+                base,
+                size,
+                exclusive,
+                acquire,
+            } => {
+                let op = if exclusive {
+                    if acquire { "ldaxp" } else { "ldxp" }
+                } else { "ldp" };
+                flow.write(first, None);
+                flow.write(second, None);
+                format!(
+                    "{} = {op}{}({}); {} = {op}{}({});",
+                    first.name(), size_suffix(size), base.name(),
+                    second.name(), size_suffix(size), base.name()
+                )
+            }
+            Self::StoreAtomicPair {
+                base,
+                status,
+                first,
+                second,
+                size,
+                exclusive,
+                acquire,
+            } => {
+                let op = if exclusive {
+                    if acquire { "stlxp" } else { "stxp" }
+                } else { "stp" };
+                let op = format!("{op}{}", size_suffix(size));
+                if let Some(status) = status {
+                    flow.write(status, None);
+                    format!(
+                        "{} = {op}({}, {}, {});",
+                        status.name(), base.name(), first.name(), second.name()
+                    )
+                } else {
+                    format!("{op}({}, {}, {});", base.name(), first.name(), second.name())
+                }
+            }
             Self::SystemMarker { mnemonic, domain } => {
                 if mnemonic == "simd" { flow.v_registers.fill(None); }
                 match domain {
@@ -5625,6 +5827,28 @@ impl Operation {
                     base.name()
                 )
             }
+            Self::LseCasPair {
+                expected1,
+                expected2,
+                desired1,
+                desired2,
+                base,
+                order,
+                size,
+            } => {
+                let mnemonic = lse_mnemonic(LseBase::Cas, order, size);
+                // No general-purpose register is written; memory write is
+                // conditional. Value flow is preserved.
+                format!(
+                    "/* {} {}, {}, {}, {}, {} */",
+                    mnemonic,
+                    expected1.name(),
+                    expected2.name(),
+                    desired1.name(),
+                    desired2.name(),
+                    base.name()
+                )
+            }
             Self::VMoveImm { vd, value } => {
                 flow.write_v(
                     vd as u32,
@@ -5679,6 +5903,15 @@ impl Operation {
                 flow.write_v(destination as u32, known.clone());
                 let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 format!("{} = {};{}", register(destination), register(source), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default())
+            }
+            Self::ScalarFloatUnary { destination, source, precision, operator } => {
+                let source_value = flow.read_v(source as u32);
+                // The preview does not fold these operations, so the destination
+                // becomes an unknown barrier; provenance is not carried.
+                flow.write_v(destination as u32, None);
+                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let op = match operator { IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint" };
+                format!("{} = {}({});{}", register(destination), op, register(source), source_value.map(|_| String::new()).unwrap_or_default())
             }
             Self::ScalarFloatImmediate { destination, precision, bits, immediate } => {
                 flow.write_v(destination as u32, Some(VKnownValue { value: bits as u128, origins: vec![pc] }));
@@ -6318,6 +6551,12 @@ mod tests {
             (0xbc00_4462, "*(float *)(x3) = s2; x3 = x3 + 0x4;"),
             (0xfc66_78a4, "d4 = *(double *)(x5 + (x6 << 3));"),
             (0xbc29_d907, "*(float *)(x8 + (sext(w9, 32) << 2)) = s7;"),
+            (0xbc40_8820, "s0 = *(float *)(x1 + 0x8);"),
+            (0xfc40_8820, "d0 = *(double *)(x1 + 0x8);"),
+            (0xbc00_8820, "*(float *)(x1 + 0x8) = s0;"),
+            (0xfc00_8820, "*(double *)(x1 + 0x8) = d0;"),
+            (0x1c00_0020, "s0 = *(float *)(pc + 0x4); /* address=0x1004 proven_by=[0x1000] */"),
+            (0x5c00_0020, "d0 = *(double *)(pc + 0x4); /* address=0x1004 proven_by=[0x1000] */"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
@@ -7388,10 +7627,6 @@ mod tests {
     #[test]
     fn unmodeled_load_store_forms_remain_opaque() {
         // stp x29, x30, [sp, #-16]! = 0xa9bf7bfd (pre-indexed pair) - now modeled
-        // ldtr x0, [x1, #8] = 0xf8408820 (unprivileged, mode 10)
-        assert!(lift(0xf840_8820, 0x1000).contains("opaque instruction"));
-        // sttr x0, [x1, #8] = 0xf8008820 (unprivileged, mode 10)
-        assert!(lift(0xf800_8820, 0x1000).contains("opaque instruction"));
         // stp with invalid mode (2) should be opaque
         // size=3 opc=2 imm7=0 mode=2 rn=31 rt=29 rt2=30 = 0xebff7bfd
         assert!(lift(0xebff_7bfd, 0x1000).contains("opaque instruction"));
@@ -7405,6 +7640,10 @@ mod tests {
         assert_eq!(lift(0xf840_8020, 0x1000), "x0 = *(x1 + 0x8);");
         // stur x0, [x1, #-8] = 0xf81f8020 (negative offset)
         assert_eq!(lift(0xf81f_8020, 0x1000), "*(x1 - 0x8) = x0;");
+        // ldtr x0, [x1, #8] = 0xf8408820 (unprivileged, mode 10)
+        assert_eq!(lift(0xf840_8820, 0x1000), "x0 = *(x1 + 0x8);");
+        // sttr x0, [x1, #8] = 0xf8008820 (unprivileged, mode 10)
+        assert_eq!(lift(0xf800_8820, 0x1000), "*(x1 + 0x8) = x0;");
         // ldur w2, [x3, #-1] = 0x385ff062 (byte access, signed immediate)
         assert_eq!(lift(0x385f_f062, 0x1000), "w2 = *(u8 *)(x3 - 0x1);");
         // ldr x0, [x1], #8 = 0xf8408420 (post-index: access then writeback)

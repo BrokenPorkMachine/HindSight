@@ -29,7 +29,7 @@
 - [x] Portable `.vgcase` plus Markdown/PDF/JSON investigation export.
 - [ ] Deterministic backend state snapshots and memory/map/control-flow diff for engines that can prove replay identity.
 
-## 0.4 — Query & Recovery
+## 0.4 — Query & Recovery (in progress)
 
 - Structured semantic query language across symbols, xrefs, types, runtime records, traces, and evidence.
 - Better function/type recovery and confidence reporting.
@@ -37,6 +37,10 @@
 - Extension API v3 around target/evidence abstractions.
 - Headless CLI for reproducible analysis pipelines.
 - Decompiler and reverse-engineering capability track: [feature gap checklist](DECOMPILER_GAP_ROADMAP.md).
+  - P0 (foundation): CFG, lifted IR, shared IR core, writeback preservation, and function boundary normalization complete. Shared IR coverage, variable recovery, control-flow structuring, call-site reconstruction, and source mapping in progress.
+  - P1 (types): Function signatures, stack locals, Objective-C dispatch, and analyst overrides in progress.
+  - P2 (coverage): Data references, library idioms, switch tables, and x86-64 architecture support planned.
+  - P3 (reviewability): Per-function controls, uncertainty exposure, quality corpus, and artifact export in progress.
 
 ## 0.5 — Broader Targets
 

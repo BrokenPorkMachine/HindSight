@@ -396,6 +396,7 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let parameters = if is_objc { objc_parameters(signature) } else { c_parameters(signature) };
     let mut gp = if is_objc { 2u8 } else { 0u8 };
     let mut fp = 0u8;
+    let mut stack_slot = 0u8;
     let mut result = Vec::new();
     if is_objc {
         result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0) });
@@ -410,7 +411,9 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
             result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp) });
             gp += 1;
         } else {
-            result.push(AbiParameter { name, register: "stack argument (unresolved)".into(), general_register: None });
+            let offset = stack_slot as usize * 8;
+            result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{offset:x})"), general_register: None });
+            stack_slot += 1;
         }
     }
     result
