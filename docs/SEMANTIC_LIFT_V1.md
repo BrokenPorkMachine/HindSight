@@ -321,7 +321,11 @@ asserts the `MRS` barrier rendering and name resolution (including the generic
 registers, and that an `MSR` preserves value flow. A synthetic conditional-comparison
 sequence asserts the `CCMP`/`CCMN` markers (register and immediate forms, 32/64-bit,
 with `nzcv` and condition), their exact words verified against `clang -arch arm64`,
-and 0 false positives / 0 false negatives over the real dylibs. LSE atomic
+and 0 false positives / 0 false negatives over the real dylibs. Cross-basic-block
+value propagation now carries constants through unconditional and conditional
+branches (both successors) and sequential fall-through, merging flows at joins
+by intersecting agreed constants; calls, returns, indirect branches and data
+barriers still clear tracked values. LSE atomic
 memory operations are modeled: `LDAPR`/`LDADD`/`SWP` render
 `dst = ldapr(base);` / `dst = ldadd(base, src);` / `dst = swp(base, src);`
 with the destination as an unknown barrier, and `CAS` renders

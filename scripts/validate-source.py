@@ -431,7 +431,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v32', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v33', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -475,7 +475,8 @@ for token in ['AArch64 register semantics v32', 'AddExtended', '0x0b20_0000', 'M
               '/* ccmp x4, x5, #0x0, eq */', '/* ccmn x0, x1, #0x0, eq */',
               'LseLoad', 'LseCas', 'LseBase', 'LseOrder', 'lse_mnemonic',
               '0x0f20_0000', '0x0820_0000', 'x8 = ldapr(x8);',
-              '/* casal x8, x24, x9 */']:
+              '/* casal x8, x24, x9 */',
+              'merge_flow', 'flows_equal', 'block_starts', 'entry: std::collections::HashMap']:
     assert token in semantic_source, token
 
 for capability in ['graph_workspace','cfg_canvas','graph_minimap','synchronized_semantics','debugger_graph_highlight','dockable_analysis_panes']:

@@ -2569,6 +2569,7 @@ struct KnownValue {
     origins: Vec<u64>,
 }
 
+#[derive(Clone)]
 struct Flow {
     registers: [Option<KnownValue>; 31],
 }
@@ -2882,7 +2883,9 @@ impl Operation {
                 format!("call({target:#x}); /* signature, arguments, result and side effects unresolved */")
             }
             Self::Branch(target) => {
-                flow.clear();
+                // Value flow is preserved across an unconditional branch: the
+                // branch writes no general-purpose register. (Cross-block
+                // propagation carries it to the target.)
                 format!("goto {target:#x};")
             }
             Self::AddImmediate {
@@ -3055,7 +3058,9 @@ impl Operation {
                         if nonzero { "!=" } else { "==" }
                     ),
                 };
-                flow.clear();
+                // Value flow is preserved across a conditional branch: it writes
+                // no general-purpose register, so it propagates to both the taken
+                // and fall-through successors.
                 format!("if ({condition}) goto {target:#x};")
             }
             Self::IndirectBranch { target } => {
@@ -3911,6 +3916,32 @@ impl Operation {
     }
 }
 
+fn merge_flow(a: &Flow, b: &Flow) -> Flow {
+    let mut r = Flow::new();
+    for i in 0..31 {
+        r.registers[i] = match (&a.registers[i], &b.registers[i]) {
+            (Some(x), Some(y)) if x.value == y.value && x.origins == y.origins => Some(x.clone()),
+            _ => None,
+        };
+    }
+    r
+}
+
+fn flows_equal(a: &Flow, b: &Flow) -> bool {
+    for i in 0..31 {
+        match (&a.registers[i], &b.registers[i]) {
+            (Some(x), Some(y)) => {
+                if x.value != y.value || x.origins != y.origins {
+                    return false;
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub fn render(
     code: &[u8],
     base: u64,
@@ -3922,7 +3953,8 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v32; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v33; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
         if start < base || start >= function_end || (start - base) % 4 != 0 {
@@ -3934,25 +3966,207 @@ pub fn render(
         let low = (start - base) as usize;
         let high =
             ((function_end - base) as usize).min(low.saturating_add(MAX_WORDS_PER_FUNCTION * 4));
-        let mut flow = Flow::new();
-        for (i, bytes) in code[low..high].chunks_exact(4).enumerate() {
-            let pc = start + (i * 4) as u64;
+
+        // Collect instruction PCs in range.
+        let mut pcs: Vec<u64> = Vec::new();
+        let mut i = 0usize;
+        while low + (i + 1) * 4 <= high {
+            pcs.push(start + (i as u64) * 4);
+            i += 1;
+        }
+        if pcs.is_empty() {
+            out.push_str("}\n");
+            if out.len() >= MAX_OUTPUT {
+                break;
+            }
+            continue;
+        }
+
+        let word_at = |pc: u64| -> u32 {
+            let off = (pc - base) as usize;
+            u32::from_le_bytes(code[off..off + 4].try_into().unwrap())
+        };
+        let is_data = |pc: u64| -> bool {
             let position = file_offset.saturating_add(pc - base);
-            let word = u32::from_le_bytes(bytes.try_into().unwrap());
-            let statement = if data_ranges
+            data_ranges
                 .iter()
                 .any(|&(lo, hi, _)| position < hi && position.saturating_add(4) > lo)
-            {
-                flow.clear();
-                "/* data-in-code barrier */".into()
-            } else {
-                decode(word, pc).render(&mut flow, pc)
-            };
-            out.push_str(&format!("  {pc:#018x}  {statement} // word={word:08x}\n"));
+        };
+        let is_cf = |op: &Operation| -> bool {
+            matches!(
+                op,
+                Operation::Branch(_)
+                    | Operation::ConditionalBranch { .. }
+                    | Operation::IndirectBranch { .. }
+                    | Operation::Call(_)
+                    | Operation::IndirectCall { .. }
+                    | Operation::Return(_)
+            )
+        };
+        let jump_target = |op: &Operation| -> Option<u64> {
+            match op {
+                Operation::Branch(t) => Some(*t),
+                Operation::ConditionalBranch { target, .. } => Some(*target),
+                // IndirectBranch has a register target; no static jump target.
+                _ => None,
+            }
+        };
+
+        // Decode all instructions once.
+        let ops: Vec<Operation> = pcs.iter().map(|&pc| decode(word_at(pc), pc)).collect();
+
+        // Build basic-block starts: function start, branch targets, and the
+        // instruction after every control-flow instruction.
+        let mut block_starts: Vec<u64> = vec![start];
+        for (idx, &pc) in pcs.iter().enumerate() {
+            if let Some(t) = jump_target(&ops[idx]) {
+                if t >= start && t < function_end && (t - start) % 4 == 0 && pcs.contains(&t) {
+                    block_starts.push(t);
+                }
+            }
+            if is_cf(&ops[idx]) {
+                let next = pc + 4;
+                if next >= start && next < function_end && pcs.contains(&next) {
+                    block_starts.push(next);
+                }
+            }
+        }
+        block_starts.sort();
+        block_starts.dedup();
+
+        // Build blocks: (start, list of pcs).
+        let mut blocks: Vec<(u64, Vec<u64>)> = Vec::new();
+        for (bi, &bs) in block_starts.iter().enumerate() {
+            let be = block_starts.get(bi + 1).copied().unwrap_or(function_end);
+            let bpcs: Vec<u64> = pcs
+                .iter()
+                .filter(|&&p| p >= bs && p < be)
+                .copied()
+                .collect();
+            if bpcs.is_empty() {
+                continue;
+            }
+            blocks.push((bs, bpcs));
+        }
+        if blocks.is_empty() {
+            out.push_str("}\n");
+            if out.len() >= MAX_OUTPUT {
+                break;
+            }
+            continue;
+        }
+
+        // pc -> block index
+        let mut pc_to_block: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        for (bi, (_, bpcs)) in blocks.iter().enumerate() {
+            for &p in bpcs {
+                pc_to_block.insert(p, bi);
+            }
+        }
+
+        let block_of = |p: u64| -> Option<usize> { pc_to_block.get(&p).copied() };
+
+        let successors = |bi: usize| -> Vec<usize> {
+            let (_, bpcs) = &blocks[bi];
+            let last_pc = *bpcs.last().unwrap();
+            let last_idx = pcs.iter().position(|&p| p == last_pc).unwrap();
+            let last_op = &ops[last_idx];
+            let mut succs: Vec<usize> = Vec::new();
+            match last_op {
+                Operation::Branch(t) => {
+                    if let Some(bi) = block_of(*t) {
+                        succs.push(bi);
+                    }
+                }
+                Operation::ConditionalBranch { target, .. } => {
+                    if let Some(bi) = block_of(*target) {
+                        succs.push(bi);
+                    }
+                    let nt = last_pc + 4;
+                    if let Some(bi) = block_of(nt) {
+                        succs.push(bi);
+                    }
+                }
+                Operation::IndirectBranch { .. } => {}
+                Operation::Call(_) | Operation::IndirectCall { .. } => {
+                    let nt = last_pc + 4;
+                    if let Some(bi) = block_of(nt) {
+                        succs.push(bi);
+                    }
+                }
+                Operation::Return(_) => {}
+                _ => {
+                    let nt = last_pc + 4;
+                    if let Some(bi) = block_of(nt) {
+                        succs.push(bi);
+                    }
+                }
+            }
+            succs
+        };
+
+        // Dataflow: compute entry flow per block (worklist, bounded).
+        let mut entry: std::collections::HashMap<usize, Flow> = std::collections::HashMap::new();
+        entry.insert(0, Flow::new());
+        let mut worklist: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        worklist.push_back(0);
+        let mut iters = 0usize;
+        while let Some(bi) = worklist.pop_front() {
+            if iters > 100000 {
+                break;
+            }
+            iters += 1;
+            let flow0 = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
+            let (_, bpcs) = &blocks[bi];
+            let mut flow = flow0;
+            for &p in bpcs {
+                if is_data(p) {
+                    flow.clear();
+                } else {
+                    let op = decode(word_at(p), p);
+                    let _ = op.render(&mut flow, p);
+                }
+            }
+            let exit_flow = flow;
+            for &s in &successors(bi) {
+                let merged = if let Some(old) = entry.get(&s) {
+                    merge_flow(old, &exit_flow)
+                } else {
+                    exit_flow.clone()
+                };
+                let changed = match entry.get(&s) {
+                    None => true,
+                    Some(old) => !flows_equal(old, &merged),
+                };
+                if changed {
+                    entry.insert(s, merged);
+                    worklist.push_back(s);
+                }
+            }
+        }
+
+        // Render phase: render each block in address order using final entry flows.
+        for (bi, (_bs, bpcs)) in blocks.iter().enumerate() {
+            let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
+            for &p in bpcs {
+                let word = word_at(p);
+                let statement = if is_data(p) {
+                    flow.clear();
+                    "/* data-in-code barrier */".into()
+                } else {
+                    decode(word, p).render(&mut flow, p)
+                };
+                out.push_str(&format!("  {p:#018x}  {statement} // word={word:08x}\n"));
+                if out.len() >= MAX_OUTPUT {
+                    break;
+                }
+            }
             if out.len() >= MAX_OUTPUT {
                 break;
             }
         }
+
         if high < (function_end - base) as usize {
             out.push_str("  /* function preview truncated at instruction budget */\n");
         }
@@ -4020,7 +4234,7 @@ mod tests {
             report.contains("ABI result register x0 /* constant=0x2 proven_by=[0x1000,0x1004] */")
         );
 
-        for barrier in [0xffff_ffffu32, 0x9400_0001, 0x1400_0001] {
+        for barrier in [0xffff_ffffu32, 0x9400_0001] {
             let words = [0x5280_0020, barrier, 0xd65f_03c0];
             let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
             let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
@@ -5166,12 +5380,14 @@ mod tests {
 
     #[test]
     fn conditional_and_indirect_branches_clear_constants() {
-        // movz w0, #0x1 ; b.eq 0x102c ; ret  -> the branch clears the constant.
+        // movz w0, #0x1 ; b.eq 0x102c ; ret  -> the conditional branch preserves
+        // value flow into the fall-through, so the trailing ret keeps the constant;
+        // the taken target (outside this function) is not propagated into.
         let words = [0x5280_0020u32, 0x5400_0140, 0xd65f_03c0];
         let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report.contains("if (eq) goto 0x102c;"));
-        assert!(!report.contains("ABI result register x0 /* constant="));
+        assert!(report.contains("ABI result register x0 /* constant="));
 
         // movz x0, #0x1 ; br x8 ; ret  -> the indirect branch clears the constant.
         let words = [0xd280_0020u32, 0xd61f_0100, 0xd65f_03c0];
