@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v28` banner identifies the statement set that
+`AArch64 register semantics v29` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -61,7 +61,8 @@ register becomes unknown (no constant is inferred). Logical operations render a
 bitmask immediate or a register operand, with a leading `~` when the negated
 `BIC`/`ORN`/`EON` form complements the right operand. The immediate is the
 architectural `DecodeBitMasks` `wmask`; reserved bitmask encodings, flag-setting
-`ANDS`/`BICS`, and the `ROR` shift stay opaque. A register operand of a modeled
+`ANDS`/`BICS` that write a general-purpose register, and the `ROR` shift stay
+opaque. A register operand of a modeled
 `ADD`/`SUB` or logical operation may carry an `LSL`/`LSR`/`ASR` immediate shift,
 rendered parenthesized (for example `w0 = w1 + (w2 << 3);` or
 `w0 = w1 & ~(w2 >> 4);`), with the shift applied before the enclosing operation.
@@ -111,7 +112,8 @@ for `SBC` (the architecture adds the inverted operand with carry). Because the
 carry input is `PSTATE.C`, which the preview does not track, the destination is
 always an unknown barrier: the shape is rendered but no constant is ever folded,
 and the write invalidates any previously tracked value of the destination. The
-flag-setting `ADCS`/`SBCS` forms (`S == 1`), like `ADDS`/`SUBS`, stay opaque, as
+flag-setting `ADCS`/`SBCS` forms (`S == 1`), like the `ADDS`/`SUBS` forms that
+write a general-purpose register, stay opaque, as
 do the conditional compares that share the class. The add/subtract (extended
 register) form applies an extension and then an `imm3` left shift to the second
 operand: `ADD` renders `dst = left + (zext(w2, 8) << 2);` and its signed and
@@ -121,7 +123,18 @@ options use the operand unchanged (no wrapper), the byte/halfword/word options
 read the narrow source view, and the extension result folds into a constant with
 provenance. The destination and the first source name the stack pointer when
 their field is 31, while `Rm` still names `ZR`; the flag-setting `ADDS`/`SUBS`
-forms and the unallocated `imm3` values (5..7) stay opaque. The same `op31` group
+forms that write a general-purpose register and the unallocated `imm3` values
+(5..7) stay opaque. Flag-only comparisons are modeled as marker comments because
+their result lives only in PSTATE, which the preview does not track: they write
+no general-purpose register and therefore preserve tracked constants rather than
+clearing them. `CMP`/`CMN` (the `SUBS`/`ADDS` forms with `Rd == 31`, in the
+immediate, shifted-register, and extended-register classes) render
+`/* cmp x0, 0x5 */`, `/* cmp x0, (x1 << 2) */`, and `/* cmp x0, sext(w1, 32) */`,
+and `TST` (the `ANDS` form with `Rd == 31`, immediate or shifted register) renders
+`/* tst x0, 0xff */`. The flag-setting arithmetic and logical forms that also
+write a general-purpose register (`ADDS`/`SUBS`/`ANDS` with `Rd != 31`), `BICS`,
+the conditional compares (`CCMP`/`CCMN`), and the add-with-carry forms stay opaque
+because their PSTATE side effect is not modeled. The same `op31` group
 also models
 the widening and high-half multiplies. `SMULL`/`UMULL` render
 `dst = sext(left, 32) * sext(right, 32);` and `dst = zext(left, 32) * zext(right, 32);`,
@@ -283,4 +296,9 @@ literal load sequence asserts the PC-relative address rendering, negative offset
 the zero-extending and sign-extending literal forms (`LDR`/`LDRSW`), their
 resolved target addresses with provenance, that the data-processing and
 conditional-select words are no longer claimed as literal loads, and that `PRFM`
-literal stays opaque.
+literal stays opaque. A synthetic flag-only compare sequence asserts the
+`CMP`/`CMN`/`TST` markers, their immediate, shifted-register, and
+extended-register operand renderings, the exact words verified against
+`clang -arch arm64`, that a constant folds through a compare (value flow is
+preserved), and that the flag-setting forms that write a general-purpose
+register, `BICS`, and `CCMP` stay opaque.

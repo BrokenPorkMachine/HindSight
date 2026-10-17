@@ -431,7 +431,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v28', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v29', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -465,7 +465,10 @@ for token in ['AArch64 register semantics v28', 'AddExtended', '0x0b20_0000', 'M
               'word & 0x7e00_0000 == 0x3400_0000',
               'word & 0x7e00_0000 == 0x3600_0000',
               'word & 0xffff_fc1f == 0xd61f_0000',
-              'word & 0xffff_fc1f == 0xd63f_0000']:
+              'word & 0xffff_fc1f == 0xd63f_0000',
+              'CompareOperand', 'Compare', 'mnemonic: if subtract { "cmp" } else { "cmn" }',
+              'word & (1 << 29) != 0', 'mnemonic: "tst"',
+              '0xf100_141f', '0xeb01_001f', '0xea01_001f', '0xf240_1c1f']:
     assert token in semantic_source, token
 
 for capability in ['graph_workspace','cfg_canvas','graph_minimap','synchronized_semantics','debugger_graph_highlight','dockable_analysis_panes']:
