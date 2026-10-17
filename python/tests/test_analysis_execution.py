@@ -41,7 +41,7 @@ class AnalysisExecutionContract(unittest.TestCase):
         self.assertIn('engineVersion: String', store)
         self.assertIn('producerVersion: String', store)
         self.assertIn('LegacyAnalysisCacheEnvelope', store)
-        self.assertIn('analysisCacheEngineVersion = "arm64-analysis-v68-schema114"', service)
+        self.assertIn('analysisCacheEngineVersion = "arm64-analysis-v69-schema115"', service)
         self.assertIn('compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', service)
         self.assertIn('Project analysis cache could not be read; running a fresh worker analysis.', service)
 

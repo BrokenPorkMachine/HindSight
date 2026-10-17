@@ -24,6 +24,6 @@ class SymbolicationContract(unittest.TestCase):
   self.assertIn('case "Symbol Resolver"',read("App/ContentView.swift"))
   self.assertIn('workspace: "Symbol Resolver"',read("App/AnalysisNavigation.swift"))
  def test_schema_advanced(self):
-  self.assertIn("arm64-analysis-v68-schema114",read("PlatformServices/CoordinatorService/main.swift"))
+  self.assertIn("arm64-analysis-v69-schema115",read("PlatformServices/CoordinatorService/main.swift"))
   self.assertIn("jsonFields.count == 72",read("Tests/analysis_protocol_contract.swift"))
 if __name__=="__main__": unittest.main()

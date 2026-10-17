@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import shutil
 import struct
 import subprocess
@@ -63,6 +64,23 @@ def score(source_type: str, report: dict) -> dict[str, int]:
     functions = report.get("functions") or ""
     cfg = report.get("cfg") or ""
     ir = report.get("ir") or ""
+    symbol_resolver = report.get("symbol_resolver") or ""
+    symbolication = report.get("symbolication") or ""
+    function_starts = {
+        int(match.group(1), 16)
+        for line in functions.splitlines()
+        if (match := re.match(r"^(0x[0-9a-fA-F]+)\s+0x[0-9a-fA-F]+\s+", line))
+    }
+    resolver_starts = {
+        int(match.group(1), 16)
+        for line in symbol_resolver.splitlines()
+        if (match := re.match(r"^range start=(0x[0-9a-fA-F]+)\s", line))
+    }
+    symbolication_starts = {
+        int(match.group(1), 16)
+        for line in symbolication.splitlines()
+        if (match := re.match(r"^range start=(0x[0-9a-fA-F]+)\s", line))
+    }
     metrics = {
         "functions": int(report.get("function_count", 0)),
         "blocks": int(report.get("basic_block_count", 0)),
@@ -81,6 +99,13 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         raise RuntimeError(f"{source_type} fixture did not produce function, CFG, and IR evidence: {metrics}")
     if metrics["pseudocode_functions"] < 1:
         raise RuntimeError(f"{source_type} fixture produced no function pseudocode: {metrics}")
+    if not function_starts or function_starts != resolver_starts or function_starts != symbolication_starts:
+        raise RuntimeError(
+            f"{source_type} fixture reports inconsistent normalized function boundaries: "
+            f"functions={len(function_starts)}, resolver={len(resolver_starts)}, "
+            f"symbolication={len(symbolication_starts)}"
+        )
+    metrics["normalized_boundary_sets"] = 1
     if source_type in {"objective-c", "objective-cpp"} and metrics["objc_method_records"] < 1:
         raise RuntimeError(f"{source_type} fixture produced no validated Objective-C method metadata: {metrics}")
     if source_type in {"objective-c", "objective-cpp"} and metrics["objc_selector_calls"] < 1:

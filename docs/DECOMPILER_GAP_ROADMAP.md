@@ -15,7 +15,7 @@ This checklist compares HindSight's current analysis path with capabilities docu
 
 ## P0 — Make current pseudocode dependable and useful
 
-- [ ] **Normalize function boundaries.** Preview boundaries combine aligned Mach-O function starts, executable nlist symbols, validated Objective-C IMPs, exports, validated `__unwind_info` index/page entries, and in-range direct `BL` targets. The function list records evidence source and marks call-target boundaries as candidates. Consistent boundary normalization across all reports remains to do.
+- [x] **Normalize function boundaries.** One aligned, deduplicated boundary set from Mach-O function starts, executable nlist symbols, validated Objective-C IMPs, exports, validated `__unwind_info` index/page entries, and in-range direct `BL` targets drives CFG, function, pseudocode, unified-symbol, and static-symbolication ranges. Reports share boundary evidence and confidence; call-target-only entries remain candidates. The decompilation corpus verifies the function, resolver, and symbolication range sets match.
 - [x] **Build a first-class per-function CFG.** Preserve block edges, predecessors, successors, reachability, dominators, loop backedges, and lifted branch conditions as structured data in the ARM64 semantics pass.
 - [x] **Prune proven conditional CFG edges.** Block-local constants and known NZCV results remove impossible branch edges before reachability and dominator analysis; unknown or unsupported operations retain both paths.
 - [x] **Add an initial lifted IR.** Address-bearing typed ARM64 instruction records and a function container now feed CFG construction, propagation, and rendering without reparsing formatted statements.
