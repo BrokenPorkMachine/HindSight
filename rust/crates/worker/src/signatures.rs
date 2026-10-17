@@ -443,6 +443,72 @@ fn candidate_abi_parameters(report: &str, address: u64) -> Vec<AbiParameter> {
     }).collect()).unwrap_or_default()
 }
 
+fn replace_register_names(statement: &str, names: &BTreeMap<String, String>) -> String {
+    let bytes = statement.as_bytes();
+    let mut output = String::with_capacity(statement.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') { cursor += 1; }
+            let token = &statement[start..cursor];
+            output.push_str(names.get(token).map(String::as_str).unwrap_or(token));
+        } else {
+            let ch = statement[cursor..].chars().next().unwrap();
+            output.push(ch);
+            cursor += ch.len_utf8();
+        }
+    }
+    output
+}
+
+fn assigned_register(statement: &str) -> Option<String> {
+    let lhs = statement.split_once('=')?.0.trim();
+    let register = lhs.split_whitespace().last()?;
+    if register.len() >= 2 && matches!(register.as_bytes()[0], b'x' | b'w' | b's' | b'd' | b'v')
+        && register[1..].bytes().all(|byte| byte.is_ascii_digit()) {
+        Some(register.to_string())
+    } else { None }
+}
+
+fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) -> BTreeMap<String, String> {
+    let parameters = signature.map(|signature| abi_parameters(Some(signature))).unwrap_or_else(|| {
+        incoming_parameter_candidates(report, address).into_iter().filter_map(|register| {
+            let index = register.strip_prefix('x')?.parse::<u8>().ok()?;
+            (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index) })
+        }).collect()
+    });
+    parameters.into_iter().map(|parameter| (parameter.register, parameter.name)).collect()
+}
+
+fn parameter_aliases_by_instruction(
+    instructions: &[(u64, String)], signature: Option<&Signature>, report: &str, address: u64,
+) -> BTreeMap<u64, BTreeMap<String, String>> {
+    // Register names have a single source-level meaning only along a straight
+    // line. At joins and loop headers we keep the machine registers explicit.
+    if instructions.iter().any(|(_, statement)| statement.starts_with("if (") || statement.starts_with("goto ")) {
+        return BTreeMap::new();
+    }
+    let mut names = parameter_names(signature, report, address);
+    let mut result = BTreeMap::new();
+    for (pc, statement) in instructions {
+        result.insert(*pc, names.clone());
+        if statement.starts_with("call(") {
+            names.clear(); // AAPCS64 caller-saved registers may be clobbered.
+        } else if let Some(destination) = assigned_register(statement) {
+            names.remove(&destination);
+            if let Some(index) = destination.strip_prefix('w') { names.remove(&format!("x{index}")); }
+            if let Some(index) = destination.strip_prefix('s') { names.remove(&format!("d{index}")); }
+        }
+    }
+    result
+}
+
+fn substitute_parameter_names(statement: &str, names: &BTreeMap<String, String>) -> String {
+    replace_register_names(statement, names)
+}
+
 fn branch_target_statement(statement:&str)->Option<u64>{
     let target=statement.strip_prefix("goto 0x")
         .or_else(||statement.strip_prefix("if (").and_then(|rest|rest.split_once(") goto 0x").map(|(_,target)|target)))?;
@@ -586,6 +652,7 @@ fn render_arm64_body(
         if !statement.is_empty() { instructions.push((address, statement.into())); }
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
+    let parameter_aliases = parameter_aliases_by_instruction(&instructions, signature, parameter_evidence, start);
     let switch_evidence=parse_switch_evidence(jump_tables);
     let mut labels = instructions.iter().filter_map(|(_,statement)| {
         let target = statement.strip_prefix("goto 0x")
@@ -810,6 +877,7 @@ fn render_arm64_body(
                 "return x0; /* inferred ABI result; source return type unresolved */".into()
             }
         } else { statement.to_string() };
+        let statement = substitute_parameter_names(&statement, parameter_aliases.get(&address).unwrap_or(&BTreeMap::new()));
         let statement=if stable_stack{localize_stack_slot_accesses(&statement)}else{statement};
         out.push_str(&format!("    {address:#018x}: {statement}\n"));
         instruction_index += 1;
@@ -915,6 +983,29 @@ fn recover_internal(
         let args = abi_parameters(Some(&mixed));
         assert_eq!(args.iter().map(|arg|arg.register.as_str()).collect::<Vec<_>>(), vec!["x0", "d0", "x1", "s1"]);
         assert_eq!(args.iter().map(|arg|arg.name.as_str()).collect::<Vec<_>>(), vec!["owner", "value", "count", "ratio"]);
+    }
+    #[test] fn parameter_names_flow_until_the_register_is_redefined() {
+        let signature = objc_method("-[Widget setObject:]", "v24@0:8@16").unwrap();
+        let instructions = vec![
+            (0x0ffc, "x4 = x2;".into()),
+            (0x1000, "x2 = *(x0 + 0x10);".into()),
+            (0x1004, "x3 = x2;".into()),
+            (0x1008, "return x2;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&instructions, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names(&instructions[0].1, &aliases[&0x0ffc]), "x4 = arg0;");
+        assert_eq!(substitute_parameter_names(&instructions[1].1, &aliases[&0x1000]), "arg0 = *(self + 0x10);");
+        assert_eq!(substitute_parameter_names(&instructions[2].1, &aliases[&0x1004]), "x3 = x2;");
+        assert_eq!(substitute_parameter_names(&instructions[3].1, &aliases[&0x1008]), "return x2;");
+    }
+    #[test] fn parameter_aliases_stop_at_control_flow_and_calls() {
+        let signature = symbol("_CFRelease").unwrap();
+        let branched = vec![(0x1000, "if (x0 == 0) goto 0x1008;".into()), (0x1004, "return x0;".into())];
+        assert!(parameter_aliases_by_instruction(&branched, Some(&signature), "", 0x1000).is_empty());
+        let called = vec![(0x1000, "call(0x2000);".into()), (0x1004, "return x0;".into())];
+        let aliases = parameter_aliases_by_instruction(&called, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1000]), "return cf;");
+        assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1004]), "return x0;");
     }
     #[test] fn direct_calls_render_prototype_parameter_bindings() {
         let signature = symbol("_CFRelease").unwrap();
