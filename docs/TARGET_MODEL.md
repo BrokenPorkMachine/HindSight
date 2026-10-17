@@ -20,8 +20,9 @@ Every target exposes a `VGSessionHeader` with:
 - engine fingerprint;
 - model fingerprint;
 - source fingerprint when the backend has a verified content digest.
+- trace fingerprint when a trace view has been captured.
 
-The current beta uses the existing captured-file SHA-256 where one is available and deterministic FNV-1a fingerprints for non-content identity tuples. A fingerprint is an identity aid, not a cryptographic authenticity claim. Future evidence bundles should add cryptographic engine/model build hashes.
+Session schema 2 uses SHA-256 for canonical identity tuples. Engine fingerprints hash the embedded `reworker`, `CoordinatorService`, or `vg-emu-server` executable bytes; a missing bundled executable is reported as `unavailable`. Model fingerprints hash a length-framed model description. Trace fingerprints cover the selected VectorEmu or Hypervisor trace text and target identity. Captured artifacts retain their verified source SHA-256. Runtime image paths are not presented as content hashes, and native debugger trace identity is not yet available.
 
 ## Address pivot doctrine
 
@@ -47,4 +48,4 @@ This is the beginning of the Target API. Later releases should replace backend-s
 
 ## Export
 
-The Targets workspace can copy or export a JSON target-session record containing the selected target identity and the most recent address pivot. This is intentionally small and inspectable so it can become a stable building block for future evidence bundles and team handoff.
+The Targets workspace can copy or export a versioned JSON target-session record containing the selected target identity, executable and model hashes, an available trace hash, and the most recent address pivot. This is intentionally small and inspectable so it can become a stable building block for future evidence bundles and team handoff.

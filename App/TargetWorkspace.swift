@@ -41,13 +41,14 @@ extension WorkbenchModel {
                 capabilities: [.readBytes, .decode, .analyze, .symbols, .mappings, .addressTranslation],
                 addressSpaces: spaces,
                 session: VGSessionHeader(
-                    schemaVersion: 1,
+                    schemaVersion: 2,
                     productVersion: VGProduct.version,
                     targetID: "static:\(record.id)",
                     targetFingerprint: targetFingerprint,
-                    engineFingerprint: VGTargetUtilities.fingerprint(["static-analyzer", VGProduct.version]),
+                    engineFingerprint: VGTargetUtilities.buildFingerprint("reworker"),
                     modelFingerprint: VGTargetUtilities.fingerprint([record.result.file_kind, record.result.architecture]),
-                    sourceFingerprint: source
+                    sourceFingerprint: source,
+                    traceFingerprint: nil
                 )
             ))
         }
@@ -64,13 +65,14 @@ extension WorkbenchModel {
                 capabilities: [.readBytes, .decode, .mappings, .registers, .executionControl, .breakpoints, .trace, .addressTranslation],
                 addressSpaces: [VGAddressSpace(id: "native-va:\(snapshot.pid)", name: "Process virtual memory", kind: "runtime-vm", base: nil, size: nil, source: "Mach VM map")],
                 session: VGSessionHeader(
-                    schemaVersion: 1,
+                    schemaVersion: 2,
                     productVersion: VGProduct.version,
                     targetID: targetID,
                     targetFingerprint: VGTargetUtilities.fingerprint(["pid", String(snapshot.pid), debugLaunchPath]),
-                    engineFingerprint: VGTargetUtilities.fingerprint(["mach-debugger", VGProduct.version]),
+                    engineFingerprint: VGTargetUtilities.buildFingerprint("CoordinatorService"),
                     modelFingerprint: VGTargetUtilities.fingerprint([selected?.result.architecture ?? "arm64", "native-process"]),
-                    sourceFingerprint: selected?.result.source_sha256.map { "sha256:\($0)" }
+                    sourceFingerprint: selected?.result.source_sha256.map { "sha256:\($0)" },
+                    traceFingerprint: nil
                 )
             ))
         }
@@ -88,13 +90,14 @@ extension WorkbenchModel {
                 capabilities: [.readBytes, .decode, .mappings, .registers, .executionControl, .breakpoints, .trace, .deterministicReset, .addressTranslation],
                 addressSpaces: vectorEmuAddressSpaces(),
                 session: VGSessionHeader(
-                    schemaVersion: 1,
+                    schemaVersion: 2,
                     productVersion: VGProduct.version,
                     targetID: targetID,
                     targetFingerprint: VGTargetUtilities.fingerprint([vectorEmuROM, vectorEmuSoC, String(vectorEmuPort)]),
-                    engineFingerprint: VGTargetUtilities.fingerprint(["vectoremu", VGProduct.version]),
+                    engineFingerprint: VGTargetUtilities.buildFingerprint("vg-emu-server"),
                     modelFingerprint: VGTargetUtilities.fingerprint(["soc", vectorEmuSoC]),
-                    sourceFingerprint: nil
+                    sourceFingerprint: nil,
+                    traceFingerprint: vectorEmuTrace.isEmpty ? nil : VGTargetUtilities.fingerprint(["vector-trace-v1", targetID, vectorEmuTrace])
                 )
             ))
         }
@@ -115,13 +118,15 @@ extension WorkbenchModel {
                 capabilities: [.readBytes, .decode, .mappings, .registers, .executionControl, .breakpoints, .trace, .snapshots, .addressTranslation],
                 addressSpaces: spaces,
                 session: VGSessionHeader(
-                    schemaVersion: 1,
+                    schemaVersion: 2,
                     productVersion: VGProduct.version,
                     targetID: targetID,
-                    targetFingerprint: VGTargetUtilities.fingerprint([targetID, String(state.ramMiB), state.cpuBackend, state.deviceBackend]),
-                    engineFingerprint: VGTargetUtilities.fingerprint([state.cpuBackend, VGProduct.version]),
+                    targetFingerprint: VGTargetUtilities.fingerprint([targetID, String(state.ramMiB), state.cpuBackend, state.deviceBackend, virtualizationImagePath]),
+                    engineFingerprint: VGTargetUtilities.buildFingerprint("CoordinatorService"),
                     modelFingerprint: VGTargetUtilities.fingerprint([profile?.id ?? virtualizationProfileID, profile?.regions.map { "\($0.base):\($0.size):\($0.kind)" }.joined(separator: "|") ?? ""]),
-                    sourceFingerprint: virtualizationImagePath.isEmpty ? nil : VGTargetUtilities.fingerprint([virtualizationImagePath])
+                    sourceFingerprint: nil,
+                    traceFingerprint: virtualizationRETitle == "VM Trace" && !virtualizationREText.isEmpty
+                        ? VGTargetUtilities.fingerprint(["hypervisor-trace-v1", targetID, virtualizationREText]) : nil
                 )
             ))
         }

@@ -836,6 +836,7 @@ struct ContentView: View {
                                 VGKeyValueField(label: "Engine", value: target.session.engineFingerprint, monospaced: true)
                                 VGKeyValueField(label: "Model", value: target.session.modelFingerprint, monospaced: true)
                                 VGKeyValueField(label: "Source", value: target.session.sourceFingerprint ?? "not content-hashed by this backend", monospaced: true)
+                                VGKeyValueField(label: "Trace", value: target.session.traceFingerprint ?? "no trace captured", monospaced: true)
                             }
                             .padding(6)
                         }

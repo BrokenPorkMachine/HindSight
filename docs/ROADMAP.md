@@ -17,7 +17,7 @@
 - [x] Capability discovery rather than backend-name conditionals at the target layer.
 - [x] One address pivot resolves file offset, preferred VM address, runtime slide, and declared emulated/guest mappings where a mapping is provable.
 - [x] Exportable session header with target/engine/model/source fingerprints.
-- [ ] Promote engine/model fingerprints to cryptographic build hashes and add trace identity after the evidence graph lands.
+- [ ] Engine/model identities now use SHA-256; session exports hash the embedded worker, CoordinatorService, and VectorEmu executables. VectorEmu and Hypervisor trace views carry a SHA-256 trace identity. Native debugger trace identity and cryptographic source-content identity for unverified runtime images remain.
 
 ## 0.3 — Evidence Graph + Investigation Time
 

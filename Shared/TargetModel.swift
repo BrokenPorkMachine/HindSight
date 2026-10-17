@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum VGProduct {
     static let name = "HindSight"
@@ -48,6 +49,7 @@ struct VGSessionHeader: Codable, Hashable {
     let engineFingerprint: String
     let modelFingerprint: String
     let sourceFingerprint: String?
+    let traceFingerprint: String?
 }
 
 struct VGTargetIdentity: Codable, Identifiable, Hashable {
@@ -80,12 +82,21 @@ struct VGAddressPivot: Codable, Hashable {
 
 struct VGTargetSessionExport: Encodable {
     let format = "ca.zensoftware.VectorGlass.target-session"
-    let schemaVersion = 1
+    let schemaVersion = 2
     let target: VGTargetIdentity
     let pivot: VGAddressPivot?
 }
 
 enum VGTargetUtilities {
+    private static let embeddedBuildFingerprints: [String: String] = {
+        let executableDirectory = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/XPCServices/CoordinatorService.xpc/Contents/MacOS", isDirectory: true)
+        return Dictionary(uniqueKeysWithValues: ["reworker", "CoordinatorService", "vg-emu-server"].map { name in
+            let url = executableDirectory.appendingPathComponent(name, isDirectory: false)
+            return (name, fileFingerprint(at: url) ?? "unavailable")
+        })
+    }()
+
     static func parseHex(_ text: String) -> UInt64? {
         var value = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if value.hasPrefix("0x") { value.removeFirst(2) }
@@ -98,12 +109,32 @@ enum VGTargetUtilities {
     }
 
     static func fingerprint(_ fields: [String]) -> String {
-        var hash: UInt64 = 1469598103934665603
-        for byte in fields.joined(separator: "\u{1f}").utf8 {
-            hash ^= UInt64(byte)
-            hash &*= 1099511628211
+        var hasher = SHA256()
+        hasher.update(data: Data("HindSight.target-fingerprint.v1\0".utf8))
+        for field in fields {
+            let data = Data(field.utf8)
+            var length = UInt64(data.count).bigEndian
+            hasher.update(data: withUnsafeBytes(of: &length) { Data($0) })
+            hasher.update(data: data)
         }
-        return String(format: "fnv1a64:%016llx", hash)
+        return "sha256:" + hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func buildFingerprint(_ executable: String) -> String {
+        embeddedBuildFingerprints[executable] ?? "unavailable"
+    }
+
+    private static func fileFingerprint(at url: URL) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: url.path),
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        do {
+            while let data = try handle.read(upToCount: 1_048_576), !data.isEmpty {
+                hasher.update(data: data)
+            }
+            return "sha256:" + hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        } catch { return nil }
     }
 
 

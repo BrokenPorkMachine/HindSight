@@ -11,6 +11,9 @@ struct TargetModelContract {
         precondition(VGTargetUtilities.applying(slide: 0x1000, to: 0x2000) == 0x3000)
         precondition(VGTargetUtilities.applying(slide: -0x1000, to: 0x2000) == 0x1000)
         precondition(VGTargetUtilities.applying(slide: -0x3000, to: 0x2000) == nil)
+        let digest = VGTargetUtilities.fingerprint(["a", "b"])
+        precondition(digest.hasPrefix("sha256:") && digest.count == 71)
+        precondition(digest != VGTargetUtilities.fingerprint(["ab", "c"]))
 
         let modules = VGTargetUtilities.nativeModuleRows("0x0000000100004000 slide=+16384 preferred=0x0000000100000000  /tmp/Demo\n")
         precondition(modules.count == 1)
@@ -21,6 +24,15 @@ struct TargetModelContract {
 
         let row = VGAddressTranslation(space: "preferred-vm", address: "0x1000", detail: "demo", evidence: "test")
         precondition(VGTargetUtilities.unique([row, row]).count == 1)
+        let session = VGSessionHeader(schemaVersion: 2, productVersion: "test", targetID: "target",
+                                      targetFingerprint: digest, engineFingerprint: "sha256:build",
+                                      modelFingerprint: digest, sourceFingerprint: nil, traceFingerprint: digest)
+        let identity = VGTargetIdentity(id: "target", name: "test", kind: .staticArtifact,
+                                        architecture: "arm64", backend: "test", state: "loaded",
+                                        capabilities: [], addressSpaces: [], session: session)
+        let export = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(VGTargetSessionExport(target: identity, pivot: nil))) as! [String: Any]
+        precondition(export["schemaVersion"] as? Int == 2)
+        precondition(((export["target"] as? [String: Any])?["session"] as? [String: Any])?["traceFingerprint"] as? String == digest)
         print("Target model contract passed.")
     }
 }
