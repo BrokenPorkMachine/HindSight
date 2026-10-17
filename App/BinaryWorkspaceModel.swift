@@ -84,6 +84,16 @@ enum VGBinaryWorkspaceParser {
         VGGraphParser.address(from: text)
     }
 
+    /// Returns the instruction address only when the renderer placed it at the
+    /// start of an address-bearing statement. Other addresses on the line may
+    /// be call targets, constants, or memory locations and are not source maps.
+    static func pseudocodeSourceAddress(_ line: String) -> UInt64? {
+        let trimmed = line.drop(while: { $0.isWhitespace })
+        guard trimmed.hasPrefix("0x") else { return nil }
+        let token = trimmed.prefix(while: { !$0.isWhitespace })
+        return address(String(token))
+    }
+
     static func references(xrefs: String, callGraph: String) -> [VGBinaryReference] {
         var result: [VGBinaryReference] = []
         var seen = Set<String>()

@@ -394,7 +394,7 @@ struct VGBinaryWorkspace: View {
                 LazyVStack(alignment: .leading, spacing: 1) {
                     ForEach(Array(functionPseudocode.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { item in
                         let line = String(item.element)
-                        if let address = VGBinaryWorkspaceParser.allAddresses(in: line).first {
+                        if let address = VGBinaryWorkspaceParser.pseudocodeSourceAddress(line) {
                             Button { selectAddress(address) } label: {
                                 Text(line)
                                     .font(.system(size: 11, design: .monospaced))

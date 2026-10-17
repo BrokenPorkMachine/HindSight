@@ -39,6 +39,9 @@ struct BinaryWorkspaceContract {
         """
         precondition(VGBinaryWorkspaceParser.pseudocode(semantic, in: functions[0])?.contains("call_target") == true)
         precondition(VGBinaryWorkspaceParser.pseudocode(semantic, in: functions[0])?.contains("function_100001010") == false)
+        precondition(VGBinaryWorkspaceParser.pseudocodeSourceAddress("  0x0000000100001004 call_target(0x0000000100001010);") == 0x100001004)
+        precondition(VGBinaryWorkspaceParser.pseudocodeSourceAddress("  call_target(0x0000000100001010);") == nil)
+        precondition(VGBinaryWorkspaceParser.pseudocodeSourceAddress("  function_100001000()") == nil)
         precondition(VGBinaryWorkspaceParser.signatureEvidence("ABI evidence\nSignature evidence: _CFRelease") == "Signature evidence: _CFRelease")
 
         let xrefs = """
