@@ -13,6 +13,7 @@ struct BasicBlock {
     instructions: Vec<u64>,
     successors: Vec<usize>,
     predecessors: Vec<usize>,
+    backedges: Vec<usize>,
     reachable: bool,
     dominators: Vec<usize>,
 }
@@ -65,6 +66,833 @@ impl FunctionCfg {
                     changed = true;
                 }
             }
+        }
+        for source in 0..blocks.len() {
+            let backedges = blocks[source].successors.iter().copied()
+                .filter(|target| blocks[source].dominators.contains(target))
+                .collect::<Vec<_>>();
+            blocks[source].backedges = backedges;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LiftedInstruction {
+    address: u64,
+    word: u32,
+    operation: Operation,
+    portable: IrOperation,
+    data: bool,
+}
+
+struct FunctionIr {
+    start: u64,
+    end: u64,
+    instructions: Vec<LiftedInstruction>,
+    cfg: FunctionCfg,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrRegisterClass { General, StackPointer, Zero, ProgramCounter }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IrRegister { class: IrRegisterClass, index: u8, bits: u8 }
+
+impl From<Register> for IrRegister {
+    fn from(register: Register) -> Self {
+        Self {
+            class: if register.index == 32 { IrRegisterClass::ProgramCounter }
+                else if register.index == 31 && register.stack_pointer { IrRegisterClass::StackPointer }
+                else if register.index == 31 { IrRegisterClass::Zero }
+                else { IrRegisterClass::General },
+            index: register.index.min(32) as u8,
+            bits: if register.wide { 64 } else { 32 },
+        }
+    }
+}
+
+impl IrRegister {
+    fn target(self) -> Register {
+        Register {
+            index: self.index as u32,
+            wide: self.bits == 64,
+            stack_pointer: self.class == IrRegisterClass::StackPointer,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrOperand { Register(IrRegister), Constant(u64) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrBinaryOp { Add, Subtract, And, Or, Xor }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrShiftKind { Left, LogicalRight, ArithmeticRight }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrVariableShiftKind { Left, LogicalRight, ArithmeticRight, Rotate }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrOneSourceKind { ReverseBits, ReverseBytes, ReverseHalfwordBytes, ReverseWordBytes, CountLeadingZeros, CountLeadingSign }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrSelectElse { None, Increment, Invert, Negate }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrInsertKind { Bfi, Bfxil, Ubfiz, Sbfiz }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrCompareKind { Compare, CompareNegative, Test }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrCompareOperand {
+    Register { register: IrRegister, shift: Option<(IrShiftKind, u8)> },
+    Extended { register: IrRegister, extension: Option<IrExtension>, shift: Option<(IrShiftKind, u8)> },
+    Immediate(u64),
+}
+
+fn ir_compare_mnemonic(kind: IrCompareKind) -> &'static str {
+    match kind { IrCompareKind::Compare => "cmp", IrCompareKind::CompareNegative => "cmn", IrCompareKind::Test => "tst" }
+}
+
+fn ir_conditional_compare_mnemonic(kind: IrCompareKind) -> &'static str {
+    match kind { IrCompareKind::Compare => "ccmp", IrCompareKind::CompareNegative => "ccmn", IrCompareKind::Test => "cctst" }
+}
+
+fn render_ir_compare_operand(operand: IrCompareOperand) -> String {
+    let shift = |shift: Option<(IrShiftKind, u8)>| shift.map(|(kind, amount)| (
+        match kind { IrShiftKind::Left => ShiftKind::Left, IrShiftKind::LogicalRight => ShiftKind::LogicalRight, IrShiftKind::ArithmeticRight => ShiftKind::ArithmeticRight }, amount,
+    ));
+    match operand {
+        IrCompareOperand::Register { register, shift: amount } => render_shifted(&register.target().name(), shift(amount)),
+        IrCompareOperand::Extended { register, extension, shift: amount } => {
+            let register = register.target();
+            let extended = match extension {
+                Some(IrExtension::Zero(bits)) => format!("zext({}, {bits})", register.name()),
+                Some(IrExtension::Sign(bits)) => format!("sext({}, {bits})", register.name()),
+                None => register.name(),
+            };
+            render_shifted(&extended, shift(amount))
+        }
+        IrCompareOperand::Immediate(value) => format!("{value:#x}"),
+    }
+}
+
+fn resolve_ir_compare_operand(operand: IrCompareOperand, flow: &Flow, wide: bool) -> Option<u64> {
+    let apply_shift = |value: u64, shift: Option<(IrShiftKind, u8)>| {
+        shift.map_or(value, |(kind, amount)| shift_value(value, match kind {
+            IrShiftKind::Left => ShiftKind::Left,
+            IrShiftKind::LogicalRight => ShiftKind::LogicalRight,
+            IrShiftKind::ArithmeticRight => ShiftKind::ArithmeticRight,
+        }, amount, wide))
+    };
+    match operand {
+        IrCompareOperand::Register { register, shift } => flow.read(register.target()).map(|value| apply_shift(value.value, shift)),
+        IrCompareOperand::Extended { register, extension, shift } => flow.read(register.target()).map(|value| {
+            let value = match extension {
+                Some(IrExtension::Zero(bits)) => extend_value(value.value, false, bits, wide),
+                Some(IrExtension::Sign(bits)) => extend_value(value.value, true, bits, wide),
+                None => value.value,
+            };
+            apply_shift(value, shift)
+        }),
+        IrCompareOperand::Immediate(value) => Some(value),
+    }
+}
+
+fn compare_flags(kind: IrCompareKind, left: u64, right: u64, wide: bool) -> u8 {
+    let bits = if wide { 64 } else { 32 };
+    let mask = if wide { u64::MAX } else { 0xffff_ffff };
+    let sign = 1u64 << (bits - 1);
+    let a = left & mask;
+    let b = right & mask;
+    let (result, carry, overflow) = match kind {
+        IrCompareKind::Test => (a & b, false, false),
+        IrCompareKind::Compare => {
+            let result = a.wrapping_sub(b) & mask;
+            (result, a >= b, ((a ^ b) & (a ^ result) & sign) != 0)
+        }
+        IrCompareKind::CompareNegative => {
+            let wide_sum = (a as u128) + (b as u128);
+            let result = wide_sum as u64 & mask;
+            (result, wide_sum > mask as u128, (!(a ^ b) & (a ^ result) & sign) != 0)
+        }
+    };
+    ((result & sign != 0) as u8) << 3
+        | ((result == 0) as u8) << 2
+        | (carry as u8) << 1
+        | overflow as u8
+}
+
+fn condition_holds(flags: u8, condition: IrFlagPredicate) -> Option<bool> {
+    let n = flags & 8 != 0;
+    let z = flags & 4 != 0;
+    let c = flags & 2 != 0;
+    let v = flags & 1 != 0;
+    Some(match condition {
+        IrFlagPredicate::Equal => z,
+        IrFlagPredicate::NotEqual => !z,
+        IrFlagPredicate::CarrySet => c,
+        IrFlagPredicate::CarryClear => !c,
+        IrFlagPredicate::Negative => n,
+        IrFlagPredicate::NonNegative => !n,
+        IrFlagPredicate::Overflow => v,
+        IrFlagPredicate::NoOverflow => !v,
+        IrFlagPredicate::UnsignedHigher => c && !z,
+        IrFlagPredicate::UnsignedLowerOrSame => !c || z,
+        IrFlagPredicate::SignedGreaterOrEqual => n == v,
+        IrFlagPredicate::SignedLess => n != v,
+        IrFlagPredicate::SignedGreater => !z && n == v,
+        IrFlagPredicate::SignedLessOrEqual => z || n != v,
+        IrFlagPredicate::Always => true,
+        IrFlagPredicate::Never => false,
+    })
+}
+
+fn evaluate_ir_condition(condition: IrCondition, flow: &Flow) -> Option<bool> {
+    match condition {
+        IrCondition::Flags(IrFlagPredicate::Always) => Some(true),
+        IrCondition::Flags(IrFlagPredicate::Never) => Some(false),
+        IrCondition::Flags(predicate) => flow.flags.and_then(|flags| condition_holds(flags, predicate)),
+        IrCondition::Zero { register, nonzero } => flow.read(register.target()).map(|value| (value.value != 0) == nonzero),
+        IrCondition::Bit { register, bit, nonzero } => flow.read(register.target()).map(|value| ((value.value >> bit) & 1 != 0) == nonzero),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrCondition {
+    Flags(IrFlagPredicate),
+    Zero { register: IrRegister, nonzero: bool },
+    Bit { register: IrRegister, bit: u8, nonzero: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrFlagPredicate { Equal, NotEqual, CarrySet, CarryClear, Negative, NonNegative, Overflow, NoOverflow,
+    UnsignedHigher, UnsignedLowerOrSame, SignedGreaterOrEqual, SignedLess, SignedGreater, SignedLessOrEqual, Always, Never }
+
+fn lift_flag_predicate(code: u8) -> IrFlagPredicate {
+    match code & 15 {
+        0 => IrFlagPredicate::Equal, 1 => IrFlagPredicate::NotEqual,
+        2 => IrFlagPredicate::CarrySet, 3 => IrFlagPredicate::CarryClear,
+        4 => IrFlagPredicate::Negative, 5 => IrFlagPredicate::NonNegative,
+        6 => IrFlagPredicate::Overflow, 7 => IrFlagPredicate::NoOverflow,
+        8 => IrFlagPredicate::UnsignedHigher, 9 => IrFlagPredicate::UnsignedLowerOrSame,
+        10 => IrFlagPredicate::SignedGreaterOrEqual, 11 => IrFlagPredicate::SignedLess,
+        12 => IrFlagPredicate::SignedGreater, 13 => IrFlagPredicate::SignedLessOrEqual,
+        14 => IrFlagPredicate::Always, _ => IrFlagPredicate::Never,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrMemoryAddress {
+    BaseOffset { base: IrRegister, offset: i64 },
+    BaseIndex { base: IrRegister, index: IrRegister, extension: Option<IrExtension>, scale: u8 },
+    PcRelative { offset: i64, target: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IrWriteback { base: IrRegister, offset: i64, pre_index: bool }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrExtension { Zero(u8), Sign(u8) }
+
+/// Architecture-neutral effects for operations shared by the supported lifters.
+/// Target-only semantics remain in `Operation` and are explicitly marked here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrOperation {
+    Nop,
+    Assign { destination: IrRegister, value: IrOperand },
+    Address { destination: IrRegister, value: u64, page: bool },
+    Binary { destination: IrRegister, operator: IrBinaryOp, left: IrOperand, right: IrOperand },
+    LogicalRegister { destination: IrRegister, left: IrRegister, right: IrRegister, operator: IrBinaryOp, negate_right: bool, shift: Option<(IrShiftKind, u8)> },
+    ShiftedArithmetic { destination: IrRegister, left: IrRegister, right: IrRegister, subtract: bool, shift: IrShiftKind, amount: u8 },
+    MoveKeep { destination: IrRegister, value: u16, shift: u32 },
+    Shift { destination: IrRegister, source: IrRegister, kind: IrShiftKind, amount: u8 },
+    VariableShift { destination: IrRegister, source: IrRegister, amount: IrRegister, kind: IrVariableShiftKind },
+    OneSource { destination: IrRegister, source: IrRegister, kind: IrOneSourceKind },
+    ExtractConcat { destination: IrRegister, left: IrRegister, right: IrRegister, lsb: u8 },
+    AddCarry { destination: IrRegister, left: IrRegister, right: IrRegister, subtract: bool },
+    ConditionalSelect { destination: IrRegister, if_true: IrRegister, if_false: IrRegister, condition: IrFlagPredicate, else_op: IrSelectElse },
+    Extend { destination: IrRegister, source: IrRegister, signed: bool, from: u8 },
+    Extract { destination: IrRegister, source: IrRegister, lsb: u8, width: u8, signed: bool },
+    Insert { destination: IrRegister, source: IrRegister, lsb: u8, width: u8, kind: IrInsertKind },
+    AddExtended { destination: IrRegister, left: IrRegister, right: IrRegister, subtract: bool, extension: Option<IrExtension>, shift: u8 },
+    Compare { kind: IrCompareKind, left: IrRegister, right: IrCompareOperand },
+    ConditionalCompare { kind: IrCompareKind, left: IrRegister, right: IrCompareOperand, nzcv: u8, condition: u8 },
+    MultiplyAdd { destination: IrRegister, left: IrRegister, right: IrRegister, addend: Option<IrRegister>, subtract: bool },
+    WideningMultiply { destination: IrRegister, left: IrRegister, right: IrRegister, addend: Option<IrRegister>, subtract: bool, signed: bool, high: bool },
+    Divide { destination: IrRegister, left: IrRegister, right: IrRegister, signed: bool },
+    Load { destination: IrRegister, address: IrMemoryAddress, bytes: u8, signed: bool, writeback: Option<IrWriteback> },
+    Store { address: IrMemoryAddress, value: IrOperand, bytes: u8, writeback: Option<IrWriteback> },
+    DirectCall { target: u64 },
+    IndirectCall { target: IrRegister },
+    Branch { target: u64 },
+    ConditionalBranch { target: u64, condition: IrCondition },
+    IndirectBranch { target: IrRegister },
+    Return { target: Option<IrRegister> },
+    TargetSpecific,
+}
+
+impl IrOperation {
+    fn is_control_flow(self) -> bool {
+        matches!(self, Self::DirectCall { .. } | Self::IndirectCall { .. } | Self::Branch { .. }
+            | Self::ConditionalBranch { .. } | Self::IndirectBranch { .. } | Self::Return { .. })
+    }
+
+    fn direct_branch_target(self) -> Option<u64> {
+        match self { Self::Branch { target } | Self::ConditionalBranch { target, .. } => Some(target), _ => None }
+    }
+
+    fn render(self, flow: &mut Flow, pc: u64) -> Option<String> {
+        let consumes_flags = matches!(self, Self::ConditionalBranch { .. } | Self::ConditionalSelect { .. } | Self::ConditionalCompare { .. });
+        let preserves_flags = matches!(self,
+            Self::Nop | Self::Assign { .. } | Self::Address { .. } | Self::MoveKeep { .. }
+            | Self::Shift { .. } | Self::VariableShift { .. } | Self::OneSource { .. }
+            | Self::ExtractConcat { .. } | Self::Extend { .. } | Self::Extract { .. }
+            | Self::Insert { .. } | Self::Load { .. } | Self::Store { .. }
+        );
+        let consumed_flags = if consumes_flags {
+            flow.flags.take()
+        } else if !preserves_flags || matches!(self, Self::Compare { .. } | Self::ConditionalCompare { .. }) {
+            flow.flags = None;
+            None
+        } else {
+            None
+        };
+        let register_name = |register: IrRegister| register.target().name();
+        let operand_name = |operand: IrOperand| match operand {
+            IrOperand::Register(register) => register_name(register),
+            IrOperand::Constant(value) => format!("{value:#x}"),
+        };
+        match self {
+            Self::Nop => Some("/* nop */".into()),
+            Self::Assign { destination, value } => {
+                let destination = destination.target();
+                let known = match value {
+                    IrOperand::Register(register) => flow.read(register.target()).and_then(|input| {
+                        Some(KnownValue { value: destination.mask(input.value), origins: combine_origins(&input.origins, &[], pc)? })
+                    }),
+                    IrOperand::Constant(value) => Some(KnownValue { value: destination.mask(value), origins: vec![pc] }),
+                };
+                flow.write(destination, known.clone());
+                let suffix = if matches!(value, IrOperand::Constant(_)) { String::new() } else { resolved_suffix(known.as_ref()) };
+                Some(format!("{} = {};{}", destination.name(), operand_name(value), suffix))
+            }
+            Self::Address { destination, value, page } => {
+                let destination = destination.target();
+                let value = destination.mask(value);
+                flow.write(destination, Some(KnownValue { value, origins: vec![pc] }));
+                Some(format!("{} = {value:#x}; /* {} */", destination.name(), if page { "pc-relative page" } else { "pc-relative" }))
+            }
+            Self::Binary { destination, operator, left, right } => {
+                let destination = destination.target();
+                let known_operand = |operand: IrOperand, flow: &Flow| match operand {
+                    IrOperand::Register(register) => flow.read(register.target()),
+                    IrOperand::Constant(value) => Some(KnownValue { value, origins: Vec::new() }),
+                };
+                let known = known_operand(left, flow).zip(known_operand(right, flow)).and_then(|(a, b)| {
+                    let value = match operator {
+                        IrBinaryOp::Add => a.value.wrapping_add(b.value),
+                        IrBinaryOp::Subtract => a.value.wrapping_sub(b.value),
+                        IrBinaryOp::And => a.value & b.value,
+                        IrBinaryOp::Or => a.value | b.value,
+                        IrBinaryOp::Xor => a.value ^ b.value,
+                    };
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&a.origins, &b.origins, pc)? })
+                });
+                flow.write(destination, known.clone());
+                let operator = match operator { IrBinaryOp::Add => "+", IrBinaryOp::Subtract => "-", IrBinaryOp::And => "&", IrBinaryOp::Or => "|", IrBinaryOp::Xor => "^" };
+                Some(format!("{} = {} {} {};{}", destination.name(), operand_name(left), operator, operand_name(right), resolved_suffix(known.as_ref())))
+            }
+            Self::LogicalRegister { destination, left, right, operator, negate_right, shift } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let target_shift = shift.map(|(kind, amount)| (match kind {
+                    IrShiftKind::Left => ShiftKind::Left,
+                    IrShiftKind::LogicalRight => ShiftKind::LogicalRight,
+                    IrShiftKind::ArithmeticRight => ShiftKind::ArithmeticRight,
+                }, amount));
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let shifted = shifted_value(b.value, target_shift, destination.wide);
+                    let rhs = if negate_right { destination.mask(!shifted) } else { shifted };
+                    let value = match operator {
+                        IrBinaryOp::And => a.value & rhs,
+                        IrBinaryOp::Or => a.value | rhs,
+                        IrBinaryOp::Xor => a.value ^ rhs,
+                        _ => return None,
+                    };
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&a.origins, &b.origins, pc)? })
+                });
+                flow.write(destination, known.clone());
+                let rhs = render_shifted(&right.name(), target_shift);
+                let rhs = if negate_right { format!("~{rhs}") } else { rhs };
+                let operator = match operator { IrBinaryOp::And => "&", IrBinaryOp::Or => "|", IrBinaryOp::Xor => "^", _ => unreachable!() };
+                Some(format!("{} = {} {operator} {rhs};{}", destination.name(), left.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::ShiftedArithmetic { destination, left, right, subtract, shift, amount } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let target_shift = match shift { IrShiftKind::Left => ShiftKind::Left, IrShiftKind::LogicalRight => ShiftKind::LogicalRight, IrShiftKind::ArithmeticRight => ShiftKind::ArithmeticRight };
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let operand = shift_value(b.value, target_shift, amount, destination.wide);
+                    Some(KnownValue {
+                        value: destination.mask(if subtract { a.value.wrapping_sub(operand) } else { a.value.wrapping_add(operand) }),
+                        origins: combine_origins(&a.origins, &b.origins, pc)?,
+                    })
+                });
+                flow.write(destination, known.clone());
+                let operator = if subtract { "-" } else { "+" };
+                Some(format!("{} = {} {operator} {};{}", destination.name(), left.name(), render_shifted(&right.name(), Some((target_shift, amount))), resolved_suffix(known.as_ref())))
+            }
+            Self::MoveKeep { destination, value, shift } => {
+                let destination = destination.target();
+                let field = 0xffffu64 << shift;
+                let inserted = (value as u64) << shift;
+                let known = flow.read(destination).and_then(|prior| Some(KnownValue {
+                    value: destination.mask((prior.value & !field) | inserted),
+                    origins: combine_origins(&prior.origins, &[], pc)?,
+                }));
+                flow.write(destination, known.clone());
+                Some(format!("{} = ({} & {:#x}) | {:#x};{}", destination.name(), destination.name(), destination.mask(!field), inserted, resolved_suffix(known.as_ref())))
+            }
+            Self::Shift { destination, source, kind, amount } => {
+                let destination = destination.target();
+                let source = source.target();
+                let target_kind = match kind { IrShiftKind::Left => ShiftKind::Left, IrShiftKind::LogicalRight => ShiftKind::LogicalRight, IrShiftKind::ArithmeticRight => ShiftKind::ArithmeticRight };
+                let known = flow.read(source).and_then(|input| Some(KnownValue {
+                    value: destination.mask(shift_value(input.value, target_kind, amount, destination.wide)),
+                    origins: combine_origins(&input.origins, &[], pc)?,
+                }));
+                flow.write(destination, known.clone());
+                let operator = match kind { IrShiftKind::Left => "<<", IrShiftKind::LogicalRight => ">>", IrShiftKind::ArithmeticRight => ">>>" };
+                Some(format!("{} = {} {operator} {amount};{}", destination.name(), source.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::VariableShift { destination, source, amount, kind } => {
+                let destination = destination.target();
+                let source = source.target();
+                let amount = amount.target();
+                let known = flow.read(source).zip(flow.read(amount)).and_then(|(input, shift)| {
+                    let width = if destination.wide { 64 } else { 32 };
+                    let shift_amount = (shift.value % width) as u8;
+                    let value = match kind {
+                        IrVariableShiftKind::Left => shift_value(input.value, ShiftKind::Left, shift_amount, destination.wide),
+                        IrVariableShiftKind::LogicalRight => shift_value(input.value, ShiftKind::LogicalRight, shift_amount, destination.wide),
+                        IrVariableShiftKind::ArithmeticRight => shift_value(input.value, ShiftKind::ArithmeticRight, shift_amount, destination.wide),
+                        IrVariableShiftKind::Rotate => rotate_right(input.value, shift_amount as u32, width as u32),
+                    };
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&input.origins, &shift.origins, pc)? })
+                });
+                flow.write(destination, known.clone());
+                let expression = match kind {
+                    IrVariableShiftKind::Rotate => format!("ror({}, {})", source.name(), amount.name()),
+                    IrVariableShiftKind::Left => format!("{} << {}", source.name(), amount.name()),
+                    IrVariableShiftKind::LogicalRight => format!("{} >> {}", source.name(), amount.name()),
+                    IrVariableShiftKind::ArithmeticRight => format!("{} >>> {}", source.name(), amount.name()),
+                };
+                Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::OneSource { destination, source, kind } => {
+                let destination = destination.target();
+                let source = source.target();
+                let target_kind = match kind {
+                    IrOneSourceKind::ReverseBits => OneSourceKind::ReverseBits,
+                    IrOneSourceKind::ReverseBytes => OneSourceKind::ReverseBytes,
+                    IrOneSourceKind::ReverseHalfwordBytes => OneSourceKind::ReverseHalfwordBytes,
+                    IrOneSourceKind::ReverseWordBytes => OneSourceKind::ReverseWordBytes,
+                    IrOneSourceKind::CountLeadingZeros => OneSourceKind::CountLeadingZeros,
+                    IrOneSourceKind::CountLeadingSign => OneSourceKind::CountLeadingSign,
+                };
+                let known = flow.read(source).and_then(|input| Some(KnownValue {
+                    value: destination.mask(target_kind.fold(input.value, destination.wide)),
+                    origins: combine_origins(&input.origins, &[], pc)?,
+                }));
+                flow.write(destination, known.clone());
+                Some(format!("{} = {}({});{}", destination.name(), target_kind.mnemonic(), source.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::ExtractConcat { destination, left, right, lsb } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let width: u32 = if destination.wide { 64 } else { 32 };
+                let known = flow.read(right).and_then(|low| {
+                    if lsb == 0 {
+                        Some(KnownValue { value: destination.mask(low.value), origins: combine_origins(&low.origins, &[], pc)? })
+                    } else {
+                        flow.read(left).and_then(|high| Some(KnownValue {
+                            value: destination.mask((low.value >> lsb) | (high.value << (width - lsb as u32))),
+                            origins: combine_origins(&high.origins, &low.origins, pc)?,
+                        }))
+                    }
+                });
+                flow.write(destination, known.clone());
+                let expression = if left.index == right.index {
+                    format!("ror({}, {lsb})", left.name())
+                } else {
+                    format!("extr({}, {}, {lsb})", left.name(), right.name())
+                };
+                Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::AddCarry { destination, left, right, subtract } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                // PSTATE.C is not modeled, so this must invalidate any prior value.
+                flow.write(destination, None);
+                let expression = if subtract {
+                    format!("{} + ~{} + carry", left.name(), right.name())
+                } else {
+                    format!("{} + {} + carry", left.name(), right.name())
+                };
+                Some(format!("{} = {expression};", destination.name()))
+            }
+            Self::ConditionalSelect { destination, if_true, if_false, condition, else_op } => {
+                let destination = destination.target();
+                let if_true = if_true.target();
+                let if_false = if_false.target();
+                let transformed = |value: u64| match else_op {
+                    IrSelectElse::None => value,
+                    IrSelectElse::Increment => value.wrapping_add(1),
+                    IrSelectElse::Invert => !value,
+                    IrSelectElse::Negate => 0u64.wrapping_sub(value),
+                };
+                let true_value = flow.read(if_true).map(|known| (known.value, known.origins));
+                let false_value = flow.read(if_false).map(|known| (transformed(known.value), known.origins));
+                let selected = if condition == IrFlagPredicate::Always { Some(true) }
+                    else if condition == IrFlagPredicate::Never { Some(false) }
+                    else { consumed_flags.and_then(|flags| condition_holds(flags, condition)) };
+                let known = if let Some(true) = selected {
+                    true_value.clone()
+                } else if let Some(false) = selected {
+                    false_value.clone()
+                } else if let (Some((a, a_origins)), Some((b, b_origins))) = (true_value.clone(), false_value) {
+                    (destination.mask(a) == destination.mask(b)).then_some((a, [a_origins, b_origins].concat()))
+                } else { None }.and_then(|(value, origins)| Some(KnownValue {
+                    value: destination.mask(value), origins: combine_origins(&origins, &[], pc)?,
+                }));
+                flow.write(destination, known.clone());
+                let false_expression = match else_op {
+                    IrSelectElse::None => if_false.name(),
+                    IrSelectElse::Increment => format!("({} + 1)", if_false.name()),
+                    IrSelectElse::Invert => format!("(~{})", if_false.name()),
+                    IrSelectElse::Negate => format!("(-{})", if_false.name()),
+                };
+                let cond_code = match condition {
+                    IrFlagPredicate::Equal => 0, IrFlagPredicate::NotEqual => 1,
+                    IrFlagPredicate::CarrySet => 2, IrFlagPredicate::CarryClear => 3,
+                    IrFlagPredicate::Negative => 4, IrFlagPredicate::NonNegative => 5,
+                    IrFlagPredicate::Overflow => 6, IrFlagPredicate::NoOverflow => 7,
+                    IrFlagPredicate::UnsignedHigher => 8, IrFlagPredicate::UnsignedLowerOrSame => 9,
+                    IrFlagPredicate::SignedGreaterOrEqual => 10, IrFlagPredicate::SignedLess => 11,
+                    IrFlagPredicate::SignedGreater => 12, IrFlagPredicate::SignedLessOrEqual => 13,
+                    IrFlagPredicate::Always => 14, IrFlagPredicate::Never => 15,
+                };
+                Some(format!("{} = {} ? {} : {};{}", destination.name(), condition_name(cond_code), if_true.name(), false_expression, resolved_suffix(known.as_ref())))
+            }
+            Self::Extend { destination, source, signed, from } => {
+                let destination = destination.target();
+                let source = source.target();
+                let known = flow.read(source).and_then(|input| Some(KnownValue {
+                    value: destination.mask(extend_value(input.value, signed, from, destination.wide)),
+                    origins: combine_origins(&input.origins, &[], pc)?,
+                }));
+                flow.write(destination, known.clone());
+                Some(format!("{} = {}({}, {from});{}", destination.name(), if signed { "sext" } else { "zext" }, source.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::Extract { destination, source, lsb, width, signed } => {
+                let destination = destination.target();
+                let source = source.target();
+                let known = flow.read(source).and_then(|input| {
+                    let extracted = extract_value(input.value, lsb, width);
+                    let value = if signed { extend_value(extracted, true, width, destination.wide) } else { extracted };
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&input.origins, &[], pc)? })
+                });
+                flow.write(destination, known.clone());
+                let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+                let expression = if signed {
+                    if lsb == 0 { format!("sext({}, {width})", source.name()) }
+                    else { format!("sext({} >> {lsb}, {width})", source.name()) }
+                } else if lsb == 0 {
+                    format!("{} & {mask:#x}", source.name())
+                } else {
+                    format!("({} >> {lsb}) & {mask:#x}", source.name())
+                };
+                Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::Insert { destination, source, lsb, width, kind } => {
+                let destination = destination.target();
+                let source = source.target();
+                let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+                let known = flow.read(source).and_then(|src| {
+                    let (value, origins) = match kind {
+                        IrInsertKind::Bfi => {
+                            let old = flow.read(destination)?;
+                            let value = (old.value & !(mask << lsb)) | ((src.value & mask) << lsb);
+                            (value, combine_origins(&src.origins, &old.origins, pc)?)
+                        }
+                        IrInsertKind::Bfxil => {
+                            let old = flow.read(destination)?;
+                            let value = (old.value & !mask) | ((src.value >> lsb) & mask);
+                            (value, combine_origins(&src.origins, &old.origins, pc)?)
+                        }
+                        IrInsertKind::Ubfiz => (src.value & mask, combine_origins(&src.origins, &[], pc)?),
+                        IrInsertKind::Sbfiz => {
+                            let extracted = src.value & mask;
+                            let value = if extracted & (1u64 << (width - 1)) != 0 { extracted | !mask } else { extracted };
+                            (value, combine_origins(&src.origins, &[], pc)?)
+                        }
+                    };
+                    Some(KnownValue { value: destination.mask(value), origins })
+                });
+                flow.write(destination, known.clone());
+                let statement = match kind {
+                    IrInsertKind::Bfi => format!("{} = ({} & ~({mask:#x} << {lsb})) | (({} & {mask:#x}) << {lsb});", destination.name(), destination.name(), source.name()),
+                    IrInsertKind::Bfxil => format!("{} = ({} & ~{mask:#x}) | (({} >> {lsb}) & {mask:#x});", destination.name(), destination.name(), source.name()),
+                    IrInsertKind::Ubfiz => format!("{} = {} & {mask:#x};", destination.name(), source.name()),
+                    IrInsertKind::Sbfiz => format!("{} = sext({} & {mask:#x}, {width});", destination.name(), source.name()),
+                };
+                Some(format!("{statement}{}", resolved_suffix(known.as_ref())))
+            }
+            Self::AddExtended { destination, left, right, subtract, extension, shift } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let shift_opt = (shift != 0).then_some((ShiftKind::Left, shift));
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let extended = match extension {
+                        Some(IrExtension::Zero(bits)) => extend_value(b.value, false, bits, destination.wide),
+                        Some(IrExtension::Sign(bits)) => extend_value(b.value, true, bits, destination.wide),
+                        None => b.value,
+                    };
+                    let operand = shifted_value(extended, shift_opt, destination.wide);
+                    Some(KnownValue {
+                        value: destination.mask(if subtract { a.value.wrapping_sub(operand) } else { a.value.wrapping_add(operand) }),
+                        origins: combine_origins(&a.origins, &b.origins, pc)?,
+                    })
+                });
+                flow.write(destination, known.clone());
+                let extended = match extension {
+                    Some(IrExtension::Zero(bits)) => format!("zext({}, {bits})", right.name()),
+                    Some(IrExtension::Sign(bits)) => format!("sext({}, {bits})", right.name()),
+                    None => right.name(),
+                };
+                let operand = render_shifted(&extended, shift_opt);
+                Some(format!("{} = {} {} {};{}", destination.name(), left.name(), if subtract { "-" } else { "+" }, operand, resolved_suffix(known.as_ref())))
+            }
+            Self::Compare { kind, left, right } => {
+                let left = left.target();
+                flow.flags = flow.read(left).zip(resolve_ir_compare_operand(right, flow, left.wide))
+                    .map(|(a, b)| compare_flags(kind, a.value, b, left.wide));
+                let operand = render_ir_compare_operand(right);
+                Some(format!("/* {} {}, {operand} */", ir_compare_mnemonic(kind), left.name()))
+            }
+            Self::ConditionalCompare { kind, left, right, nzcv, condition } => {
+                let left = left.target();
+                let execute = consumed_flags.and_then(|flags| condition_holds(flags, lift_flag_predicate(condition)));
+                flow.flags = match execute {
+                    Some(false) => Some(nzcv & 0xf),
+                    Some(true) => flow.read(left).zip(resolve_ir_compare_operand(right, flow, left.wide))
+                        .map(|(a, b)| compare_flags(kind, a.value, b, left.wide)),
+                    None => None,
+                };
+                let operand = render_ir_compare_operand(right);
+                Some(format!("/* {} {}, {}, #0x{nzcv:x}, {} */", ir_conditional_compare_mnemonic(kind), left.name(), operand, condition_name(condition)))
+            }
+            Self::MultiplyAdd { destination, left, right, addend, subtract } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let add = match addend.map(IrRegister::target).and_then(|r| flow.read(r)) {
+                        Some(value) => Some((value.value, value.origins)),
+                        None if addend.is_none() => Some((0, Vec::new())),
+                        None => None,
+                    }?;
+                    let product = a.value.wrapping_mul(b.value);
+                    let value = if subtract { add.0.wrapping_sub(product) } else { add.0.wrapping_add(product) };
+                    let origins = [a.origins.as_slice(), b.origins.as_slice()].concat();
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&origins, &add.1, pc)? })
+                });
+                flow.write(destination, known.clone());
+                let suffix = resolved_suffix(known.as_ref());
+                let expression = match (addend.map(IrRegister::target), subtract) {
+                    (Some(add), false) => format!("{} * {} + {}", left.name(), right.name(), add.name()),
+                    (Some(add), true) => format!("{} - {} * {}", add.name(), left.name(), right.name()),
+                    (None, false) => format!("{} * {}", left.name(), right.name()),
+                    (None, true) => format!("0 - {} * {}", left.name(), right.name()),
+                };
+                Some(format!("{} = {expression};{suffix}", destination.name()))
+            }
+            Self::WideningMultiply { destination, left, right, addend, subtract, signed, high } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| {
+                    let add = match addend.map(IrRegister::target).and_then(|r| flow.read(r)) {
+                        Some(value) => Some((value.value, value.origins)),
+                        None if addend.is_none() => Some((0, Vec::new())),
+                        None => None,
+                    }?;
+                    let product = widening_product(a.value, b.value, signed, high);
+                    let value = if subtract { add.0.wrapping_sub(product) } else { add.0.wrapping_add(product) };
+                    let origins = [a.origins.as_slice(), b.origins.as_slice()].concat();
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&origins, &add.1, pc)? })
+                });
+                flow.write(destination, known.clone());
+                let product = if high {
+                    format!("{}({}, {})", if signed { "smulh" } else { "umulh" }, left.name(), right.name())
+                } else if signed {
+                    format!("sext({}, 32) * sext({}, 32)", left.name(), right.name())
+                } else {
+                    format!("zext({}, 32) * zext({}, 32)", left.name(), right.name())
+                };
+                let expression = match (addend.map(IrRegister::target), subtract) {
+                    (Some(add), false) => format!("{product} + {}", add.name()),
+                    (Some(add), true) => format!("{} - {product}", add.name()),
+                    (None, false) => product,
+                    (None, true) => format!("0 - {product}"),
+                };
+                Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::Divide { destination, left, right, signed } => {
+                let destination = destination.target();
+                let left = left.target();
+                let right = right.target();
+                let known = flow.read(left).zip(flow.read(right)).and_then(|(a, b)| Some(KnownValue {
+                    value: divide_value(a.value, b.value, signed, destination.wide),
+                    origins: combine_origins(&a.origins, &b.origins, pc)?,
+                }));
+                flow.write(destination, known.clone());
+                Some(format!("{} = {} {} {};{}", destination.name(), left.name(), if signed { "sdiv" } else { "udiv" }, right.name(), resolved_suffix(known.as_ref())))
+            }
+            Self::Load { destination, address, bytes, signed, writeback } => {
+                let destination = destination.target();
+                let (expression, known) = match address {
+                    IrMemoryAddress::BaseOffset { base, offset } => {
+                        let base_register = base.target();
+                        let expression = signed_memory_operand(&base_register, offset);
+                        let known = flow.read(base_register).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(offset as u64), origins }));
+                        (expression, known)
+                    }
+                    IrMemoryAddress::BaseIndex { base, index, extension, scale } => {
+                        resolve_ir_indexed_address(base, index, extension, scale, flow, pc)
+                    }
+                    IrMemoryAddress::PcRelative { offset, target } => {
+                        let expression = if offset >= 0 { format!("pc + {:#x}", offset as u64) }
+                            else { format!("pc - {:#x}", offset.unsigned_abs()) };
+                        (expression, Some(KnownValue { value: target, origins: vec![pc] }))
+                    }
+                };
+                let pre_update = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
+                let post_update = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
+                let size = bytes.trailing_zeros();
+                let access = memory_access_operand(&expression, size, signed, destination.wide);
+                flow.write(destination, None);
+                let mut statement = String::new();
+                if let Some((base, rendered, value)) = pre_update {
+                    if base.index != destination.index || base.wide != destination.wide || base.stack_pointer != destination.stack_pointer {
+                        flow.write(base, value);
+                    }
+                    statement.push_str(&format!("{} = {rendered}; ", base.name()));
+                }
+                statement.push_str(&format!("{} = {access};{}", destination.name(), address_suffix(known.as_ref())));
+                if let Some((base, rendered, value)) = post_update {
+                    flow.write(base, value);
+                    statement.push_str(&format!(" {} = {rendered};", base.name()));
+                }
+                Some(statement)
+            }
+            Self::Store { address, value, bytes, writeback } => {
+                let (expression, known) = match address {
+                    IrMemoryAddress::BaseOffset { base, offset } => {
+                        let base_register = base.target();
+                        let expression = signed_memory_operand(&base_register, offset);
+                        let known = flow.read(base_register).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(offset as u64), origins }));
+                        (expression, known)
+                    }
+                    IrMemoryAddress::BaseIndex { base, index, extension, scale } => {
+                        resolve_ir_indexed_address(base, index, extension, scale, flow, pc)
+                    }
+                    IrMemoryAddress::PcRelative { offset, target } => {
+                        let expression = if offset >= 0 { format!("pc + {:#x}", offset as u64) }
+                            else { format!("pc - {:#x}", offset.unsigned_abs()) };
+                        (expression, Some(KnownValue { value: target, origins: vec![pc] }))
+                    }
+                };
+                let value = match value { IrOperand::Register(register) => register.target(), _ => return None };
+                let access = memory_access_operand(&expression, bytes.trailing_zeros(), false, value.wide);
+                let mut statement = String::new();
+                if let Some(item) = writeback.filter(|item| item.pre_index) {
+                    let (base, rendered, new_value) = apply_ir_writeback(item, flow, pc);
+                    flow.write(base, new_value);
+                    statement.push_str(&format!("{} = {rendered}; ", base.name()));
+                }
+                statement.push_str(&format!("{access} = {};{}", value.name(), address_suffix(known.as_ref())));
+                if let Some(item) = writeback.filter(|item| !item.pre_index) {
+                    let (base, rendered, new_value) = apply_ir_writeback(item, flow, pc);
+                    flow.write(base, new_value);
+                    statement.push_str(&format!(" {} = {rendered};", base.name()));
+                }
+                Some(statement)
+            }
+            Self::DirectCall { target } => {
+                flow.clear();
+                Some(format!("call({target:#x}); /* signature, arguments, result and side effects unresolved */"))
+            }
+            Self::IndirectCall { target } => {
+                let target = target.target();
+                let resolved = flow.read(target).filter(|value| !value.origins.is_empty());
+                flow.clear();
+                Some(match resolved {
+                    Some(value) => format!("call({:#x}); /* indirect via {}; {}; signature, arguments, result and side effects unresolved */", value.value, target.name(), proven_by(&value)),
+                    None => format!("call({}); /* indirect; signature, arguments, result and side effects unresolved */", target.name()),
+                })
+            }
+            Self::Branch { target } => Some(format!("goto {target:#x};")),
+            Self::ConditionalBranch { target, condition } => {
+                let proven = match condition {
+                    IrCondition::Flags(IrFlagPredicate::Always) => Some(true),
+                    IrCondition::Flags(IrFlagPredicate::Never) => Some(false),
+                    IrCondition::Flags(predicate) => consumed_flags.and_then(|flags| condition_holds(flags, predicate)),
+                    IrCondition::Zero { register, nonzero } => flow.read(register.target()).map(|value| (value.value != 0) == nonzero),
+                    IrCondition::Bit { register, bit, nonzero } => flow.read(register.target()).map(|value| ((value.value >> bit) & 1 != 0) == nonzero),
+                };
+                let condition = match condition {
+                    IrCondition::Flags(predicate) => condition_name(match predicate {
+                        IrFlagPredicate::Equal => 0, IrFlagPredicate::NotEqual => 1,
+                        IrFlagPredicate::CarrySet => 2, IrFlagPredicate::CarryClear => 3,
+                        IrFlagPredicate::Negative => 4, IrFlagPredicate::NonNegative => 5,
+                        IrFlagPredicate::Overflow => 6, IrFlagPredicate::NoOverflow => 7,
+                        IrFlagPredicate::UnsignedHigher => 8, IrFlagPredicate::UnsignedLowerOrSame => 9,
+                        IrFlagPredicate::SignedGreaterOrEqual => 10, IrFlagPredicate::SignedLess => 11,
+                        IrFlagPredicate::SignedGreater => 12, IrFlagPredicate::SignedLessOrEqual => 13,
+                        IrFlagPredicate::Always => 14, IrFlagPredicate::Never => 15,
+                    }).to_string(),
+                    IrCondition::Zero { register, nonzero } => format!("{} {} 0", register_name(register), if nonzero { "!=" } else { "==" }),
+                    IrCondition::Bit { register, bit, nonzero } => format!("({} & {:#x}) {} 0", register_name(register), 1u64 << bit, if nonzero { "!=" } else { "==" }),
+                };
+                let evidence = match proven { Some(true) => " /* condition proven true */", Some(false) => " /* condition proven false */", None => "" };
+                Some(format!("if ({condition}) goto {target:#x};{evidence}"))
+            }
+            Self::IndirectBranch { target } => {
+                let target = target.target();
+                let resolved = flow.read(target).filter(|value| !value.origins.is_empty());
+                flow.clear();
+                Some(match resolved {
+                    Some(value) => format!("goto {:#x}; /* indirect via {}; {} */", value.value, target.name(), proven_by(&value)),
+                    None => format!("goto {}; /* indirect target unresolved */", target.name()),
+                })
+            }
+            Self::Return { target } => {
+                let via = target.map(register_name).unwrap_or_else(|| "ABI return".into());
+                let result = flow.read(Register { index: 0, wide: true, stack_pointer: false });
+                let statement = format!("return /* ABI result register x0{}; return type unknown, via {} */;", resolved_suffix(result.as_ref()), via);
+                flow.clear();
+                Some(statement)
+            }
+            Self::TargetSpecific => None,
         }
     }
 }
@@ -1096,6 +1924,183 @@ enum Operation {
     },
     Discard(&'static str),
     Opaque,
+}
+
+fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
+    let reg = |value: Register| IrRegister::from(value);
+    let operand = |value: Register| IrOperand::Register(reg(value));
+    let compare_operand = |value: CompareOperand| match value {
+        CompareOperand::Register { reg: register, shift } => IrCompareOperand::Register {
+            register: reg(register), shift: shift.map(|(kind, amount)| (match kind {
+                ShiftKind::Left => IrShiftKind::Left, ShiftKind::LogicalRight => IrShiftKind::LogicalRight, ShiftKind::ArithmeticRight => IrShiftKind::ArithmeticRight,
+            }, amount)),
+        },
+        CompareOperand::Extended { reg: register, extend, shift } => IrCompareOperand::Extended {
+            register: reg(register),
+            extension: extend.map(|(signed, bits)| if signed { IrExtension::Sign(bits) } else { IrExtension::Zero(bits) }),
+            shift: shift.map(|(kind, amount)| (match kind {
+                ShiftKind::Left => IrShiftKind::Left, ShiftKind::LogicalRight => IrShiftKind::LogicalRight, ShiftKind::ArithmeticRight => IrShiftKind::ArithmeticRight,
+            }, amount)),
+        },
+        CompareOperand::Immediate(value) => IrCompareOperand::Immediate(value),
+    };
+    let address = |base: Register, form: AddressForm| -> Option<(IrMemoryAddress, Option<IrWriteback>)> {
+        Some(match form {
+            AddressForm::Immediate(offset) => (IrMemoryAddress::BaseOffset { base: reg(base), offset: offset as i64 }, None),
+            AddressForm::ImmediateSigned(offset, Writeback::None) => (IrMemoryAddress::BaseOffset { base: reg(base), offset }, None),
+            AddressForm::ImmediateSigned(offset, Writeback::Pre) => (IrMemoryAddress::BaseOffset { base: reg(base), offset }, Some(IrWriteback { base: reg(base), offset, pre_index: true })),
+            AddressForm::ImmediateSigned(offset, Writeback::Post) => (IrMemoryAddress::BaseOffset { base: reg(base), offset: 0 }, Some(IrWriteback { base: reg(base), offset, pre_index: false })),
+            AddressForm::RegOffset { rm_index, option, s, size } => {
+                let (index_register, extension) = match option {
+                    2 => (Register { index: rm_index, wide: false, stack_pointer: false }, Some(IrExtension::Zero(32))),
+                    3 => (Register { index: rm_index, wide: true, stack_pointer: false }, None),
+                    6 => (Register { index: rm_index, wide: false, stack_pointer: false }, Some(IrExtension::Sign(32))),
+                    7 => (Register { index: rm_index, wide: true, stack_pointer: false }, None),
+                    _ => return None,
+                };
+                (IrMemoryAddress::BaseIndex {
+                    base: reg(base), index: reg(index_register), extension,
+                    scale: if s { size as u8 } else { 0 },
+                }, None)
+            }
+            AddressForm::Literal(offset) => (IrMemoryAddress::PcRelative { offset, target: pc.wrapping_add_signed(offset) }, None),
+            AddressForm::ImmediateSigned(_, _) => return None,
+        })
+    };
+    match operation {
+        Operation::Nop => IrOperation::Nop,
+        Operation::MoveZero { dst, value } => IrOperation::Assign { destination: reg(dst), value: IrOperand::Constant(value) },
+        Operation::MoveNot { dst, value } => IrOperation::Assign { destination: reg(dst), value: IrOperand::Constant(value) },
+        Operation::MoveKeep { dst, value, shift } => IrOperation::MoveKeep { destination: reg(dst), value, shift },
+        Operation::Address { dst, value, page } => IrOperation::Address { destination: reg(dst), value, page },
+        Operation::AddImmediate { dst, src, value, subtract } => IrOperation::Binary {
+            destination: reg(dst), operator: if subtract { IrBinaryOp::Subtract } else { IrBinaryOp::Add },
+            left: operand(src), right: IrOperand::Constant(value),
+        },
+        Operation::AddRegister { dst, left, right, subtract, shift: None } => IrOperation::Binary {
+            destination: reg(dst), operator: if subtract { IrBinaryOp::Subtract } else { IrBinaryOp::Add },
+            left: operand(left), right: operand(right),
+        },
+        Operation::AddRegister { dst, left, right, subtract, shift: Some((kind, amount)) } => IrOperation::ShiftedArithmetic {
+            destination: reg(dst), left: reg(left), right: reg(right), subtract,
+            shift: match kind { ShiftKind::Left => IrShiftKind::Left, ShiftKind::LogicalRight => IrShiftKind::LogicalRight, ShiftKind::ArithmeticRight => IrShiftKind::ArithmeticRight },
+            amount,
+        },
+        Operation::LogicalImmediate { dst, src, op, mask } => IrOperation::Binary {
+            destination: reg(dst), operator: match op { LogicalOp::And => IrBinaryOp::And, LogicalOp::Orr => IrBinaryOp::Or, LogicalOp::Eor => IrBinaryOp::Xor },
+            left: operand(src), right: IrOperand::Constant(mask),
+        },
+        Operation::LogicalRegister { dst, left, right, op, negate_right, shift } => IrOperation::LogicalRegister {
+            destination: reg(dst), left: reg(left), right: reg(right),
+            operator: match op { LogicalOp::And => IrBinaryOp::And, LogicalOp::Orr => IrBinaryOp::Or, LogicalOp::Eor => IrBinaryOp::Xor },
+            negate_right,
+            shift: shift.map(|(kind, amount)| (match kind {
+                ShiftKind::Left => IrShiftKind::Left,
+                ShiftKind::LogicalRight => IrShiftKind::LogicalRight,
+                ShiftKind::ArithmeticRight => IrShiftKind::ArithmeticRight,
+            }, amount)),
+        },
+        Operation::Shift { dst, src, kind, amount } => IrOperation::Shift {
+            destination: reg(dst), source: reg(src),
+            kind: match kind { ShiftKind::Left => IrShiftKind::Left, ShiftKind::LogicalRight => IrShiftKind::LogicalRight, ShiftKind::ArithmeticRight => IrShiftKind::ArithmeticRight },
+            amount,
+        },
+        Operation::RegisterShift { dst, src, amount, kind } => IrOperation::VariableShift {
+            destination: reg(dst), source: reg(src), amount: reg(amount),
+            kind: match kind {
+                VariableShiftKind::Left => IrVariableShiftKind::Left,
+                VariableShiftKind::LogicalRight => IrVariableShiftKind::LogicalRight,
+                VariableShiftKind::ArithmeticRight => IrVariableShiftKind::ArithmeticRight,
+                VariableShiftKind::Rotate => IrVariableShiftKind::Rotate,
+            },
+        },
+        Operation::OneSource { dst, src, kind } => IrOperation::OneSource {
+            destination: reg(dst), source: reg(src),
+            kind: match kind {
+                OneSourceKind::ReverseBits => IrOneSourceKind::ReverseBits,
+                OneSourceKind::ReverseBytes => IrOneSourceKind::ReverseBytes,
+                OneSourceKind::ReverseHalfwordBytes => IrOneSourceKind::ReverseHalfwordBytes,
+                OneSourceKind::ReverseWordBytes => IrOneSourceKind::ReverseWordBytes,
+                OneSourceKind::CountLeadingZeros => IrOneSourceKind::CountLeadingZeros,
+                OneSourceKind::CountLeadingSign => IrOneSourceKind::CountLeadingSign,
+            },
+        },
+        Operation::ExtractConcat { dst, left, right, lsb } => IrOperation::ExtractConcat {
+            destination: reg(dst), left: reg(left), right: reg(right), lsb,
+        },
+        Operation::AddCarry { dst, left, right, subtract } => IrOperation::AddCarry {
+            destination: reg(dst), left: reg(left), right: reg(right), subtract,
+        },
+        Operation::ConditionalSelect { dst, if_true, if_false, cond, else_op } => IrOperation::ConditionalSelect {
+            destination: reg(dst), if_true: reg(if_true), if_false: reg(if_false),
+            condition: lift_flag_predicate(cond),
+            else_op: match else_op {
+                ConditionalElse::None => IrSelectElse::None,
+                ConditionalElse::Increment => IrSelectElse::Increment,
+                ConditionalElse::Invert => IrSelectElse::Invert,
+                ConditionalElse::Negate => IrSelectElse::Negate,
+            },
+        },
+        Operation::Extend { dst, src, signed, from } => IrOperation::Extend {
+            destination: reg(dst), source: reg(src), signed, from,
+        },
+        Operation::Extract { dst, src, lsb, width, signed } => IrOperation::Extract {
+            destination: reg(dst), source: reg(src), lsb, width, signed,
+        },
+        Operation::Insert { dst, src, lsb, width, kind } => IrOperation::Insert {
+            destination: reg(dst), source: reg(src), lsb, width,
+            kind: match kind {
+                InsertKind::Bfi => IrInsertKind::Bfi,
+                InsertKind::Bfxil => IrInsertKind::Bfxil,
+                InsertKind::Ubfiz => IrInsertKind::Ubfiz,
+                InsertKind::Sbfiz => IrInsertKind::Sbfiz,
+            },
+        },
+        Operation::AddExtended { dst, left, right, subtract, extend, shift } => IrOperation::AddExtended {
+            destination: reg(dst), left: reg(left), right: reg(right), subtract,
+            extension: extend.map(|(signed, bits)| if signed { IrExtension::Sign(bits) } else { IrExtension::Zero(bits) }),
+            shift,
+        },
+        Operation::Compare { mnemonic, left, right } => IrOperation::Compare {
+            kind: match mnemonic { "cmn" => IrCompareKind::CompareNegative, "tst" => IrCompareKind::Test, _ => IrCompareKind::Compare },
+            left: reg(left), right: compare_operand(right),
+        },
+        Operation::ConditionalCompare { mnemonic, left, right, nzcv, cond } => IrOperation::ConditionalCompare {
+            kind: if mnemonic == "ccmn" { IrCompareKind::CompareNegative } else { IrCompareKind::Compare },
+            left: reg(left), right: compare_operand(right), nzcv, condition: cond,
+        },
+        Operation::MultiplyAdd { dst, mul_left, mul_right, addend, subtract } => IrOperation::MultiplyAdd {
+            destination: reg(dst), left: reg(mul_left), right: reg(mul_right), addend: addend.map(reg), subtract,
+        },
+        Operation::WideningMultiply { dst, left, right, addend, subtract, signed, high } => IrOperation::WideningMultiply {
+            destination: reg(dst), left: reg(left), right: reg(right), addend: addend.map(reg), subtract, signed, high,
+        },
+        Operation::Divide { dst, left, right, signed } => IrOperation::Divide {
+            destination: reg(dst), left: reg(left), right: reg(right), signed,
+        },
+        Operation::Load { dst, base, address: form, size, signed } => match address(base, form) {
+            Some((address, writeback)) => IrOperation::Load { destination: reg(dst), address, bytes: 1u8.checked_shl(size).unwrap_or(0), signed, writeback },
+            None => IrOperation::TargetSpecific,
+        },
+        Operation::Store { base, address: form, src, size } => match address(base, form) {
+            Some((address, writeback)) => IrOperation::Store { address, value: operand(src), bytes: 1u8.checked_shl(size).unwrap_or(0), writeback },
+            None => IrOperation::TargetSpecific,
+        },
+        Operation::Call(target) => IrOperation::DirectCall { target },
+        Operation::IndirectCall { target } => IrOperation::IndirectCall { target: reg(target) },
+        Operation::Branch(target) => IrOperation::Branch { target },
+        Operation::ConditionalBranch { target, test } => IrOperation::ConditionalBranch {
+            target,
+            condition: match test {
+                BranchTest::Code(code) => IrCondition::Flags(lift_flag_predicate(code)),
+                BranchTest::Zero { reg: register, nonzero } => IrCondition::Zero { register: reg(register), nonzero },
+                BranchTest::Bit { reg: register, bit, nonzero } => IrCondition::Bit { register: reg(register), bit, nonzero },
+            },
+        },
+        Operation::IndirectBranch { target } => IrOperation::IndirectBranch { target: reg(target) },
+        Operation::Return(target) => IrOperation::Return { target: Some(reg(target)) },
+        _ => IrOperation::TargetSpecific,
+    }
 }
 
 /// Decode only encodings with modeled operand and effect semantics.
@@ -2725,6 +3730,7 @@ struct VKnownValue {
 struct Flow {
     registers: [Option<KnownValue>; 31],
     v_registers: [Option<VKnownValue>; 32],
+    flags: Option<u8>,
 }
 
 impl Flow {
@@ -2732,12 +3738,14 @@ impl Flow {
         Self {
             registers: std::array::from_fn(|_| None),
             v_registers: std::array::from_fn(|_| None),
+            flags: None,
         }
     }
 
     fn clear(&mut self) {
         self.registers.fill(None);
         self.v_registers.fill(None);
+        self.flags = None;
     }
 
     fn read(&self, reg: Register) -> Option<KnownValue> {
@@ -2892,6 +3900,41 @@ fn index_resolved(value: u64, option: u32, s: bool, size: u32) -> u64 {
     } else {
         extended
     }
+}
+
+fn resolve_ir_indexed_address(
+    base: IrRegister, index: IrRegister, extension: Option<IrExtension>, scale: u8,
+    flow: &Flow, pc: u64,
+) -> (String, Option<KnownValue>) {
+    let base_register = base.target();
+    let index_register = index.target();
+    let index_expression = match extension {
+        Some(IrExtension::Sign(bits)) => format!("sext({}, {bits})", index_register.name()),
+        Some(IrExtension::Zero(bits)) if bits != index.bits => format!("zext({}, {bits})", index_register.name()),
+        _ => index_register.name(),
+    };
+    let index_expression = if scale == 0 { index_expression } else { format!("({index_expression} << {scale})") };
+    let expression = format!("{} + {index_expression}", base_register.name());
+    let known = flow.read(base_register).zip(flow.read(index_register)).and_then(|(base, index)| {
+        let value = match extension {
+            Some(IrExtension::Zero(bits)) if bits < 64 => index.value & ((1u64 << bits) - 1),
+            Some(IrExtension::Sign(32)) => sign_extend_32(index.value),
+            _ => index.value,
+        }.wrapping_shl(scale as u32);
+        combine_origins(&base.origins, &index.origins, pc).map(|origins| KnownValue {
+            value: base.value.wrapping_add(value), origins,
+        })
+    });
+    (expression, known)
+}
+
+fn apply_ir_writeback(writeback: IrWriteback, flow: &Flow, pc: u64) -> (Register, String, Option<KnownValue>) {
+    let base = writeback.base.target();
+    let expression = signed_memory_operand(&base, writeback.offset);
+    let known = flow.read(base).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
+        value: input.value.wrapping_add(writeback.offset as u64), origins,
+    }));
+    (base, expression, known)
 }
 
 /// Renders the proven address of a load/store statement, with provenance, when
@@ -4214,39 +5257,30 @@ pub fn render(
                 .iter()
                 .any(|&(lo, hi, _)| position < hi && position.saturating_add(4) > lo)
         };
-        let is_cf = |op: &Operation| -> bool {
-            matches!(
-                op,
-                Operation::Branch(_)
-                    | Operation::ConditionalBranch { .. }
-                    | Operation::IndirectBranch { .. }
-                    | Operation::Call(_)
-                    | Operation::IndirectCall { .. }
-                    | Operation::Return(_)
-            )
-        };
-        let jump_target = |op: &Operation| -> Option<u64> {
-            match op {
-                Operation::Branch(t) => Some(*t),
-                Operation::ConditionalBranch { target, .. } => Some(*target),
-                // IndirectBranch has a register target; no static jump target.
-                _ => None,
+        // Lift every instruction once into a typed, address-bearing IR record.
+        // CFG analysis and value propagation consume this representation rather
+        // than decoding or parsing rendered assembly text again.
+        let lifted_instructions: Vec<LiftedInstruction> = pcs.iter().map(|&pc| {
+            let operation = decode(word_at(pc), pc);
+            LiftedInstruction {
+                address: pc,
+                word: word_at(pc),
+                portable: lift_operation(operation, pc),
+                operation,
+                data: is_data(pc),
             }
-        };
-
-        // Decode all instructions once.
-        let ops: Vec<Operation> = pcs.iter().map(|&pc| decode(word_at(pc), pc)).collect();
+        }).collect();
 
         // Build basic-block starts: function start, branch targets, and the
         // instruction after every control-flow instruction.
         let mut block_starts: Vec<u64> = vec![start];
         for (idx, &pc) in pcs.iter().enumerate() {
-            if let Some(t) = jump_target(&ops[idx]) {
+            if let Some(t) = lifted_instructions[idx].portable.direct_branch_target() {
                 if t >= start && t < function_end && (t - start) % 4 == 0 && pcs.contains(&t) {
                     block_starts.push(t);
                 }
             }
-            if is_cf(&ops[idx]) {
+            if lifted_instructions[idx].portable.is_control_flow() {
                 let next = pc + 4;
                 if next >= start && next < function_end && pcs.contains(&next) {
                     block_starts.push(next);
@@ -4273,6 +5307,7 @@ pub fn render(
                 instructions: bpcs,
                 successors: Vec::new(),
                 predecessors: Vec::new(),
+                backedges: Vec::new(),
                 reachable: false,
                 dominators: Vec::new(),
             });
@@ -4299,31 +5334,44 @@ pub fn render(
         for bi in 0..blocks.len() {
             let last_pc = *blocks[bi].instructions.last().unwrap();
             let last_idx = pcs.iter().position(|&p| p == last_pc).unwrap();
-            let last_op = &ops[last_idx];
+            let last_op = lifted_instructions[last_idx].portable;
             let mut successors: Vec<usize> = Vec::new();
             match last_op {
-                Operation::Branch(t) => {
-                    if let Some(target) = block_of(*t) {
+                IrOperation::Branch { target } => {
+                    if let Some(target) = block_of(target) {
                         successors.push(target);
                     }
                 }
-                Operation::ConditionalBranch { target, .. } => {
-                    if let Some(target) = block_of(*target) {
-                        successors.push(target);
+                IrOperation::ConditionalBranch { target, .. } => {
+                    let outcome = if let IrOperation::ConditionalBranch { condition, .. } = last_op {
+                        let mut local_flow = Flow::new();
+                        let mut supported = true;
+                        for &instruction_pc in blocks[bi].instructions.iter().take(blocks[bi].instructions.len().saturating_sub(1)) {
+                            let instruction_index = pcs.iter().position(|&pc| pc == instruction_pc).unwrap();
+                            let operation = lifted_instructions[instruction_index].portable;
+                            if matches!(operation, IrOperation::TargetSpecific) || operation.render(&mut local_flow, instruction_pc).is_none() {
+                                supported = false;
+                                break;
+                            }
+                        }
+                        if supported { evaluate_ir_condition(condition, &local_flow) } else { None }
+                    } else { None };
+                    if outcome != Some(false) {
+                        if let Some(target) = block_of(target) { successors.push(target); }
                     }
+                    if outcome != Some(true) {
+                        let nt = last_pc + 4;
+                        if let Some(fallthrough) = block_of(nt) { successors.push(fallthrough); }
+                    }
+                }
+                IrOperation::IndirectBranch { .. } => {}
+                IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. } => {
                     let nt = last_pc + 4;
                     if let Some(fallthrough) = block_of(nt) {
                         successors.push(fallthrough);
                     }
                 }
-                Operation::IndirectBranch { .. } => {}
-                Operation::Call(_) | Operation::IndirectCall { .. } => {
-                    let nt = last_pc + 4;
-                    if let Some(fallthrough) = block_of(nt) {
-                        successors.push(fallthrough);
-                    }
-                }
-                Operation::Return(_) => {}
+                IrOperation::Return { .. } => {}
                 _ => {
                     let nt = last_pc + 4;
                     if let Some(fallthrough) = block_of(nt) {
@@ -4343,12 +5391,20 @@ pub fn render(
         for block in &mut blocks { block.predecessors.sort_unstable(); }
         let mut cfg = FunctionCfg { blocks };
         FunctionCfg::analyze(&mut cfg.blocks);
-        let blocks = &cfg.blocks;
+        let function_ir = FunctionIr {
+            start,
+            end: function_end,
+            instructions: lifted_instructions,
+            cfg,
+        };
+        let blocks = &function_ir.cfg.blocks;
 
         out.push_str("  // CFG blocks: block, predecessor/successor indices, reachability, dominators\n");
+        let _ = writeln!(out, "  // lifted IR function={:#x}..{:#x} instructions={}",
+            function_ir.start, function_ir.end, function_ir.instructions.len());
         for (index, block) in blocks.iter().enumerate() {
-            let _ = writeln!(out, "  // cfg B{index} start={:#x} preds={:?} succs={:?} reachable={} dom={:?}",
-                block.start, block.predecessors, block.successors, block.reachable, block.dominators);
+            let _ = writeln!(out, "  // cfg B{index} start={:#x} preds={:?} succs={:?} backedges={:?} reachable={} dom={:?}",
+                block.start, block.predecessors, block.successors, block.backedges, block.reachable, block.dominators);
         }
 
         // Dataflow: compute entry flow per block (worklist, bounded).
@@ -4366,11 +5422,12 @@ pub fn render(
             let bpcs = &blocks[bi].instructions;
             let mut flow = flow0;
             for &p in bpcs {
-                if is_data(p) {
+                let instruction = &function_ir.instructions[((p - function_ir.start) / 4) as usize];
+                if instruction.data {
                     flow.clear();
                 } else {
-                    let op = decode(word_at(p), p);
-                    let _ = op.render(&mut flow, p);
+                    let _ = instruction.portable.render(&mut flow, instruction.address)
+                        .unwrap_or_else(|| instruction.operation.render(&mut flow, instruction.address));
                 }
             }
             let exit_flow = flow;
@@ -4395,14 +5452,15 @@ pub fn render(
         for (bi, block) in blocks.iter().enumerate() {
             let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
             for &p in &block.instructions {
-                let word = word_at(p);
-                let statement = if is_data(p) {
+                let instruction = &function_ir.instructions[((p - function_ir.start) / 4) as usize];
+                let statement = if instruction.data {
                     flow.clear();
                     "/* data-in-code barrier */".into()
                 } else {
-                    decode(word, p).render(&mut flow, p)
+                    instruction.portable.render(&mut flow, instruction.address)
+                        .unwrap_or_else(|| instruction.operation.render(&mut flow, instruction.address))
                 };
-                out.push_str(&format!("  {p:#018x}  {statement} // word={word:08x}\n"));
+                out.push_str(&format!("  {:#018x}  {statement} // word={:08x}\n", instruction.address, instruction.word));
                 if out.len() >= MAX_OUTPUT {
                     break;
                 }

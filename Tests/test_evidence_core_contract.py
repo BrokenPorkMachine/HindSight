@@ -31,7 +31,7 @@ def test_compatibility_transport_remains_schema66():
     messages = read('Shared/WorkbenchMessages.swift')
     assert 'static let jsonFields: Set<String>' in messages
     assert 'function_neighborhoods' in messages and 'analysis_insights' in messages
-    assert 'arm64-analysis-v22-schema72' in read('PlatformServices/CoordinatorService/main.swift')
+    assert 'arm64-analysis-v45-schema91' in read('PlatformServices/CoordinatorService/main.swift')
 
 def test_capabilities_publish_evidence_core():
     bridge = read('rust/crates/bridge/src/lib.rs')
