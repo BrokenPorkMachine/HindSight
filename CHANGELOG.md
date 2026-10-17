@@ -63,6 +63,10 @@
 
 - Extend the ARM64 SIMD/FP family to `FMov`: the register form `fmov xD, dS` renders `xD = fmov(dS);` and propagates the V register's low 64 bits into the general-purpose destination when tracked (enabling V-to-GP flow from `MOVI.2D` and future V definitions), and the immediate forms (`fmov.2d`/`fmov.2s`/`fmov.4s`) render as markers. Other SIMD/FP forms stay opaque pending V-register value tracking. No report field or engine-identity change (banner advances to v36).
 
+# 0.5.11 — SIMD/FP data processing markers in the preview
+
+- Extend the ARM64 SIMD/FP family: scalar floating-point data processing (0x1e...) and vector SIMD data processing (0x0e...) are rendered as `/* simd */` markers preserving general-purpose value flow, since the preview does not track floating-point or V-register values precisely yet. This keeps general-purpose constants from being cleared by intervening SIMD/FP code. No report field or engine-identity change (banner advances to v38).
+
 # 0.5.11 — Cross-basic-block value propagation in the preview
 
 - Add bounded cross-basic-block value propagation to the ARM64 semantic preview: constants now survive unconditional and conditional branches (propagating to both the taken and fall-through successors) and sequential fall-through, with flows merged at joins by intersecting agreed constants. Calls, returns, indirect branches and data barriers still clear tracked values. Implemented as a worklist over basic blocks (split at branch targets and control-flow instructions) with bounded fixpoint iteration; no report field or engine-identity change (banner advances to v33).

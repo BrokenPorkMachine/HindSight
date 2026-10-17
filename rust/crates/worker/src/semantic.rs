@@ -2630,6 +2630,16 @@ fn decode(word: u32, pc: u64) -> Operation {
             arrangement: "4s",
         };
     }
+    // Vector (SIMD) data processing (0x0e...): modeled as a marker preserving
+    // general-purpose value flow. These instructions operate on V registers,
+    // which are not tracked precisely yet, but they do not touch the
+    // general-purpose registers.
+    if (word & 0x0e00_0000) == 0x0e00_0000 {
+        return Operation::SystemMarker {
+            mnemonic: "simd",
+            domain: None,
+        };
+    }
     Operation::Opaque
 }
 
@@ -4101,7 +4111,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v36; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v38; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -4347,7 +4357,7 @@ mod tests {
 
     #[test]
     fn unsupported_words_and_data_ranges_are_barriers() {
-        assert!(lift(0xffff_ffff, 0x1000).contains("opaque instruction"));
+        assert!(lift(0x0000_0001, 0x1000).contains("opaque instruction"));
         assert!(lift(0x0000_0000, 0x1000).contains("opaque instruction"));
         let code = 0x5280_0020u32.to_le_bytes();
         assert!(
@@ -4382,7 +4392,7 @@ mod tests {
             report.contains("ABI result register x0 /* constant=0x2 proven_by=[0x1000,0x1004] */")
         );
 
-        for barrier in [0xffff_ffffu32, 0x9400_0001] {
+        for barrier in [0x0000_0001u32, 0x9400_0001] {
             let words = [0x5280_0020, barrier, 0xd65f_03c0];
             let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
             let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);

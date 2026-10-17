@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v34` banner identifies the statement set that
+`AArch64 register semantics v38` banner identifies the statement set that
 produced a preview.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
@@ -328,7 +328,11 @@ and 0 false positives / 0 false negatives over the real dylibs. Cross-basic-bloc
 value propagation now carries constants through unconditional and conditional
 branches (both successors) and sequential fall-through, merging flows at joins
 by intersecting agreed constants; calls, returns, indirect branches and data
-barriers still clear tracked values. The first SIMD/FP instruction is modeled:
+barriers still clear tracked values. The first SIMD/FP instruction family is modeled:
+scalar floating-point data processing (0x1e...) and vector SIMD data processing
+(0x0e...) are rendered as `/* simd */` markers preserving general-purpose value
+flow, since the preview does not track floating-point or V-register values
+precisely yet. The first SIMD/FP instruction is modeled:
 `MOVI.2D` renders `/* movi.2d v0, #0x00 */` as a marker preserving GP value
 flow, with V0-V31 (128-bit) added to the flow for future SIMD value tracking.
 `FMov` (register form) renders `xD = fmov(dS);` and propagates the V register's
