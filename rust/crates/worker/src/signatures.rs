@@ -329,28 +329,101 @@ fn callable_name(name: &str, signature: Option<&Signature>) -> String {
     }
 }
 
-fn call_arguments(signature: Option<&Signature>, name: &str) -> Vec<String> {
-    if let Some(sig) = signature {
-        if sig.language == "Objective-C / Objective-C++" {
-            let selector = sig.declaration.split(')').nth(1).unwrap_or("");
-            let count = selector.bytes().filter(|byte| *byte == b':').count();
-            return (0..count + 2).map(|index| match index { 0 => "self".into(), 1 => "_cmd".into(), n => format!("x{n}") }).collect();
-        }
-        if let Some((_, tail)) = sig.declaration.split_once('(') {
-            if let Some((args, _)) = tail.split_once(')') {
-                let args = args.trim();
-                if args.is_empty() || args == "void" { return Vec::new(); }
-                let count = args.split(',').count();
-                return (0..count).map(|index| format!("x{index}")).collect();
-            }
-        }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AbiParameter { name: String, register: String, general_register: Option<u8> }
+
+fn split_declarators(arguments: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (index, byte) in arguments.bytes().enumerate() {
+        match byte { b'(' | b'[' | b'<' => depth += 1, b')' | b']' | b'>' => depth -= 1,
+            b',' if depth == 0 => { result.push(arguments[start..index].trim()); start = index + 1; }, _ => {} }
     }
-    let _ = name;
-    Vec::new()
+    let last = arguments[start..].trim();
+    if !last.is_empty() { result.push(last); }
+    result
 }
 
-fn argument_register(argument: &str) -> Option<u8> {
-    match argument { "self" => Some(0), "_cmd" => Some(1), _ => argument.strip_prefix('x')?.parse::<u8>().ok().filter(|register|*register<8) }
+fn named_declarator(value: &str, fallback: usize) -> (String, String) {
+    let token = value.split_whitespace().last().unwrap_or("").trim_start_matches('*');
+    let token = token.trim_end_matches("[]");
+    if !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        let name_start = value.rfind(token).unwrap_or(0);
+        if name_start > 0 { (value[..name_start].trim().into(), token.into()) }
+        else { (value.into(), format!("arg{fallback}")) }
+    } else { (value.into(), format!("arg{fallback}")) }
+}
+
+fn c_parameters(signature: &Signature) -> Vec<(String, String)> {
+    let Some(open) = signature.declaration.find('(') else { return Vec::new() };
+    let mut depth = 0i32;
+    let mut close = None;
+    for (offset, ch) in signature.declaration[open..].char_indices() {
+        if ch == '(' { depth += 1; }
+        if ch == ')' { depth -= 1; if depth == 0 { close = Some(open + offset); break; } }
+    }
+    let Some(close) = close else { return Vec::new() };
+    let body = signature.declaration[open + 1..close].trim();
+    if body.is_empty() || body == "void" { return Vec::new(); }
+    split_declarators(body).into_iter().enumerate().filter_map(|(index, declaration)| {
+        if declaration == "..." { return None; }
+        let (ty, name) = named_declarator(declaration, index);
+        Some((ty, name))
+    }).collect()
+}
+
+fn objc_parameters(signature: &Signature) -> Vec<(String, String)> {
+    let Some((_, selector)) = signature.declaration.split_once(')') else { return Vec::new() };
+    let mut result = Vec::new();
+    let mut rest = selector;
+    while let Some(colon) = rest.find(':') {
+        let after_colon = rest[colon + 1..].trim_start();
+        let Some(after_open) = after_colon.strip_prefix('(') else { break };
+        let Some(type_end) = after_open.find(')') else { break };
+        let ty = after_open[..type_end].trim();
+        let after_type = after_open[type_end + 1..].trim_start();
+        let name = after_type.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_').next().unwrap_or("");
+        if name.is_empty() || ty.is_empty() { break; }
+        result.push((ty.into(), name.into()));
+        rest = after_type.get(name.len()..).unwrap_or("");
+    }
+    result
+}
+
+fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
+    let Some(signature) = signature else { return Vec::new() };
+    let is_objc = signature.language == "Objective-C / Objective-C++";
+    let parameters = if is_objc { objc_parameters(signature) } else { c_parameters(signature) };
+    let mut gp = if is_objc { 2u8 } else { 0u8 };
+    let mut fp = 0u8;
+    let mut result = Vec::new();
+    if is_objc {
+        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0) });
+        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1) });
+    }
+    for (ty, name) in parameters {
+        if (ty.contains("float") || ty.contains("double")) && fp < 8 {
+            let register = format!("{}{fp}", if ty.contains("float") && !ty.contains("double") { "s" } else { "d" });
+            result.push(AbiParameter { name, register, general_register: None });
+            fp += 1;
+        } else if gp < 8 {
+            result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp) });
+            gp += 1;
+        } else {
+            result.push(AbiParameter { name, register: "stack argument (unresolved)".into(), general_register: None });
+        }
+    }
+    result
+}
+
+fn abi_parameter_bindings(signature: Option<&Signature>, candidates: &[String]) -> Vec<String> {
+    let mut bindings = abi_parameters(signature).into_iter().map(|parameter| {
+        format!("{}={}", parameter.name, parameter.register)
+    }).collect::<Vec<_>>();
+    if bindings.is_empty() {
+        bindings.extend(candidates.iter().enumerate().map(|(index, register)| format!("arg{index}={register} (candidate; type unresolved)")));
+    }
+    bindings
 }
 
 fn incoming_parameter_candidates(report: &str, address: u64) -> Vec<String> {
@@ -360,6 +433,14 @@ fn incoming_parameter_candidates(report: &str, address: u64) -> Vec<String> {
         let registers = line.split("parameter-registers=[").nth(1)?.split(']').next()?;
         Some(registers.split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_string).collect())
     }).unwrap_or_default()
+}
+
+fn candidate_abi_parameters(report: &str, address: u64) -> Vec<AbiParameter> {
+    let candidates = incoming_parameter_candidates(report, address);
+    let highest = candidates.iter().filter_map(|register| register.strip_prefix('x')?.parse::<u8>().ok()).max();
+    highest.map(|highest| (0..=highest.min(7)).map(|index| AbiParameter {
+        name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index),
+    }).collect()).unwrap_or_default()
 }
 
 fn branch_target_statement(statement:&str)->Option<u64>{
@@ -425,7 +506,7 @@ fn localize_stack_slot_accesses(statement:&str)->String{
 fn render_linear_statement(
     statement:&str,address:u64,start:u64,
     symbols:&[(u64,String)],signatures:&BTreeMap<u64,(String,Signature)>,
-    signature:Option<&Signature>,code:&[u8],base:u64,stable_stack:bool,objc_selectors:&BTreeMap<u64,String>,
+    signature:Option<&Signature>,parameter_evidence:&str,code:&[u8],base:u64,stable_stack:bool,objc_selectors:&BTreeMap<u64,String>,
 )->String{
     if let Some(rest)=statement.strip_prefix("call(0x"){
         if let Some((hex,_))=rest.split_once(')'){
@@ -452,17 +533,22 @@ fn render_linear_statement(
                 return if let Some(name)=target_name{
                     let target_signature=signatures.get(&target).map(|(_,signature)|signature);
                     let values=known.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
-                    let args=call_arguments(target_signature,name);
+                    let args=target_signature.map(|signature|abi_parameters(Some(signature))).unwrap_or_else(||candidate_abi_parameters(parameter_evidence,target));
+                    let bindings=args.iter().map(|argument|format!("{}={}",argument.name,argument.register)).collect::<Vec<_>>().join(", ");
                     let mut evidence=Vec::new();
                     let rendered=args.iter().map(|argument|{
-                        let Some(register)=argument_register(argument) else{return argument.clone()};
-                        if let Some((value,provenance))=values.get(&register){
-                            evidence.push(format!("x{register}={value:#x} {provenance}"));format!("{value:#x}")
-                        }else{argument.clone()}
+                        if let Some(register)=argument.general_register {
+                            if let Some((value,provenance))=values.get(&register){
+                                evidence.push(format!("{}({})={value:#x} {provenance}",argument.name,argument.register));return format!("{value:#x}")
+                            }
+                        }
+                        argument.register.clone()
                     }).collect::<Vec<_>>();
                     let arguments=if args.is_empty()&&target_signature.is_none(){if known_values.is_empty(){"/* prototype and ABI arguments unresolved */".into()}else{format!("/* prototype unresolved; known ABI register values: {} */",known_values.join(", "))}}else{rendered.join(", ")};
                     let resolved=evidence.join(", ");
-                    format!("{}({}); /* direct call target {target:#x}; {}; {} */",callable_name(name,target_signature),arguments,if target_signature.is_some(){"arguments follow recovered prototype arity"}else{"callee prototype unavailable"},if resolved.is_empty(){"no argument constants proven in the straight-line call block".to_string()}else{format!("argument evidence: {resolved}")})
+                    let binding_note=if bindings.is_empty(){"argument register bindings unresolved".into()}else if target_signature.is_some(){format!("argument bindings: {bindings}")}else{format!("candidate ABI argument bindings: {bindings}; callee types unresolved")};
+                    let evidence_note=if resolved.is_empty(){"no argument constants proven in the straight-line call block".to_string()}else{format!("constant argument evidence: {resolved}")};
+                    format!("{}({}); /* direct call target {target:#x}; {}; {binding_note}; {evidence_note} */",callable_name(name,target_signature),arguments,if target_signature.is_some(){"arguments follow recovered prototype arity"}else if args.is_empty(){"callee prototype and entry-use arity unavailable"}else{"arity candidate from callee entry-register uses"})
                 }else{format!("call(/* unresolved target {target:#x}; direct BL; {} */);",if known_values.is_empty(){"arguments unresolved".to_string()}else{format!("known ABI register values: {}",known_values.join(", "))})};
             }
         }
@@ -535,8 +621,12 @@ fn render_arm64_body(
         out.push_str(&format!("/* {}: source signature unresolved; ABI arguments remain machine registers */\n", callable_name(display_name, None)));
     }
     let parameters = incoming_parameter_candidates(parameter_evidence, start);
+    let bindings = abi_parameter_bindings(signature, &parameters);
+    if !bindings.is_empty() {
+        out.push_str(&format!("/* AAPCS64 parameter bindings: {}; names/types come from the signature evidence or remain candidates */\n", bindings.join(", ")));
+    }
     if !parameters.is_empty() {
-        out.push_str(&format!("/* incoming parameter candidates: {}; types unresolved */\n", parameters.join(", ")));
+        out.push_str(&format!("/* observed entry-block uses: {}; uses before a modeled definition; this is not a complete source-variable analysis */\n", parameters.join(", ")));
     }
     if !opened_body { out.push_str("{\n"); }
     let mut instruction_index = 0usize;
@@ -573,7 +663,7 @@ fn render_arm64_body(
                             &&(instruction_index+1..backedge).all(|index|is_linear_statement(&instructions[index].1)){
                             out.push_str(&format!("    {header:#018x}: while (!({condition})) {{ /* natural loop */\n"));
                             for (body_address,body_statement) in &instructions[instruction_index+1..backedge]{
-                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
                                 out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
                             }
                             out.push_str(&format!("    }} /* backedge at {tail_address:#x}; exit at {exit:#x} */\n"));
@@ -602,7 +692,7 @@ fn render_arm64_body(
                 if let Some(condition)=condition.filter(|_|single_backedge&&no_interior_entries&&linear_body){
                     out.push_str(&format!("    {loop_header:#018x}: do {{ /* natural loop */\n"));
                     for (body_address,body_statement) in &instructions[instruction_index..loop_tail]{
-                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
                         out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
                     }
                     out.push_str(&format!("    }} while ({condition}); /* backedge at {:#x} */\n",instructions[loop_tail].0));
@@ -637,12 +727,12 @@ fn render_arm64_body(
                                         &&arm_is_linear(else_index..join_index){
                                         out.push_str(&format!("    {address:#018x}: if (!({condition})) {{ /* structured diamond; else={else_start:#x}, join={join:#x} */\n"));
                                         for (arm_address,arm_statement) in &instructions[instruction_index+1..then_branch]{
-                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
                                             out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
                                         }
                                         out.push_str("    } else {\n");
                                         for (arm_address,arm_statement) in &instructions[else_index..join_index]{
-                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors);
+                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
                                             out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
                                         }
                                         out.push_str("    }\n");
@@ -683,7 +773,7 @@ fn render_arm64_body(
         let (address, statement) = (*address, statement.as_str());
         if labels.contains(&address) { out.push_str(&format!("loc_{address:x}:\n")); }
         let statement = if statement.starts_with("call(0x") {
-            render_linear_statement(statement,address,start,symbols,signatures,signature,code,base,stable_stack,objc_selectors)
+            render_linear_statement(statement,address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors)
         } else if let Some(rest) = statement.strip_prefix("if (") {
             if let Some((condition,target)) = rest.split_once(") goto 0x") {
                 if let Ok(target) = u64::from_str_radix(target.trim_end_matches(';'),16) {
@@ -699,8 +789,8 @@ fn render_arm64_body(
                         .or_else(|| symbols.iter().find(|(candidate,_)| *candidate == target).map(|(_,name)| name.as_str()));
                     if let Some(name) = target_name {
                         let target_signature = signatures.get(&target).map(|(_,signature)| signature);
-                        let args = call_arguments(target_signature, name);
-                        let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers unresolved */".into() } else { args.join(", ") };
+                        let args = abi_parameters(target_signature);
+                        let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers unresolved */".into() } else { args.iter().map(|argument|argument.register.as_str()).collect::<Vec<_>>().join(", ") };
                         let callee = callable_name(name,target_signature);
                         if target_signature.is_some_and(|sig| sig.declaration.starts_with("void ") || sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)")) {
                             format!("{callee}({arguments}); return; /* cross-function B tail-call candidate */")
@@ -814,6 +904,32 @@ fn recover_internal(
         assert!(symbol("_CFReleaseExtra").is_none());
         assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
+    }
+    #[test] fn abi_parameters_resolve_objc_hidden_arguments_and_fp_register_banks() {
+        let objc = objc_method("-[RoadmapScorer score:]", "q24@0:8q16").unwrap();
+        assert_eq!(abi_parameter_bindings(Some(&objc), &["x2".into()]), vec!["self=x0", "_cmd=x1", "arg0=x2"]);
+        let foundation = objc_method("-[NSString substringFromIndex:]", "@\"NSString\"24@0:8Q16").unwrap();
+        assert_eq!(abi_parameter_bindings(Some(&foundation), &["x2".into()]), vec!["self=x0", "_cmd=x1", "from=x2"]);
+
+        let mixed = Signature { language: "C", declaration: "void mixed(uint64_t owner, double value, int count, float ratio);".into(), source: "test prototype" };
+        let args = abi_parameters(Some(&mixed));
+        assert_eq!(args.iter().map(|arg|arg.register.as_str()).collect::<Vec<_>>(), vec!["x0", "d0", "x1", "s1"]);
+        assert_eq!(args.iter().map(|arg|arg.name.as_str()).collect::<Vec<_>>(), vec!["owner", "value", "count", "ratio"]);
+    }
+    #[test] fn direct_calls_render_prototype_parameter_bindings() {
+        let signature = symbol("_CFRelease").unwrap();
+        let signatures = BTreeMap::from([(0x2000, ("_CFRelease".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("CFRelease(x0);"), "{call}");
+        assert!(call.contains("argument bindings: cf=x0"), "{call}");
+    }
+    #[test] fn direct_calls_use_candidate_arity_without_prototype() {
+        let symbols = [(0x2000, "_consume".into())];
+        let evidence = "function 0x0000000000002000 _consume parameter-registers=[x0, x2] highest-abi-position=3 classification=incoming-parameter-candidate\n";
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &symbols, &BTreeMap::new(), None, evidence, &[], 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("consume(x0, x1, x2);"), "{call}");
+        assert!(call.contains("arity candidate from callee entry-register uses"), "{call}");
+        assert!(call.contains("candidate ABI argument bindings: arg0=x0, arg1=x1, arg2=x2; callee types unresolved"), "{call}");
     }
     #[test] fn joins_method_encoding_and_cf_stub_with_direct_call() {
         let symbols=[(0x2000,"_CFRelease".into())];

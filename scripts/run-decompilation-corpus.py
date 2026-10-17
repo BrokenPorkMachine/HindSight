@@ -89,6 +89,7 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         "pseudocode_functions": semantic.count("decoded machine operations translated to C-like statements"),
         "objc_method_records": (report.get("objc_classes") or "").count("confidence=validated"),
         "objc_selector_calls": (report.get("semantic_preview") or "").count("objc_msgSend selector validated through __objc_selrefs"),
+        "abi_parameter_bindings": semantic.count("AAPCS64 parameter bindings:"),
         "cpp_signature_records": (report.get("call_values") or "").count("Itanium mangled parameter types"),
         "function_rows": sum(1 for line in functions.splitlines() if "confidence=" in line),
         "cfg_blocks": sum(1 for line in cfg.splitlines() if line.startswith("block B")),
@@ -110,6 +111,8 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         raise RuntimeError(f"{source_type} fixture produced no validated Objective-C method metadata: {metrics}")
     if source_type in {"objective-c", "objective-cpp"} and metrics["objc_selector_calls"] < 1:
         raise RuntimeError(f"{source_type} fixture produced no validated selector message-send: {metrics}")
+    if source_type in {"objective-c", "objective-cpp"} and ("self=x0" not in semantic or "_cmd=x1" not in semantic):
+        raise RuntimeError(f"{source_type} fixture did not reconstruct the Objective-C hidden ABI parameters: {metrics}")
     return metrics
 
 
