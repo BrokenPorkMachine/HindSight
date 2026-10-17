@@ -81,6 +81,18 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         for line in symbolication.splitlines()
         if (match := re.match(r"^range start=(0x[0-9a-fA-F]+)\s", line))
     }
+    pseudocode = semantic.split("Reconstructed pseudocode\n========================\n", 1)
+    pseudocode = pseudocode[1] if len(pseudocode) == 2 else ""
+    pseudocode_sites = {
+        int(match.group(1), 16)
+        for line in pseudocode.splitlines()
+        if (match := re.match(r"^\s+(0x[0-9a-fA-F]+):", line))
+    }
+    ir_sites = {
+        int(match.group(1), 16)
+        for line in ir.splitlines()
+        if (match := re.match(r"^(0x[0-9a-fA-F]+)\s+(?:op|branch|cbranch|term|opaque)\s", line))
+    }
     metrics = {
         "functions": int(report.get("function_count", 0)),
         "blocks": int(report.get("basic_block_count", 0)),
@@ -95,6 +107,8 @@ def score(source_type: str, report: dict) -> dict[str, int]:
             for line in semantic.splitlines()
             if re.match(r"^\s+0x[0-9a-fA-F]+:", line)
         ),
+        "pseudocode_address_rows": len(pseudocode_sites),
+        "source_mapping_valid_rows": len(pseudocode_sites & ir_sites),
         "cpp_signature_records": (report.get("call_values") or "").count("Itanium mangled parameter types"),
         "function_rows": sum(1 for line in functions.splitlines() if "confidence=" in line),
         "cfg_blocks": sum(1 for line in cfg.splitlines() if line.startswith("block B")),
@@ -105,6 +119,9 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         raise RuntimeError(f"{source_type} fixture did not produce function, CFG, and IR evidence: {metrics}")
     if metrics["pseudocode_functions"] < 1:
         raise RuntimeError(f"{source_type} fixture produced no function pseudocode: {metrics}")
+    if not pseudocode_sites or pseudocode_sites - ir_sites:
+        missing = sorted(pseudocode_sites - ir_sites)
+        raise RuntimeError(f"{source_type} pseudocode source addresses did not map to lifted IR: {missing[:8]}")
     if not function_starts or function_starts != resolver_starts or function_starts != symbolication_starts:
         raise RuntimeError(
             f"{source_type} fixture reports inconsistent normalized function boundaries: "

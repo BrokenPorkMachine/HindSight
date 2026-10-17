@@ -30,6 +30,12 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn("budget-skipped functions", body)
         self.assertIn("not silently treated as negative evidence", body)
 
+    def test_decompilation_corpus_checks_pseudocode_source_mapping(self):
+        source = (ROOT / "scripts/run-decompilation-corpus.py").read_text()
+        self.assertIn('"pseudocode_address_rows": len(pseudocode_sites)', source)
+        self.assertIn('"source_mapping_valid_rows": len(pseudocode_sites & ir_sites)', source)
+        self.assertIn("if not pseudocode_sites or pseudocode_sites - ir_sites:", source)
+
     def test_transport_and_ui_expose_quality_surfaces(self):
         messages = MESSAGES.read_text()
         content = CONTENT.read_text()
