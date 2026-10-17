@@ -5830,14 +5830,14 @@ fn flows_equal(a: &Flow, b: &Flow) -> bool {
 fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Option<Flow> {
     if function_start < base || callsite < function_start || (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return None; }
     let call_index = usize::try_from(callsite - base).ok().map(|offset| offset / 4);
-    let Some(call_index) = call_index.filter(|index| index.saturating_mul(4) <= code.len()) else { return None };
+    let call_index = call_index.filter(|index| index.saturating_mul(4) <= code.len())?;
     let function_index = usize::try_from(function_start - base).ok().map(|offset|offset / 4);
-    let Some(function_index)=function_index else{return None};
+    let function_index = function_index?;
     let start_index = call_index.saturating_sub(64).max(function_index);
     let mut flow = Flow::new();
     for index in start_index..call_index {
         let pc = base.saturating_add(index as u64 * 4);
-        let Some(bytes) = code.get(index * 4..index * 4 + 4) else { return None };
+        let bytes = code.get(index * 4..index * 4 + 4)?;
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         let operation = decode(word, pc);
         let portable = lift_operation(operation, pc);
