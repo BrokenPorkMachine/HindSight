@@ -4,6 +4,29 @@ This is the implementation order for the remaining work in [ROADMAP.md](ROADMAP.
 
 Inputs: the two existing roadmaps, the independent [reconstruction-first draft](RECONSTRUCTION_FIRST_ROADMAP.md), the [Apple Silicon application specification](Apple_Silicon_Reverse_Engineering_App_Spec_v1.md), and the current implementation. No separate replacement roadmap from the other model was available when this synthesis was written. The user directed work to proceed with these inputs.
 
+## Active priority: AArch64 pseudocode and source reconstruction
+
+First deliver accurate, named, typed AArch64 pseudocode for Apple binaries, then carry the same representation into compilable reconstructed source. Darwin runtime evidence and Apple SDK declarations are early inputs to this path. Mach-O/dyld decoding and proven shared semantics are reused across macOS and iOS.
+
+The rows below describe the delivery order. Each row adds to a working function pipeline; completing every instruction family or platform feature is not a prerequisite for delivering the next improvement. Validation and evidence tracing accompany each row.
+
+| Order | Work to deliver | Depends on | Visible completion evidence |
+| --- | --- | --- | --- |
+| 1 | Canonical Mach-O/AArch64 function parsing: image/slice identity, code/data separation, bounds, instructions, CFG and symbol/linkage facts | Existing loaders/IR; C00, early C02 | One function range and instruction set feeds every view; each boundary has its evidence. |
+| 2 | Native Darwin evidence and SDK type catalog: images, functions, C declarations, classes, methods/selectors, properties, ivars, structs and types | C00N, alongside row 1 | Real catalog records carry image/SDK/ABI identities and can be joined to the target. |
+| 3 | Structured AArch64 effects and immediately useful pseudocode: exact widths/flags/addresses, resolved names, known calls and typed declarations | Rows 1–2; C01 and early C04/C05 | Every statement maps to IR and bytes; unknown effects remain visible and block unsound reconstruction. |
+| 4 | Register/vector/flags SSA, memory SSA, stack frames, aliases and variable lifetimes | Rows 1–3; C03 | Register reuse, calls, partial writes, stack changes and joins preserve correct identities and effects. |
+| 5 | ABI-aware calls and type solving: arguments/returns, aggregate layouts, casts, fields, object receivers and dispatch alternatives | Rows 2–4; C04–C06 | Names and types have evidence; calls and memory access agree with ABI/layout fixtures. |
+| 6 | Recovered variables and expression AST: parameters, locals, globals, fields, arrays, assignments and idioms | Rows 4–5; C07 | Pseudocode uses source-level values while retaining full def-use and side-effect provenance. |
+| 7 | Nested conditions, short circuit, loops, switches and returns | Rows 4–6; C08 | Reconstructed AST regenerates the supported CFG and effects. |
+| 8 | Recompilable recovered C17/Objective-C and strict machine-state C with native Darwin dependencies | Early machine-state emitter from row 3; recovered AST from rows 5–7; C09 | Exported source compiles with exact declarations, dependencies and address maps. |
+| 9 | Native/IR differential execution, bounded proofs and source-fidelity gates | Starts at row 3 and expands through row 8; C10 | Recorded return/memory/trap/call agreement, proof assumptions, failures and fidelity scores. |
+| 10 | Synchronized source/assembly/SSA/type/evidence review, analyst corrections and per-function reanalysis | Starts at row 3; expands through C11 | Selecting an expression reveals its instructions and reasons; overrides invalidate affected results. |
+| 11 | Qualify the complete AArch64 C/Objective-C reconstruction path; expand optimized/stripped, C++ and Swift coverage | Rows 1–10; C12 | Each supported feature/language passes its reconstruction and behavior matrix. |
+| 12 | Other architectures/formats, broad interoperability, team/on-prem features and release completion | First reconstruction milestone; C12–C16 | Original roadmap requirements and release gates close with their own evidence. |
+
+Persistence, memory/work budgets, cancellation, cache invalidation and crash recovery from C15 accompany this work wherever needed. They remain prerequisites for trustworthy reconstruction runs.
+
 ## What the comparison changed
 
 | Question | Existing roadmaps | Independent draft | Master decision |
@@ -25,9 +48,27 @@ Original names, layout, idioms, and structure should be recovered whenever avail
 
 Completion evidence must identify the source hash, architecture, ABI, function bounds, analysis revision, toolchain, execution model, assumptions, test seeds, supported paths, and unresolved effects. “Compiled,” “exercised,” “differential-tested,” and “formally checked under assumptions” are different claims.
 
+## Darwin native runtime and shared macOS/iOS qualification
+
+Apple reconstruction uses Darwin native facilities: SDK Mach-O definitions and available inspection helpers; dyld image/slide/linkage APIs; libSystem, libobjc, libdispatch, CoreFoundation and Foundation; and Mach/XPC for applicable process and service contracts. Reconstructed programs link real native libraries when those libraries supply the recovered behavior. The existing Mach debugger and NSXPC coordinator are integration points.
+
+macOS execution qualifies the shared foundation of iOS semantics when the relevant contract and implementation are shared. Reuse instruction/IR, C/Objective-C, Foundation/CoreFoundation, dispatch, allocation, and messaging qualification at the level established by evidence. Record function/API, architecture, ABI/data layout, implementation/version identity or source-backed shared contract, preconditions, environment, and validation scope. Version/ABI/platform differences become explicit unqualified deltas; simulator/device/guest checks address those deltas.
+
+In particular, use one shared Mach-O/dyld decoder and test corpus for both platforms. Common load commands, binding/export opcodes, chained-fixup pointer formats, and cache structures are selected by their encoded layout/version and feature fields. The originating OS is metadata rather than a reason to duplicate parsing. Successful macOS fixtures qualify the same dyld decoding paths for iOS; platform-specific records and unsupported format versions retain their own coverage status.
+
+| Facility | Reconstruction use | Qualification evidence |
+| --- | --- | --- |
+| SDK `mach-o/loader.h`, `getsect.h`, `dyld.h`, `dyld_images.h`, fixup definitions | Image/slice/platform identity, sections, loaded images, slides, imports/fixups | SDK/build identity, UUID, load commands and mapped range agreement |
+| dyld / `dladdr` / validated symbol lookup | Runtime resolution and binding evidence | Actual provider image/symbol, image identity, architecture, symbol contract |
+| libobjc, Foundation, CoreFoundation | Objects, encodings, dispatch, ARC/runtime behavior and real framework calls | Shared contract/implementation evidence, metadata, layout, object and return effects |
+| libSystem and libdispatch | Memory, strings, synchronization, blocks and execution primitives | ABI, ordering/lifetime contract, native observations and recorded environment |
+| Mach and XPC/NSXPC | Task/VM/port/message and service-boundary behavior | Rights, message format, connection/endpoint contract, actual supported environment |
+
+Native helpers inspect mapped runtime images; bounded static parsers inspect captured files. Each runtime observation stays attached to its platform and implementation, with an explicit shared-qualification edge where applicable.
+
 ## Execution rules
 
-1. Start with C00 and C01, then run C02–C12 as an expanding vertical slice. Shared evidence identities, budget accounting, persistence, cancellation, and source maps accompany every pass.
+1. Follow the active delivery order above: thin C00 contracts, native catalog C00N and early function parsing first, then C01–C12 as an expanding vertical slice. Shared evidence identities, budget accounting, persistence, cancellation, and source maps accompany every pass.
 2. Preserve machine widths and effects before simplifying. Unknown reachable instructions/calls/memory effects block strict source export unless a defined intrinsic or explicit dependency models them.
 3. The canonical pipeline consumes structured IR and a typed source AST. Rendered pseudocode is a presentation and optional parsed input language, not an analysis database.
 4. Every task below is still open unless evidence explicitly establishes its complete acceptance gate. A schema draft or row-count test alone cannot close an integrated feature.
@@ -37,13 +78,31 @@ Completion evidence must identify the source hash, architecture, ABI, function b
 
 Dependencies: current captured-source identity, normalized function boundaries, worker IR/CFG.
 
-- [ ] Define versioned reconstruction AST, effects, types, variables, hypotheses, source spans, dependencies, and validation artifacts; reconcile the draft JSON schema with C17 and the worker transport.
+- [~] Define versioned reconstruction AST, effects, types, variables, hypotheses, source spans, dependencies, and validation artifacts; reconcile the draft JSON schema with C17 and the worker transport. *(in progress — claimed)*
 - [ ] Implement content-derived identities scoped to binary, function, pass version, and analysis settings; validate uniqueness, references, spans, graph integrity, limits, and artifact hashes.
 - [ ] Separate observed facts, derivations, assumptions, analyst assertions, rejected alternatives, and conflicts; support bounded “why,” alternatives, dependency, contradiction, and invalidation queries.
 - [ ] Introduce per-function review/export/validation eligibility with explicit blockers and completeness; incomplete analysis cannot acquire an equivalence label.
 - [ ] Extend the redistributable corpus to `-O0/-O1/-O2/-Os`, stripped/symbol-rich builds, compiler variants, and per-feature ground truth. Keep scoring-only source/debug oracles out of the recovery path.
 
 Acceptance: real worker artifacts pass structural and semantic validation; mutations of content, references, provenance, completeness, or eligibility are rejected. Reports distinguish decoded coverage, semantic coverage, fidelity, compilation, and tested behavior.
+
+Current progress: a C17 artifact schema, offline content/reference/AST/eligibility validator, and bounded evidence-query implementation exist with executable positive/adversarial tests. Worker-produced artifacts and native catalog integration remain open; this does not close C00.
+
+## C00N — Darwin native naming, declarations, images, and type evidence
+
+Dependencies: captured image identity and the thin C00 evidence contract. This work begins before general SSA/type inference and supplies its initial names and types.
+
+- [ ] Build one version-aware Mach-O/dyld path for macOS/iOS: UUIDs, architecture/subtype, platform/build version, segments/sections, symbols/exports, dylib ordinals, reexports, stubs/GOT/authenticated pointers, chained fixups and shared-cache image identities.
+- [ ] Collect native loaded-image ownership and slide/symbol evidence through dyld, `dladdr` and applicable Mach APIs; join file/preferred/runtime addresses only through a validated mapping. Native introspection runs in its own helper or qualified target runtime.
+- [ ] Recover function names from exact target symbols, validated exports/import providers, runtime IMPs, debug records, and SDK declarations. Preserve exact names and raw mangling alongside inferred aliases and provenance; a nearby symbol address alone does not establish an exact function identity.
+- [ ] Collect Objective-C class/metaclass names, superclasses, class/instance methods, selectors, complete method encodings, return/argument types and IMP ownership using target metadata and applicable libobjc APIs (`class_getName`, `class_getSuperclass`, `class_copyMethodList`, `method_getName`, `sel_getName`, `method_getTypeEncoding`, `method_getImplementation`).
+- [ ] Recover properties and their attributes, declared types, getter/setter selectors, backing ivars and ownership qualifiers; recover ivar names, encodings, offsets, widths, alignment and inheritance boundaries using metadata plus `class_copyPropertyList`, `property_getAttributes`, `class_copyIvarList`, `ivar_getTypeEncoding`, and `ivar_getOffset` where runtime access exists.
+- [ ] Import C-style function declarations and SDK definitions through the Apple Clang AST: typedefs, enums, pointers/function pointers, callbacks/blocks, structs/unions, field offsets, packing, alignment, bitfields, variadic prototypes and ABI attributes. Associate declarations with the actual providing image and retain aliases/source spelling.
+- [ ] Use SDK/Clang record layouts, `sizeof`/alignment/offset probes, Objective-C encodings and Foundation size/alignment helpers to establish structure layouts and types. Runtime encodings seed layout evidence; missing field names or erased typedefs remain explicitly unresolved until headers/debug/type constraints supply them.
+- [ ] Feed this catalog into function-boundary parsing, prototype/ABI recovery, selector/message-send reconstruction, class/property/ivar expressions and struct field access. Reuse libSystem, libobjc, Foundation/CoreFoundation, dispatch, Mach and XPC contracts and implementations where applicable.
+- [ ] Record shared macOS/iOS qualification per layout/decoder/runtime contract, including version/architecture/ABI applicability. Run identical shared-format fixtures through the same dyld decoder; only the platform-specific deltas require separate qualification.
+
+Acceptance: native fixtures exercise images, C functions, classes/metaclasses, instance/class selectors, properties/ivars, C structs and ABI layouts. Their names/types/layouts agree with SDK/Clang/runtime ground truth. Catalog joins reject image/UUID/ABI mismatches; shared-format macOS/iOS fixtures yield the same semantic decoding. Every catalog-derived pseudocode construct links back to the record that supplied it.
 
 ## C01 — Exact semantics, effects, and executable machine-state C
 
@@ -52,14 +111,16 @@ Dependencies: C00. Extend semantics as each corpus slice requires; full ISA qual
 - [ ] Inventory exact, intrinsic, privileged/runtime, and unsupported instruction families; finish shared ARM64/ARM64e semantics including vector/half FP, flags, partial lanes, SP, PAC, atomics, barriers, traps, and exception effects.
 - [ ] Specify typed bitvectors, modular arithmetic, comparisons, shifts, extensions, poison/unknowns, endianness, memory alignment, FP modes, and architectural aliases.
 - [ ] Build an IR interpreter and strict C17 emitter with checked guest-memory helpers and explicit imports/intrinsics. Preserve ordering and side effects.
+- [ ] Connect the Darwin native support runtime and record reusable macOS/iOS semantic qualifications with explicit ABI/environment deltas.
 - [ ] Differential-test semantics against hardware or a qualified independent engine; exercise reserved and neighboring encodings and architectural edge cases.
 - [ ] Replace text reparsing in reconstruction consumers with structured effects.
+- [ ] Render named/typed low-level pseudocode directly from the structured effects and C00N evidence before general source recovery is complete; keep expression source ranges and explicit unresolved effects throughout.
 
 Acceptance: eligible machine-state C recompiles and agrees with original execution on recorded tests; unsupported reachable effects fail eligibility. FP/atomic/PAC claims require their dedicated state/model tests.
 
 ## C02 — Function discovery and complete control-flow facts
 
-Dependencies: C00, C01 effects for the supported slice.
+Dependencies: C00 and C00N seed identity/boundaries; C01 effects complete the CFG for the supported slice. Initial function parsing proceeds using the existing decoder/IR while semantics expand.
 
 - [ ] Reconcile symbol, unwind, export, runtime, direct-call, prologue, thunk, tail-call, and cross-reference evidence for stripped/optimized code; retain competing boundaries and cold fragments.
 - [ ] Canonicalize per-function CFG with reachability, dominators/post-dominators, loop forest, control dependence, exceptional exits, and unknown successors.
@@ -80,7 +141,7 @@ Acceptance: dominance, phi inputs, interference, def-use, memory versions, read-
 
 ## C04 — Calls, ABI, summaries, and the call graph
 
-Dependencies: C02, C03; basic library types from C05 seed the solver.
+Dependencies: C00N names/prototypes/layouts, C02 and C03; basic library types seed the solver before general C05 propagation.
 
 - [ ] Complete Apple AAPCS64 parameter/return recovery: GP/FP banks, stack values, homogeneous/arbitrary aggregates, varargs, hidden result/context values, returns, tails, and nonreturning calls.
 - [ ] Build typed direct/import/tail/thunk/indirect/dispatch call edges, confidence, candidate sets, and caller/callee navigation.
@@ -91,9 +152,10 @@ Acceptance: compiled ABI fixtures and execution agree on argument/return locatio
 
 ## C05 — Type library, layout, and constraint propagation
 
-Dependencies: C00; iterate with C03/C04.
+Dependencies: C00/C00N seed the library and layouts; iterate with C03/C04 for inferred types.
 
 - [ ] Import project/SDK C declarations, DWARF/dSYM, structs/unions/enums/typedefs/prototypes, and validated runtime types; persist source and version.
+- [ ] Preserve native C declarations, Objective-C property/ivar attributes and actual compiler field layouts while propagating them into parameters, locals, fields, method declarations and expressions.
 - [ ] Solve types bidirectionally across SSA, calls, returns, casts, loads/stores, and pointer arithmetic, separating machine representation, semantic type, and source spelling.
 - [ ] Infer stack/global/pointer-relative aggregate layouts and fields from width/offset/use/lifetime/alias evidence; retain incompatible layouts and alternatives.
 - [ ] Recover signedness, nullability, mutability, constness, ownership, and lifetime only to the degree supported by evidence.
@@ -102,9 +164,10 @@ Acceptance: held-out fixture types/layouts match the source oracle where determi
 
 ## C06 — Apple object models, strings, and library idioms
 
-Dependencies: C04, C05.
+Dependencies: C00N establishes class/selector/property/ivar facts early; C04/C05 add receiver, dispatch and data-flow inference.
 
 - [ ] Complete Objective-C class/metaclass/superclass/category/protocol/ivar/property/IMP relationships, selector stubs, receiver classes, and dynamic dispatch candidate sets.
+- [ ] Render validated property/ivar access, class/instance method declarations and C-style prototypes with their owning image and type/layout evidence; retain property-accessor calls when an accessor rewrite has not been justified.
 - [ ] Recover strings, pointer/string xrefs, CFString/CFData, globals, block captures, tagged pointers, bounds checks, ownership/runtime calls, and Foundation/CoreFoundation idioms from data flow.
 - [ ] Connect runtime observations and their validated image mappings to static hypotheses without promoting temporal proximity to causation.
 
@@ -151,6 +214,7 @@ Dependencies: C00/C01; expand continuously with C02–C09.
 - [ ] Add bounded SMT equivalence for supported pure/region models, including assumptions, timeouts, and counterexamples.
 - [ ] Score recovered AST structure, variables/types/names, CFG/def-use/effects, recompilation, and tested behavior separately by language/optimization/feature/compiler.
 - [ ] Store input/toolchain/backend/test identities and results as graph evidence; enforce per-category regression thresholds in CI.
+- [ ] Reuse macOS qualification for shared AArch64, Mach-O/dyld, native type/layout and Darwin runtime semantics on iOS; report the tested common foundation and the remaining platform/version/ABI deltas separately.
 
 Acceptance: zero unexplained behavioral mismatches in the qualification matrix. A differential pass reports its tested domain; a formal result states its proof model and assumptions. Compilation alone never grants equivalence.
 
@@ -267,7 +331,8 @@ An original checkbox closes only when all mapped work and its stated gate are pr
 
 ## Next executable work
 
-1. Validate the draft artifact schema with real positive and adversarial artifact instances, content identities, references, AST/evidence integrity, and eligibility gates (C00).
-2. Bind real lifted instructions and their coverage/effects to evidence nodes; publish per-function reconstruction blockers without reparsing pseudocode (C00/C01).
-3. Implement the first machine-state C17 and IR-interpreter fixture, compile it, run differential tests, and retain graph-linked results (C01/C10).
-4. Carry that fixture through SSA, calls/types, recovered AST, structured source, and synchronized review; add complexity only after the complete path runs (C02–C11).
+1. Bind real per-function AArch64 IR/CFG records to the implemented artifact/evidence gate; carry exact function and image identity into named pseudocode (C00/C01/C02).
+2. Implement the Darwin catalog helper and Apple Clang layout/declaration importer for images, functions/C declarations, classes, selectors/methods, properties, ivars, structs and types; join validated records to pseudocode (C00N).
+3. Generate the first machine-state C17 and IR-interpreter fixture, compile against applicable native Darwin libraries, run differential tests, and retain graph-linked results (C01/C10).
+4. Extend that same function path through memory/register SSA, ABI/type solving, recovered variables/expressions, nested control flow, compilable recovered source, and synchronized evidence review (C03–C11).
+5. Expand the AArch64 macOS/iOS shared corpus, enforce per-feature fidelity/behavior gates, and only then promote broader architecture/format/product work (C12–C16).

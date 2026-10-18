@@ -12,7 +12,7 @@ This checklist compares HindSight's current analysis path with capabilities docu
 - [x] C-like ARM64 output with dyld, Objective-C, C, CoreFoundation, and supported C++ symbol/signature recovery.
 - [x] Pseudocode accessible from the Binary Workspace and application navigation.
 - [x] Conservative conditional-return structuring for one proven branch pattern.
-- [~] General source-variable, stack-local, and type recovery. *(in progress — claimed)*
+- [ ] General source-variable, stack-local, and type recovery.
 - [ ] General C control-flow structuring, switch recovery, and architecture-independent decompilation.
 
 ## P0 — Make current pseudocode dependable and useful
@@ -77,8 +77,8 @@ This checklist compares HindSight's current analysis path with capabilities docu
 
 ## Suggested implementation order
 
-1. Reconstruction/evidence contracts, corpus ground truth, and eligibility gates (C00).
-2. Exact effects, machine-state C17, interpreter, and immediate differential validation for a working slice (C01/C10).
+1. Thin reconstruction/evidence contracts, native Darwin image/name/type/declaration catalog, and canonical AArch64 function parsing (C00/C00N/early C02).
+2. Exact effects and named/typed AArch64 pseudocode, machine-state C17, interpreter, and immediate differential validation for a working slice (C01/C10).
 3. Function/CFG truth, register/memory SSA, calls/ABI, and type constraints (C02–C05).
 4. Apple runtime/data models, source variables/expressions, and nested structure (C06–C08).
 5. Reconstructed source emission, round-trip grammar, evidence-centered review, and fidelity qualification (C09–C12).
