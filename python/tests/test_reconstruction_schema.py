@@ -19,6 +19,7 @@ AnalysisScope = MODULE.AnalysisScope
 ReconstructionArtifact = MODULE.ReconstructionArtifact
 content_id = MODULE.content_id
 settings_digest = MODULE.settings_digest
+compute_eligibility = MODULE.compute_eligibility
 
 PASS_VERSION = "reconstruct-1"
 SETTINGS = {"memory_budget": 4096, "variable_recovery": True}
@@ -79,6 +80,23 @@ class ReconstructionArtifactTests(unittest.TestCase):
         self.assertFalse(result["truncated"])
         self.assertEqual(len(artifact.query(document["nodes"][0]["id"], "lifts-to", "outgoing")["nodes"]), 2)
         self.assertEqual(len(artifact.query(document["nodes"][1]["id"], "contradicts")["nodes"]), 1)
+
+    def test_compute_eligibility_blocks_incomplete_and_unsupported(self):
+        document = fixture()
+        eligibility = compute_eligibility(document)
+        self.assertEqual(eligibility["state"], "review-only")
+        self.assertEqual(eligibility["reasons"], [])
+        # truncated analysis cannot claim export
+        truncated = copy.deepcopy(document)
+        truncated["truncated"] = True
+        self.assertEqual(compute_eligibility(truncated)["state"], "blocked")
+        self.assertTrue(any(reason["blocking"] for reason in compute_eligibility(truncated)["reasons"]))
+        # unsupported effect blocks export
+        unsupported_doc = copy.deepcopy(document)
+        unsupported_doc["nodes"].append({"id": "sha256:" + "1" * 64, "kind": "unsupported-effect",
+                                       "epistemic": "derived", "producer": "fixture-v1",
+                                       "confidence": 1, "payload": {}, "ranges": []})
+        self.assertEqual(compute_eligibility(unsupported_doc)["state"], "blocked")
 
     def test_why_conflicts_and_invalidation_queries(self):
         document = fixture()

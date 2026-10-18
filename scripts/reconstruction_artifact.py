@@ -166,6 +166,52 @@ def content_id(domain, source_sha256, function_id, record, scope):
     return "sha256:" + hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
+def compute_eligibility(artifact):
+    """Derive per-function eligibility from an artifact's completeness state.
+
+    Incomplete or unsupported analyses cannot claim export/equivalence. The
+    result is a candidate for the artifact's ``eligibility`` field and is
+    validated by ``ReconstructionArtifact`` before acceptance.
+    """
+    nodes = artifact.get("nodes", [])
+    ast = artifact.get("ast", {}) or {}
+    reasons = []
+    truncated = bool(artifact.get("truncated", False))
+    exhausted = bool((artifact.get("budgets") or {}).get("exhausted"))
+    unsupported = [node for node in nodes if node.get("kind") == "unsupported-effect"]
+    validation = artifact.get("validation", []) or []
+    has_failed = any(run.get("status") == "failed" for run in validation)
+    passed = {run.get("kind") for run in validation if run.get("status") == "passed"}
+
+    if truncated:
+        reasons.append({"code": "truncated", "message": "analysis was truncated", "blocking": True,
+                       "evidence": []})
+    if exhausted:
+        reasons.append({"code": "budget-exhausted", "message": "analysis budget was exhausted", "blocking": True,
+                       "evidence": []})
+    for node in unsupported:
+        reasons.append({"code": "unsupported-effect", "message": "unsupported effect blocks export", "blocking": True,
+                       "evidence": [node["id"]]})
+    if has_failed:
+        reasons.append({"code": "validation-failed", "message": "validation run failed", "blocking": True,
+                       "evidence": []})
+
+    compilable = bool(ast.get("compilable")) and ast.get("root") is not None
+    blocking = any(reason["blocking"] for reason in reasons)
+
+    if blocking:
+        state = "blocked"
+    elif not compilable:
+        state = "review-only"
+    elif {"cfg", "def-use", "memory-effects", "smt"} <= passed and not any(
+            node.get("epistemic") in {"assumption", "analyst-assertion"} for node in nodes):
+        state = "equivalent"
+    else:
+        state = "recompilable-with-intrinsics"
+
+    return {"state": state, "reasons": reasons}
+
+
 def reconstruction_digest(artifact):
     """Digest the candidate independently of validation observations.
 
