@@ -1,12 +1,39 @@
 //! Source signature evidence recovered from names and Objective-C runtime type encodings.
 //! A declaration is emitted only when metadata or an exact API catalog entry supplies it.
 use std::collections::BTreeMap;
+use std::io::{self, Read};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature {
     pub language: &'static str,
     pub declaration: String,
     pub source: &'static str,
+}
+
+fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTreeMap<String,Signature>, &'static str> {
+    if contents.len()>4*1024*1024||contents.lines().count()>20_000{return Err("External prototype catalog exceeds byte/record budget")}
+    let mut bound=false;let mut result=BTreeMap::new();
+    for line in contents.lines() {
+        if let Some(expected)=line.strip_prefix("# source_sha256="){if expected.len()!=64||!expected.bytes().all(|byte|byte.is_ascii_hexdigit())||!expected.eq_ignore_ascii_case(source_sha256){return Err("External prototype catalog source SHA-256 mismatch")}bound=true;continue}
+        let line=line.trim();if line.is_empty()||line.starts_with('#'){continue}
+        if line.len()>2048{return Err("External prototype catalog record exceeds length budget")}
+        let Some((symbol,declaration))=line.split_once('\t')else{return Err("External prototype records require a tab between symbol and declaration")};
+        let symbol=symbol.trim();let declaration=declaration.trim();
+        if !clean(symbol)||!declaration.ends_with(';')||declaration.len()>1024||declaration.chars().any(|ch|ch.is_control()||matches!(ch,'\\'|'{'|'}'|'#'|'='|'"')){return Err("External prototype catalog contains an unsafe declaration")}
+        let Some((head,arguments))=declaration[..declaration.len()-1].split_once('(')else{return Err("External prototype declaration is malformed")};
+        if !arguments.ends_with(')')||arguments[..arguments.len()-1].contains(['(',')']){return Err("External prototype declaration has unsupported nesting")}
+        let declared=head.split_whitespace().last().map(|name|name.trim_start_matches('*')).unwrap_or("");
+        if declared.is_empty()||!declared.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_')||symbol.trim_start_matches('_')!=declared{return Err("External prototype symbol and declaration name differ")}
+        result.insert(symbol.to_owned(),Signature{language:"C",declaration:declaration.to_owned(),source:"hash-bound analyst C prototype catalog"});
+    }
+    if !bound{return Err("External prototype catalog requires source_sha256 binding")}Ok(result)
+}
+
+pub fn external_prototype_database(source_sha256:&str)->io::Result<BTreeMap<String,Signature>>{
+    let Some(path)=std::env::var_os("HINDSIGHT_PROTOTYPE_DB")else{return Ok(BTreeMap::new())};let path=std::path::PathBuf::from(path);
+    if !path.is_absolute()||path.to_string_lossy().len()>16*1024{return Err(io::Error::new(io::ErrorKind::InvalidInput,"HINDSIGHT_PROTOTYPE_DB must be an absolute path"))}
+    let mut contents=String::new();std::fs::File::open(path)?.take(4*1024*1024+1).read_to_string(&mut contents)?;
+    parse_prototype_database(&contents,source_sha256).map_err(|message|io::Error::new(io::ErrorKind::InvalidData,message))
 }
 
 fn clean(text: &str) -> bool {
@@ -341,7 +368,7 @@ pub fn symbol(name: &str) -> Option<Signature> {
 }
 
 pub fn recover(starts: &[u64], symbols: &[(u64, String)], objc_records: &str, calls: &[(u64,u64,u64)], scan_end: u64) -> (String, String) {
-    recover_internal(starts, symbols, objc_records, calls, scan_end, None)
+    recover_internal(starts, symbols, objc_records, calls, scan_end, &BTreeMap::new(), None)
 }
 
 struct Arm64RenderContext<'a> {
@@ -360,9 +387,9 @@ pub fn recover_arm64(
     starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
     calls: &[(u64,u64,u64)], scan_end: u64, code: &[u8], base: u64,
     file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
-    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>,
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, external_prototypes:&BTreeMap<String,Signature>,
 ) -> (String, String) {
-    recover_internal(starts, symbols, objc_records, calls, scan_end,
+    recover_internal(starts, symbols, objc_records, calls, scan_end, external_prototypes,
         Some(Arm64RenderContext { code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors }))
 }
 
@@ -1286,11 +1313,12 @@ fn instructions_truncated(machine: &str) -> bool {
 fn recover_internal(
     starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
     calls: &[(u64,u64,u64)], scan_end: u64,
+    external_prototypes:&BTreeMap<String,Signature>,
     arm64: Option<Arm64RenderContext<'_>>,
 ) -> (String, String) {
     let mut by_address = BTreeMap::<u64,(String,Signature)>::new();
     let mut name_only = BTreeMap::<String,Signature>::new();
-    for (address,name) in symbols { if let Some(sig) = symbol(name) {
+    for (address,name) in symbols { if let Some(sig) = symbol(name).or_else(||external_prototypes.get(name).cloned()) {
         if *address == 0 { name_only.insert(name.clone(),sig); }
         else { by_address.insert(*address,(name.clone(),sig)); }
     } }
@@ -1301,7 +1329,7 @@ fn recover_internal(
         let Some(encoding) = line.split(" types=").nth(1).and_then(|s| s.split(" imp=").next()) else { continue };
         if let Some(sig) = objc_method(name.trim(),encoding.trim()) { by_address.insert(imp,(name.trim().into(),sig)); }
     }
-    let mut signatures = String::from("Signature evidence: exact SDK ABI declarations, validated Objective-C type encodings, and supported Itanium mangled parameter types. Unknown source types remain unresolved.\n");
+    let mut signatures = String::from("Signature evidence: exact SDK ABI declarations, validated Objective-C type encodings, hash-bound analyst C prototypes, and supported Itanium mangled parameter types. Unknown source types remain unresolved.\n");
     for (address,(name,sig)) in by_address.iter().take(700) {
         let abi = if arm64.is_some() {
             format!("    ABI profile=Apple-arm64-LP64 bindings=[{}] result={}{}\n",
@@ -1384,6 +1412,26 @@ fn recover_internal(
         assert!(symbol("_CFReleaseExtra").is_none());
         assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
+    }
+    #[test] fn hash_bound_external_c_prototypes_supply_types_and_reject_unsafe_records() {
+        let digest="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let records=format!("# source_sha256={digest}\n_custom\tint custom(const char *name, size_t count);\n_empty\tvoid empty(void);\n");
+        let parsed=parse_prototype_database(&records,digest).unwrap();
+        let signature=parsed.get("_custom").unwrap();
+        assert_eq!(signature.source,"hash-bound analyst C prototype catalog");
+        assert_eq!(signature.declaration,"int custom(const char *name, size_t count);");
+        let parameters=abi_parameters(Some(signature));
+        assert_eq!(parameters.iter().map(|parameter|parameter.register.as_str()).collect::<Vec<_>>(),vec!["x0","x1"]);
+        let (report,pseudocode)=recover_internal(&[0x1000],&[(0x1000,"_custom".into())],"",&[],0x1004,&parsed,None);
+        assert!(report.contains("source=hash-bound analyst C prototype catalog declaration=int custom(const char *name, size_t count);"),"{report}");
+        assert!(pseudocode.contains("int custom(const char *name, size_t count)"),"{pseudocode}");
+        for invalid in [
+            "_custom\tint custom(int value);\n".to_string(),
+            format!("# source_sha256={}\n_custom\tint custom(int value);\n","f".repeat(64)),
+            format!("# source_sha256={digest}\n_custom int custom(int value);\n"),
+            format!("# source_sha256={digest}\n_other\tint custom(int value);\n"),
+            format!("# source_sha256={digest}\n_custom\tint custom(int value) {{ return value; }}\n"),
+        ] {assert!(parse_prototype_database(&invalid,digest).is_err(),"{invalid}")}
     }
     #[test] fn typed_argument_casts_use_prototype_width_signedness_and_pointer_evidence() {
         for (value, ty, expected) in [

@@ -4,7 +4,7 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v5` in analysis/cache/continuity identities.
+`prototype-abi-v6` in analysis/cache/continuity identities.
 
 Supported Apple ARM64 LP64 rules include:
 
@@ -53,6 +53,13 @@ values. FP and aggregate stack contents remain unresolved.
 Foundation catalog refinements must agree with the runtime encoding's ABI
 width, register class and integer interpretation. A conflicting encoding keeps
 its own declaration and reports the SDK conflict instead of adopting the catalog.
+
+The opt-in `HINDSIGHT_PROTOTYPE_DB` project catalog supplies exact C declarations
+for symbols present in the image. Catalogs require a matching source SHA-256,
+use bounded tab-separated records, and reject malformed or unsafe declarations.
+Built-in exact SDK declarations retain precedence. Supported catalog types feed
+the same argument, return, cast, and Apple ARM64 location recovery as built-ins;
+unknown layouts remain explicitly unresolved.
 
 Validated protocol objects now contribute scoped method declarations to Call
 Values, preserving required/optional and class/instance membership. Each

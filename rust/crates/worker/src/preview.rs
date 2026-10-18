@@ -1294,7 +1294,8 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
  let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols)?;
- let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls);
+ let external_prototypes=super::signatures::external_prototype_database(digest)?;
+ let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes);
  let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_signatures=super::signatures::objc_conformance_declarations(&objc_classes);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
  if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
  call_values.push_str("\n\n");
