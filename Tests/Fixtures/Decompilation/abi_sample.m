@@ -17,6 +17,10 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 - (double)optionalRatio:(float)ratio;
 @end
 
+@protocol ABICategory
+- (int)categoryValue;
+@end
+
 @interface ABISample : NSObject <ABIRecovered>
 - (void *)pointer;
 - (double)scalar;
@@ -45,6 +49,14 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
            byte:(char)byte half:(short)half word:(int)word pointer:(double *)pointer {
     argument_sink = a + b + c + d + e + f + byte + half + word + (long)pointer;
 }
+@end
+
+
+@interface ABISample (RecoveredCategory) <ABICategory>
+@end
+
+@implementation ABISample (RecoveredCategory)
+- (int)categoryValue { return 9; }
 @end
 
 int main(void) {

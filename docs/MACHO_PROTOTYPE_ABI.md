@@ -4,7 +4,7 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v6` in analysis/cache/continuity identities.
+`prototype-abi-v7` in analysis/cache/continuity identities.
 
 Supported Apple ARM64 LP64 rules include:
 
@@ -74,6 +74,12 @@ it does not establish class conformance, an IMP, or a dispatch target.
 Validated `class_ro_t` protocol lists now preserve class declarations such as
 `@interface Class <Protocol>`. Conformance does not establish that required or
 optional methods have local implementations, and does not select dispatch targets.
+Validated category records resolve their class pointer and protocol list into
+`@interface Class (Category) <Protocol>` declarations. Category conformance stays
+separate from the base class record and carries the same implementation limits.
+When the static linker folds a local category protocol list into `class_ro_t`,
+the report preserves the effective class conformance because category provenance
+is no longer present in the linked image.
 
 Unknown typedefs and aggregate layouts can change both register banks and stack
 offsets. The unsupported parameter and subsequent bindings remain unresolved.
@@ -83,7 +89,7 @@ receiver; those argument bindings remain unresolved without membership evidence.
 This is progress toward complete resolution. It does not recover arbitrary C/C++
 layouts, Swift ABI, DWARF types, user header libraries, most stack-passed values,
 anonymous variadic values, hidden ABI attributes, or caller/callee constraints.
-Superclass/category conformance propagation, extended method-type tables and
+Superclass conformance propagation, extended method-type tables and
 conflict resolution across receiver hypotheses remain open.
 Unresolved GP return candidates and register-use arity evidence remain explicitly
 weaker than source declarations. Objective-C selector evidence alone does not

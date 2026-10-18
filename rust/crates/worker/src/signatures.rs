@@ -223,21 +223,26 @@ pub fn protocol_signatures(records: &str) -> String {
     output
 }
 
-/// A class RO protocol list proves a declared conformance. It does not prove
+/// A class RO or category protocol list proves a declared conformance. It does not prove
 /// that any required method has a local implementation or resolve dispatch.
 pub fn objc_conformance_declarations(records: &str) -> String {
     let valid=|value:&str|!value.is_empty()&&value.len()<=256&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'));
     let mut seen=std::collections::BTreeSet::new();let mut output=String::new();
     for line in records.lines().take(8192) {
-        let line=line.trim();if line.len()>4096||!line.starts_with("reconstructed class "){continue}
-        let Some(name)=line.split("  name=").nth(1).and_then(|tail|tail.split_whitespace().next())else{continue};
+        let line=line.trim();if line.len()>4096{continue}
+        let (name,category,source)=if line.starts_with("reconstructed class ") {
+            let Some(name)=line.split("  name=").nth(1).and_then(|tail|tail.split_whitespace().next())else{continue};(name,None,"validated-class-ro-protocol-list")
+        } else if line.starts_with("category ") {
+            let Some(category)=line.split_whitespace().find_map(|field|field.strip_prefix("name="))else{continue};let Some(name)=line.split_whitespace().find_map(|field|field.strip_prefix("class_name="))else{continue};(name,Some(category),"validated-category-protocol-list")
+        } else {continue};
         let Some(protocols)=line.split_whitespace().find_map(|field|field.strip_prefix("conforms="))else{continue};
-        if !valid(name){continue}let conformances=protocols.split(',').filter(|protocol|valid(protocol)).take(32).collect::<Vec<_>>();
-        if conformances.is_empty(){continue}let key=(name.to_owned(),conformances.join(","));if !seen.insert(key){continue}
-        let row=format!("class={name} conforms={} source=validated-class-ro-protocol-list implementation-coverage=unproven dispatch-targets=unresolved\n@interface {name} <{}>\n@end\n",conformances.join(","),conformances.join(", "));
+        if !valid(name)||category.is_some_and(|value|!valid(value)){continue}let conformances=protocols.split(',').filter(|protocol|valid(protocol)).take(32).collect::<Vec<_>>();
+        if conformances.is_empty(){continue}let key=(name.to_owned(),category.unwrap_or("").to_owned(),conformances.join(","));if !seen.insert(key){continue}
+        let category_declaration=category.map(|value|format!(" ({value})")).unwrap_or_default();let category_evidence=category.map(|value|format!(" category={value}")).unwrap_or_default();
+        let row=format!("class={name}{category_evidence} conforms={} source={source} implementation-coverage=unproven dispatch-targets=unresolved\n@interface {name}{category_declaration} <{}>\n@end\n",conformances.join(","),conformances.join(", "));
         if output.len()+row.len()>12_000||seen.len()>128{output.push_str("Objective-C conformance output truncated at declaration/byte budget.\n");break}output.push_str(&row);
     }
-    if !output.is_empty(){output.insert_str(0,"Objective-C class conformance evidence; conformance does not establish method implementations.\n")}output
+    if !output.is_empty(){output.insert_str(0,"Objective-C class/category conformance evidence; conformance does not establish method implementations.\n")}output
 }
 
 // Exact SDK ABI declarations. No prefix or substring matching: unknown APIs stay unknown.
@@ -1509,11 +1514,13 @@ fn recover_internal(
         ] { assert!(protocol_signatures(records).is_empty(), "{records}"); }
     }
     #[test] fn class_conformance_declarations_preserve_protocol_sets_without_implementation_claims() {
-        let records="reconstructed class 0x0000000000001000  name=Worker  super=0x0  ro=0x2000  conforms=Primary,Tracing\nreconstructed class 0x0000000000003000  name=Plain  super=0x0  ro=0x4000\n";
+        let records="reconstructed class 0x0000000000001000  name=Worker  super=0x0  ro=0x2000  conforms=Primary,Tracing\nreconstructed class 0x0000000000003000  name=Plain  super=0x0  ro=0x4000\ncategory 0x5000 name=Extras class=0x1000 class_name=Worker conforms=Supplemental confidence=validated\n";
         let output=objc_conformance_declarations(&(records.to_string()+records));
         assert_eq!(output.matches("class=Worker conforms=Primary,Tracing").count(),1,"{output}");
         assert!(output.contains("@interface Worker <Primary, Tracing>"),"{output}");
         assert!(output.contains("implementation-coverage=unproven dispatch-targets=unresolved"),"{output}");
+        assert_eq!(output.matches("class=Worker category=Extras conforms=Supplemental").count(),1,"{output}");
+        assert!(output.contains("@interface Worker (Extras) <Supplemental>"),"{output}");
         assert!(!output.contains("Plain"));
         for invalid in ["reconstructed class 0x1  name=<bad>  conforms=Good\n","reconstructed class 0x1  name=Good  conforms=<bad>\n","category 0x1 name=Good conforms=Protocol\n"] {assert!(objc_conformance_declarations(invalid).is_empty(),"{invalid}")}
     }

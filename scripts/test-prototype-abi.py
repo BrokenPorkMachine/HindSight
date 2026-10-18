@@ -82,9 +82,12 @@ def run(worker):
             assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=required-instance selector=castValue:" in evidence, evidence[-12000:]
             assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated" in evidence, evidence[-12000:]
             assert "@protocol ABIRecovered <ABIParent>" in evidence
-            assert "class=ABISample conforms=ABIRecovered source=validated-class-ro-protocol-list" in evidence
-            assert "@interface ABISample <ABIRecovered>" in evidence
+            assert re.search(r"class=ABISample conforms=[^\n]*ABIRecovered[^\n]* source=validated-class-ro-protocol-list", evidence), evidence[-12000:]
+            assert re.search(r"@interface ABISample <[^>]*ABIRecovered", evidence)
             assert "implementation-coverage=unproven dispatch-targets=unresolved" in evidence
+            # ld may merge a local category's protocols into the class RO list.
+            assert re.search(r"class=ABISample conforms=[^\n]*ABICategory[^\n]* source=validated-class-ro-protocol-list", evidence), evidence[-12000:]
+            assert "protocol=ABICategory membership=required-instance selector=categoryValue" in evidence
             # Runtime `c` encodes char/signed-char without a source typedef name.
             assert "- (int)castValue:(char)arg0;" in evidence
             assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=optional-class selector=makeOptional" in evidence
