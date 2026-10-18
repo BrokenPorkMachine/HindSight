@@ -112,7 +112,7 @@ The following checks require a real Intel Mac and an 8 GiB Apple-Silicon Mac. Re
 results here after each run; do not treat this file as passing until every item is
 verified on the required host.
 
-- [ ] Large-firmware memory-pressure reproduction; record peak RSS and bounded failure/completion.
+- [ ] Large-firmware memory-pressure reproduction; record peak RSS and bounded failure/completion. (see scripts/test-memory-pressure.sh)
 - [ ] Real stripped, symbol-rich, data-in-code, and encrypted-metadata arm64 Mach-O inputs.
 - [ ] 0.4.1 schema-1 migration and 0.4.2 schema-2 cache reuse/invalidation.
 - [ ] Monotonic progress, cancellation, and clean worker diagnostics.
@@ -120,7 +120,8 @@ verified on the required host.
 - [ ] Binary Diff, responsive layouts, Function Neighborhoods, and continuity/reconnect flows.
 - [ ] VectorEmu flows and Intel closed-out debugger/Hypervisor/SoC surfaces.
 - [ ] Apple-Silicon debugger, Hypervisor, and SoC execution paths.
-- [ ] Final Gatekeeper assessment after notarization.
+- [ ] Final Gatekeeper assessment after notarization. (see scripts/notarization-checklist.md)
+- [ ] Crash diagnostics reproduction and validation. (see scripts/crash-diagnostics-check.sh)
 
 See docs/RELEASE_READINESS.md for the complete numbered matrix.
 EOF

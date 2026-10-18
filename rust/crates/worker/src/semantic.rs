@@ -357,7 +357,7 @@ enum IrExtension { Zero(u8), Sign(u8) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrAtomicOrdering { Relaxed, Acquire, Release }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round }
+enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round, ReciprocalEstimate, ReciprocalSqrtEstimate }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatPrecision { Single, Double }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,7 +366,7 @@ fn float_register_name(register: IrFloatRegister) -> String {
     format!("{}{index}", match register.precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }, index = register.index)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide, Max, Min, MaxNum, MinNum }
+enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide, Max, Min, MaxNum, MinNum, ReciprocalStep, ReciprocalSqrtStep }
 /// Scalar fused multiply-add: optionally subtract the product from the addend,
 /// then optionally negate the result. Rendering retains the instruction name
 /// because FPCR rounding, NaNs, signed zero, and exceptions are not folded.
@@ -1200,14 +1200,25 @@ impl IrOperation {
                     IrFloatBinaryOperator::Min => format!("fmin({}, {})", register(left), register(right)),
                     IrFloatBinaryOperator::MaxNum => format!("fmaxnm({}, {})", register(left), register(right)),
                     IrFloatBinaryOperator::MinNum => format!("fminnm({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::ReciprocalStep => format!("frecps({}, {})", register(left), register(right)),
+                    IrFloatBinaryOperator::ReciprocalSqrtStep => format!("frsqrts({}, {})", register(left), register(right)),
                 };
-                Some(format!("{} = {expression};", register(destination)))
+                let note = if matches!(operator, IrFloatBinaryOperator::ReciprocalStep | IrFloatBinaryOperator::ReciprocalSqrtStep) {
+                    " /* refinement step; FPCR rounding and FP exceptions unresolved */"
+                } else { "" };
+                Some(format!("{} = {expression};{note}", register(destination)))
             }
             Self::ScalarFloatUnary { destination, source, precision, operator } => {
                 flow.write_v(destination as u32, None);
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let function = match operator { IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint" };
-                Some(format!("{} = {function}({});", register(destination), register(source)))
+                let function = match operator {
+                    IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint",
+                    IrFloatUnaryOperator::ReciprocalEstimate => "frecpe", IrFloatUnaryOperator::ReciprocalSqrtEstimate => "frsqrte",
+                };
+                let note = if matches!(operator, IrFloatUnaryOperator::ReciprocalEstimate | IrFloatUnaryOperator::ReciprocalSqrtEstimate) {
+                    " /* estimate accuracy and FPCR/FPSR behavior unresolved */"
+                } else { "" };
+                Some(format!("{} = {function}({});{note}", register(destination), register(source)))
             }
             Self::ScalarFloatMultiplyAdd(operation) => {
                 flow.write_v(operation.destination as u32, None);
@@ -4580,6 +4591,30 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
         return Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits: None };
     }
+    // Scalar Advanced SIMD reciprocal estimates and refinement steps. Exact
+    // masks admit only S/D forms; FP16, vector lanes, integer estimates, and
+    // reciprocal-exponent operations retain their existing fallback. These
+    // operations are named, never evaluated as host division/sqrt expressions.
+    let scalar_estimate = match word & 0xffff_fc00 {
+        0x5ea1_d800 => Some((IrFloatPrecision::Single, IrFloatUnaryOperator::ReciprocalEstimate)),
+        0x5ee1_d800 => Some((IrFloatPrecision::Double, IrFloatUnaryOperator::ReciprocalEstimate)),
+        0x7ea1_d800 => Some((IrFloatPrecision::Single, IrFloatUnaryOperator::ReciprocalSqrtEstimate)),
+        0x7ee1_d800 => Some((IrFloatPrecision::Double, IrFloatUnaryOperator::ReciprocalSqrtEstimate)),
+        _ => None,
+    };
+    if let Some((precision, operator)) = scalar_estimate {
+        return Operation::ScalarFloatUnary { destination: (word & 31) as u8, source: ((word >> 5) & 31) as u8, precision, operator };
+    }
+    let scalar_refinement = match word & 0xffe0_fc00 {
+        0x5e20_fc00 => Some((IrFloatPrecision::Single, IrFloatBinaryOperator::ReciprocalStep)),
+        0x5e60_fc00 => Some((IrFloatPrecision::Double, IrFloatBinaryOperator::ReciprocalStep)),
+        0x5ea0_fc00 => Some((IrFloatPrecision::Single, IrFloatBinaryOperator::ReciprocalSqrtStep)),
+        0x5ee0_fc00 => Some((IrFloatPrecision::Double, IrFloatBinaryOperator::ReciprocalSqrtStep)),
+        _ => None,
+    };
+    if let Some((precision, operator)) = scalar_refinement {
+        return Operation::ScalarFloatBinary { destination: (word & 31) as u8, left: ((word >> 5) & 31) as u8, right: ((word >> 16) & 31) as u8, precision, operator };
+    }
     // Scalar FCSEL: only the single/double encodings are modeled. For this
     // instruction AArch64 AL and NV both select Rn, independent of NZCV.
     if word & 0xff20_0c00 == 0x1e20_0c00 {
@@ -4617,9 +4652,8 @@ fn decode(word: u32, pc: u64) -> Operation {
         });
     }
     // Scalar single/double two-source arithmetic and minimum/maximum. Keep the
-    // whitelist narrow: other FP data-processing encodings (including the
-    // estimate forms) remain explicit
-    // target-specific IR. FMAX/FMIN propagate NaN and raise the FP exception
+    // whitelist narrow: other FP data-processing encodings retain their
+    // explicit fallback. FMAX/FMIN propagate NaN and raise the FP exception
     // flags; FMAXNM/FMINNM implement the IEEE 754-2008 minNum/maxNum selection.
     if matches!(word & 0xff20_fc00, 0x1e20_0800 | 0x1e20_1800 | 0x1e20_2800 | 0x1e20_3800 | 0x1e20_4800 | 0x1e20_5800 | 0x1e20_6800 | 0x1e20_7800) {
         let precision = match (word >> 22) & 3 {
@@ -4647,7 +4681,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
     }
     // Scalar FCMP against another FP register or +0.0. The comparison is
-    // represented, but its floating-point NZCV truth table is not propagated.
+    // represented with known NZCV and bounded operand provenance when possible.
     if matches!(word & 0xff20_fc1f, 0x1e20_2000 | 0x1e20_2008) {
         let precision = match (word >> 22) & 3 {
             0 => IrFloatPrecision::Single,
@@ -6187,13 +6221,7 @@ impl Operation {
                 format!("{} = {};{}", register(destination), register(source), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default())
             }
             Self::ScalarFloatUnary { destination, source, precision, operator } => {
-                let source_value = flow.read_v(source as u32);
-                // The preview does not fold these operations, so the destination
-                // becomes an unknown barrier; provenance is not carried.
-                flow.write_v(destination as u32, None);
-                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let op = match operator { IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint" };
-                format!("{} = {}({});{}", register(destination), op, register(source), source_value.map(|_| String::new()).unwrap_or_default())
+                IrOperation::ScalarFloatUnary { destination, source, precision, operator }.render(flow, pc).unwrap_or_default()
             }
             Self::ScalarFloatMultiplyAdd(operation) => {
                 // The preview does not fold fused multiply-adds, so the destination
@@ -6213,19 +6241,7 @@ impl Operation {
                 format!("{register} = {}; /* fmov immediate=0x{immediate:02x}; constant={bits:#x} proven_by=[{pc:#x}] */", scalar_float_literal(bits, precision))
             }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
-                flow.write_v(destination as u32, None);
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let expression = match operator {
-                    IrFloatBinaryOperator::Add => format!("{} + {}", register(left), register(right)),
-                    IrFloatBinaryOperator::Subtract => format!("{} - {}", register(left), register(right)),
-                    IrFloatBinaryOperator::Multiply => format!("{} * {}", register(left), register(right)),
-                    IrFloatBinaryOperator::Divide => format!("{} / {}", register(left), register(right)),
-                    IrFloatBinaryOperator::Max => format!("fmax({}, {})", register(left), register(right)),
-                    IrFloatBinaryOperator::Min => format!("fmin({}, {})", register(left), register(right)),
-                    IrFloatBinaryOperator::MaxNum => format!("fmaxnm({}, {})", register(left), register(right)),
-                    IrFloatBinaryOperator::MinNum => format!("fminnm({}, {})", register(left), register(right)),
-                };
-                format!("{} = {expression};", register(destination))
+                IrOperation::ScalarFloatBinary { destination, left, right, precision, operator }.render(flow, pc).unwrap_or_default()
             }
             Self::ScalarFloatSelect { destination, if_true, if_false, precision, condition } => {
                 IrOperation::ScalarFloatSelect { destination, if_true, if_false, precision, condition }.render(flow, pc).unwrap_or_default()
@@ -6648,7 +6664,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v47; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v48; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -9176,5 +9192,101 @@ mod fcsel_tests {
         flow.flag_origins = Some(vec![0xffc]);
         flow.clear();
         assert!(flow.flag_origins.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reciprocal_tests {
+    use super::*;
+
+    // Independently assembled using Apple's clang -arch arm64.
+    const CASES: [(u32, &str); 8] = [
+        (0x5ea1_d820, "s0 = frecpe(s1);"),
+        (0x5ee1_d862, "d2 = frecpe(d3);"),
+        (0x7ea1_d8a4, "s4 = frsqrte(s5);"),
+        (0x7ee1_d8e6, "d6 = frsqrte(d7);"),
+        (0x5e2a_fd28, "s8 = frecps(s9, s10);"),
+        (0x5e6d_fd8b, "d11 = frecps(d12, d13);"),
+        (0x5eb0_fdee, "s14 = frsqrts(s15, s16);"),
+        (0x5ef3_fe51, "d17 = frsqrts(d18, d19);"),
+    ];
+
+    fn is_reciprocal(operation: IrOperation) -> bool {
+        matches!(operation,
+            IrOperation::ScalarFloatUnary { operator: IrFloatUnaryOperator::ReciprocalEstimate | IrFloatUnaryOperator::ReciprocalSqrtEstimate, .. }
+            | IrOperation::ScalarFloatBinary { operator: IrFloatBinaryOperator::ReciprocalStep | IrFloatBinaryOperator::ReciprocalSqrtStep, .. })
+    }
+
+    #[test]
+    fn scalar_estimates_and_steps_lift_without_claiming_exact_arithmetic() {
+        for (word, expected) in CASES {
+            let operation = decode(word, 0x1000);
+            let portable = lift_operation(operation, 0x1000);
+            assert!(is_reciprocal(portable), "{word:#x}");
+            let statement = portable.render(&mut Flow::new(), 0x1000).unwrap();
+            assert!(statement.starts_with(expected), "{statement}");
+            assert!(statement.contains("unresolved"), "{statement}");
+            assert_eq!(statement, operation.render(&mut Flow::new(), 0x1000));
+            let report = render(&word.to_le_bytes(), 0x1000, 0, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("barrier=all_gprs"), "{report}");
+        }
+    }
+
+    #[test]
+    fn half_vector_integer_and_exponent_neighbors_retain_fallbacks() {
+        // Assembled with -march=armv8.2-a+fp16. These include valid FP16,
+        // vector, integer estimate, and scalar reciprocal-exponent encodings.
+        for word in [0x5ef9_d820, 0x7ef9_d862, 0x5e46_3ca4, 0x5ec9_3d07,
+            0x0ea1_d820, 0x4ea1_d862, 0x4ee1_d8a4, 0x6ea1_d8e6,
+            0x4e6a_fd28, 0x4ead_fd8b, 0x4ea1_c9ee, 0x6ea1_ca30,
+            0x5ea1_fa72, 0x5ee1_fab4,
+            // Reserved neighboring size/opcode bits must not broaden the lift.
+            0x5e21_d820, 0x5e61_d820, 0x5ea1_dc20, 0x5e22_f820] {
+            assert!(!is_reciprocal(lift_operation(decode(word, 0x1000), 0x1000)), "{word:#x}");
+        }
+    }
+
+    #[test]
+    fn estimates_invalidate_only_destination_and_preserve_gp_nzcv_and_other_fp_values() {
+        for (word, _) in CASES {
+            // Exercise distinct destinations, source/destination aliases, and
+            // V31 (an ordinary FP register, never the integer zero register).
+            for destination in [(word & 31), (word >> 5) & 31, 31] {
+                let word = (word & !31) | destination;
+                let mut flow = Flow::new();
+                for index in 0..31 {
+                    flow.write(Register { index, wide: true, stack_pointer: false }, Some(KnownValue { value: index as u64 + 1, origins: vec![0xff0] }));
+                }
+                for index in 0..32 {
+                    flow.write_v(index, Some(VKnownValue { value: (1u128 << 100) | (index as u128 + 1), origins: vec![0xff4] }));
+                }
+                flow.flags = Some(0b0110);
+                flow.flag_origins = Some(vec![0xff8]);
+                let mut expected = flow.clone();
+                expected.write_v(destination, None);
+                let statement = lift_operation(decode(word, 0x1000), 0x1000).render(&mut flow, 0x1000).unwrap();
+                assert!(flows_equal(&flow, &expected), "{word:#x}");
+                assert_eq!(flow.flags, expected.flags);
+                assert_eq!(flow.flag_origins, expected.flag_origins);
+                assert!(!statement.contains("constant="), "{statement}");
+            }
+        }
+    }
+
+    #[test]
+    fn call_arguments_keep_unrelated_constants_but_never_reuse_estimate_destinations() {
+        for estimate in [0x5ee1_d820, 0x7ee1_d820, 0x5e62_fc20, 0x5ee2_fc20] {
+            let code = [0x1e6e_1000, 0x1e6e_1001, 0x1e60_1002, estimate, 0x9400_0001]
+                .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            let arguments = known_call_float_argument_values(&code, 0x1000, 0x1000, 0x1010);
+            assert!(!arguments.iter().any(|(index, _, _)| *index == 0));
+            assert_eq!(arguments.iter().find(|(index, _, _)| *index == 1).unwrap().1, 1.0f64.to_bits() as u128);
+            assert_eq!(arguments.iter().find(|(index, _, _)| *index == 2).unwrap().1, 2.0f64.to_bits() as u128);
+            let code = [0xd280_0020, 0xf100_041f, estimate, 0x5400_0040, 0xd65f_03c0, 0xd65f_03c0]
+                .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            let report = render(&code, 0x1000, 0, &[0x1000], &[]);
+            assert!(report.contains("if (eq) goto 0x1014; /* condition proven true */"), "{report}");
+        }
     }
 }

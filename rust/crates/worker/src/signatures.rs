@@ -1689,6 +1689,15 @@ fn recover_internal(
         assert_eq!(names.get("d0").map(String::as_str), Some("factor"));
         assert_eq!(names.get("d1").map(String::as_str), Some("value"));
     }
+    #[test] fn reciprocal_results_remain_unknown_while_unrelated_call_arguments_survive() {
+        let code = [0x1e6e_1000, 0x1e6e_1001, 0x5ee1_d820, 0x9400_03fd]
+            .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let signature = Signature { language: "C", declaration: "void consume(double estimate, double input);".into(), source: "test prototype" };
+        let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        assert!(call.contains("consume(d0, 1.0);"), "{call}");
+        assert!(!call.contains("estimate(d0)=1.0"), "{call}");
+    }
     #[test] fn selected_fp_call_arguments_retain_comparison_provenance() {
         let words = [0x1e6e_1001u32, 0x1e60_1002, 0x1e62_2020, 0x1e62_bc20, 0x9400_03fc];
         let code = words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();

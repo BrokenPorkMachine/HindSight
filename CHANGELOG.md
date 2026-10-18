@@ -12,7 +12,8 @@
 - Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.
 - Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
 - Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.
-- Advance the analysis/cache identity to `arm64-analysis-v81-schema122` and semantic preview banner to v47; the report schema is unchanged.
+- Lift scalar single/double reciprocal estimates and refinement steps (`FRECPE`, `FRSQRTE`, `FRECPS`, `FRSQRTS`) as named shared IR operations with unresolved FP behavior; only their destination values are invalidated.
+- Advance the analysis/cache identity to `arm64-analysis-v82-schema122` and semantic preview banner to v48; the report schema is unchanged.
 
 # 0.5.12 — Objective-C/C Argument Reconstruction
 

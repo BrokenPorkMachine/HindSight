@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v47` banner identifies the statement set that
+`AArch64 register semantics v48` banner identifies the statement set that
 produced a preview.
 
 The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
@@ -61,7 +61,7 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v81-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v82-schema122`; the report fields
 and cache-envelope schema are unchanged.
 
 Scalar single/double `FCSEL` now has shared IR. Its output names the condition
@@ -74,6 +74,15 @@ Provenance remains bounded to eight distinct instruction sites; missing or
 exhausted provenance, unknown predicates, or unknown selected operands invalidate
 the destination value. GP registers, unrelated FP registers, and NZCV remain
 intact. Half precision and reserved encodings remain outside this shared lift.
+
+Scalar single/double `FRECPE`, `FRSQRTE`, `FRECPS`, and `FRSQRTS` now use
+shared unary/binary IR. Named calls retain the distinction between estimates,
+refinement steps, and ordinary division or square root. Their results remain
+unknown: estimate accuracy, FPCR rounding/modes, and FPSR exceptions are unresolved.
+Each operation invalidates only its destination FP value, preserving unrelated
+FP values, GP values, NZCV, and predicate provenance. FP16, vector/integer forms,
+and `FRECPX` retain their prior fallback. Narrow encoding masks are checked
+against independently assembled S/D instructions and adjacent unsupported forms.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument
