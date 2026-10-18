@@ -360,10 +360,41 @@ enum IrAtomicOrdering { Relaxed, Acquire, Release }
 enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round, ReciprocalEstimate, ReciprocalSqrtEstimate }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatPrecision { Single, Double }
+/// Width of a SIMD load/store operand. `Quad` names the whole 128-bit V
+/// register; the narrower variants name one lane of it. Byte and Half are
+/// memory views only — no half-precision arithmetic is claimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct IrFloatRegister { index: u8, precision: IrFloatPrecision }
-fn float_register_name(register: IrFloatRegister) -> String {
-    format!("{}{index}", match register.precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }, index = register.index)
+enum IrSimdWidth { Byte, Half, Single, Double, Quad }
+impl IrSimdWidth {
+    /// Scalar width `size` (bits 31..30) of the load/store single-register group
+    /// with the array-selecting opcodes: opc 00/01 address one lane of
+    /// `1 << size` bytes, opc 10/11 address the full 128-bit register.
+    fn from_load_store(size: u32, quad: bool) -> IrSimdWidth {
+        if quad { return IrSimdWidth::Quad; }
+        match size { 0 => IrSimdWidth::Byte, 1 => IrSimdWidth::Half, 2 => IrSimdWidth::Single, _ => IrSimdWidth::Double }
+    }
+    /// Bytes moved by a load or store of this width.
+    fn bytes(self) -> u8 {
+        match self { IrSimdWidth::Byte => 1, IrSimdWidth::Half => 2, IrSimdWidth::Single => 4, IrSimdWidth::Double => 8, IrSimdWidth::Quad => 16 }
+    }
+    /// Pointer type used when the access is rendered. Byte and Half are named
+    /// as integer views because the preview makes no floating-point claim for
+    /// them; Quad names the machine 128-bit register rather than a source type.
+    fn pointer_type(self) -> &'static str {
+        match self { IrSimdWidth::Byte => "u8", IrSimdWidth::Half => "u16", IrSimdWidth::Single => "float", IrSimdWidth::Double => "double", IrSimdWidth::Quad => "u128" }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IrSimdRegister { index: u8, width: IrSimdWidth }
+fn simd_register_name(register: IrSimdRegister) -> String {
+    format!("{}{index}", match register.width {
+        IrSimdWidth::Byte => 'b', IrSimdWidth::Half => 'h', IrSimdWidth::Single => 's',
+        IrSimdWidth::Double => 'd', IrSimdWidth::Quad => 'q',
+    }, index = register.index)
+}
+fn float_register_name(index: u8, precision: IrFloatPrecision) -> String {
+    let width = if precision == IrFloatPrecision::Single { IrSimdWidth::Single } else { IrSimdWidth::Double };
+    simd_register_name(IrSimdRegister { index, width })
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide, Max, Min, MaxNum, MinNum, ReciprocalStep, ReciprocalSqrtStep }
@@ -442,6 +473,8 @@ enum IrOperation {
     Store { address: IrMemoryAddress, value: IrOperand, bytes: u8, writeback: Option<IrWriteback> },
     LoadPair { first: IrRegister, second: IrRegister, address: IrMemoryAddress, bytes: u8, signed: bool, writeback: Option<IrWriteback> },
     StorePair { address: IrMemoryAddress, first: IrRegister, second: IrRegister, bytes: u8, writeback: Option<IrWriteback> },
+    SimdPairLoad { first: IrSimdRegister, second: IrSimdRegister, address: IrMemoryAddress, bytes: u8, writeback: Option<IrWriteback> },
+    SimdPairStore { first: IrSimdRegister, second: IrSimdRegister, address: IrMemoryAddress, bytes: u8, writeback: Option<IrWriteback> },
     AtomicLoad { destination: IrRegister, address: IrMemoryAddress, bytes: u8, ordering: IrAtomicOrdering, exclusive: bool },
     AtomicStore { status: Option<IrRegister>, address: IrMemoryAddress, value: IrRegister, bytes: u8, ordering: IrAtomicOrdering, exclusive: bool },
     ScalarFloatImmediate { destination: u8, precision: IrFloatPrecision, bits: u64, immediate: u8 },
@@ -453,8 +486,8 @@ enum IrOperation {
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
-    FloatLoad { destination: IrFloatRegister, address: IrMemoryAddress, bytes: u8, writeback: Option<IrWriteback> },
-    FloatStore { source: IrFloatRegister, address: IrMemoryAddress, bytes: u8, writeback: Option<IrWriteback> },
+    SimdLoad { destination: IrSimdRegister, address: IrMemoryAddress, writeback: Option<IrWriteback> },
+    SimdStore { source: IrSimdRegister, address: IrMemoryAddress, writeback: Option<IrWriteback> },
     DirectCall { target: u64 },
     IndirectCall { target: IrRegister },
     Branch { target: u64 },
@@ -565,7 +598,17 @@ impl IrOperation {
                 effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
                 effects.uses = address_gpr_mask(address) | gpr_mask(first) | gpr_mask(second);
             }
-            Self::FloatLoad { address, writeback, .. } | Self::FloatStore { address, writeback, .. } => {
+            // SIMD&FP pairs write V registers only, so the base writeback is the
+            // sole general-purpose effect and the value read is not a use.
+            Self::SimdPairLoad { address, writeback, .. } => {
+                effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address);
+            }
+            Self::SimdPairStore { address, writeback, .. } => {
+                effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address);
+            }
+            Self::SimdLoad { address, writeback, .. } | Self::SimdStore { address, writeback, .. } => {
                 effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
                 effects.uses = address_gpr_mask(address);
             }
@@ -624,13 +667,14 @@ impl IrOperation {
             | Self::ExtractConcat { .. } | Self::Extend { .. } | Self::Extract { .. }
             | Self::Insert { .. } | Self::Load { .. } | Self::Store { .. }
             | Self::LoadPair { .. } | Self::StorePair { .. }
+            | Self::SimdPairLoad { .. } | Self::SimdPairStore { .. }
             | Self::AtomicLoad { .. } | Self::AtomicStore { .. }
             | Self::ScalarFloatImmediate { .. }
             | Self::ScalarFloatMove { .. }
             | Self::ScalarFloatBinary { .. }
             | Self::ScalarFloatUnary { .. }
             | Self::ScalarFloatMultiplyAdd(..) | Self::ScalarFloatSelect { .. }
-            | Self::FloatLoad { .. } | Self::FloatStore { .. }
+            | Self::SimdLoad { .. } | Self::SimdStore { .. }
         );
         let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
         let consumed_flags = if consumes_flags {
@@ -1057,7 +1101,7 @@ impl IrOperation {
                 let (expression, known) = match address {
                     IrMemoryAddress::BaseOffset { base, offset } => {
                         let base_register = base.target();
-                        let expression = signed_memory_operand(&base_register, offset);
+                        let expression = signed_memory_operand(&base_register.name(), offset);
                         let known = flow.read(base_register).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(offset as u64), origins }));
                         (expression, known)
                     }
@@ -1093,7 +1137,7 @@ impl IrOperation {
                 let (expression, known) = match address {
                     IrMemoryAddress::BaseOffset { base, offset } => {
                         let base_register = base.target();
-                        let expression = signed_memory_operand(&base_register, offset);
+                        let expression = signed_memory_operand(&base_register.name(), offset);
                         let known = flow.read(base_register).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(offset as u64), origins }));
                         (expression, known)
                     }
@@ -1123,51 +1167,79 @@ impl IrOperation {
                 Some(statement)
             }
             Self::LoadPair { first, second, address, bytes, signed, writeback } => {
-                let render_address = |address: IrMemoryAddress, flow: &Flow, pc| match address {
-                    IrMemoryAddress::BaseOffset { base, offset } => {
-                        let base_register=base.target();
-                        let expression=signed_memory_operand(&base_register,offset);
-                        let known=flow.read(base_register).and_then(|input|combine_origins(&input.origins,&[],pc).map(|origins|KnownValue{value:input.value.wrapping_add(offset as u64),origins}));
-                        (expression,known)
-                    }
-                    _ => ("<unsupported pair address>".into(),None),
-                };
-                let pre_update=writeback.filter(|item|item.pre_index).map(|item|apply_ir_writeback(item,flow,pc));
-                let effective_address=if writeback.is_some_and(|item|item.pre_index){
-                    match address { IrMemoryAddress::BaseOffset{base,offset}=>IrMemoryAddress::BaseOffset{base,offset}, other=>other }
-                }else{address};
-                let (expression,known)=render_address(effective_address,flow,pc);
-                let second_offset=match effective_address {IrMemoryAddress::BaseOffset{offset,..}=>offset.saturating_add(bytes as i64),_=>0};
-                let (second_expression,second_known)=match effective_address {IrMemoryAddress::BaseOffset{base,..}=>render_address(IrMemoryAddress::BaseOffset{base,offset:second_offset},flow,pc),_=>("<unsupported pair address>".into(),None)};
-                let first=first.target();let second=second.target();
-                let mut pre_text=None;
-                if let Some((base,rendered,value))=pre_update{flow.write(base,value);pre_text=Some((base,rendered));}
-                flow.write(first,None);flow.write(second,None);
-                let mut statement=String::new();
-                if let Some((base,rendered))=pre_text{statement.push_str(&format!("{} = {}; ",base.name(),rendered));}
-                statement.push_str(&format!("{} = {};{} {} = {};{}",first.name(),memory_access_operand(&expression,bytes.trailing_zeros(),signed,first.wide),address_suffix(known.as_ref()),second.name(),memory_access_operand(&second_expression,bytes.trailing_zeros(),signed,second.wide),address_suffix(second_known.as_ref())));
-                if let Some(item)=writeback.filter(|item|!item.pre_index){let (base,rendered,value)=apply_ir_writeback(item,flow,pc);flow.write(base,value);statement.push_str(&format!(" {} = {};",base.name(),rendered));}
+                let pre_index = writeback.is_some_and(|item| item.pre_index);
+                // A pre-indexed writeback has already updated the base, so both
+                // accesses are relative to the new value; every other form keeps
+                // the encoded offset.
+                let mut pre_text = None;
+                if let Some((base, rendered, value)) = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) {
+                    flow.write(base, value);
+                    pre_text = Some((base, rendered));
+                }
+                let [(expression, known), (second_expression, second_known)] = pair_accesses(flow, pc, address, bytes, pre_index)?;
+                let first = first.target(); let second = second.target();
+                flow.write(first, None); flow.write(second, None);
+                let mut statement = String::new();
+                if let Some((base, rendered)) = pre_text { statement.push_str(&format!("{} = {}; ", base.name(), rendered)); }
+                statement.push_str(&format!("{} = {};{} {} = {};{}", first.name(), memory_access_operand(&expression, bytes.trailing_zeros(), signed, first.wide), address_suffix(known.as_ref()), second.name(), memory_access_operand(&second_expression, bytes.trailing_zeros(), signed, second.wide), address_suffix(second_known.as_ref())));
+                if let Some((base, rendered, value)) = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) { flow.write(base, value); statement.push_str(&format!(" {} = {};", base.name(), rendered)); }
                 Some(statement)
             }
             Self::StorePair { address, first, second, bytes, writeback } => {
-                let (expression,known)=match address{IrMemoryAddress::BaseOffset{base,offset}=>{let base=base.target();let expression=signed_memory_operand(&base,offset);let known=flow.read(base).and_then(|input|combine_origins(&input.origins,&[],pc).map(|origins|KnownValue{value:input.value.wrapping_add(offset as u64),origins}));(expression,known)},_=>return None};
-                let first=first.target();let second=second.target();let second_offset=match address{IrMemoryAddress::BaseOffset{offset,..}=>offset.saturating_add(bytes as i64),_=>0};
-                let second_expression=match address{IrMemoryAddress::BaseOffset{base,..}=>signed_memory_operand(&base.target(),second_offset),_=>return None};
-                let mut statement=String::new();
-                if let Some(item)=writeback.filter(|item|item.pre_index){let (base,rendered,value)=apply_ir_writeback(item,flow,pc);flow.write(base,value);statement.push_str(&format!("{} = {}; ",base.name(),rendered));}
-                let second_known=known.as_ref().and_then(|value|combine_origins(&value.origins,&[],pc).map(|origins|KnownValue{value:value.value.wrapping_add(bytes as u64),origins}));
-                statement.push_str(&format!("{} = {};{} {} = {};{}",memory_access_operand(&expression,bytes.trailing_zeros(),false,first.wide),first.name(),address_suffix(known.as_ref()),memory_access_operand(&second_expression,bytes.trailing_zeros(),false,second.wide),second.name(),address_suffix(second_known.as_ref())));
-                if let Some(item)=writeback.filter(|item|!item.pre_index){let (base,rendered,value)=apply_ir_writeback(item,flow,pc);flow.write(base,value);statement.push_str(&format!(" {} = {};",base.name(),rendered));}
+                let pre_index = writeback.is_some_and(|item| item.pre_index);
+                let mut pre_text = None;
+                if let Some((base, rendered, value)) = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) {
+                    flow.write(base, value);
+                    pre_text = Some((base, rendered));
+                }
+                let [(expression, known), (second_expression, second_known)] = pair_accesses(flow, pc, address, bytes, pre_index)?;
+                let first = first.target(); let second = second.target();
+                let mut statement = String::new();
+                if let Some((base, rendered)) = pre_text { statement.push_str(&format!("{} = {}; ", base.name(), rendered)); }
+                statement.push_str(&format!("{} = {};{} {} = {};{}", memory_access_operand(&expression, bytes.trailing_zeros(), false, first.wide), first.name(), address_suffix(known.as_ref()), memory_access_operand(&second_expression, bytes.trailing_zeros(), false, second.wide), second.name(), address_suffix(second_known.as_ref())));
+                if let Some((base, rendered, value)) = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) { flow.write(base, value); statement.push_str(&format!(" {} = {};", base.name(), rendered)); }
+                Some(statement)
+            }
+            Self::SimdPairLoad { first, second, address, bytes, writeback } => {
+                let pre_index = writeback.is_some_and(|item| item.pre_index);
+                let mut pre_text = None;
+                if let Some((base, rendered, value)) = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) {
+                    flow.write(base, value);
+                    pre_text = Some((base, rendered));
+                }
+                let [(expression, known), (second_expression, second_known)] = pair_accesses(flow, pc, address, bytes, pre_index)?;
+                flow.write_v(first.index as u32, None);
+                flow.write_v(second.index as u32, None);
+                let ty = first.width.pointer_type();
+                let mut statement = String::new();
+                if let Some((base, rendered)) = pre_text { statement.push_str(&format!("{} = {}; ", base.name(), rendered)); }
+                statement.push_str(&format!("{} = *({ty} *)({expression});{} {} = *({ty} *)({second_expression});{}", simd_register_name(first), address_suffix(known.as_ref()), simd_register_name(second), address_suffix(second_known.as_ref())));
+                if let Some((base, rendered, value)) = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) { flow.write(base, value); statement.push_str(&format!(" {} = {};", base.name(), rendered)); }
+                Some(statement)
+            }
+            Self::SimdPairStore { first, second, address, bytes, writeback } => {
+                let pre_index = writeback.is_some_and(|item| item.pre_index);
+                let mut pre_text = None;
+                if let Some((base, rendered, value)) = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) {
+                    flow.write(base, value);
+                    pre_text = Some((base, rendered));
+                }
+                let [(expression, known), (second_expression, second_known)] = pair_accesses(flow, pc, address, bytes, pre_index)?;
+                let ty = first.width.pointer_type();
+                let mut statement = String::new();
+                if let Some((base, rendered)) = pre_text { statement.push_str(&format!("{} = {}; ", base.name(), rendered)); }
+                statement.push_str(&format!("*({ty} *)({expression}) = {};{} *({ty} *)({second_expression}) = {};{}", simd_register_name(first), address_suffix(known.as_ref()), simd_register_name(second), address_suffix(second_known.as_ref())));
+                if let Some((base, rendered, value)) = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) { flow.write(base, value); statement.push_str(&format!(" {} = {};", base.name(), rendered)); }
                 Some(statement)
             }
             Self::AtomicLoad { destination, address, bytes, ordering, exclusive } => {
-                let (base, address_suffix_text)=match address{IrMemoryAddress::BaseOffset{base,offset}=>{let name=signed_memory_operand(&base.target(),offset);let known=flow.read(base.target()).and_then(|input|combine_origins(&input.origins,&[],pc).map(|origins|KnownValue{value:input.value.wrapping_add(offset as u64),origins}));(name,address_suffix(known.as_ref()))},_=>return None};
+                let (base, address_suffix_text)=match address{IrMemoryAddress::BaseOffset{base,offset}=>{let name=signed_memory_operand(&base.target().name(),offset);let known=flow.read(base.target()).and_then(|input|combine_origins(&input.origins,&[],pc).map(|origins|KnownValue{value:input.value.wrapping_add(offset as u64),origins}));(name,address_suffix(known.as_ref()))},_=>return None};
                 let destination=destination.target();flow.write(destination,None);
                 let operation=if exclusive{"exclusive_load"}else{"atomic_load"};let ordering=match ordering{IrAtomicOrdering::Relaxed=>"relaxed",IrAtomicOrdering::Acquire=>"acquire",IrAtomicOrdering::Release=>"release"};
                 Some(format!("{} = {operation}_{ordering}{}({base});{address_suffix_text}",destination.name(),size_suffix(bytes.trailing_zeros())))
             }
             Self::AtomicStore { status, address, value, bytes, ordering, exclusive } => {
-                let (base,address_suffix_text)=match address{IrMemoryAddress::BaseOffset{base,offset}=>{let name=signed_memory_operand(&base.target(),offset);let known=flow.read(base.target()).and_then(|input|combine_origins(&input.origins,&[],pc).map(|origins|KnownValue{value:input.value.wrapping_add(offset as u64),origins}));(name,address_suffix(known.as_ref()))},_=>return None};
+                let (base,address_suffix_text)=match address{IrMemoryAddress::BaseOffset{base,offset}=>{let name=signed_memory_operand(&base.target().name(),offset);let known=flow.read(base.target()).and_then(|input|combine_origins(&input.origins,&[],pc).map(|origins|KnownValue{value:input.value.wrapping_add(offset as u64),origins}));(name,address_suffix(known.as_ref()))},_=>return None};
                 let value=value.target();let operation=if exclusive{"exclusive_store"}else{"atomic_store"};let ordering=match ordering{IrAtomicOrdering::Relaxed=>"relaxed",IrAtomicOrdering::Acquire=>"acquire",IrAtomicOrdering::Release=>"release"};
                 let statement=if let Some(status)=status.map(IrRegister::target){flow.write(status,None);format!("{} = {operation}_{ordering}{}({base}, {});{address_suffix_text}",status.name(),size_suffix(bytes.trailing_zeros()),value.name())}else{format!("{operation}_{ordering}{}({base}, {});{address_suffix_text}",size_suffix(bytes.trailing_zeros()),value.name())};
                 Some(statement)
@@ -1231,7 +1303,7 @@ impl IrOperation {
                 Some(format!("{} = {function}({}, {}, {});", register(destination), register(left), register(right), register(addend)))
             }
             Self::ScalarFloatSelect { destination, if_true, if_false, precision, condition } => {
-                let register = |index| float_register_name(IrFloatRegister { index, precision });
+                let register = |index| float_register_name(index, precision);
                 let selected = if condition == IrFlagPredicate::Always { Some(true) }
                     else { flow.flags.and_then(|flags| condition_holds(flags, condition)) };
                 let known = selected.and_then(|take_true| {
@@ -1266,13 +1338,13 @@ impl IrOperation {
                 }
                 Some(render_int_float_conversion(destination, source, signed, fractional_bits))
             }
-            Self::FloatLoad { destination, address, bytes, writeback } => {
+            Self::SimdLoad { destination, address, writeback } => {
                 flow.write_v(destination.index as u32, None);
                 let (expression, known) = match address {
                     IrMemoryAddress::BaseOffset { base, offset } => {
                         let base = base.target();
                         let known = flow.read(base).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(offset as u64), origins }));
-                        (signed_memory_operand(&base, offset), known)
+                        (signed_memory_operand(&base.name(), offset), known)
                     }
                     IrMemoryAddress::BaseIndex { base, index, extension, scale } => resolve_ir_indexed_address(base, index, extension, scale, flow, pc),
                     IrMemoryAddress::PcRelative { offset, target } => {
@@ -1281,8 +1353,8 @@ impl IrOperation {
                     }
                 };
                 let expression = writeback.filter(|item| item.pre_index).map(|item| item.base.target().name()).unwrap_or(expression);
-                let register = float_register_name(destination);
-                let ty = if bytes == 4 { "float" } else { "double" };
+                let register = simd_register_name(destination);
+                let ty = destination.width.pointer_type();
                 let pre_update = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
                 let post_update = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
                 let mut statement = String::new();
@@ -1291,12 +1363,12 @@ impl IrOperation {
                 if let Some((base, rendered, value)) = post_update { flow.write(base, value); statement.push_str(&format!(" {} = {rendered};", base.name())); }
                 Some(statement)
             }
-            Self::FloatStore { source, address, bytes, writeback } => {
+            Self::SimdStore { source, address, writeback } => {
                 let (expression, known) = match address {
                     IrMemoryAddress::BaseOffset { base, offset } => {
                         let base = base.target();
                         let known = flow.read(base).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(offset as u64), origins }));
-                        (signed_memory_operand(&base, offset), known)
+                        (signed_memory_operand(&base.name(), offset), known)
                     }
                     IrMemoryAddress::BaseIndex { base, index, extension, scale } => resolve_ir_indexed_address(base, index, extension, scale, flow, pc),
                     IrMemoryAddress::PcRelative { offset, target } => {
@@ -1305,12 +1377,12 @@ impl IrOperation {
                     }
                 };
                 let expression = writeback.filter(|item| item.pre_index).map(|item| item.base.target().name()).unwrap_or(expression);
-                let ty = if bytes == 4 { "float" } else { "double" };
+                let ty = source.width.pointer_type();
                 let pre_update = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
                 let post_update = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
                 let mut statement = String::new();
                 if let Some((base, rendered, value)) = pre_update { flow.write(base, value); statement.push_str(&format!("{} = {rendered}; ", base.name())); }
-                statement.push_str(&format!("*({ty} *)({expression}) = {};{}", float_register_name(source), address_suffix(known.as_ref())));
+                statement.push_str(&format!("*({ty} *)({expression}) = {};{}", simd_register_name(source), address_suffix(known.as_ref())));
                 if let Some((base, rendered, value)) = post_update { flow.write(base, value); statement.push_str(&format!(" {} = {rendered};", base.name())); }
                 Some(statement)
             }
@@ -1962,12 +2034,15 @@ enum AddressForm {
     Immediate(u64),
     /// `[base, #imm]` with a signed immediate offset (unscaled) and optional writeback.
     ImmediateSigned(i64, Writeback),
-    /// `[base, index, extend/shift]` for register-offset load/store.
+    /// `[base, index, extend/shift]` for register-offset load/store. `scale`
+    /// is the log2 index shift the architecture applies when `s` is set: the
+    /// integer forms scale by their access size, and the SIMD forms scale by
+    /// the full 128-bit access even though their `size` field reads zero.
     RegOffset {
         rm_index: u32,
         option: u32,
         s: bool,
-        size: u32,
+        scale: u8,
     },
     /// PC-relative literal load: `PC + (imm19 << 2)`.
     Literal(i64),
@@ -2246,8 +2321,8 @@ enum Operation {
         /// Log2 of the memory access width in bytes (`size` field, 0..=3).
         size: u32,
     },
-    FloatLoad { destination: IrFloatRegister, base: Register, address: AddressForm, size: u32 },
-    FloatStore { source: IrFloatRegister, base: Register, address: AddressForm, size: u32 },
+    SimdLoad { destination: IrSimdRegister, base: Register, address: AddressForm },
+    SimdStore { source: IrSimdRegister, base: Register, address: AddressForm },
     LoadPair {
         dst1: Register,
         dst2: Register,
@@ -2264,6 +2339,23 @@ enum Operation {
         offset: i64,
         writeback: Writeback,
         size: u32,
+    },
+    /// SIMD&FP register pair (`LDP`/`STP` with V=1). Both halves share one
+    /// width, so `first` carries it and `second` names the adjacent register.
+    /// These touch no general-purpose register beyond an optional base writeback.
+    SimdPairLoad {
+        first: IrSimdRegister,
+        second: IrSimdRegister,
+        base: Register,
+        offset: i64,
+        writeback: Writeback,
+    },
+    SimdPairStore {
+        first: IrSimdRegister,
+        second: IrSimdRegister,
+        base: Register,
+        offset: i64,
+        writeback: Writeback,
     },
     /// Load/store exclusive and acquire/release, from the exclusive group
     /// (`LDXR`/`STXR`/`LDAXR`/`STLXR` and the ordered `LDAR`/`STLR`). The
@@ -2485,7 +2577,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
             AddressForm::ImmediateSigned(offset, Writeback::None) => (IrMemoryAddress::BaseOffset { base: reg(base), offset }, None),
             AddressForm::ImmediateSigned(offset, Writeback::Pre) => (IrMemoryAddress::BaseOffset { base: reg(base), offset }, Some(IrWriteback { base: reg(base), offset, pre_index: true })),
             AddressForm::ImmediateSigned(offset, Writeback::Post) => (IrMemoryAddress::BaseOffset { base: reg(base), offset: 0 }, Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-            AddressForm::RegOffset { rm_index, option, s, size } => {
+            AddressForm::RegOffset { rm_index, option, s, scale } => {
                 let (index_register, extension) = match option {
                     2 => (Register { index: rm_index, wide: false, stack_pointer: false }, Some(IrExtension::Zero(32))),
                     3 => (Register { index: rm_index, wide: true, stack_pointer: false }, None),
@@ -2495,7 +2587,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 };
                 (IrMemoryAddress::BaseIndex {
                     base: reg(base), index: reg(index_register), extension,
-                    scale: if s { size as u8 } else { 0 },
+                    scale: if s { scale } else { 0 },
                 }, None)
             }
             AddressForm::Literal(offset) => (IrMemoryAddress::PcRelative { offset, target: pc.wrapping_add_signed(offset) }, None),
@@ -2623,12 +2715,12 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
             Some((address, writeback)) => IrOperation::Store { address, value: operand(src), bytes: 1u8.checked_shl(size).unwrap_or(0), writeback },
             None => IrOperation::TargetSpecific,
         },
-        Operation::FloatLoad { destination, base, address: form, size } => match address(base, form) {
-            Some((address, writeback)) => IrOperation::FloatLoad { destination, address, bytes: 1u8.checked_shl(size).unwrap_or(0), writeback },
+        Operation::SimdLoad { destination, base, address: form } => match address(base, form) {
+            Some((address, writeback)) => IrOperation::SimdLoad { destination, address, writeback },
             None => IrOperation::TargetSpecific,
         },
-        Operation::FloatStore { source, base, address: form, size } => match address(base, form) {
-            Some((address, writeback)) => IrOperation::FloatStore { source, address, bytes: 1u8.checked_shl(size).unwrap_or(0), writeback },
+        Operation::SimdStore { source, base, address: form } => match address(base, form) {
+            Some((address, writeback)) => IrOperation::SimdStore { source, address, writeback },
             None => IrOperation::TargetSpecific,
         },
         Operation::LoadPair { dst1, dst2, base, offset, writeback, size, signed } => {
@@ -2669,6 +2761,28 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::LoadAtomicPair { .. } => IrOperation::TargetSpecific,
         Operation::StoreAtomicPair { .. } => IrOperation::TargetSpecific,
         Operation::LseCasPair { .. } => IrOperation::TargetSpecific,
+        Operation::SimdPairLoad { first, second, base, offset, writeback } => {
+            let (form, update) = match writeback {
+                Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
+                Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
+                Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
+                Writeback::Reserved => return IrOperation::TargetSpecific,
+            };
+            if let Some((address, _)) = address(base, form) {
+                IrOperation::SimdPairLoad { first, second, address, bytes: first.width.bytes(), writeback: update }
+            } else { IrOperation::TargetSpecific }
+        }
+        Operation::SimdPairStore { first, second, base, offset, writeback } => {
+            let (form, update) = match writeback {
+                Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
+                Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
+                Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
+                Writeback::Reserved => return IrOperation::TargetSpecific,
+            };
+            if let Some((address, _)) = address(base, form) {
+                IrOperation::SimdPairStore { first, second, address, bytes: first.width.bytes(), writeback: update }
+            } else { IrOperation::TargetSpecific }
+        }
         Operation::ScalarFloatImmediate { destination, precision, bits, immediate } => IrOperation::ScalarFloatImmediate { destination, precision, bits, immediate },
         Operation::ScalarFloatBinary { destination, left, right, precision, operator } => IrOperation::ScalarFloatBinary { destination, left, right, precision, operator },
         Operation::ScalarFloatMove { destination, source, precision } => IrOperation::ScalarFloatMove { destination, source, precision },
@@ -3429,68 +3543,69 @@ fn decode(word: u32, pc: u64) -> Operation {
             acquire,
         };
     }
-    // Scalar single/double FP load/store with unsigned immediate offset (V=1).
-    // The smaller vector-element forms remain on the SIMD marker path.
+    // Advanced SIMD load/store single register, unsigned immediate offset
+    // (V=1): `size:2 111 1 00 opc:2 imm12:12 Rn:5 Rt:5`. opc 00/01 address one
+    // lane of `1 << size` bytes (`B`/`H`/`S`/`D`); opc 10/11 address the whole
+    // 128-bit register. Only the moved width is claimed: no half-precision or
+    // lane-wise arithmetic is implied.
     if word & 0x3f00_0000 == 0x3d00_0000 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
-        if (size == 2 || size == 3) && (opc == 0 || opc == 1) {
-            let precision = if size == 2 { IrFloatPrecision::Single } else { IrFloatPrecision::Double };
-            let register = IrFloatRegister { index: (word & 31) as u8, precision };
-            let base_index = (word >> 5) & 31;
-            let base = Register { index: base_index, wide: true, stack_pointer: base_index == 31 };
-            let offset = u64::from((word >> 10) & 0xfff) << size;
-            let address = AddressForm::Immediate(offset);
-            return if opc == 0 {
-                Operation::FloatStore { source: register, base, address, size }
-            } else {
-                Operation::FloatLoad { destination: register, base, address, size }
-            };
-        }
+        let store = opc == 0 || opc == 2;
+        let register = IrSimdRegister { index: (word & 31) as u8, width: IrSimdWidth::from_load_store(size, opc >= 2) };
+        let base_index = (word >> 5) & 31;
+        let base = Register { index: base_index, wide: true, stack_pointer: base_index == 31 };
+        // The unsigned-offset form scales the 12-bit immediate by the access
+        // size, which is 16 bytes for the 128-bit opcodes.
+        let offset = u64::from((word >> 10) & 0xfff) << register.width.bytes().trailing_zeros();
+        let address = AddressForm::Immediate(offset);
+        return if store {
+            Operation::SimdStore { source: register, base, address }
+        } else {
+            Operation::SimdLoad { destination: register, base, address }
+        };
     }
-    // Scalar FP register-offset addressing, using the same legal index
-    // extensions and optional element scaling as the integer memory family.
+    // Advanced SIMD load/store single register, register offset (V=1), using the
+    // same legal index extensions and optional element scaling as the integer
+    // memory family. No writeback exists in this form, so general-purpose value
+    // flow survives untouched.
     if word & 0x3f20_0c00 == 0x3c20_0800 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
         let option = (word >> 13) & 7;
-        if (size == 2 || size == 3) && (opc == 0 || opc == 1) && matches!(option, 2 | 3 | 6 | 7) {
-            let precision = if size == 2 { IrFloatPrecision::Single } else { IrFloatPrecision::Double };
-            let register = IrFloatRegister { index: (word & 31) as u8, precision };
+        if matches!(opc, 0..=3) && matches!(option, 2 | 3 | 6 | 7) {
+            let register = IrSimdRegister { index: (word & 31) as u8, width: IrSimdWidth::from_load_store(size, opc >= 2) };
             let base_index = (word >> 5) & 31;
             let base = Register { index: base_index, wide: true, stack_pointer: base_index == 31 };
-            let address = AddressForm::RegOffset { rm_index: (word >> 16) & 31, option, s: (word >> 12) & 1 != 0, size };
-            return if opc == 0 {
-                Operation::FloatStore { source: register, base, address, size }
+            let address = AddressForm::RegOffset { rm_index: (word >> 16) & 31, option, s: (word >> 12) & 1 != 0, scale: register.width.bytes().trailing_zeros() as u8 };
+            return if opc == 0 || opc == 2 {
+                Operation::SimdStore { source: register, base, address }
             } else {
-                Operation::FloatLoad { destination: register, base, address, size }
+                Operation::SimdLoad { destination: register, base, address }
             };
         }
     }
-    // Scalar FP unscaled, pre-indexed, post-indexed, and unprivileged forms.
-    // The unprivileged `LDTR`/`STTR` form (mode 2) uses the same address
-    // computation as the unscaled form, since the address expression
-    // `[Rn, #imm9]` is identical;
-    // only the translation regime differs and it does not affect the shared IR.
-    // Vector element widths remain on the
-    // conservative fallback path.
+    // Advanced SIMD load/store single register, unscaled, pre-indexed,
+    // post-indexed, and unprivileged forms. The unprivileged `LDTR`/`STTR` form
+    // (mode 2) uses the same address computation as the unscaled form, since the
+    // address expression `[Rn, #imm9]` is identical; only the translation
+    // regime differs and it does not affect the shared IR.
     if word & 0x3f20_0000 == 0x3c00_0000 {
         let size = (word >> 30) & 3;
         let opc = (word >> 22) & 3;
         let mode = (word >> 10) & 3;
-        if (size == 2 || size == 3) && (opc == 0 || opc == 1) && (mode == 0 || mode == 1 || mode == 2 || mode == 3) {
-            let precision = if size == 2 { IrFloatPrecision::Single } else { IrFloatPrecision::Double };
-            let register = IrFloatRegister { index: (word & 31) as u8, precision };
+        if matches!(opc, 0..=3) {
+            let register = IrSimdRegister { index: (word & 31) as u8, width: IrSimdWidth::from_load_store(size, opc >= 2) };
             let base_index = (word >> 5) & 31;
             let base = Register { index: base_index, wide: true, stack_pointer: base_index == 31 };
             let immediate = (word >> 12) & 0x1ff;
             let offset = (((immediate << 23) as i32) >> 23) as i64;
             let writeback = match mode { 0 => Writeback::None, 1 => Writeback::Post, 2 => Writeback::None, 3 => Writeback::Pre, _ => unreachable!() };
             let address = AddressForm::ImmediateSigned(offset, writeback);
-            return if opc == 0 {
-                Operation::FloatStore { source: register, base, address, size }
+            return if opc == 0 || opc == 2 {
+                Operation::SimdStore { source: register, base, address }
             } else {
-                Operation::FloatLoad { destination: register, base, address, size }
+                Operation::SimdLoad { destination: register, base, address }
             };
         }
     }
@@ -3595,7 +3710,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                             rm_index,
                             option,
                             s,
-                            size,
+                            scale: size as u8,
                         },
                         src: data(size == 3),
                         size,
@@ -3609,7 +3724,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                             rm_index,
                             option,
                             s,
-                            size,
+                            scale: size as u8,
                         },
                         size,
                         signed: false,
@@ -3623,7 +3738,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                             rm_index,
                             option,
                             s,
-                            size,
+                            scale: size as u8,
                         },
                         size,
                         signed: true,
@@ -3637,7 +3752,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                             rm_index,
                             option,
                             s,
-                            size,
+                            scale: size as u8,
                         },
                         size,
                         signed: true,
@@ -3722,92 +3837,97 @@ fn decode(word: u32, pc: u64) -> Operation {
             _ => {}
         }
     }
-    // Load/store register pair (LDP/STP), V=0:
-    // `size:2 111 V:1 01 opc:2 0 imm7:7 10 Rt2:5 Rn:5 Rt:5` (post-index)
-    // `size:2 111 V:1 01 opc:2 0 imm7:7 11 Rt2:5 Rn:5 Rt:5` (pre-index)
-    // `size:2 111 V:1 01 opc:2 0 imm7:7 00 Rt2:5 Rn:5 Rt:5` (signed offset, no WB)
-    // opc: 0=STP (both src), 1=LDP (both dst, zero-extend), 2=LDP (sign-extend 64), 3=LDP (sign-extend 32).
-    if word & 0x3f00_0000 == 0x2900_0000 {
-        let size = (word >> 30) & 3;
-        let opc = (word >> 22) & 3;
+    // Load/store register pair (LDP/STP): `opc:2 101 V:1 0 LL:2 L:1 imm7:7 Rt2:5
+    // Rn:5 Rt:5`. Bit 22 (`L`) selects store from load; bits 24-23 (`LL`)
+    // select the addressing mode: 00 non-temporal (`LDNP`/`STNP`, left on the
+    // conservative fallback because the hint is not modelled), 01 post-index,
+    // 10 signed offset with no writeback, 11 pre-index. `opc` selects the
+    // access width, not the direction: with V=0 it is `W`/`X` plus the
+    // load-only `LDPSW`, and with V=1 it is `S`/`D`/`Q`. The `101` in bits
+    // 29-27 already separates this group from the exclusive `LDXP`/`STXP`
+    // encodings, which occupy a different prefix.
+    if word & 0x3a00_0000 == 0x2800_0000 {
+        let opc = (word >> 30) & 3;
+        let vector = word & 0x0400_0000 != 0;
+        let load = word & 0x0040_0000 != 0;
+        let mode = (word >> 23) & 3;
         let rn = (word >> 5) & 31;
         let rt = word & 31;
         let rt2 = (word >> 10) & 31;
         let imm7 = (word >> 15) & 0x7f;
-        let mode = (word >> 23) & 3;
-        // Sign-extend the 7-bit immediate and scale by access size.
-        let offset = (((imm7 << 25) as i32) >> 25) as i64 * (1 << size);
         let writeback = match mode {
-            0 => Writeback::None,
             1 => Writeback::Post,
+            2 => Writeback::None,
             3 => Writeback::Pre,
-            _ => Writeback::Reserved, // 2 is invalid/reserved
+            _ => Writeback::Reserved, // 0 is the non-temporal hint pair
         };
         if !matches!(writeback, Writeback::Reserved) {
-            let base = Register {
-                index: rn,
-                wide: true,
-                stack_pointer: rn == 31,
+            // Access width in bytes, and the sign-extension `LDPSW` needs.
+            let (size, extend) = if vector {
+                match opc {
+                    0 => (2, false),
+                    1 => (3, false),
+                    2 => (4, false),
+                    _ => (0, false),
+                }
+            } else {
+                match (opc, load) {
+                    (0, _) => (2, false),
+                    (1, true) => (2, true),
+                    (2, _) => (3, false),
+                    _ => (0, false),
+                }
             };
-            let reg1 = |wide: bool| Register {
-                index: rt,
-                wide,
-                stack_pointer: false,
-            };
-            let reg2 = |wide: bool| Register {
-                index: rt2,
-                wide,
-                stack_pointer: false,
-            };
-            match (size, opc) {
-                (_, 0) => {
-                    // STP: store pair
-                    return Operation::StorePair {
-                        base,
-                        src1: reg1(size == 3),
-                        src2: reg2(size == 3),
-                        offset,
-                        writeback,
-                        size,
+            if size != 0 {
+                let base = Register {
+                    index: rn,
+                    wide: true,
+                    stack_pointer: rn == 31,
+                };
+                // Sign-extend the 7-bit immediate and scale by access size.
+                let offset = (((imm7 << 25) as i32) >> 25) as i64 * (1 << size);
+                if vector {
+                    // Lane widths name the SIMD&FP view of V registers; only the
+                    // moved bytes are claimed.
+                    let width = match size {
+                        2 => IrSimdWidth::Single,
+                        3 => IrSimdWidth::Double,
+                        _ => IrSimdWidth::Quad,
+                    };
+                    let first = IrSimdRegister { index: rt as u8, width };
+                    let second = IrSimdRegister { index: rt2 as u8, width };
+                    return if load {
+                        Operation::SimdPairLoad { first, second, base, offset, writeback }
+                    } else {
+                        Operation::SimdPairStore { first, second, base, offset, writeback }
                     };
                 }
-                (_, 1) => {
-                    // LDP: zero-extending load pair
-                    return Operation::LoadPair {
-                        dst1: reg1(size == 3),
-                        dst2: reg2(size == 3),
-                        base,
-                        offset,
-                        writeback,
-                        size,
-                        signed: false,
-                    };
-                }
-                (0..=2, 2) => {
-                    // LDP: sign-extending into 64-bit
-                    return Operation::LoadPair {
-                        dst1: reg1(true),
-                        dst2: reg2(true),
-                        base,
-                        offset,
-                        writeback,
-                        size,
-                        signed: true,
-                    };
-                }
-                (0..=1, 3) => {
-                    // LDP: sign-extending into 32-bit
-                    return Operation::LoadPair {
-                        dst1: reg1(false),
-                        dst2: reg2(false),
+                // `LDPSW` sign-extends into the 64-bit X view; every other form
+                // keeps the architectural width of its opcode.
+                let wide = extend || size == 3;
+                let reg1 = |wide: bool| Register {
+                    index: rt,
+                    wide,
+                    stack_pointer: false,
+                };
+                let reg2 = |wide: bool| Register {
+                    index: rt2,
+                    wide,
+                    stack_pointer: false,
+                };
+                return if load {
+                    Operation::LoadPair {
+                        dst1: reg1(wide),
+                        dst2: reg2(wide),
                         base,
                         offset,
                         writeback,
                         size,
-                        signed: true,
-                    };
-                }
-                _ => {}
+                        signed: extend,
+                    }
+                } else {
+                    Operation::StorePair { base, src1: reg1(wide), src2: reg2(wide), offset, writeback, size }
+                };
             }
         }
     }
@@ -4075,29 +4195,25 @@ fn decode(word: u32, pc: u64) -> Operation {
             else_op,
         };
     }
-    // Scalar FP load register (literal, PC-relative), V=1:
-    // `opc:2 011 V:1 00 imm19:19 Rt:5`. `opc` 0 and 1 are scalar single and
-    // double loads; the vector-Q form remains target-specific.
+    // SIMD&FP load register (literal, PC-relative), V=1:
+    // `opc:2 011 V:1 00 imm19:19 Rt:5`. `opc` 00 and 01 are scalar single and
+    // double loads; `opc` 10 loads the whole 128-bit register. The literal is
+    // always 4-byte aligned and the resolved address is retained as provenance.
     if word & 0x3f00_0000 == 0x1c00_0000 {
         let opc = (word >> 30) & 3;
-        if opc == 0 || opc == 1 {
-            let imm19 = (word >> 5) & 0x7ffff;
-            let offset = (((imm19 << 13) as i32) >> 13) as i64 * 4;
-            let precision = if opc == 0 {
-                IrFloatPrecision::Single
-            } else {
-                IrFloatPrecision::Double
-            };
-            return Operation::FloatLoad {
-                destination: IrFloatRegister {
-                    index: (word & 31) as u8,
-                    precision,
-                },
-                base: Register::pc(),
-                address: AddressForm::Literal(offset),
-                size: if opc == 0 { 2 } else { 3 },
-            };
-        }
+        let width = match opc {
+            0 => IrSimdWidth::Single,
+            1 => IrSimdWidth::Double,
+            2 => IrSimdWidth::Quad,
+            _ => return Operation::Opaque,
+        };
+        let imm19 = (word >> 5) & 0x7ffff;
+        let offset = (((imm19 << 13) as i32) >> 13) as i64 * 4;
+        return Operation::SimdLoad {
+            destination: IrSimdRegister { index: (word & 31) as u8, width },
+            base: Register::pc(),
+            address: AddressForm::Literal(offset),
+        };
     }
     // Load register (literal, PC-relative), V=0:
     // `opc:2 011 V:1 00 imm19:19 Rt:5`, i.e. bits 29-24 == 011000 with V=0.
@@ -4928,7 +5044,7 @@ fn resolve_ir_indexed_address(
 
 fn apply_ir_writeback(writeback: IrWriteback, flow: &Flow, pc: u64) -> (Register, String, Option<KnownValue>) {
     let base = writeback.base.target();
-    let expression = signed_memory_operand(&base, writeback.offset);
+    let expression = signed_memory_operand(&base.name(), writeback.offset);
     let known = flow.read(base).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
         value: input.value.wrapping_add(writeback.offset as u64), origins,
     }));
@@ -4946,14 +5062,34 @@ fn address_suffix(value: Option<&KnownValue>) -> String {
 
 /// Renders a signed immediate memory operand (`base`, `base + off`, or
 /// `base - off`), eliding a zero offset.
-fn signed_memory_operand(base: &Register, offset: i64) -> String {
+fn signed_memory_operand(base: &str, offset: i64) -> String {
     if offset == 0 {
-        base.name()
+        base.to_string()
     } else if offset > 0 {
-        format!("{} + {:#x}", base.name(), offset as u64)
+        format!("{base} + {:#x}", offset as u64)
     } else {
-        format!("{} - {:#x}", base.name(), offset.unsigned_abs())
+        format!("{base} - {:#x}", offset.unsigned_abs())
     }
+}
+
+/// The two resolved access expressions of a pair access, in architectural order.
+///
+/// A pre-indexed writeback has already updated the base register before this
+/// runs, so both halves are relative to the new value and the encoded offset
+/// has already been consumed. Every other form keeps the encoded offset for the
+/// first half and adds `bytes` for the second.
+fn pair_accesses(flow: &Flow, pc: u64, address: IrMemoryAddress, bytes: u8, pre_index: bool) -> Option<[(String, Option<KnownValue>); 2]> {
+    let IrMemoryAddress::BaseOffset { base, offset } = address else { return None };
+    let base = base.target();
+    let first_offset = if pre_index { 0 } else { offset };
+    let resolve = |value: i64| {
+        let expression = signed_memory_operand(&base.name(), value);
+        let known = flow.read(base).and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(value as u64), origins }));
+        (expression, known)
+    };
+    let first = resolve(first_offset);
+    let second = resolve(first_offset + bytes as i64);
+    Some([first, second])
 }
 
 /// The resolved pieces of a load/store address form, shared by the load and
@@ -4997,7 +5133,7 @@ fn resolve_address(
                     origins,
                 })
             });
-            let new_base = signed_memory_operand(base, *offset);
+            let new_base = signed_memory_operand(&base.name(), *offset);
             match writeback {
                 Writeback::Pre => AddressResolution {
                     operand: new_base.clone(),
@@ -5023,7 +5159,7 @@ fn resolve_address(
             rm_index,
             option,
             s,
-            size: scale,
+            scale,
         } => {
             let index_reg = index_register(*option, *rm_index);
             let base_known = flow.read(*base);
@@ -5031,11 +5167,11 @@ fn resolve_address(
             let expr = format!(
                 "{} + {}",
                 base.name(),
-                index_expression(&index_reg, *option, *s, *scale)
+                index_expression(&index_reg, *option, *s, *scale as u32)
             );
             let addr = match (base_known, index_known) {
                 (Some(b), Some(i)) => {
-                    let offset_val = index_resolved(i.value, *option, *s, *scale);
+                    let offset_val = index_resolved(i.value, *option, *s, *scale as u32);
                     combine_origins(&b.origins, &i.origins, pc).map(|origins| KnownValue {
                         value: b.value.wrapping_add(offset_val),
                         origins,
@@ -5859,10 +5995,10 @@ impl Operation {
                 }
                 statement
             }
-            Self::FloatLoad { destination, base, address, size } => {
+            Self::SimdLoad { destination, base, address } => {
                 flow.write_v(destination.index as u32, None);
                 let resolution = resolve_address(flow, &base, &address, pc);
-                let ty = if size == 2 { "float" } else { "double" };
+                let ty = destination.width.pointer_type();
                 let mut statement = String::new();
                 let operand = if resolution.writeback_pre {
                     if let Some((expression, value)) = &resolution.writeback {
@@ -5871,16 +6007,16 @@ impl Operation {
                     }
                     base.name()
                 } else { resolution.operand.clone() };
-                statement.push_str(&format!("{} = *({ty} *)({operand});{}", float_register_name(destination), address_suffix(resolution.access.as_ref())));
+                statement.push_str(&format!("{} = *({ty} *)({operand});{}", simd_register_name(destination), address_suffix(resolution.access.as_ref())));
                 if let Some((expression, value)) = &resolution.writeback {
                     if !resolution.writeback_pre { flow.write(base, value.clone()); }
                     if !resolution.writeback_pre { statement.push_str(&format!(" {} = {expression};", base.name())); }
                 }
                 statement
             }
-            Self::FloatStore { source, base, address, size } => {
+            Self::SimdStore { source, base, address } => {
                 let resolution = resolve_address(flow, &base, &address, pc);
-                let ty = if size == 2 { "float" } else { "double" };
+                let ty = source.width.pointer_type();
                 let mut statement = String::new();
                 let operand = if resolution.writeback_pre {
                     if let Some((expression, value)) = &resolution.writeback {
@@ -5889,12 +6025,59 @@ impl Operation {
                     }
                     base.name()
                 } else { resolution.operand.clone() };
-                statement.push_str(&format!("*({ty} *)({operand}) = {};{}", float_register_name(source), address_suffix(resolution.access.as_ref())));
+                statement.push_str(&format!("*({ty} *)({operand}) = {};{}", simd_register_name(source), address_suffix(resolution.access.as_ref())));
                 if let Some((expression, value)) = &resolution.writeback {
                     if !resolution.writeback_pre {
                         flow.write(base, value.clone());
                         statement.push_str(&format!(" {} = {expression};", base.name()));
                     }
+                }
+                statement
+            }
+            Self::SimdPairLoad { first, second, base, offset, writeback } => {
+                let pre_index = matches!(writeback, Writeback::Pre);
+                // Both writeback forms access the base as it stands before the
+                // update; only the unsigned/offset form keeps the encoded offset.
+                let first_offset = if matches!(writeback, Writeback::None) { offset } else { 0 };
+                let expr = signed_memory_operand(&base.name(), first_offset);
+                let second_expr = signed_memory_operand(&base.name(), first_offset + first.width.bytes() as i64);
+                let resolve = |value: i64| flow.read(base).as_ref().and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(value as u64), origins }));
+                let known = resolve(first_offset);
+                let second_known = resolve(first_offset + first.width.bytes() as i64);
+                let ty = first.width.pointer_type();
+                flow.write_v(first.index as u32, None);
+                flow.write_v(second.index as u32, None);
+
+                let mut statement = String::new();
+                if pre_index { statement.push_str(&format!("{} = {}; ", base.name(), signed_memory_operand(&base.name(), offset))); }
+                statement.push_str(&format!("{} = *({ty} *)({expr});{} {} = *({ty} *)({second_expr});{}", simd_register_name(first), address_suffix(known.as_ref()), simd_register_name(second), address_suffix(second_known.as_ref())));
+                if let Writeback::Post = writeback {
+                    // The update is architecturally certain; only its proven
+                    // value depends on the base being known.
+                    statement.push_str(&format!(" {} = {};", base.name(), signed_memory_operand(&base.name(), offset)));
+                    if let Some(value) = &known { flow.write(base, Some(value.clone())); }
+                }
+                statement
+            }
+            Self::SimdPairStore { first, second, base, offset, writeback } => {
+                let pre_index = matches!(writeback, Writeback::Pre);
+                // Both writeback forms access the base as it stands before the
+                // update; only the unsigned/offset form keeps the encoded offset.
+                let first_offset = if matches!(writeback, Writeback::None) { offset } else { 0 };
+                let expr = signed_memory_operand(&base.name(), first_offset);
+                let second_expr = signed_memory_operand(&base.name(), first_offset + first.width.bytes() as i64);
+                let resolve = |value: i64| flow.read(base).as_ref().and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(value as u64), origins }));
+                let known = resolve(first_offset);
+                let second_known = resolve(first_offset + first.width.bytes() as i64);
+                let ty = first.width.pointer_type();
+                let mut statement = String::new();
+                if pre_index { statement.push_str(&format!("{} = {}; ", base.name(), signed_memory_operand(&base.name(), offset))); }
+                statement.push_str(&format!("*({ty} *)({expr}) = {};{} *({ty} *)({second_expr}) = {};{}", simd_register_name(first), address_suffix(known.as_ref()), simd_register_name(second), address_suffix(second_known.as_ref())));
+                if let Writeback::Post = writeback {
+                    // The update is architecturally certain; only its proven
+                    // value depends on the base being known.
+                    statement.push_str(&format!(" {} = {};", base.name(), signed_memory_operand(&base.name(), offset)));
+                    if let Some(value) = &known { flow.write(base, Some(value.clone())); }
                 }
                 statement
             }
@@ -5907,37 +6090,31 @@ impl Operation {
                 size,
                 signed,
             } => {
-                let base_known = flow.read(base);
-                let combined = base_known.as_ref().and_then(|input| {
-                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
-                        value: input.value.wrapping_add(offset as u64),
-                        origins,
-                    })
-                });
-                let expr = if offset >= 0 {
-                    format!("{} + {:#x}", base.name(), offset as u64)
-                } else {
-                    format!("{} - {:#x}", base.name(), offset.unsigned_abs())
-                };
+                let pre_index = matches!(writeback, Writeback::Pre);
+                // Both writeback forms access the base as it stands before the
+                // update; only the unsigned/offset form keeps the encoded offset.
+                let first_offset = if matches!(writeback, Writeback::None) { offset } else { 0 };
+                let expr = signed_memory_operand(&base.name(), first_offset);
+                let second_expr = signed_memory_operand(&base.name(), first_offset + (1i64 << size));
+                let resolve = |value: i64| flow.read(base).as_ref().and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(value as u64), origins }));
+                let known = resolve(first_offset);
+                let second_known = resolve(first_offset + (1i64 << size));
                 let access1 = memory_access_operand(&expr, size, signed, dst1.wide);
-                let access2 = memory_access_operand(&expr, size, signed, dst2.wide);
-                let suffix = address_suffix(combined.as_ref());
+                let access2 = memory_access_operand(&second_expr, size, signed, dst2.wide);
                 flow.write(dst1, None);
                 flow.write(dst2, None);
-                let mut statement = format!(
-                    "{} = {};{}; {} = {};{}",
-                    dst1.name(),
-                    access1,
-                    suffix,
-                    dst2.name(),
-                    access2,
-                    suffix
-                );
-                if let Writeback::Pre | Writeback::Post = writeback {
-                    if let Some(value) = &combined {
-                        flow.write(base, Some(value.clone()));
-                        statement.push_str(&format!(" {} = {expr};", base.name()));
-                    }
+                let mut statement = String::new();
+                if pre_index { statement.push_str(&format!("{} = {}; ", base.name(), signed_memory_operand(&base.name(), offset))); }
+                statement.push_str(&format!(
+                    "{} = {};{} {} = {};{}",
+                    dst1.name(), access1, address_suffix(known.as_ref()),
+                    dst2.name(), access2, address_suffix(second_known.as_ref())
+                ));
+                if let Writeback::Post = writeback {
+                    // The update is architecturally certain; only its proven
+                    // value depends on the base being known.
+                    statement.push_str(&format!(" {} = {};", base.name(), signed_memory_operand(&base.name(), offset)));
+                    if let Some(value) = &known { flow.write(base, Some(value.clone())); }
                 }
                 statement
             }
@@ -5949,31 +6126,29 @@ impl Operation {
                 writeback,
                 size,
             } => {
-                let base_known = flow.read(base);
-                let combined = base_known.as_ref().and_then(|input| {
-                    combine_origins(&input.origins, &[], pc).map(|origins| KnownValue {
-                        value: input.value.wrapping_add(offset as u64),
-                        origins,
-                    })
-                });
-                let expr = if offset >= 0 {
-                    format!("{} + {:#x}", base.name(), offset as u64)
-                } else {
-                    format!("{} - {:#x}", base.name(), offset.unsigned_abs())
-                };
+                let pre_index = matches!(writeback, Writeback::Pre);
+                // Both writeback forms access the base as it stands before the
+                // update; only the unsigned/offset form keeps the encoded offset.
+                let first_offset = if matches!(writeback, Writeback::None) { offset } else { 0 };
+                let expr = signed_memory_operand(&base.name(), first_offset);
+                let second_expr = signed_memory_operand(&base.name(), first_offset + (1i64 << size));
+                let resolve = |value: i64| flow.read(base).as_ref().and_then(|input| combine_origins(&input.origins, &[], pc).map(|origins| KnownValue { value: input.value.wrapping_add(value as u64), origins }));
+                let known = resolve(first_offset);
+                let second_known = resolve(first_offset + (1i64 << size));
                 let access1 = memory_access_operand(&expr, size, false, src1.wide);
-                let access2 = memory_access_operand(&expr, size, false, src2.wide);
-                let suffix = address_suffix(combined.as_ref());
-                let mut statement = format!(
-                    "{access1} = {};{suffix}; {access2} = {};{suffix}",
-                    src1.name(),
-                    src2.name()
-                );
-                if let Writeback::Pre | Writeback::Post = writeback {
-                    if let Some(value) = &combined {
-                        flow.write(base, Some(value.clone()));
-                        statement.push_str(&format!(" {} = {expr};", base.name()));
-                    }
+                let access2 = memory_access_operand(&second_expr, size, false, src2.wide);
+                let mut statement = String::new();
+                if pre_index { statement.push_str(&format!("{} = {}; ", base.name(), signed_memory_operand(&base.name(), offset))); }
+                statement.push_str(&format!(
+                    "{access1} = {};{} {access2} = {};{}",
+                    src1.name(), address_suffix(known.as_ref()),
+                    src2.name(), address_suffix(second_known.as_ref())
+                ));
+                if let Writeback::Post = writeback {
+                    // The update is architecturally certain; only its proven
+                    // value depends on the base being known.
+                    statement.push_str(&format!(" {} = {};", base.name(), signed_memory_operand(&base.name(), offset)));
+                    if let Some(value) = &known { flow.write(base, Some(value.clone())); }
                 }
                 statement
             }
@@ -6608,8 +6783,8 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
                 | IrOperation::Store { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
                 | IrOperation::LoadPair { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
                 | IrOperation::StorePair { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
-                | IrOperation::FloatLoad { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
-                | IrOperation::FloatStore { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. });
+                | IrOperation::SimdLoad { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::SimdStore { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. });
         if sp_changed { stack.clear(); }
         match portable {
             IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, offset }, value, bytes, writeback: None }
@@ -6622,7 +6797,7 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
                     };
                     if let Some((value, provenance)) = known { stack.insert(offset, (bytes, value, provenance)); }
                 }
-            IrOperation::Store { .. } | IrOperation::StorePair { .. } | IrOperation::FloatStore { .. } | IrOperation::AtomicStore { .. } => stack.clear(),
+            IrOperation::Store { .. } | IrOperation::StorePair { .. } | IrOperation::SimdStore { .. } | IrOperation::AtomicStore { .. } => stack.clear(),
             _ => {}
         }
         if portable == IrOperation::TargetSpecific || portable.render(&mut flow, pc).is_none() { flow.clear(); stack.clear(); }
@@ -6664,7 +6839,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v48; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v49; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -9022,7 +9197,7 @@ mod ssa_tests {
             (IrOperation::Insert { destination: reg(0, 64), source: reg(1, 64), lsb: 8, width: 8, kind: IrInsertKind::Bfi }, 3, 1),
             (IrOperation::Insert { destination: reg(0, 64), source: reg(1, 64), lsb: 8, width: 8, kind: IrInsertKind::Ubfiz }, 2, 1),
             (IrOperation::Load { destination: reg(0, 64), address, bytes: 8, signed: false, writeback: None }, (1 << 31) | 4, 1),
-            (IrOperation::FloatStore { source: IrFloatRegister { index: 0, precision: IrFloatPrecision::Double }, address: IrMemoryAddress::BaseOffset { base: sp, offset: 8 }, bytes: 8, writeback: Some(IrWriteback { base: sp, offset: 8, pre_index: false }) }, 1 << 31, 1 << 31),
+            (IrOperation::SimdStore { source: IrSimdRegister { index: 0, width: IrSimdWidth::Double }, address: IrMemoryAddress::BaseOffset { base: sp, offset: 8 }, writeback: Some(IrWriteback { base: sp, offset: 8, pre_index: false }) }, 1 << 31, 1 << 31),
             (IrOperation::AtomicStore { status: Some(reg(0, 32)), address, value: reg(1, 64), bytes: 8, ordering: IrAtomicOrdering::Release, exclusive: true }, (1 << 31) | 6, 1),
             (IrOperation::Compare { kind: IrCompareKind::Compare, left: reg(0, 64), right: IrCompareOperand::Extended { register: reg(2, 32), extension: Some(IrExtension::Sign(32)), shift: None } }, 5, 0),
             (IrOperation::ConditionalBranch { target: 0x2000, condition: IrCondition::Bit { register: reg(1, 64), bit: 0, nonzero: true } }, 2, 0),
@@ -9288,5 +9463,139 @@ mod reciprocal_tests {
             let report = render(&code, 0x1000, 0, &[0x1000], &[]);
             assert!(report.contains("if (eq) goto 0x1014; /* condition proven true */"), "{report}");
         }
+    }
+}
+
+#[cfg(test)]
+mod simd_memory_tests {
+    use super::*;
+
+    // Independently assembled with Apple's clang -arch arm64.
+    const SINGLE: [(u32, &str); 16] = [
+        (0x3dc0_0000, "q0 = *(u128 *)(x0);"),
+        (0x3dc0_0401, "q1 = *(u128 *)(x0 + 0x10);"),
+        (0x3d80_0800, "*(u128 *)(x0 + 0x20) = q0;"),
+        (0x3cc1_0400, "q0 = *(u128 *)(x0); x0 = x0 + 0x10;"),
+        (0x3c9f_0c20, "x1 = x1 - 0x10; *(u128 *)(x1) = q0;"),
+        (0x3cc1_0c22, "x1 = x1 + 0x10; q2 = *(u128 *)(x1);"),
+        (0x3cc0_8040, "q0 = *(u128 *)(x2 + 0x8);"),
+        (0x3c80_1064, "*(u128 *)(x3 + 0x1) = q4;"),
+        (0x3ce8_68e8, "q8 = *(u128 *)(x7 + x8);"),
+        (0x3ca8_68e9, "*(u128 *)(x7 + x8) = q9;"),
+        (0x3ce1_7800, "q0 = *(u128 *)(x0 + (x1 << 4));"),
+        (0x3d40_0000, "b0 = *(u8 *)(x0);"),
+        (0x7d40_0000, "h0 = *(u16 *)(x0);"),
+        (0x7c40_7030, "h16 = *(u16 *)(x1 + 0x7);"),
+        (0x9c00_0060, "q0 = *(u128 *)(pc + 0xc);"),
+        (0xbd40_0000, "s0 = *(float *)(x0);"),
+    ];
+
+    const PAIRS: [(u32, &str); 8] = [
+        (0x2d40_0400, "s0 = *(float *)(x0); s1 = *(float *)(x0 + 0x4);"),
+        (0x6d40_8c22, "d2 = *(double *)(x1 + 0x8); d3 = *(double *)(x1 + 0x10);"),
+        (0xad40_9444, "q4 = *(u128 *)(x2 + 0x10); q5 = *(u128 *)(x2 + 0x20);"),
+        (0x2cc1_1c66, "s6 = *(float *)(x3); s7 = *(float *)(x3 + 0x4); x3 = x3 + 0x8;"),
+        (0xa902_07e0, "*(sp + 0x20) = x0; *(sp + 0x28) = x1;"),
+        (0xa942_07e0, "x0 = *(sp + 0x20); x1 = *(sp + 0x28);"),
+        (0xad00_bcee, "*(u128 *)(x7 + 0x10) = q14; *(u128 *)(x7 + 0x20) = q15;"),
+        (0x2940_5554, "w20 = *(x10); w21 = *(x10 + 0x4);"),
+    ];
+
+    fn statement(word: u32) -> String {
+        let portable = lift_operation(decode(word, 0x1000), 0x1000);
+        assert_ne!(portable, IrOperation::TargetSpecific, "0x{word:08x} stayed target-specific");
+        let shared = portable.render(&mut Flow::new(), 0x1000).unwrap();
+        assert_eq!(shared, decode(word, 0x1000).render(&mut Flow::new(), 0x1000), "0x{word:08x} target fallback disagrees");
+        shared
+    }
+
+    #[test]
+    fn single_register_simd_memory_lifts_with_address_provenance() {
+        for (word, expected) in SINGLE {
+            assert!(statement(word).starts_with(expected), "0x{word:08x}");
+        }
+    }
+
+    #[test]
+    fn pair_simd_and_general_registers_lift_in_architectural_order() {
+        for (word, expected) in PAIRS {
+            assert!(statement(word).starts_with(expected), "0x{word:08x}");
+        }
+    }
+
+    #[test]
+    fn preindexed_pairs_access_the_updated_base() {
+        // `stp x29, x30, [sp, #-0x10]!` and `ldp d8, d9, [x4, #8]!`: the
+        // writeback is applied first, so both halves must be relative to the
+        // new base rather than repeating the encoded offset.
+        assert_eq!(statement(0xa9bf_7bfd), "sp = sp - 0x10; *(sp) = x29; *(sp + 0x8) = x30;");
+        assert_eq!(statement(0x6dc0_a488), "x4 = x4 + 0x8; d8 = *(double *)(x4); d9 = *(double *)(x4 + 0x8);");
+    }
+
+    #[test]
+    fn simd_memory_never_invalidates_general_registers() {
+        // A V-register access touches no GPR except an explicit base writeback,
+        // so unrelated proven constants must survive through it.
+        for (word, _) in SINGLE.iter().chain(PAIRS.iter()) {
+            let mut flow = Flow::new();
+            for index in 0..31 {
+                flow.write(Register { index, wide: true, stack_pointer: false }, Some(KnownValue { value: index as u64 + 1, origins: vec![0xff0] }));
+            }
+            flow.write_v(0, Some(VKnownValue { value: 7, origins: vec![0xff4] }));
+            flow.write_v(31, Some(VKnownValue { value: 9, origins: vec![0xff8] }));
+            flow.flags = Some(0b0110);
+            let before: Vec<Option<u64>> = (0..31u32).map(|index| flow.read(Register { index, wide: true, stack_pointer: false }).map(|value| value.value)).collect();
+            let portable = lift_operation(decode(*word, 0x1000), 0x1000);
+            let effects = portable.gpr_effects();
+            assert!(!effects.barrier, "0x{word:08x} claims a GPR barrier");
+            let defined = effects.definitions;
+            let mut after = flow.clone();
+            let _ = portable.render(&mut after, 0x1000);
+            for index in 0..31u32 {
+                if defined & (1 << index) == 0 {
+                    let register = Register { index, wide: true, stack_pointer: false };
+                    assert_eq!(after.read(register).map(|value| value.value), before[index as usize], "0x{word:08x} x{index}");
+                }
+            }
+            assert_eq!(after.flags, flow.flags, "0x{word:08x}");
+            assert!(after.read_v(31).is_some(), "0x{word:08x} cleared an unrelated V register");
+        }
+    }
+
+    #[test]
+    fn loads_invalidate_only_their_destination_vector_registers() {
+        // Clear exactly the destinations named by each load and keep every
+        // other tracked V value.
+        for (word, destinations) in [(0x3ce8_68e8, &[8u8][..]), (0xad40_9444, &[4u8, 5][..]), (0x3dc0_0000, &[0u8][..])] {
+            let mut flow = Flow::new();
+            for index in 0..32u32 {
+                flow.write_v(index, Some(VKnownValue { value: (index as u128 + 1) << 64, origins: vec![0xff0] }));
+            }
+            let mut expected = flow.clone();
+            for destination in destinations {
+                expected.write_v(*destination as u32, None);
+            }
+            let _ = lift_operation(decode(word, 0x1000), 0x1000).render(&mut flow, 0x1000);
+            assert!(flows_equal(&flow, &expected), "0x{word:08x}");
+        }
+    }
+
+    #[test]
+    fn non_temporal_and_reserved_pairs_retain_the_conservative_fallback() {
+        // `stnp`/`ldnp` (LL=00) hint non-temporal access that is not modelled,
+        // and the reserved opcodes stay opaque rather than widening the lift.
+        for word in [0x6c02_07e0, 0x6c42_07e0, 0x6802_07e0] {
+            assert_eq!(lift_operation(decode(word, 0x1000), 0x1000), IrOperation::TargetSpecific, "0x{word:08x}");
+        }
+    }
+
+    #[test]
+    fn byte_and_half_forms_move_only_their_lane_width() {
+        // The pointer type follows the moved width; no floating-point or
+        // half-precision arithmetic is implied by a half-precision access.
+        assert_eq!(statement(0x3d40_0000), "b0 = *(u8 *)(x0);");
+        assert_eq!(statement(0x7d40_0000), "h0 = *(u16 *)(x0);");
+        assert_eq!(statement(0x7c40_7030), "h16 = *(u16 *)(x1 + 0x7);");
+        assert_eq!(statement(0x7c40_2020), "h0 = *(u16 *)(x1 + 0x2);");
     }
 }
