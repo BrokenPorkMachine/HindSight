@@ -475,6 +475,27 @@ enum IrVectorFloatUnaryOperator {
     /// `Vd = frsqrte(Vn)` (`FRSQRTE`).
     ReciprocalSqrtEstimate,
 }
+
+/// Lane-wise vector half-precision floating-point three-same binary operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrVectorHalfBinaryOperator {
+    /// `Vd = Vn + Vm` (`FADD`).
+    Add,
+    /// `Vd = Vn - Vm` (`FSUB`).
+    Subtract,
+    /// `Vd = Vn * Vm` (`FMUL`).
+    Multiply,
+    /// `Vd = Vn / Vm` (`FDIV`).
+    Divide,
+    /// `Vd = fmax(Vn, Vm)` (`FMAX`).
+    Max,
+    /// `Vd = fmin(Vn, Vm)` (`FMIN`).
+    Min,
+    /// `Vd = fmaxnm(Vn, Vm)` (`FMAXNM`).
+    MaxNum,
+    /// `Vd = fminnm(Vn, Vm)` (`FMINNM`).
+    MinNum,
+}
 /// Lane-wise vector floating-point three-same binary operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrVectorFloatBinaryOperator {
@@ -596,6 +617,8 @@ enum IrOperation {
     VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
     /// Lane-wise vector floating-point unary operation (reciprocal estimate).
     VectorFloatUnary { destination: IrSimdRegister, source: IrSimdRegister, operator: IrVectorFloatUnaryOperator },
+    /// Lane-wise vector half-precision floating-point three-same binary operation.
+    VectorHalfBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorHalfBinaryOperator },
     /// Lane-wise vector integer arithmetic. Registers carry the architectural
     /// width (`Quad`/`Double`); element size is not tracked because the lane
     /// count is implied by the width and the instruction's arrangement.
@@ -654,7 +677,7 @@ impl IrOperation {
             // destination and read no general-purpose register.
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
             | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
-            | Self::VectorFloatUnary { .. }
+            | Self::VectorFloatUnary { .. } | Self::VectorHalfBinary { .. }
             | Self::Return { target: None } => {}
             Self::Assign { destination, value } => {
                 effects.definitions = gpr_mask(destination);
@@ -801,7 +824,7 @@ impl IrOperation {
             | Self::SimdLoad { .. } | Self::SimdStore { .. }
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
             | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
-            | Self::VectorFloatUnary { .. }
+            | Self::VectorFloatUnary { .. } | Self::VectorHalfBinary { .. }
             | Self::VectorExtract { .. }
         );
         let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
@@ -1745,6 +1768,23 @@ impl IrOperation {
                 Some(format!("{} = {}({});",
                     simd_register_name(destination), mnemonic, simd_register_name(source)))
             }
+            Self::VectorHalfBinary { destination, left, right, operator } => {
+                flow.write_v(destination.index as u32, None);
+                let dest_name = simd_register_name(destination);
+                let left_name = simd_register_name(left);
+                let right_name = simd_register_name(right);
+                let mnemonic = match operator {
+                    IrVectorHalfBinaryOperator::Add => "fadd",
+                    IrVectorHalfBinaryOperator::Subtract => "fsub",
+                    IrVectorHalfBinaryOperator::Multiply => "fmul",
+                    IrVectorHalfBinaryOperator::Divide => "fdiv",
+                    IrVectorHalfBinaryOperator::Max => "fmax",
+                    IrVectorHalfBinaryOperator::Min => "fmin",
+                    IrVectorHalfBinaryOperator::MaxNum => "fmaxnm",
+                    IrVectorHalfBinaryOperator::MinNum => "fminnm",
+                };
+                Some(format!("{} = {}({}, {});", dest_name, mnemonic, left_name, right_name))
+            }
             Self::TargetSpecific => None,
         }
     }
@@ -2628,6 +2668,7 @@ enum Operation {
     VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
     VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
     VectorFloatUnary { destination: IrSimdRegister, source: IrSimdRegister, operator: IrVectorFloatUnaryOperator },
+    VectorHalfBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorHalfBinaryOperator },
     VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorArithmeticOperator },
     VectorExtract { destination: Register, source: u8, lane: u8, bits: u8, signed: bool },
     LoadPair {
@@ -3040,6 +3081,9 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         }
         Operation::VectorFloatUnary { destination, source, operator } => {
             IrOperation::VectorFloatUnary { destination, source, operator }
+        }
+        Operation::VectorHalfBinary { destination, left, right, operator } => {
+            IrOperation::VectorHalfBinary { destination, left, right, operator }
         }
         Operation::VectorExtract { destination, source, lane, bits, signed } => {
             IrOperation::VectorExtract { destination: reg(destination), source, lane, bits, signed }
@@ -5222,6 +5266,49 @@ fn decode(word: u32, pc: u64) -> Operation {
             return Operation::VectorFloatBinary { destination, left, right, operator };
         }
     }
+    // Lane-wise vector half-precision three-same: `0 Q U 0 1110 size 1 Rm
+    // opcode Rn Rd` with bit 21 = 0 (vs 1 for single/double FP) and bit 15 = 0.
+    // size=01 (bit23=0) for ADD/MAX/MAXNM; size=11 (bit23=1) for SUB/MIN/MINNM.
+    // Q=bit30 selects .4h (Q=0, 64-bit D) vs .8h (Q=1, 128-bit Q).
+    // U=bit29 selects MUL/DIV (1) vs ADD/SUB/MAX/MIN/MAXNM/FMINNM (0).
+    if word & 0x9f00_8000 == 0x0e00_0000 && word & 0x0020_0000 == 0 {
+        let size = (word >> 22) & 3;
+        // Only size=01 (.4h, bit23=0) and size=11 (.8h, bit23=1) are valid.
+        // Other sizes fall through to other decoders (e.g., vector extract).
+        if matches!(size, 1 | 3) {
+            let vb = (size >> 1) & 1;  // bit 23: 0 for ADD/MAX/MAXNM, 1 for SUB/MIN/MINNM
+            let opcode = (word >> 11) & 0x1f;
+            let u = (word >> 29) & 1;
+            let operator = if u == 0 && opcode == 0b00010 && vb == 0 {
+                Some(IrVectorHalfBinaryOperator::Add)
+            } else if u == 0 && opcode == 0b00010 && vb == 1 {
+                Some(IrVectorHalfBinaryOperator::Subtract)
+            } else if u == 1 && opcode == 0b00011 {
+                Some(IrVectorHalfBinaryOperator::Multiply)
+            } else if u == 1 && opcode == 0b00111 {
+                Some(IrVectorHalfBinaryOperator::Divide)
+            } else if u == 0 && opcode == 0b00110 && vb == 0 {
+                Some(IrVectorHalfBinaryOperator::Max)
+            } else if u == 0 && opcode == 0b00110 && vb == 1 {
+                Some(IrVectorHalfBinaryOperator::Min)
+            } else if u == 0 && opcode == 0b00000 && vb == 0 {
+                Some(IrVectorHalfBinaryOperator::MaxNum)
+            } else if u == 0 && opcode == 0b00000 && vb == 1 {
+                Some(IrVectorHalfBinaryOperator::MinNum)
+            } else {
+                None
+            };
+            if let Some(operator) = operator {
+                let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
+                let destination = IrSimdRegister { index: (word & 31) as u8, width };
+                let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
+                let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
+                return Operation::VectorHalfBinary { destination, left, right, operator };
+            }
+            // fall through for unrecognized opcodes
+        }
+        // fall through for invalid sizes or unrecognized opcodes or unrecognized opcodes
+    }
     // Advanced SIMD two-register reciprocal estimate (FRECPE/FRSQRTE).
     // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q selects Quad (1) or Double (0).
     // Only single/double precision (size=10/11) are modeled; half/reserved sizes stay opaque.
@@ -6728,6 +6815,9 @@ impl Operation {
             Self::VectorFloatUnary { destination, source, operator } => {
                 IrOperation::VectorFloatUnary { destination, source, operator }.render(flow, pc).unwrap_or_default()
             }
+            Self::VectorHalfBinary { destination, left, right, operator } => {
+                IrOperation::VectorHalfBinary { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
+            }
             Self::VectorExtract { destination, source, lane, bits, signed } => {
                 IrOperation::VectorExtract { destination: destination.into(), source, lane, bits, signed }.render(flow, pc).unwrap_or_default()
             }
@@ -7961,6 +8051,32 @@ mod tests {
     #[test]
     fn scalar_float16_fmov_immediate_stays_opaque() {
         assert!(matches!(decode(0x1eee_1000, 0x1000), Operation::Opaque));
+    }
+
+    #[test]
+    fn vector_half_arithmetic_lifts_to_shared_ir() {
+        let cases = [
+            (0x0e42_1420, "d0 = fadd(d1, d2);"),
+            (0x4e42_1420, "q0 = fadd(q1, q2);"),
+            (0x0ec2_1420, "d0 = fsub(d1, d2);"),
+            (0x2e42_1c20, "d0 = fmul(d1, d2);"),
+            (0x6e42_3c20, "q0 = fdiv(q1, q2);"),
+            (0x0e42_3420, "d0 = fmax(d1, d2);"),
+            (0x0ec2_3420, "d0 = fmin(d1, d2);"),
+            (0x4e42_3420, "q0 = fmax(q1, q2);"),
+            (0x4ec2_3420, "q0 = fmin(q1, q2);"),
+            (0x0e42_0420, "d0 = fmaxnm(d1, d2);"),
+            (0x0ec2_0420, "d0 = fminnm(d1, d2);"),
+            (0x4e42_0420, "q0 = fmaxnm(q1, q2);"),
+            (0x4ec2_0420, "q0 = fminnm(q1, q2);"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
     }
 
     #[test]
