@@ -1121,6 +1121,15 @@ fn recover_internal(
         assert_eq!(names.get("d0").map(String::as_str), Some("factor"));
         assert_eq!(names.get("d1").map(String::as_str), Some("value"));
     }
+    #[test] fn selected_fp_call_arguments_retain_comparison_provenance() {
+        let words = [0x1e6e_1001u32, 0x1e60_1002, 0x1e62_2020, 0x1e62_bc20, 0x9400_03fc];
+        let code = words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let signature = Signature { language: "C", declaration: "void consume(double value);".into(), source: "test prototype" };
+        let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);", 0x1010, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        assert!(call.contains("consume(1.0);"), "{call}");
+        assert!(call.contains("proven_by=[0x1000,0x1004,0x1008,0x100c]"), "{call}");
+    }
     #[test] fn direct_calls_render_prototype_parameter_bindings() {
         let signature = symbol("_CFRelease").unwrap();
         let signatures = BTreeMap::from([(0x2000, ("_CFRelease".into(), signature))]);

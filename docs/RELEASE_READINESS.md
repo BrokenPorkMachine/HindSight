@@ -9,7 +9,7 @@ HindSight 0.5.12 uses the stable product/release-channel identity in source. Tha
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
 - Analysis Quality distinguishes coverage from negative evidence; candidate control-flow remains labelled candidate evidence.
-- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v80-schema122` prevents reuse of results from earlier semantic lifts.
+- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v81-schema122` prevents reuse of results from earlier semantic lifts.
 - Existing schema-v1 projects require no database migration for the cache feature.
 - Worker progress records must remain separate from framed stdout and real stderr diagnostics; final evidence publication remains atomic.
 - App and Coordinator macOS Swift type-check source sets are derived directly from `Config/project-topology.json`; `AnalysisNavigation.swift`, `AnalysisContinuity.swift`, and future generated-target Swift files cannot be omitted by stale hand-maintained shell lists.

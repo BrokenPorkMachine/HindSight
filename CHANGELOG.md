@@ -7,11 +7,12 @@
 - Bound SwiftUI workspace type expansion to fix the reproduced Swift 6.4 SIL-generation crash in ContentView.
 - Regenerate consistent build settings and add clean, commit-based source recreation without Git metadata, DerivedData, or Xcode user state.
 
-# Unreleased — Decompiler SSA foundation
+# Unreleased — Decompiler SSA and scalar FP foundation
 
 - Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.
 - Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
-- Advance the analysis/cache identity to `arm64-analysis-v80-schema122` and semantic preview banner to v46; the report schema is unchanged.
+- Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.
+- Advance the analysis/cache identity to `arm64-analysis-v81-schema122` and semantic preview banner to v47; the report schema is unchanged.
 
 # 0.5.12 — Objective-C/C Argument Reconstruction
 

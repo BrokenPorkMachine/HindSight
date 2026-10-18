@@ -285,6 +285,15 @@ fn condition_holds(flags: u8, condition: IrFlagPredicate) -> Option<bool> {
     })
 }
 
+fn ir_compare_origins(left: Register, right: IrCompareOperand, flow: &Flow, pc: u64) -> Option<Vec<u64>> {
+    let left = flow.read(left)?;
+    let right = match right {
+        IrCompareOperand::Register { register, .. } | IrCompareOperand::Extended { register, .. } => flow.read(register.target())?.origins,
+        IrCompareOperand::Immediate(_) => Vec::new(),
+    };
+    combine_origins(&left.origins, &right, pc)
+}
+
 fn evaluate_ir_condition(condition: IrCondition, flow: &Flow) -> Option<bool> {
     match condition {
         IrCondition::Flags(IrFlagPredicate::Always) => Some(true),
@@ -305,6 +314,20 @@ enum IrCondition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFlagPredicate { Equal, NotEqual, CarrySet, CarryClear, Negative, NonNegative, Overflow, NoOverflow,
     UnsignedHigher, UnsignedLowerOrSame, SignedGreaterOrEqual, SignedLess, SignedGreater, SignedLessOrEqual, Always, Never }
+
+fn flag_predicate_name(condition: IrFlagPredicate) -> &'static str {
+    let code = match condition {
+        IrFlagPredicate::Equal => 0, IrFlagPredicate::NotEqual => 1,
+        IrFlagPredicate::CarrySet => 2, IrFlagPredicate::CarryClear => 3,
+        IrFlagPredicate::Negative => 4, IrFlagPredicate::NonNegative => 5,
+        IrFlagPredicate::Overflow => 6, IrFlagPredicate::NoOverflow => 7,
+        IrFlagPredicate::UnsignedHigher => 8, IrFlagPredicate::UnsignedLowerOrSame => 9,
+        IrFlagPredicate::SignedGreaterOrEqual => 10, IrFlagPredicate::SignedLess => 11,
+        IrFlagPredicate::SignedGreater => 12, IrFlagPredicate::SignedLessOrEqual => 13,
+        IrFlagPredicate::Always => 14, IrFlagPredicate::Never => 15,
+    };
+    condition_name(code)
+}
 
 fn lift_flag_predicate(code: u8) -> IrFlagPredicate {
     match code & 15 {
@@ -426,6 +449,7 @@ enum IrOperation {
     ScalarFloatBinary { destination: u8, left: u8, right: u8, precision: IrFloatPrecision, operator: IrFloatBinaryOperator },
     ScalarFloatUnary { destination: u8, source: u8, precision: IrFloatPrecision, operator: IrFloatUnaryOperator },
     ScalarFloatMultiplyAdd(IrFloatMultiplyAdd),
+    ScalarFloatSelect { destination: u8, if_true: u8, if_false: u8, precision: IrFloatPrecision, condition: IrFlagPredicate },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -473,7 +497,7 @@ impl IrOperation {
             Self::Nop | Self::Marker { .. }
             | Self::ScalarFloatImmediate { .. } | Self::ScalarFloatMove { .. }
             | Self::ScalarFloatBinary { .. } | Self::ScalarFloatUnary { .. }
-            | Self::ScalarFloatMultiplyAdd(_) | Self::ScalarFloatCompare { .. }
+            | Self::ScalarFloatMultiplyAdd(_) | Self::ScalarFloatSelect { .. } | Self::ScalarFloatCompare { .. }
             | Self::ScalarFloatConvert { .. } | Self::Branch { .. }
             | Self::Return { target: None } => {}
             Self::Assign { destination, value } => {
@@ -605,13 +629,15 @@ impl IrOperation {
             | Self::ScalarFloatMove { .. }
             | Self::ScalarFloatBinary { .. }
             | Self::ScalarFloatUnary { .. }
-            | Self::ScalarFloatMultiplyAdd(..)
+            | Self::ScalarFloatMultiplyAdd(..) | Self::ScalarFloatSelect { .. }
             | Self::FloatLoad { .. } | Self::FloatStore { .. }
         );
+        let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
         let consumed_flags = if consumes_flags {
             flow.flags.take()
         } else if !preserves_flags || matches!(self, Self::Compare { .. } | Self::ConditionalCompare { .. }) {
             flow.flags = None;
+            flow.flag_origins = None;
             None
         } else {
             None
@@ -839,17 +865,7 @@ impl IrOperation {
                     IrSelectElse::Invert => format!("(~{})", if_false.name()),
                     IrSelectElse::Negate => format!("(-{})", if_false.name()),
                 };
-                let cond_code = match condition {
-                    IrFlagPredicate::Equal => 0, IrFlagPredicate::NotEqual => 1,
-                    IrFlagPredicate::CarrySet => 2, IrFlagPredicate::CarryClear => 3,
-                    IrFlagPredicate::Negative => 4, IrFlagPredicate::NonNegative => 5,
-                    IrFlagPredicate::Overflow => 6, IrFlagPredicate::NoOverflow => 7,
-                    IrFlagPredicate::UnsignedHigher => 8, IrFlagPredicate::UnsignedLowerOrSame => 9,
-                    IrFlagPredicate::SignedGreaterOrEqual => 10, IrFlagPredicate::SignedLess => 11,
-                    IrFlagPredicate::SignedGreater => 12, IrFlagPredicate::SignedLessOrEqual => 13,
-                    IrFlagPredicate::Always => 14, IrFlagPredicate::Never => 15,
-                };
-                Some(format!("{} = {} ? {} : {};{}", destination.name(), condition_name(cond_code), if_true.name(), false_expression, resolved_suffix(known.as_ref())))
+                Some(format!("{} = {} ? {} : {};{}", destination.name(), flag_predicate_name(condition), if_true.name(), false_expression, resolved_suffix(known.as_ref())))
             }
             Self::Extend { destination, source, signed, from } => {
                 let destination = destination.target();
@@ -945,6 +961,7 @@ impl IrOperation {
                 let left = left.target();
                 flow.flags = flow.read(left).zip(resolve_ir_compare_operand(right, flow, left.wide))
                     .map(|(a, b)| compare_flags(kind, a.value, b, left.wide));
+                flow.flag_origins = ir_compare_origins(left, right, flow, pc).filter(|_| flow.flags.is_some());
                 let operand = render_ir_compare_operand(right);
                 Some(format!("/* {} {}, {operand} */", ir_compare_mnemonic(kind), left.name()))
             }
@@ -957,6 +974,14 @@ impl IrOperation {
                         .map(|(a, b)| compare_flags(kind, a.value, b, left.wide)),
                     None => None,
                 };
+                flow.flag_origins = consumed_flag_origins.and_then(|prior| {
+                    let operands = match execute {
+                        Some(true) => ir_compare_origins(left, right, flow, pc)?,
+                        Some(false) => Vec::new(),
+                        None => return None,
+                    };
+                    combine_origins(&prior, &operands, pc)
+                }).filter(|_| flow.flags.is_some());
                 let operand = render_ir_compare_operand(right);
                 Some(format!("/* {} {}, {}, #0x{nzcv:x}, {} */", ir_conditional_compare_mnemonic(kind), left.name(), operand, condition_name(condition)))
             }
@@ -1194,12 +1219,28 @@ impl IrOperation {
                 };
                 Some(format!("{} = {function}({}, {}, {});", register(destination), register(left), register(right), register(addend)))
             }
+            Self::ScalarFloatSelect { destination, if_true, if_false, precision, condition } => {
+                let register = |index| float_register_name(IrFloatRegister { index, precision });
+                let selected = if condition == IrFlagPredicate::Always { Some(true) }
+                    else { flow.flags.and_then(|flags| condition_holds(flags, condition)) };
+                let known = selected.and_then(|take_true| {
+                    let input = flow.read_v(if take_true { if_true } else { if_false } as u32)?;
+                    let predicate_origins = if condition == IrFlagPredicate::Always { &[][..] }
+                        else { flow.flag_origins.as_deref()? };
+                    let value = match precision { IrFloatPrecision::Single => u128::from(input.value as u32), IrFloatPrecision::Double => u128::from(input.value as u64) };
+                    Some(VKnownValue { value, origins: combine_origins(&input.origins, predicate_origins, pc)? })
+                });
+                flow.write_v(destination as u32, known.clone());
+                let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
+                Some(format!("{} = {} ? {} : {};{evidence}", register(destination), flag_predicate_name(condition), register(if_true), register(if_false)))
+            }
             Self::ScalarFloatCompare { left, right, precision } => {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let right_text = right.map(register).unwrap_or_else(|| "#0.0".into());
-                let left_value = flow.read_v(left as u32).map(|value| value.value as u64);
-                let right_value = right.map(|index| flow.read_v(index as u32).map(|value| value.value as u64)).unwrap_or(Some(0));
-                flow.flags = left_value.zip(right_value).map(|(left, right)| scalar_float_compare_flags(left, right, precision));
+                let left_value = flow.read_v(left as u32);
+                let right_value = right.map(|index| flow.read_v(index as u32)).unwrap_or(Some(VKnownValue { value: 0, origins: Vec::new() }));
+                flow.flags = left_value.as_ref().zip(right_value.as_ref()).map(|(left, right)| scalar_float_compare_flags(left.value as u64, right.value as u64, precision));
+                flow.flag_origins = left_value.zip(right_value).and_then(|(left, right)| combine_origins(&left.origins, &right.origins, pc));
                 Some(format!("fcmp {}, {right_text}; /* floating comparison flags modeled when operands are known */", register(left)))
             }
             Self::ScalarFloatConvert { destination, destination_precision, source, source_precision } => {
@@ -2379,6 +2420,7 @@ enum Operation {
     ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
     ScalarFloatUnary { destination: u8, source: u8, precision: IrFloatPrecision, operator: IrFloatUnaryOperator },
     ScalarFloatMultiplyAdd(IrFloatMultiplyAdd),
+    ScalarFloatSelect { destination: u8, if_true: u8, if_false: u8, precision: IrFloatPrecision, condition: IrFlagPredicate },
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -2621,6 +2663,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::ScalarFloatMove { destination, source, precision } => IrOperation::ScalarFloatMove { destination, source, precision },
         Operation::ScalarFloatUnary { destination, source, precision, operator } => IrOperation::ScalarFloatUnary { destination, source, precision, operator },
         Operation::ScalarFloatMultiplyAdd(operation) => IrOperation::ScalarFloatMultiplyAdd(operation),
+        Operation::ScalarFloatSelect { destination, if_true, if_false, precision, condition } => IrOperation::ScalarFloatSelect { destination, if_true, if_false, precision, condition },
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
         Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
@@ -4537,6 +4580,22 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
         return Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits: None };
     }
+    // Scalar FCSEL: only the single/double encodings are modeled. For this
+    // instruction AArch64 AL and NV both select Rn, independent of NZCV.
+    if word & 0xff20_0c00 == 0x1e20_0c00 {
+        let precision = match (word >> 22) & 3 {
+            0 => IrFloatPrecision::Single,
+            1 => IrFloatPrecision::Double,
+            _ => return Operation::Opaque,
+        };
+        return Operation::ScalarFloatSelect {
+            destination: (word & 31) as u8,
+            if_true: ((word >> 5) & 31) as u8,
+            if_false: ((word >> 16) & 31) as u8,
+            precision,
+            condition: lift_flag_predicate((((word >> 12) & 15) as u8).min(14)),
+        };
+    }
     // Scalar fused multiply-add group (`FMADD`/`FMSUB`/`FNMADD`/`FNMSUB`):
     // Bit 15 subtracts the product from Ra; bit 21 negates the fused result.
     // Bits 31-23 fix the scalar group, so vector forms stay with the SIMD
@@ -4558,7 +4617,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         });
     }
     // Scalar single/double two-source arithmetic and minimum/maximum. Keep the
-    // whitelist narrow: other FP data-processing encodings (FCSEL and the
+    // whitelist narrow: other FP data-processing encodings (including the
     // estimate forms) remain explicit
     // target-specific IR. FMAX/FMIN propagate NaN and raise the FP exception
     // flags; FMAXNM/FMINNM implement the IEEE 754-2008 minNum/maxNum selection.
@@ -4633,6 +4692,7 @@ struct Flow {
     registers: [Option<KnownValue>; 31],
     v_registers: [Option<VKnownValue>; 32],
     flags: Option<u8>,
+    flag_origins: Option<Vec<u64>>,
 }
 
 impl Flow {
@@ -4641,6 +4701,7 @@ impl Flow {
             registers: std::array::from_fn(|_| None),
             v_registers: std::array::from_fn(|_| None),
             flags: None,
+            flag_origins: None,
         }
     }
 
@@ -4648,6 +4709,7 @@ impl Flow {
         self.registers.fill(None);
         self.v_registers.fill(None);
         self.flags = None;
+        self.flag_origins = None;
     }
 
     fn read(&self, reg: Register) -> Option<KnownValue> {
@@ -6165,13 +6227,11 @@ impl Operation {
                 };
                 format!("{} = {expression};", register(destination))
             }
+            Self::ScalarFloatSelect { destination, if_true, if_false, precision, condition } => {
+                IrOperation::ScalarFloatSelect { destination, if_true, if_false, precision, condition }.render(flow, pc).unwrap_or_default()
+            }
             Self::ScalarFloatCompare { left, right, precision } => {
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                let right_text = right.map(register).unwrap_or_else(|| "#0.0".into());
-                let left_value = flow.read_v(left as u32).map(|value| value.value as u64);
-                let right_value = right.map(|index| flow.read_v(index as u32).map(|value| value.value as u64)).unwrap_or(Some(0));
-                flow.flags = left_value.zip(right_value).map(|(left, right)| scalar_float_compare_flags(left, right, precision));
-                format!("fcmp {}, {right_text}; /* floating comparison flags modeled when operands are known */", register(left))
+                IrOperation::ScalarFloatCompare { left, right, precision }.render(flow, pc).unwrap_or_default()
             }
             Self::ScalarFloatConvert { destination, destination_precision, source, source_precision } => {
                 flow.write_v(destination as u32, None);
@@ -6541,7 +6601,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v46; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v47; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -8925,5 +8985,149 @@ mod ssa_tests {
         assert_eq!(report.matches("SSA evidence truncated").count(), 1);
         assert_eq!(report.lines().filter(|line| line.trim_start().starts_with("0x")).count(), MAX_WORDS_PER_FUNCTION);
         assert!(report.len() < MAX_OUTPUT);
+    }
+}
+
+#[cfg(test)]
+mod fcsel_tests {
+    use super::*;
+
+    fn vector(value: u128, pc: u64) -> Option<VKnownValue> {
+        Some(VKnownValue { value, origins: vec![pc] })
+    }
+
+    #[test]
+    fn scalar_select_encodings_lift_and_normalize_nv_to_always() {
+        // Encodings independently assembled with Apple's clang -arch arm64.
+        for (word, expected) in [
+            (0x1e22_0c20u32, "s0 = eq ? s1 : s2;"),
+            (0x1e65_1c83, "d3 = ne ? d4 : d5;"),
+            (0x1e3d_efdf, "s31 = al ? s30 : s29;"),
+            (0x1e7d_ffdf, "d31 = al ? d30 : d29;"),
+        ] {
+            let operation = decode(word, 0x1000);
+            let portable = lift_operation(operation, 0x1000);
+            assert!(matches!(portable, IrOperation::ScalarFloatSelect { .. }));
+            assert_eq!(operation.render(&mut Flow::new(), 0x1000), expected);
+            assert_eq!(portable.render(&mut Flow::new(), 0x1000).as_deref(), Some(expected));
+            let report = render(&word.to_le_bytes(), 0x1000, 0, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("barrier=all_gprs"), "{report}");
+        }
+        for word in [0x1ea2_0c20, 0x1ee2_0c20, 0x9e22_0c20, 0x3e22_0c20, 0x5e22_0c20, 0x1e02_0c20, 0x1e22_0420, 0x1e22_2820, 0x1e62_2020] {
+            assert!(!matches!(lift_operation(decode(word, 0x1000), 0x1000), IrOperation::ScalarFloatSelect { .. }), "{word:#x}");
+        }
+    }
+
+    #[test]
+    fn every_condition_matches_native_arm64_selection_and_preserves_nzcv() {
+        // For each condition, bit N records native FCSEL's choice for NZCV=N.
+        // Measured for both S and D forms on Apple Silicon; AL and NV are true.
+        let native_masks = [0xf0f0u16, 0x0f0f, 0xcccc, 0x3333, 0xff00, 0x00ff, 0xaaaa, 0x5555,
+            0x0c0c, 0xf3f3, 0xaa55, 0x55aa, 0x0a05, 0xf5fa, 0xffff, 0xffff];
+        for (condition, mask) in native_masks.into_iter().enumerate() {
+            for flags in 0..16u8 {
+                for (base, true_bits, false_bits) in [
+                    (0x1e22_0c20u32, 0x7fa0_1234u128, 0x8000_0000u128),
+                    (0x1e62_0c20, 0x7ff8_0000_0000_1234, 0x8000_0000_0000_0000),
+                ] {
+                    let mut flow = Flow::new();
+                    flow.flags = Some(flags);
+                    flow.flag_origins = Some(vec![0xffc]);
+                    flow.write_v(1, vector(true_bits | (0xbeefu128 << 64), 0xff0));
+                    flow.write_v(2, vector(false_bits | (0xdeadu128 << 64), 0xff4));
+                    // Alias Rd with Rm to catch writes before source reads.
+                    let operation = lift_operation(decode((base | ((condition as u32) << 12)) + 2, 0x1000), 0x1000);
+                    operation.render(&mut flow, 0x1000);
+                    let choose_true = mask & (1 << flags) != 0;
+                    let result = flow.read_v(2).expect("proven selection");
+                    assert_eq!(result.value, if choose_true { true_bits } else { false_bits }, "condition={condition} flags={flags}");
+                    assert_eq!(result.origins, if condition >= 14 { vec![0xff0, 0x1000] }
+                        else { vec![if choose_true { 0xff0 } else { 0xff4 }, 0xffc, 0x1000] });
+                    assert_eq!(flow.flags, Some(flags));
+                    assert_eq!(flow.flag_origins, Some(vec![0xffc]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_predicates_sources_and_exhausted_provenance_do_not_claim_constants() {
+        let operation = lift_operation(decode(0x1e62_0c20, 0x1000), 0x1000);
+        for case in 0..5 {
+            let mut flow = Flow::new();
+            flow.write_v(0, vector(17, 0xff0));
+            flow.write_v(1, vector(1, 0xff4));
+            flow.write_v(2, vector(2, 0xff8));
+            flow.flags = Some(0b0110); // EQ would select D1.
+            flow.flag_origins = Some(vec![0xffc]);
+            match case {
+                0 => { flow.flags = None; flow.flag_origins = None; }
+                1 => flow.flag_origins = None,
+                2 => flow.write_v(1, None),
+                3 => flow.flag_origins = Some((0..8).collect()),
+                _ => { flow.write_v(1, None); flow.write_v(2, None); }
+            }
+            let x0 = Register { index: 0, wide: true, stack_pointer: false };
+            flow.write(x0, Some(KnownValue { value: 7, origins: vec![0xfe0] }));
+            let statement = operation.render(&mut flow, 0x1000).unwrap();
+            assert!(flow.read_v(0).is_none(), "case={case}");
+            assert!(!statement.contains("constant="));
+            assert_eq!(flow.read(x0).map(|known| known.value), Some(7));
+            if case < 4 { assert!(flow.read_v(2).is_some()); }
+        }
+    }
+
+    #[test]
+    fn selected_values_carry_float_comparison_provenance_and_preserve_flags_for_branches() {
+        let words = [0x1e6e_1001, 0x1e60_1002, 0x1e62_2020, 0x1e62_bc20];
+        let mut flow = Flow::new();
+        for (index, word) in words.into_iter().enumerate() {
+            let pc = 0x1000 + index as u64 * 4;
+            lift_operation(decode(word, pc), pc).render(&mut flow, pc);
+        }
+        let result = flow.read_v(0).unwrap();
+        assert_eq!(result.value, 1.0f64.to_bits() as u128);
+        assert_eq!(result.origins, [0x1000, 0x1004, 0x1008, 0x100c]);
+        assert_eq!(flow.flags, Some(0b1000));
+        assert_eq!(flow.flag_origins, Some(vec![0x1000, 0x1004, 0x1008]));
+        // Branch immediately after FCSEL must still see the preceding FCMP.
+        let code = [0x1e6e_1001, 0x1e60_1002, 0x1e62_2020, 0x1e62_bc20, 0x5400_004b, 0xd65f_03c0, 0xd65f_03c0]
+            .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let report = render(&code, 0x1000, 0, &[0x1000], &[]);
+        assert!(report.contains("condition proven true"), "{report}");
+        assert!(report.contains("constant=0x3ff0000000000000 proven_by=[0x1000,0x1004,0x1008,0x100c]"), "{report}");
+    }
+
+    #[test]
+    fn selected_call_arguments_include_integer_and_conditional_compare_evidence() {
+        // fmov d1,#1; fmov d2,#2; mov x3,#1; cmp x3,#1;
+        // ccmp x3,#1,#0,eq; fcsel d0,d1,d2,eq; bl ...
+        let words = [0x1e6e_1001, 0x1e60_1002, 0xd280_0023, 0xf100_047f, 0xfa41_0860, 0x1e62_0c20, 0x9400_0001];
+        let code = words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let values = known_call_float_argument_values(&code, 0x1000, 0x1000, 0x1018);
+        let (_, value, provenance) = values.iter().find(|(register, _, _)| *register == 0).expect("selected FP call argument");
+        assert_eq!(*value, 1.0f64.to_bits() as u128);
+        assert_eq!(provenance, "proven_by=[0x1000,0x1008,0x100c,0x1010,0x1014]");
+        // The false CCMP arm uses its immediate NZCV and prior predicate proof,
+        // not the compare operands which were skipped.
+        let mut code = code;
+        code[16..20].copy_from_slice(&0xfa41_1864u32.to_le_bytes()); // CCMP ..., #4, NE
+        let values = known_call_float_argument_values(&code, 0x1000, 0x1000, 0x1018);
+        assert_eq!(values.iter().find(|(register, _, _)| *register == 0).unwrap().1, 1.0f64.to_bits() as u128);
+    }
+
+    #[test]
+    fn flag_barriers_discard_predicate_provenance() {
+        let mut flow = Flow::new();
+        flow.flags = Some(0b0110);
+        flow.flag_origins = Some(vec![0xffc]);
+        IrOperation::TargetSpecific.render(&mut flow, 0x1000);
+        assert!(flow.flags.is_none());
+        assert!(flow.flag_origins.is_none());
+        flow.flags = Some(0b0110);
+        flow.flag_origins = Some(vec![0xffc]);
+        flow.clear();
+        assert!(flow.flag_origins.is_none());
     }
 }

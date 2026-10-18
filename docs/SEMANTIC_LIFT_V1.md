@@ -48,10 +48,10 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v46` banner identifies the statement set that
+`AArch64 register semantics v47` banner identifies the statement set that
 produced a preview.
 
-The v46 preview includes bounded GPR SSA evidence in separate `// ssa` lines.
+The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
 A value such as `x0@0x1004` names the definition at that instruction, while
 `x0@B3 = phi(B1:x0@0x1004, B2:x0@entry)` records the reaching values from each
 reachable predecessor. Entry values are unknown inputs. W/X register views
@@ -61,8 +61,19 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v80-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v81-schema122`; the report fields
 and cache-envelope schema are unchanged.
+
+Scalar single/double `FCSEL` now has shared IR. Its output names the condition
+and both FP register operands; the encoding's NV condition is normalized to AL
+because both always select the first source. Other predicates resolve only from
+tracked block-local NZCV. Selection copies the source bit pattern without FP
+arithmetic, preserving NaN payloads and signed zero. A recovered constant cites
+both the source definition and the comparison's input/condition provenance.
+Provenance remains bounded to eight distinct instruction sites; missing or
+exhausted provenance, unknown predicates, or unknown selected operands invalidate
+the destination value. GP registers, unrelated FP registers, and NZCV remain
+intact. Half precision and reserved encodings remain outside this shared lift.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument

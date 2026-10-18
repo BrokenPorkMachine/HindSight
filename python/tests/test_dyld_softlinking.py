@@ -33,7 +33,7 @@ class DyldSoftLinkingContract(unittest.TestCase):
         self.assertIn('let mappings: [DyldCacheMappingRecord]', messages)
 
     def test_schema_identity_advanced_for_new_fields(self):
-        self.assertIn('arm64-analysis-v80-schema122', read('PlatformServices/CoordinatorService/main.swift'))
+        self.assertIn('arm64-analysis-v81-schema122', read('PlatformServices/CoordinatorService/main.swift'))
         self.assertIn('precondition(AnalysisReport.jsonFields.count == 72)', read('Tests/analysis_protocol_contract.swift'))
 
 if __name__ == '__main__':
