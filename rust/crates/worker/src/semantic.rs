@@ -246,8 +246,26 @@ fn compare_flags(kind: IrCompareKind, left: u64, right: u64, wide: bool) -> u8 {
 }
 
 
+fn f16_to_f32_bits(bits: u16) -> u32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    if exp == 0 {
+        if mant == 0 { return sign << 31; }
+        let mut m = mant;
+        let mut e = -14i32;
+        while m < 0x400 { m <<= 1; e -= 1; }
+        (sign << 31) | (((e + 127) as u32) << 23) | ((m & 0x3ff) << 13)
+    } else if exp == 0x1f {
+        (sign << 31) | (0xff << 23) | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+    }
+}
+
 fn scalar_float_compare_flags(left: u64, right: u64, precision: IrFloatPrecision) -> u8 {
     let ordering = match precision {
+        IrFloatPrecision::Half => f32::from_bits(f16_to_f32_bits(left as u16)).partial_cmp(&f32::from_bits(f16_to_f32_bits(right as u16))),
         IrFloatPrecision::Single => f32::from_bits(left as u32).partial_cmp(&f32::from_bits(right as u32)),
         IrFloatPrecision::Double => f64::from_bits(left).partial_cmp(&f64::from_bits(right)),
     };
@@ -261,6 +279,7 @@ fn scalar_float_compare_flags(left: u64, right: u64, precision: IrFloatPrecision
 
 fn scalar_float_literal(bits: u64, precision: IrFloatPrecision) -> String {
     let value = match precision {
+        IrFloatPrecision::Half => f32::from_bits(f16_to_f32_bits(bits as u16)).to_string(),
         IrFloatPrecision::Single => f32::from_bits(bits as u32).to_string(),
         IrFloatPrecision::Double => f64::from_bits(bits).to_string(),
     };
@@ -366,7 +385,7 @@ enum IrAtomicOrdering { Relaxed, Acquire, Release }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round, ReciprocalEstimate, ReciprocalSqrtEstimate, ReciprocalExponent }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IrFloatPrecision { Single, Double }
+enum IrFloatPrecision { Half, Single, Double }
 /// Width of a SIMD load/store operand. `Quad` names the whole 128-bit V
 /// register; the narrower variants name one lane of it. Byte and Half are
 /// memory views only — no half-precision arithmetic is claimed.
@@ -400,7 +419,7 @@ fn simd_register_name(register: IrSimdRegister) -> String {
     }, index = register.index)
 }
 fn float_register_name(index: u8, precision: IrFloatPrecision) -> String {
-    let width = if precision == IrFloatPrecision::Single { IrSimdWidth::Single } else { IrSimdWidth::Double };
+    let width = match precision { IrFloatPrecision::Half => IrSimdWidth::Half, IrFloatPrecision::Single => IrSimdWidth::Single, IrFloatPrecision::Double => IrSimdWidth::Double };
     simd_register_name(IrSimdRegister { index, width })
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,7 +477,7 @@ enum IrConversionRegister { Float { index: u8, precision: IrFloatPrecision }, In
 
 fn render_int_float_conversion(destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8>) -> String {
     let register = |value| match value {
-        IrConversionRegister::Float { index, precision } => format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }),
+        IrConversionRegister::Float { index, precision } => format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }),
         IrConversionRegister::Integer { index, wide } => format!("{}{index}", if wide { 'x' } else { 'w' }),
     };
     if let Some(bits) = fractional_bits {
@@ -466,13 +485,13 @@ fn render_int_float_conversion(destination: IrConversionRegister, source: IrConv
             (IrConversionRegister::Float { precision, .. }, IrConversionRegister::Integer { wide, .. }) => {
                 let mnemonic = if signed { "scvtf" } else { "ucvtf" };
                 let width = if wide { 64 } else { 32 };
-                let precision_name = match precision { IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
+                let precision_name = match precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
                 format!("{} = {mnemonic}_fixed{width}({}, fractional_bits={bits}); /* {precision_name}; FPCR rounding mode applies */", register(destination), register(source))
             }
             (IrConversionRegister::Integer { wide, .. }, IrConversionRegister::Float { precision, .. }) => {
                 let mnemonic = if signed { "fcvtzs" } else { "fcvtzu" };
                 let width = if wide { 64 } else { 32 };
-                let precision_name = match precision { IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
+                let precision_name = match precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
                 format!("{} = {mnemonic}_fixed{width}({}, fractional_bits={bits}); /* {precision_name}; truncates toward zero; out-of-range result is architecture-specific */", register(destination), register(source))
             }
             _ => format!("{} = fixed_conversion({});", register(destination), register(source)),
@@ -480,7 +499,7 @@ fn render_int_float_conversion(destination: IrConversionRegister, source: IrConv
     }
     match (destination, source) {
         (IrConversionRegister::Float { precision, .. }, IrConversionRegister::Integer { wide, .. }) => {
-            let destination_type = match precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" };
+            let destination_type = match precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" };
             let source_type = format!("{}int{}_t", if signed { "" } else { "u" }, if wide { 64 } else { 32 });
             format!("{} = ({destination_type})({source_type}){};", register(destination), register(source))
         }
@@ -1329,22 +1348,22 @@ impl IrOperation {
             Self::ScalarFloatImmediate { destination, precision, bits, immediate } => {
                 let value = scalar_float_literal(bits, precision);
                 flow.write_v(destination as u32, Some(VKnownValue { value: bits as u128, origins: vec![pc] }));
-                let register = match precision { IrFloatPrecision::Single => format!("s{destination}"), IrFloatPrecision::Double => format!("d{destination}") };
+                let register = match precision { IrFloatPrecision::Half => format!("h{destination}"), IrFloatPrecision::Single => format!("s{destination}"), IrFloatPrecision::Double => format!("d{destination}") };
                 Some(format!("{register} = {value}; /* fmov immediate=0x{immediate:02x}; constant={bits:#x} proven_by=[{pc:#x}] */"))
             }
             Self::ScalarFloatMove { destination, source, precision } => {
                 let source_value = flow.read_v(source as u32);
                 let known = source_value.and_then(|value| {
-                    let bits = match precision { IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value as u64 };
+                    let bits = match precision { IrFloatPrecision::Half => u64::from(value.value as u16), IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value as u64 };
                     Some(VKnownValue { value: bits as u128, origins: combine_origins(&value.origins, &[], pc)? })
                 });
                 flow.write_v(destination as u32, known.clone());
-                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 Some(format!("{} = {};{}", register(destination), register(source), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default()))
             }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
                 flow.write_v(destination as u32, None);
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let expression = match operator {
                     IrFloatBinaryOperator::Add => format!("{} + {}", register(left), register(right)),
                     IrFloatBinaryOperator::Subtract => format!("{} - {}", register(left), register(right)),
@@ -1364,7 +1383,7 @@ impl IrOperation {
             }
             Self::ScalarFloatUnary { destination, source, precision, operator } => {
                 flow.write_v(destination as u32, None);
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let function = match operator {
                     IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint",
                     IrFloatUnaryOperator::ReciprocalEstimate => "frecpe", IrFloatUnaryOperator::ReciprocalSqrtEstimate => "frsqrte",
@@ -1380,7 +1399,7 @@ impl IrOperation {
             Self::ScalarFloatMultiplyAdd(operation) => {
                 flow.write_v(operation.destination as u32, None);
                 let IrFloatMultiplyAdd { destination, left, right, addend, precision, subtract_product, negate_result } = operation;
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let function = match (subtract_product, negate_result) {
                     (false, false) => "fmadd", (true, false) => "fmsub",
                     (false, true) => "fnmadd", (true, true) => "fnmsub",
@@ -1395,7 +1414,7 @@ impl IrOperation {
                     let input = flow.read_v(if take_true { if_true } else { if_false } as u32)?;
                     let predicate_origins = if condition == IrFlagPredicate::Always { &[][..] }
                         else { flow.flag_origins.as_deref()? };
-                    let value = match precision { IrFloatPrecision::Single => u128::from(input.value as u32), IrFloatPrecision::Double => u128::from(input.value as u64) };
+                    let value = match precision { IrFloatPrecision::Half => u128::from(input.value as u16), IrFloatPrecision::Single => u128::from(input.value as u32), IrFloatPrecision::Double => u128::from(input.value as u64) };
                     Some(VKnownValue { value, origins: combine_origins(&input.origins, predicate_origins, pc)? })
                 });
                 flow.write_v(destination as u32, known.clone());
@@ -1403,7 +1422,7 @@ impl IrOperation {
                 Some(format!("{} = {} ? {} : {};{evidence}", register(destination), flag_predicate_name(condition), register(if_true), register(if_false)))
             }
             Self::ScalarFloatCompare { left, right, precision } => {
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let right_text = right.map(register).unwrap_or_else(|| "#0.0".into());
                 let left_value = flow.read_v(left as u32);
                 let right_value = right.map(|index| flow.read_v(index as u32)).unwrap_or(Some(VKnownValue { value: 0, origins: Vec::new() }));
@@ -1413,8 +1432,8 @@ impl IrOperation {
             }
             Self::ScalarFloatConvert { destination, destination_precision, source, source_precision } => {
                 flow.write_v(destination as u32, None);
-                let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                Some(format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source)))
+                let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                Some(format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source)))
             }
             Self::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
                 match destination {
@@ -4795,7 +4814,7 @@ fn decode(word: u32, pc: u64) -> Operation {
     }
     // FMOV scalar immediate; expand the architectural imm8 into IEEE bits.
     // The expansion follows LLVM's AArch64 VFPExpandImm implementation.
-    if word & 0xff20_1fe0 == 0x1e20_1000 {
+    if word & 0xff20_1fe0 == 0x1e20_1000 && word & (1 << 23) == 0 {
         let precision = if word & (1 << 22) == 0 { IrFloatPrecision::Single } else { IrFloatPrecision::Double };
         let immediate = ((word >> 13) & 0xff) as u8;
         let sign = (immediate as u64 >> 7) & 1;
@@ -4815,6 +4834,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                 | (if exponent & 4 != 0 { 0xff << 54 } else { 0 })
                 | (((exponent & 3) as u64) << 52)
                 | (mantissa << 48),
+            IrFloatPrecision::Half => return Operation::Opaque,
         };
         return Operation::ScalarFloatImmediate { destination: (word & 31) as u8, precision, bits, immediate };
     }
@@ -4951,6 +4971,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         let precision = match (word >> 22) & 3 {
             0 => IrFloatPrecision::Single,
             1 => IrFloatPrecision::Double,
+            3 => IrFloatPrecision::Half,
             _ => return Operation::Opaque,
         };
         return Operation::ScalarFloatSelect {
@@ -4969,6 +4990,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         let precision = match (word >> 22) & 3 {
             0 => IrFloatPrecision::Single,
             1 => IrFloatPrecision::Double,
+            3 => IrFloatPrecision::Half,
             _ => return Operation::Opaque,
         };
         return Operation::ScalarFloatMultiplyAdd(IrFloatMultiplyAdd {
@@ -4989,6 +5011,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         let precision = match (word >> 22) & 3 {
             0 => IrFloatPrecision::Single,
             1 => IrFloatPrecision::Double,
+            3 => IrFloatPrecision::Half,
             _ => return Operation::Opaque,
         };
         let operator = match word & 0xff20_fc00 {
@@ -5016,6 +5039,7 @@ fn decode(word: u32, pc: u64) -> Operation {
         let precision = match (word >> 22) & 3 {
             0 => IrFloatPrecision::Single,
             1 => IrFloatPrecision::Double,
+            3 => IrFloatPrecision::Half,
             _ => return Operation::Opaque,
         };
         return Operation::ScalarFloatCompare {
@@ -6655,11 +6679,11 @@ impl Operation {
             Self::FmovToVector { dst_v, src, precision } => {
                 let source = flow.read(src);
                 let known = source.and_then(|value| {
-                    let bits = match precision { IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value };
+                    let bits = match precision { IrFloatPrecision::Half => u64::from(value.value as u16), IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value };
                     Some(VKnownValue { value: bits as u128, origins: combine_origins(&value.origins, &[], pc)? })
                 });
                 flow.write_v(dst_v as u32, known.clone());
-                let name = match precision { IrFloatPrecision::Single => format!("s{dst_v}"), IrFloatPrecision::Double => format!("d{dst_v}") };
+                let name = match precision { IrFloatPrecision::Half => format!("h{dst_v}"), IrFloatPrecision::Single => format!("s{dst_v}"), IrFloatPrecision::Double => format!("d{dst_v}") };
                 format!("{name} = fmov({});{}", src.name(), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default())
             }
             Self::FmovImm { vd, arrangement } => {
@@ -6670,11 +6694,11 @@ impl Operation {
             Self::ScalarFloatMove { destination, source, precision } => {
                 let source_value = flow.read_v(source as u32);
                 let known = source_value.and_then(|value| {
-                    let bits = match precision { IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value as u64 };
+                    let bits = match precision { IrFloatPrecision::Half => u64::from(value.value as u16), IrFloatPrecision::Single => u64::from(value.value as u32), IrFloatPrecision::Double => value.value as u64 };
                     Some(VKnownValue { value: bits as u128, origins: combine_origins(&value.origins, &[], pc)? })
                 });
                 flow.write_v(destination as u32, known.clone());
-                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 format!("{} = {};{}", register(destination), register(source), known.as_ref().map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default())
             }
             Self::ScalarFloatUnary { destination, source, precision, operator } => {
@@ -6685,7 +6709,7 @@ impl Operation {
                 // becomes an unknown barrier; provenance is not carried.
                 flow.write_v(operation.destination as u32, None);
                 let IrFloatMultiplyAdd { destination, left, right, addend, precision, subtract_product, negate_result } = operation;
-                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let function = match (subtract_product, negate_result) {
                     (false, false) => "fmadd", (true, false) => "fmsub",
                     (false, true) => "fnmadd", (true, true) => "fnmsub",
@@ -6694,7 +6718,7 @@ impl Operation {
             }
             Self::ScalarFloatImmediate { destination, precision, bits, immediate } => {
                 flow.write_v(destination as u32, Some(VKnownValue { value: bits as u128, origins: vec![pc] }));
-                let register = match precision { IrFloatPrecision::Single => format!("s{destination}"), IrFloatPrecision::Double => format!("d{destination}") };
+                let register = match precision { IrFloatPrecision::Half => format!("h{destination}"), IrFloatPrecision::Single => format!("s{destination}"), IrFloatPrecision::Double => format!("d{destination}") };
                 format!("{register} = {}; /* fmov immediate=0x{immediate:02x}; constant={bits:#x} proven_by=[{pc:#x}] */", scalar_float_literal(bits, precision))
             }
             Self::ScalarFloatBinary { destination, left, right, precision, operator } => {
@@ -6708,8 +6732,8 @@ impl Operation {
             }
             Self::ScalarFloatConvert { destination, destination_precision, source, source_precision } => {
                 flow.write_v(destination as u32, None);
-                let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
-                format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source))
+                let register = |precision, index| format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                format!("{} = ({}){};", register(destination_precision, destination), match destination_precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" }, register(source_precision, source))
             }
             Self::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
                 match destination {
@@ -7710,7 +7734,7 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, render, scalar_float_compare_flags, Flow, IrFloatPrecision};
+    use super::{decode, render, scalar_float_compare_flags, f16_to_f32_bits, Flow, IrFloatPrecision, Operation};
 
     fn lift(word: u32, pc: u64) -> String {
         decode(word, pc).render(&mut Flow::new(), pc)
@@ -7725,6 +7749,52 @@ mod tests {
         assert!(report.contains("0x0000000000001004  w0 = w0 + 0x1;"));
         assert!(report.contains("0x0000000000001008  w0 = w0 + w1;"));
         assert!(report.contains("return /* ABI result register x0"));
+    }
+
+    #[test]
+    fn scalar_float16_arithmetic_lifts_to_shared_ir() {
+        let cases = [
+            (0x1ee2_2820, "h0 = h1 + h2;"),
+            (0x1ee2_3820, "h0 = h1 - h2;"),
+            (0x1ee2_0820, "h0 = h1 * h2;"),
+            (0x1ee2_1820, "h0 = h1 / h2;"),
+            (0x1ee2_4820, "h0 = fmax(h1, h2);"),
+            (0x1ee2_5820, "h0 = fmin(h1, h2);"),
+            (0x1ee2_6820, "h0 = fmaxnm(h1, h2);"),
+            (0x1ee2_7820, "h0 = fminnm(h1, h2);"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
+    }
+
+    #[test]
+    fn scalar_float16_compare_and_select_lift_to_shared_ir() {
+        let cmp = lift(0x1ee2_2020, 0x1000);
+        assert!(cmp.contains("h1"), "{cmp}");
+        assert!(!cmp.contains("target-specific"), "{cmp}");
+        let csel = lift(0x1ee2_0c20, 0x1000);
+        assert!(csel.contains("h0"), "{csel}");
+        assert!(!csel.contains("target-specific"), "{csel}");
+    }
+
+    #[test]
+    fn f16_to_f32_bits_matches_ieee754_half_precision() {
+        assert_eq!(f16_to_f32_bits(0x0000), 0x0000_0000); // +0.0
+        assert_eq!(f16_to_f32_bits(0x8000), 0x8000_0000); // -0.0
+        assert_eq!(f16_to_f32_bits(0x3c00), 0x3f80_0000); // 1.0
+        assert_eq!(f16_to_f32_bits(0xbc00), 0xbf80_0000); // -1.0
+        assert_eq!(f16_to_f32_bits(0x7c00), 0x7f80_0000); // +inf
+        assert_eq!(f16_to_f32_bits(0xfc00), 0xff80_0000); // -inf
+    }
+
+    #[test]
+    fn scalar_float16_fmov_immediate_stays_opaque() {
+        assert!(matches!(decode(0x1eee_1000, 0x1000), Operation::Opaque));
     }
 
     #[test]
@@ -9839,7 +9909,7 @@ mod fcsel_tests {
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("barrier=all_gprs"), "{report}");
         }
-        for word in [0x1ea2_0c20, 0x1ee2_0c20, 0x9e22_0c20, 0x3e22_0c20, 0x5e22_0c20, 0x1e02_0c20, 0x1e22_0420, 0x1e22_2820, 0x1e62_2020] {
+        for word in [0x1ea2_0c20, 0x9e22_0c20, 0x3e22_0c20, 0x5e22_0c20, 0x1e02_0c20, 0x1e22_0420, 0x1e22_2820, 0x1e62_2020] {
             assert!(!matches!(lift_operation(decode(word, 0x1000), 0x1000), IrOperation::ScalarFloatSelect { .. }), "{word:#x}");
         }
     }

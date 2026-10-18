@@ -40,6 +40,7 @@ fn fp(index: u8) -> usize {
 
 fn float_bits(precision: IrFloatPrecision) -> u8 {
     match precision {
+        IrFloatPrecision::Half => 16,
         IrFloatPrecision::Single => 32,
         IrFloatPrecision::Double => 64,
     }

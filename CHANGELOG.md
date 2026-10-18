@@ -9,6 +9,8 @@
 
 # Unreleased — Decompiler SSA and scalar FP foundation
 
+- Lift half-precision scalar FP add, subtract, multiply, divide, minimum/maximum (`FMAX`/`FMIN`/`FMAXNM`/`FMINNM`), comparisons, and conditional select into shared IR with a `Half` precision variant; a manual f16→f32 bit conversion supports constant materialization and comparison. Half-precision vector arithmetic and remaining reciprocal-exponent forms stay opaque. No report field or engine-identity change.
+
 - Replace text-derived pseudocode parameter flow with bounded shared-IR entry identities, width-specific register views, CFG must-joins, frame spills/restores and paired-write invalidation. Separate input/output names and record join/limit reasons.
 - Correct scalar pre-indexed access rendering and capture original effective addresses for overlapping-base pair loads. Six Apple-assembled functions qualify pseudocode names/effects with 1,560 original-native result checks; reconstructed-source equivalence remains open.
 - Advance analysis/cache identity to `arm64-analysis-v89-schema122` and statement banner to v54; transport/cache schemas remain unchanged.
