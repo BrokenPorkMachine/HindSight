@@ -5223,18 +5223,16 @@ fn decode(word: u32, pc: u64) -> Operation {
         }
     }
     // Advanced SIMD two-register reciprocal estimate (FRECPE/FRSQRTE).
-    // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q=1 (vector); U=0 FRECPE, U=1 FRSQRTE.
-    if word & 0x9f00_fc00 == 0x0e00_d800 && word & 0x4000_0000 != 0 {
-        // This lift models only the architecturally encoded single- and
-        // double-precision arrangements (size=10/11). Half-precision and
-        // reserved size encodings must not inherit this operation's effects.
+    // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q selects Quad (1) or Double (0).
+    // Only single/double precision (size=10/11) are modeled; half/reserved sizes stay opaque.
+    if word & 0x9f00_fc00 == 0x0e00_d800 {
         if (word >> 22) & 3 < 2 { return Operation::Opaque; }
         let operator = if word & 0x2000_0000 != 0 {
             IrVectorFloatUnaryOperator::ReciprocalSqrtEstimate
         } else {
             IrVectorFloatUnaryOperator::ReciprocalEstimate
         };
-        let width = IrSimdWidth::Quad;
+        let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
         let destination = IrSimdRegister { index: (word & 31) as u8, width };
         let source = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
         return Operation::VectorFloatUnary { destination, source, operator };
@@ -7972,6 +7970,10 @@ mod tests {
             (0x4ee1_d820, "q0 = frecpe(q1);"),
             (0x6ea1_d820, "q0 = frsqrte(q1);"),
             (0x6ee1_d820, "q0 = frsqrte(q1);"),
+            (0x0ea1_d820, "d0 = frecpe(d1);"),
+            (0x0ee1_d820, "d0 = frecpe(d1);"),
+            (0x2ea1_d820, "d0 = frsqrte(d1);"),
+            (0x2ee1_d820, "d0 = frsqrte(d1);"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
@@ -7979,10 +7981,6 @@ mod tests {
             let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("target-specific"), "{report}");
-        }
-        // Q=0 (D) forms stay opaque
-        for word in [0x0ea1_d820u32, 0x0ee1_d820, 0x2ea1_d820, 0x2ee1_d820] {
-            assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
         }
     }
 
