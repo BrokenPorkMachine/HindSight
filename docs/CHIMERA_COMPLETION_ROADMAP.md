@@ -266,7 +266,7 @@ Dependencies: C00/C01 contracts; format work serves reconstruction after the fir
 - [x] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers): bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied.
 - [ ] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host).
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
-- [ ] Standalone COFF objects.
+- [~] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs). *(in progress — claimed; do not start independently)*
 - [ ] PDB validation.
 - [ ] Authenticode validation.
 - [ ] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification.

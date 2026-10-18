@@ -121,7 +121,7 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [ ] Linux native process attach (environmental gate; requires a Linux qualification host).
 - [x] Bounded PE32/PE32+ image ingestion for Windows-oriented static projects (i386, x86-64, AArch64): preferred-base mappings, entry points, file-backed/zero-fill separation, disassembly, CFG candidates, strings and verified paging.
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
-- [ ] Standalone COFF objects.
+- [~] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs). **In progress — claimed; do not start independently.**
 - [ ] PDB validation.
 - [ ] Authenticode validation.
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).
