@@ -175,7 +175,7 @@ Dependencies: C00/C00N seed the library and layouts; iterate with C03/C04 for in
 - [~] Preserve native C declarations, Objective-C property/ivar attributes and actual compiler field layouts while propagating them into parameters, locals, fields, method declarations and expressions. *(in progress — claimed)*
 - [~] Solve types bidirectionally across SSA, calls, returns, casts, loads/stores, and pointer arithmetic, separating machine representation, semantic type, and source spelling. *(in progress — claimed)*
 - [~] Infer stack/global/pointer-relative aggregate layouts and fields from width/offset/use/lifetime/alias evidence; retain incompatible layouts and alternatives. *(in progress — claimed)*
-- [ ] Recover signedness, nullability, mutability, constness, ownership, and lifetime only to the degree supported by evidence.
+- [~] Recover signedness, nullability, mutability, constness, ownership, and lifetime only to the degree supported by evidence. *(in progress — claimed)*
 
 Acceptance: held-out fixture types/layouts match the source oracle where determined; incompatible constraints remain inspectable and never disappear through silent casts.
 
