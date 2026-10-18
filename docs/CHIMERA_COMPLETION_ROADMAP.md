@@ -213,7 +213,7 @@ Dependencies: C02–C05, C07.
 
 - [~] Build typed regions for nested conditions, short circuit/ternaries, guards/early exits, loops, multi-exit regions, switches/defaults/fallthrough, tails, and supported exception constructs. *(in progress — claimed)*
 - [~] Use induction/bounds evidence for `for` and normalized switch indices; represent irreducible regions explicitly. *(in progress — claimed)*
-- [ ] Regenerate and compare CFG and effects from the source AST after each structural transform.
+- [~] Regenerate and compare CFG and effects from the source AST after each structural transform. *(in progress — claimed)*
 
 Acceptance: nested and optimized fixtures retain all reachable exits and side effects; no extra edge or removed case is justified solely by a pretty rendering.
 
