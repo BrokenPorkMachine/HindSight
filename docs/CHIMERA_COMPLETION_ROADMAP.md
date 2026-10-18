@@ -150,7 +150,7 @@ Acceptance: known-source fixture CFGs agree, including disconnected/unreachable 
 Dependencies: C01, C02.
 
 - [~] Promote GPR SSA evidence to canonical structured definitions, uses, phis, and value IDs with W/X, SP, vector lanes, FP, and flags. *(in progress — claimed)*
-- [ ] Add memory SSA, call clobbers, ordered/volatile/atomic effects, and conservative alias partitions for frame objects, globals, constants, heap, and escaped/unknown memory.
+- [~] Add memory SSA, call clobbers, ordered/volatile/atomic effects, and conservative alias partitions for frame objects, globals, constants, heap, and escaped/unknown memory. *(in progress — claimed)*
 - [ ] Prove frame adjustments and saved-register behavior; handle dynamic alignment, overlapping slots, spills, and lifetimes.
 - [ ] Preserve instruction origins through SSA transforms, copies, merges, and dead-value elimination; bound fixed points and publish exhaustion reasons.
 
