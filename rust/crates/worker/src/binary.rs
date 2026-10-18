@@ -15,6 +15,8 @@ use std::{
 };
 #[path = "compression.rs"]
 mod compression;
+#[path = "formats.rs"]
+mod formats;
 const SCAN: usize = 4 * 1024 * 1024;
 const TEXT: usize = 60_000;
 fn bad(s: &str) -> io::Error {
@@ -47,7 +49,7 @@ impl Options {
             base: number(&args[2])?,
             offset: number(&args[3])?,
         };
-        if !["auto", "macho", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
+        if !["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
             || !["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
                 .contains(&o.architecture.as_str())
         {
@@ -156,6 +158,8 @@ struct Symbol {
 }
 #[derive(Debug)]
 struct Image {
+    format: &'static str,
+    entries: Vec<u64>,
     arch: Arch,
     origin: u64,
     length: u64,
@@ -270,6 +274,8 @@ fn thin(file: &mut File, origin: u64, length: u64, o: &Options) -> io::Result<Im
     range(header, nb, length)?;
     let window = read(file, origin + header, nb as usize)?;
     let mut image = Image {
+        format: "Mach-O",
+        entries: vec![],
         arch,
         origin,
         length,
@@ -496,6 +502,15 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     let size = file.metadata()?.len();
     range(o.offset, 1, size)?;
     let header = read(file, o.offset, (size - o.offset).min(32) as usize)?;
+    if matches!(o.format.as_str(), "auto" | "elf") && header.starts_with(b"\x7fELF") {
+        return formats::elf(file, o);
+    }
+    if matches!(o.format.as_str(), "auto" | "pe") && header.starts_with(b"MZ") {
+        return formats::pe(file, o);
+    }
+    if matches!(o.format.as_str(), "elf" | "pe") {
+        return Err(bad("Selected format does not match the image header"));
+    }
     if o.format != "raw" && magic(&header).is_some() {
         return thin(file, o.offset, size - o.offset, o);
     }
@@ -635,6 +650,8 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     }
     add(o.base, length)?;
     Ok(Image {
+        format: "Raw",
+        entries: vec![],
         arch,
         origin: o.offset,
         length,
@@ -746,7 +763,7 @@ fn code_ready(image: &Image) -> io::Result<()> {
         ));
     }
     if image.be {
-        return Err(bad("Big-endian Mach-O metadata parsed; instruction decoding for this byte order is unavailable"));
+        return Err(bad("Big-endian metadata parsed; instruction decoding for this byte order is unavailable"));
     }
     Ok(())
 }
@@ -864,7 +881,8 @@ pub fn describe(
             format!("{} raw image", o.format)
         } else {
             format!(
-                "Mach-O {} {}",
+                "{} {} {}",
+                i.format,
                 i.bits,
                 if i.be { "big-endian" } else { "little-endian" }
             )
@@ -1329,7 +1347,7 @@ fn function_starts(file: &mut File, i: &Image) -> io::Result<BTreeSet<u64>> {
     Ok(out)
 }
 fn entry_points(i: &Image) -> io::Result<Vec<u64>> {
-    let mut out = vec![];
+    let mut out = i.entries.clone();
     for (cmd, p) in &i.commands {
         if *cmd == 0x80000028 {
             if p.len() != 24 {
@@ -2790,7 +2808,7 @@ const REPORT_TEXT_FIELDS: &[&str] = &[
 pub fn legacy_arm64(path: &str, o: &Options) -> bool {
     if o.offset != 0
         || o.base != 0
-        || o.format == "raw"
+        || !matches!(o.format.as_str(), "auto" | "macho" | "sepos")
         || !matches!(o.architecture.as_str(), "auto" | "aarch64")
     {
         return false;

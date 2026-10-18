@@ -108,8 +108,10 @@
 
 ### 0.6.1 — Binary Format Expansion (in progress)
 - [x] Mach-O 32/64 (Intel + AArch64), ARM32/Thumb-2 for SEPOS composites.
-- [ ] ELF ingestion and Linux process workflows (static analysis first, then native attach).
-- [ ] PE/COFF ingestion and Windows-oriented static projects.
+- [x] Bounded ELF32/ELF64 executable/shared-image static ingestion (i386, x86-64, AArch64): validated load/section mappings, sectionless images, entry points, disassembly, CFG candidates, strings, verified paging and project capture. Big-endian images remain metadata-only.
+- [ ] ELF symbol/dynamic-link/relocation recovery, relocatable objects, and Linux native process attach.
+- [x] Bounded PE32/PE32+ image ingestion for Windows-oriented static projects (i386, x86-64, AArch64): preferred-base mappings, entry points, file-backed/zero-fill separation, disassembly, CFG candidates, strings and verified paging.
+- [ ] Standalone COFF objects, PE imports/exports/relocations, PDB and Authenticode validation.
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).
 - [ ] Import/export of common reversing artifacts (Ghidra/IDA/Binary Ninja interop) rather than forced ecosystem lock-in.
 

@@ -931,11 +931,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let alert = NSAlert()
         alert.messageText = "Import \(url.lastPathComponent)"
-        alert.informativeText = "Mach-O uses validated header addresses. Raw firmware needs an explicit architecture and load address. For composite SEPI, choose an image offset; Auto selects the first validated embedded Mach-O."
+        alert.informativeText = "Mach-O, ELF and PE use validated header addresses. Raw firmware needs an explicit architecture and load address. For composite SEPI, choose an image offset; Auto selects the first validated embedded Mach-O."
         alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
         let format = NSPopUpButton(frame: .zero, pullsDown: false)
-        let formats = ["auto", "macho", "sepos", "securerom", "iboot", "raw"]
-        format.addItems(withTitles: ["Auto / composite", "Mach-O", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary"])
+        let formats = ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"]
+        format.addItems(withTitles: ["Auto / composite", "Mach-O", "ELF (static)", "PE/COFF image (static)", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary"])
         let architecture = NSPopUpButton(frame: .zero, pullsDown: false)
         let architectures = ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
         architecture.addItems(withTitles: ["From header (ARM32 defaults to Thumb-2)", "AArch64", "Intel 32-bit", "Intel 64-bit", "ARM32", "Thumb-2"])

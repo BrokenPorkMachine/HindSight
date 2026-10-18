@@ -11,7 +11,7 @@ struct BinaryImportOptions: Codable, Equatable {
         return UInt64(text)
     }
     var validated: BinaryImportOptions? {
-        guard ["auto", "macho", "sepos", "securerom", "iboot", "raw"].contains(format),
+        guard ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"].contains(format),
               ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"].contains(architecture),
               let address = Self.number(load_address), let offset = Self.number(file_offset),
               offset < 8_589_934_592 else { return nil }
