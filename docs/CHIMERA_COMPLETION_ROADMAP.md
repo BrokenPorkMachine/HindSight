@@ -139,7 +139,7 @@ Dependencies: C00 and C00N seed identity/boundaries; C01 effects complete the CF
 
 - [~] Reconcile symbol, unwind, export, runtime, direct-call, prologue, thunk, tail-call, and cross-reference evidence for stripped/optimized code; retain competing boundaries and cold fragments. *(in progress — claimed)*
 - [~] Canonicalize per-function CFG with reachability, dominators/post-dominators, loop forest, control dependence, exceptional exits, and unknown successors. *(in progress — claimed)*
-- [ ] Recover indirect destinations and switch data paths with bounds/range/index-normalization proof; retain explicit unresolved targets.
+- [~] Recover indirect destinations and switch data paths with bounds/range/index-normalization proof; retain explicit unresolved targets. *(in progress — claimed)*
 
 Acceptance: known-source fixture CFGs agree, including disconnected/unreachable code, tails, exceptional paths, and optimized switch lowering; no missing path is silently treated as a function return.
 
