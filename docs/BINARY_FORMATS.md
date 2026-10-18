@@ -61,8 +61,9 @@ mappings. ELF tables have a 256-entry limit; PE has a 96-section limit. Existing
 The structural backend supplies instruction previews, selected-section CFG and
 direct-call candidates, strings, pointer candidates, address-bearing evidence,
 and SHA-256-verified instruction paging. It does not apply relocations, recover
-PE symbols/imports/exports, sectionless ELF dynamic symbols or relocations, provide semantic decompilation, or
-execute/attach to Linux or Windows processes. PIE and ASLR addresses remain
+PE symbols, provide semantic decompilation, or execute/attach to Linux or
+Windows processes. PE imports, exports and base relocations are recovered as
+bounded evidence, as are sectionless ELF dynamic symbols or relocations. PIE and ASLR addresses remain
 preferred image addresses until runtime mapping evidence exists. Decoding uses
 the existing LLVM availability requirements.
 
