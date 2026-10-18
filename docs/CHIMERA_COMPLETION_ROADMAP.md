@@ -113,7 +113,7 @@ Dependencies: C00. Extend semantics as each corpus slice requires; full ISA qual
 - [~] Build an IR interpreter and strict C17 emitter with checked guest-memory helpers and explicit imports/intrinsics. Preserve ordering and side effects. *(in progress — claimed)*
 - [~] Connect the Darwin native support runtime and record reusable macOS/iOS semantic qualifications with explicit ABI/environment deltas. *(in progress — claimed)*
 - [~] Differential-test semantics against hardware or a qualified independent engine; exercise reserved and neighboring encodings and architectural edge cases. *(in progress — claimed)*
-- [ ] Replace text reparsing in reconstruction consumers with structured effects.
+- [~] Replace text reparsing in reconstruction consumers with structured effects. *(in progress — claimed)*
 - [ ] Render named/typed low-level pseudocode directly from the structured effects and C00N evidence before general source recovery is complete; keep expression source ranges and explicit unresolved effects throughout.
 
 Acceptance: eligible machine-state C recompiles and agrees with original execution on recorded tests; unsupported reachable effects fail eligibility. FP/atomic/PAC claims require their dedicated state/model tests.
