@@ -247,7 +247,7 @@ Dependencies: C00; extend alongside C03–C10.
 
 - [~] Synchronize source/AST, types, SSA/memory SSA, CFG, calls, assembly, bytes, and runtime observations; one selection follows all contributing instruction spans. *(in progress — claimed)*
 - [~] Expose why/alternatives/conflicts/assumptions/blockers and variable uses at expression granularity. *(in progress — claimed)*
-- [ ] Add per-function reanalysis, analysis bounds, simplification controls, cancellation/progress, and retained completed work.
+- [~] Add per-function reanalysis, analysis bounds, simplification controls, cancellation/progress, and retained completed work. *(in progress — claimed)*
 - [ ] Export/import typed signatures, types, call graphs, annotations, AST/evidence graphs, manifests, and hashes; qualify GUI import and native adapters.
 
 Acceptance: multi-instruction expressions navigate to every origin; constants/call targets never steal the source selection. Edits trigger the correct dependent work and cancelled results retain accurate completeness.
