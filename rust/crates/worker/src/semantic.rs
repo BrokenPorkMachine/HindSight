@@ -5196,7 +5196,10 @@ fn decode(word: u32, pc: u64) -> Operation {
         let opcode = (word >> 11) & 0x1f;
         // Only recognized FP three-same opcodes proceed; others (including the
         // bitwise group that shares bit 21) fall through to their own decoders.
-        if !matches!(opcode, 0b11010 | 0b11011 | 0b11111 | 0b11110 | 0b11000) {
+        // Exclude the two-register reciprocal estimate (FRECPE/FRSQRTE) which
+        // shares opcode 0b11011 but has bits 15-10 = 0b110110.
+        if !matches!(opcode, 0b11010 | 0b11011 | 0b11111 | 0b11110 | 0b11000)
+            || (opcode == 0b11011 && (word >> 10) & 0x3f == 0b110110) {
             // fall through
         } else {
             let size = (word >> 22) & 3;
@@ -7959,6 +7962,27 @@ mod tests {
     }
 
     #[test]
+    fn vector_reciprocal_estimate_lifts_to_shared_ir() {
+        let cases = [
+            (0x4ea1_d820, "q0 = frecpe(q1);"),
+            (0x4ee1_d820, "q0 = frecpe(q1);"),
+            (0x6ea1_d820, "q0 = frsqrte(q1);"),
+            (0x6ee1_d820, "q0 = frsqrte(q1);"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
+        // Q=0 (D) forms stay opaque
+        for word in [0x0ea1_d820u32, 0x0ee1_d820, 0x2ea1_d820, 0x2ee1_d820] {
+            assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
+        }
+    }
+
+    #[test]
     fn scalar_float_arithmetic_lifts_to_shared_ir_for_single_and_double_precision() {
         let cases = [
             (0x1e22_2820, "s0 = s1 + s2;"),
@@ -10223,27 +10247,6 @@ mod reciprocal_tests {
             let report = render(&word.to_le_bytes(), 0x1000, 0, &[0x1000], &[]);
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("barrier=all_gprs"), "{report}");
-        }
-    }
-
-    #[test]
-    fn vector_reciprocal_estimate_lifts_to_shared_ir() {
-        let cases = [
-            (0x4ea1_d820, "q0 = frecpe(q1);"),
-            (0x4ee1_d820, "q0 = frecpe(q1);"),
-            (0x6ea1_d820, "q0 = frsqrte(q1);"),
-            (0x6ee1_d820, "q0 = frsqrte(q1);"),
-        ];
-        for (word, expected) in cases {
-            assert_eq!(lift(word, 0x1000), expected);
-            let code = word.to_le_bytes();
-            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
-            assert!(report.contains(expected), "{report}");
-            assert!(!report.contains("target-specific"), "{report}");
-        }
-        // Q=0 (D) forms stay opaque
-        for word in [0x0ea1_d820u32, 0x0ee1_d820, 0x2ea1_d820, 0x2ee1_d820] {
-            assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
         }
     }
 
