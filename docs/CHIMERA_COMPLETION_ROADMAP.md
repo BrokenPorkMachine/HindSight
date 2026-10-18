@@ -186,7 +186,7 @@ Dependencies: C00N establishes class/selector/property/ivar facts early; C04/C05
 Verified progress: target-local structured property/ivar layouts now feed declarations, object accessor types and bounded shared-IR-proven `self->ivar` accesses. Native-oracle fixtures qualify LP64 offsets and class/metaclass method lists; ambiguous receivers/layouts remain explicit. This does not complete general dispatch/receiver/type inference below.
 
 - [~] Complete Objective-C class/metaclass/superclass/category/protocol/ivar/property/IMP relationships, selector stubs, receiver classes, and dynamic dispatch candidate sets. *(in progress — claimed)*
-- [ ] Render validated property/ivar access, class/instance method declarations and C-style prototypes with their owning image and type/layout evidence; retain property-accessor calls when an accessor rewrite has not been justified.
+- [~] Render validated property/ivar access, class/instance method declarations and C-style prototypes with their owning image and type/layout evidence; retain property-accessor calls when an accessor rewrite has not been justified. *(in progress — claimed)*
 - [ ] Recover strings, pointer/string xrefs, CFString/CFData, globals, block captures, tagged pointers, bounds checks, ownership/runtime calls, and Foundation/CoreFoundation idioms from data flow.
 - [ ] Connect runtime observations and their validated image mappings to static hypotheses without promoting temporal proximity to causation.
 
