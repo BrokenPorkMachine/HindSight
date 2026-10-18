@@ -163,7 +163,7 @@ Dependencies: C00N names/prototypes/layouts, C02 and C03; basic library types se
 - [~] Complete Apple AAPCS64 parameter/return recovery: GP/FP banks, stack values, homogeneous/arbitrary aggregates, varargs, hidden result/context values, returns, tails, and nonreturning calls. *(in progress — claimed)*
 - [~] Build typed direct/import/tail/thunk/indirect/dispatch call edges, confidence, candidate sets, and caller/callee navigation. *(in progress — claimed)*
 - [~] Compute effects, clobbers, memory, ownership/allocation, throws/nonreturn, arguments/returns, and target summaries; iterate caller/callee constraints with bounded convergence. *(in progress — claimed)*
-- [ ] Preserve prototype conflicts and per-parameter evidence; treat names, signatures, targets, and implementations as separate claims.
+- [~] Preserve prototype conflicts and per-parameter evidence; treat names, signatures, targets, and implementations as separate claims. *(in progress — claimed)*
 
 Acceptance: compiled ABI fixtures and execution agree on argument/return locations and call effects; caller constraints improve recovery without inventing indirect targets or suppressing unknown memory writes.
 
