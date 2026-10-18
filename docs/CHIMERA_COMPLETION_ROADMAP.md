@@ -294,7 +294,7 @@ Remote integration companion: [app-hosted server contract and client-readiness/p
 
 Dependencies: existing project/cache/job model. Implement affected portions with each reconstruction pass.
 
-- [ ] Version project/analysis schemas and tested migrations beyond v1; stable documented SDK/target protocol and explicit compatibility negotiation.
+- [~] Version project/analysis schemas and tested migrations beyond v1; stable documented SDK/target protocol and explicit compatibility negotiation. *(in progress — claimed)*
 - [ ] Add worker checkpoints, coordinator recovery, resumable long jobs, atomic publication, and dependency-based invalidation.
 - [ ] Enforce CI regression budgets for memory, latency, work/cardinality, queue/backpressure, cancellation, deterministic output, and the 8 GiB profile.
 
