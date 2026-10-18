@@ -232,7 +232,7 @@ Acceptance: exported projects compile under recorded flags and their address/AST
 
 Dependencies: C00/C01; expand continuously with C02–C09.
 
-- [ ] Execute original and generated code with matched ISA, ABI, inputs, mapped memory, deterministic imports, and bounds; compare returns/registers, memory writes, traps, and call events.
+- [~] Execute original and generated code with matched ISA, ABI, inputs, mapped memory, deterministic imports, and bounds; compare returns/registers, memory writes, traps, and call events. *(in progress — claimed)*
 - [ ] Exercise integer/FP boundary cases, invalid memory, random seeds, aliasing, and supported concurrency/atomic models.
 - [ ] Add bounded SMT equivalence for supported pure/region models, including assumptions, timeouts, and counterexamples.
 - [ ] Score recovered AST structure, variables/types/names, CFG/def-use/effects, recompilation, and tested behavior separately by language/optimization/feature/compiler.
