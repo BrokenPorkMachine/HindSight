@@ -145,9 +145,10 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
     let mut i = image("ELF", arch, bits, be, o, length)?;
     i.cpu = machine as u32;
     i.filetype = half(&h[16..], be) as u32;
-    if !matches!(i.filetype, 2 | 3) {
-        return Err(bad("ELF admission requires an executable or shared image; relocatable/core files are unsupported"));
+    if !matches!(i.filetype, 1 | 2 | 3) {
+        return Err(bad("ELF admission requires a relocatable object, executable, or shared image; core files are unsupported"));
     }
+    let relocatable = i.filetype == 1;
     if u32v(&h[20..], be) != 1 {
         return Err(bad("Unsupported ELF header version"));
     }
@@ -175,13 +176,19 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
     let shsize = half(&h[tail + 6..], be) as u64;
     let shnum = half(&h[tail + 8..], be) as u64;
     let names_index = half(&h[tail + 10..], be) as u64;
-    if ehsize != fixed || phnum == 0 || phnum > 256 || phsize != if bits == 64 { 56 } else { 32 } {
+    if ehsize != fixed
+        || if relocatable {
+            phnum != 0 || phoff != 0
+        } else {
+            phnum == 0 || phnum > 256 || phsize != if bits == 64 { 56 } else { 32 }
+        }
+    {
         return Err(bad("Invalid or over-budget ELF program header table"));
     }
     range(phoff, phnum * phsize, length)?;
     let table = read(file, add(o.offset, phoff)?, (phnum * phsize) as usize)?;
     let mut loads = vec![];
-    for p in table.chunks_exact(phsize as usize) {
+    for p in table.chunks_exact(phsize.max(1) as usize) {
         let kind = u32v(p, be);
         let (offset, va, filesz, memsz, permission, alignment) = if bits == 64 {
             (
@@ -221,7 +228,7 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
         loads.push((va, memsz, offset, filesz, permission));
         push(&mut i.inventory, &format!("ELF PT_LOAD VA={va:#x} memory={memsz:#x} file={offset:#x} bytes={filesz:#x} permissions={permission:#x}\n"));
     }
-    if loads.is_empty() {
+    if loads.is_empty() && !relocatable {
         return Err(bad("ELF contains no load mappings"));
     }
     if shoff != 0 {
@@ -261,8 +268,10 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
             range(offset, size, length)?;
             names = read(file, add(o.offset, offset)?, size as usize)?;
         }
-        for s in headers.chunks_exact(shsize as usize).skip(1) {
-            let (flags, va, offset, size) = fields(s);
+        let mut section_addresses = vec![None; shnum as usize];
+        let mut next_object_address = 0x1_0000u64;
+        for (section_index, s) in headers.chunks_exact(shsize as usize).enumerate().skip(1) {
+            let (flags, header_va, offset, size) = fields(s);
             let zero = u32v(&s[4..], be) == 8;
             if !zero {
                 range(offset, size, length)?;
@@ -271,7 +280,20 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
                 continue;
             }
             let executable = flags & 4 != 0;
-            if !loads.iter().any(|&(a, m, f, n, p)| {
+            let va = if relocatable {
+                let alignment = if bits == 64 { u64v(&s[48..], be) } else { u32v(&s[32..], be) as u64 };
+                if alignment > 0x10_0000 || alignment > 1 && !alignment.is_power_of_two() {
+                    return Err(bad("Invalid ELF object section alignment"));
+                }
+                let alignment = alignment.max(i.arch.unit());
+                next_object_address = next_object_address.checked_add(alignment - 1).ok_or_else(|| bad("ELF object address overflow"))? & !(alignment - 1);
+                let assigned = next_object_address;
+                next_object_address = add(assigned, size)?;
+                assigned
+            } else {
+                header_va
+            };
+            if !relocatable && !loads.iter().any(|&(a, m, f, n, p)| {
                 va >= a
                     && size <= m.saturating_sub(va - a)
                     && (zero
@@ -282,6 +304,7 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
             }) {
                 return Err(bad("ELF section disagrees with load mappings"));
             }
+            section_addresses[section_index] = Some(va);
             let index = u32v(s, be) as usize;
             let label = if names.is_empty() {
                 format!("section_{}", i.sections.len())
@@ -305,7 +328,9 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
                 },
             )?;
         }
-        elf_symbols(file, &mut i, &headers, shsize as usize)?;
+        let object_sections = if relocatable { Some(section_addresses.as_slice()) } else { None };
+        elf_symbols(file, &mut i, &headers, shsize as usize, object_sections)?;
+        elf_relocations(file, &mut i, &headers, shsize as usize, object_sections)?;
     } else if shnum != 0 || names_index != 0 {
         return Err(bad("ELF section count without section table"));
     }
@@ -341,11 +366,14 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
         }
     }
     entry(&mut i, address)?;
-    push(&mut i.inventory, "ELF static structural analysis with section-backed symbol tables; sectionless dynamic symbols, runtime linking, relocations, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
+    if relocatable {
+        push(&mut i.inventory, "ELF relocatable object sections use deterministic analysis-only addresses; symbols are rebased from section-relative values. No loader placement or relocation application is claimed.\n");
+    }
+    push(&mut i.inventory, "ELF static structural analysis with section-backed symbol and relocation tables; sectionless dynamic symbols/relocations, runtime linking, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
     Ok(i)
 }
 
-fn elf_symbols(file: &mut File, i: &mut Image, headers: &[u8], stride: usize) -> io::Result<()> {
+fn elf_symbols(file: &mut File, i: &mut Image, headers: &[u8], stride: usize, object_sections: Option<&[Option<u64>]>) -> io::Result<()> {
     let wide = i.bits == 64;
     let be = i.be;
     let mut budget = 16 * 1024 * 1024usize;
@@ -457,6 +485,7 @@ fn elf_symbols(file: &mut File, i: &mut Image, headers: &[u8], stride: usize) ->
                 continue;
             }
             let mut proven_address = false;
+            let mut resolved_value = value;
             if section_index < count {
                 let target = &headers[section_index * stride..];
                 let (flags, va) = if wide {
@@ -468,27 +497,32 @@ fn elf_symbols(file: &mut File, i: &mut Image, headers: &[u8], stride: usize) ->
                     )
                 };
                 let (_, section_size) = extent(target);
+                let object_base = object_sections.and_then(|sections| sections.get(section_index).copied().flatten());
+                let section_offset = if object_sections.is_some() { value } else { value.saturating_sub(va) };
                 // TLS values are offsets, not preferred addresses.
-                if symbol_type != 6 && flags & 2 != 0 && value >= va && value - va < section_size {
-                    if symbol_size > section_size - (value - va) {
+                if symbol_type != 6 && flags & 2 != 0
+                    && (object_sections.is_some() && object_base.is_some() && value < section_size
+                        || object_sections.is_none() && value >= va && value - va < section_size) {
+                    if symbol_size > section_size - section_offset {
                         return Err(bad("ELF symbol extent exceeds its section"));
                     }
+                    resolved_value = if let Some(base) = object_base { add(base, value)? } else { value };
                     proven_address = true;
                     if symbol_type == 2
                         && flags & 4 != 0
-                        && value % i.arch.unit() == 0
-                        && i.sections.iter().any(|s| s.executable && s.contains(value))
+                        && resolved_value % i.arch.unit() == 0
+                        && i.sections.iter().any(|s| s.executable && s.contains(resolved_value))
                     {
                         i.foreign
                             .functions
-                            .push((value, label.clone(), source.into()));
+                            .push((resolved_value, label.clone(), source.into()));
                     }
                 } else if symbol_type == 2 && flags & 2 != 0 {
                     return Err(bad("ELF function symbol lies outside its declared section"));
                 }
             }
             let row = if proven_address {
-                format!("0x{value:016x} name={label} source={source} type={symbol_type} binding={binding} visibility={visibility} section={section_index}\n")
+                format!("0x{resolved_value:016x} name={label} source={source} type={symbol_type} binding={binding} visibility={visibility} section={section_index}{}\n", if object_sections.is_some() { " address=analysis-only-section-rebase" } else { "" })
             } else {
                 format!("name={label} value={value:#x} source={source} type={symbol_type} binding={binding} section={section_index}; address unresolved\n")
             };
@@ -499,6 +533,75 @@ fn elf_symbols(file: &mut File, i: &mut Image, headers: &[u8], stride: usize) ->
         }
     }
     push(&mut i.inventory, &format!("ELF symbol records={} (including unnamed records); undefined names remain address-free.\n", i.foreign.symbol_count));
+    Ok(())
+}
+
+fn elf_relocations(file: &mut File, i: &mut Image, headers: &[u8], stride: usize, object_sections: Option<&[Option<u64>]>) -> io::Result<()> {
+    let wide = i.bits == 64;
+    let be = i.be;
+    let count = headers.len() / stride;
+    let extent = |s: &[u8]| -> (u64, u64) {
+        if wide { (u64v(&s[24..], be), u64v(&s[32..], be)) }
+        else { (u32v(&s[16..], be) as u64, u32v(&s[20..], be) as u64) }
+    };
+    let mut records = 0usize;
+    let mut bytes = 0usize;
+    for s in headers.chunks_exact(stride) {
+        let kind = u32v(&s[4..], be);
+        if !matches!(kind, 4 | 9) { continue; }
+        let (offset, size) = extent(s);
+        let link = u32v(&s[if wide { 40 } else { 24 }..], be) as usize;
+        let target_index = u32v(&s[if wide { 44 } else { 28 }..], be) as usize;
+        let entry_size = if wide { u64v(&s[56..], be) } else { u32v(&s[36..], be) as u64 };
+        let expected = match (wide, kind) { (true, 4) => 24, (true, 9) => 16, (false, 4) => 12, (false, 9) => 8, _ => unreachable!() };
+        if entry_size != expected || size % expected != 0 || link == 0 || link >= count || target_index >= count
+            || !matches!(u32v(&headers[link * stride + 4..], be), 2 | 11)
+            || records.saturating_add((size / expected) as usize) > 200_000
+            || bytes.saturating_add(size as usize) > 16 * 1024 * 1024 {
+            return Err(bad("Invalid or over-budget ELF relocation table"));
+        }
+        let symbol_header = &headers[link * stride..];
+        let (_, symbol_bytes) = extent(symbol_header);
+        let symbol_stride = if wide { 24 } else { 16 };
+        if symbol_bytes % symbol_stride != 0 { return Err(bad("ELF relocation links malformed symbol table")); }
+        let symbol_count = symbol_bytes / symbol_stride;
+        let target = &headers[target_index * stride..];
+        let (target_flags, target_va, _, target_size) = if wide {
+            (u64v(&target[8..], be), u64v(&target[16..], be), u64v(&target[24..], be), u64v(&target[32..], be))
+        } else {
+            (u32v(&target[8..], be) as u64, u32v(&target[12..], be) as u64, u32v(&target[16..], be) as u64, u32v(&target[20..], be) as u64)
+        };
+        range(offset, size, i.length)?;
+        let table = read(file, add(i.origin, offset)?, size as usize)?;
+        for record in table.chunks_exact(expected as usize) {
+            let relocation_offset = if wide { u64v(record, be) } else { u32v(record, be) as u64 };
+            let info = if wide { u64v(&record[8..], be) } else { u32v(&record[4..], be) as u64 };
+            let symbol = if wide { info >> 32 } else { info >> 8 };
+            let relocation_type = if wide { info & 0xffff_ffff } else { info & 0xff };
+            if symbol >= symbol_count { return Err(bad("ELF relocation symbol index outside linked table")); }
+            let object_base = object_sections.and_then(|sections| sections.get(target_index).copied().flatten());
+            if object_sections.is_some() && object_base.is_none() {
+                return Err(bad("ELF object relocation targets an unallocated section"));
+            }
+            let site = if let Some(base) = object_base {
+                if relocation_offset >= target_size { return Err(bad("ELF object relocation site outside target section")); }
+                add(base, relocation_offset)?
+            } else {
+                if target_index != 0 && target_flags & 2 != 0 && (relocation_offset < target_va || relocation_offset - target_va >= target_size) {
+                    return Err(bad("ELF relocation site outside target section"));
+                }
+                relocation_offset
+            };
+            let addend = if kind == 4 {
+                if wide { u64v(&record[16..], be) as i64 }
+                else { u32v(&record[8..], be) as i32 as i64 }
+            } else { 0 };
+            push(&mut i.foreign.relocations, &format!("0x{site:016x} ELF relocation type={relocation_type} symbol-index={symbol} addend={addend} target-section={target_index} source={}\n", if kind == 4 { "SHT_RELA" } else { "SHT_REL" }));
+            records += 1;
+        }
+        bytes += size as usize;
+    }
+    if records > 0 { push(&mut i.inventory, &format!("ELF relocation records={records}; references remain unapplied.\n")); }
     Ok(())
 }
 

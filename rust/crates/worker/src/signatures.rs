@@ -887,14 +887,15 @@ fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) ->
 fn parameter_aliases_by_instruction(
     instructions: &[(u64, String)], signature: Option<&Signature>, report: &str, address: u64,
 ) -> BTreeMap<u64, BTreeMap<String, String>> {
-    // Register names have a single source-level meaning only along a straight
-    // line. At joins and loop headers we keep the machine registers explicit.
-    if instructions.iter().any(|(_, statement)| statement.starts_with("if (") || statement.starts_with("goto ")) {
-        return BTreeMap::new();
+    if instructions.is_empty() { return BTreeMap::new(); }
+
+    fn branch_target(statement: &str) -> Option<u64> {
+        let text = statement.strip_prefix("goto 0x").or_else(|| {
+            statement.strip_prefix("if (")?.split_once(") goto 0x").map(|(_, target)| target)
+        })?;
+        u64::from_str_radix(text.trim_end_matches(';'), 16).ok()
     }
-    let mut names = parameter_names(signature, report, address);
-    let mut result = BTreeMap::new();
-    for (pc, statement) in instructions {
+    fn transfer(mut names: BTreeMap<String, String>, statement: &str) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
         let copied_name = assigned_register(statement).and_then(|destination| {
             copied_register(statement).and_then(|source| {
                 (register_bank(&source) == register_bank(&destination))
@@ -910,7 +911,6 @@ fn parameter_aliases_by_instruction(
         if let Some((destination, copied_name)) = &copied_name {
             bind_register_name(&mut instruction_names, destination, copied_name.clone());
         }
-        result.insert(*pc, instruction_names);
         if statement.starts_with("call(") {
             names.clear(); // AAPCS64 caller-saved registers may be clobbered.
         } else if let Some(destination) = assigned_register(statement) {
@@ -920,6 +920,57 @@ fn parameter_aliases_by_instruction(
                 names.remove(&format!("s{index}")); names.remove(&format!("d{index}")); names.remove(&format!("v{index}"));
             } else { names.remove(&destination); }
             if let Some((_, name)) = copied_name { bind_register_name(&mut names, &destination, name); }
+        }
+        (instruction_names, names)
+    }
+    fn intersect_names(left: &BTreeMap<String, String>, right: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        left.iter().filter_map(|(register, name)| {
+            (right.get(register) == Some(name)).then(|| (register.clone(), name.clone()))
+        }).collect()
+    }
+
+    let address_to_index = instructions.iter().enumerate()
+        .map(|(index, (pc, _))| (*pc, index)).collect::<BTreeMap<_, _>>();
+    let mut successors = vec![Vec::<usize>::new(); instructions.len()];
+    for (index, (_, statement)) in instructions.iter().enumerate() {
+        let target = branch_target(statement).and_then(|target| address_to_index.get(&target).copied());
+        if statement.starts_with("if (") {
+            if let Some(target) = target { successors[index].push(target); }
+            if index + 1 < instructions.len() { successors[index].push(index + 1); }
+        } else if statement.starts_with("goto 0x") {
+            if let Some(target) = target { successors[index].push(target); }
+        } else if !statement.starts_with("return") && index + 1 < instructions.len() {
+            successors[index].push(index + 1);
+        }
+        successors[index].sort_unstable();
+        successors[index].dedup();
+    }
+
+    // A name survives a join only when every observed predecessor carries the
+    // exact same identity. This is deliberately a must-analysis: conflicting
+    // or killed identities leave the machine register visible.
+    let mut incoming = vec![None::<BTreeMap<String, String>>; instructions.len()];
+    incoming[0] = Some(parameter_names(signature, report, address));
+    let mut queue = std::collections::VecDeque::from([0usize]);
+    while let Some(index) = queue.pop_front() {
+        let state = incoming[index].clone().unwrap_or_default();
+        let (_, outgoing) = transfer(state, &instructions[index].1);
+        for &successor in &successors[index] {
+            let merged = incoming[successor].as_ref()
+                .map(|prior| intersect_names(prior, &outgoing))
+                .unwrap_or_else(|| outgoing.clone());
+            if incoming[successor].as_ref() != Some(&merged) {
+                incoming[successor] = Some(merged);
+                if !queue.contains(&successor) { queue.push_back(successor); }
+            }
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    for (index, (pc, statement)) in instructions.iter().enumerate() {
+        if let Some(state) = incoming[index].clone() {
+            let (display, _) = transfer(state, statement);
+            result.insert(*pc, display);
         }
     }
     result
@@ -1670,10 +1721,26 @@ fn recover_internal(
         assert_eq!(substitute_parameter_names(&instructions[4].1, &aliases[&0x100c]), "return arg0_copy_x4_copy_x5;");
         assert_eq!(substitute_parameter_names("w2 = w2;", &parameter_names(Some(&signature), "", 0)), "arg0 = arg0;");
     }
-    #[test] fn parameter_aliases_stop_at_control_flow_and_calls() {
+    #[test] fn parameter_aliases_merge_across_control_flow_and_stop_at_calls() {
         let signature = symbol("_CFRelease").unwrap();
-        let branched = vec![(0x1000, "if (x0 == 0) goto 0x1008;".into()), (0x1004, "return x0;".into())];
-        assert!(parameter_aliases_by_instruction(&branched, Some(&signature), "", 0x1000).is_empty());
+        let branched = vec![
+            (0x1000, "if (x1 == 0) goto 0x1008;".into()),
+            (0x1004, "goto 0x100c;".into()),
+            (0x1008, "x1 = 1;".into()),
+            (0x100c, "return x0;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&branched, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x100c]), "return cf;");
+
+        let conflicting = vec![
+            (0x1000, "if (x1 == 0) goto 0x100c;".into()),
+            (0x1004, "x2 = x0;".into()),
+            (0x1008, "goto 0x1010;".into()),
+            (0x100c, "x2 = x1;".into()),
+            (0x1010, "return x2;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&conflicting, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1010]), "return x2;");
         let called = vec![(0x1000, "call(0x2000);".into()), (0x1004, "return x0;".into())];
         let aliases = parameter_aliases_by_instruction(&called, Some(&signature), "", 0x1000);
         assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1000]), "return cf;");

@@ -7,8 +7,10 @@ flow. The runner compiles each source at `-O0` and `-O2`, then repeats each
 build after stripping local symbols and debug data.
 
 The checks measure functions, CFG blocks, decoder coverage, reconstructed
-pseudocode presence, and parameter-name use in address-bearing function
-statements. They deliberately avoid exact pseudocode text comparisons.
+pseudocode presence, expression rows, resolved call-target rows, recovered type
+evidence, parameter-name use, and source-address mapping. They deliberately
+avoid exact pseudocode text comparisons. Every push and pull request runs the
+same corpus on a macOS CI worker.
 The Objective-C fixtures require the macOS SDK and Foundation framework.
 
 Run the corpus on macOS after building the analysis worker:

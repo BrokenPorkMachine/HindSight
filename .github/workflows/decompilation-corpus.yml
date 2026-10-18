@@ -1,0 +1,20 @@
+name: Decompilation corpus
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality-corpus:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build analysis worker
+        run: cargo build -p reworkbench-worker --manifest-path rust/Cargo.toml
+      - name: Score decompilation corpus
+        run: python3 scripts/run-decompilation-corpus.py --worker rust/target/debug/reworker

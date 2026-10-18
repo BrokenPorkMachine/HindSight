@@ -162,6 +162,7 @@ struct FormatEvidence {
     symbols: String,
     imports: String,
     exports: String,
+    relocations: String,
     symbol_count: usize,
 }
 #[derive(Debug)]
@@ -2302,7 +2303,8 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         );
     }
     push(&mut metadata,"Instruction paging/CFG uses the selected primary executable section; other sections remain available as metadata, strings and table evidence.\n");
-    let relocation_text = relocations(&mut file, &image, &symbols)?;
+    let mut relocation_text = relocations(&mut file, &image, &symbols)?;
+    push(&mut relocation_text, &image.foreign.relocations);
     let indirect = indirect_symbols(&mut file, &image, &symbols)?;
     let (export_text, export_names) = exports(&mut file, &image)?;
     for (a, name) in export_names {

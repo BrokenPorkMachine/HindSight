@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v51` banner identifies the statement set that
+`AArch64 register semantics v52` banner identifies the statement set that
 produced a preview.
 
 The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
@@ -61,8 +61,15 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v85-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v86-schema122`; the report fields
 and cache-envelope schema are unchanged.
+
+Lane-wise vector bitwise `AND`/`BIC`/`ORR`/`ORN`/`EOR`/`BSL`/`BIT`/`BIF`
+and the `MOV` alias now use shared IR. Full-width operations can fold proven
+128-bit values with bounded instruction provenance; 64-bit forms invalidate the
+destination because the current V-register model cannot represent a partial
+write without inventing the preserved high half. Replicated `MOVI.2D` constants
+also enter shared IR and can feed these operations.
 
 Non-temporal `LDNP`/`STNP` instructions use the shared pair-load/store IR. Their
 cache-policy hint does not change the represented register or memory effects,

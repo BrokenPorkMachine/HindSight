@@ -239,6 +239,7 @@ fn compare_flags(kind: IrCompareKind, left: u64, right: u64, wide: bool) -> u8 {
         | overflow as u8
 }
 
+
 fn scalar_float_compare_flags(left: u64, right: u64, precision: IrFloatPrecision) -> u8 {
     let ordering = match precision {
         IrFloatPrecision::Single => f32::from_bits(left as u32).partial_cmp(&f32::from_bits(right as u32)),
@@ -398,6 +399,32 @@ fn float_register_name(index: u8, precision: IrFloatPrecision) -> String {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide, Max, Min, MaxNum, MinNum, ReciprocalStep, ReciprocalSqrtStep }
+/// Lane-wise vector bitwise data processing. These operations combine bits
+/// without interpreting them, so they are exact at every arrangement and carry
+/// no rounding, saturation, or exception behavior. The destination-reading
+/// forms use `VectorBitwise.destination` as their third operand, so its prior
+/// value is a genuine input rather than only an output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrVectorBitwiseOperator {
+    /// `Vd = Vn & Vm` (`AND`).
+    And,
+    /// `Vd = Vn & ~Vm` (`BIC`).
+    AndNot,
+    /// `Vd = Vn | Vm` (`ORR`).
+    Or,
+    /// `Vd = Vn | ~Vm` (`ORN`).
+    OrNot,
+    /// `Vd = Vn ^ Vm` (`EOR`).
+    ExclusiveOr,
+    /// `Vd = (Vn & Vd) | (Vm & ~Vd)` (`BSL`).
+    MaskSelect,
+    /// `Vd = (Vd & ~Vm) | (Vn & Vm)` (`BIT`).
+    BitInsert,
+    /// `Vd = (Vd & Vm) | (Vn & ~Vm)` (`BIF`).
+    BitInsertIfFalse,
+    /// `Vd = Vn` — the architectural `MOV` alias of `ORR` with `Rn == Rm`.
+    Move,
+}
 /// Scalar fused multiply-add: optionally subtract the product from the addend,
 /// then optionally negate the result. Rendering retains the instruction name
 /// because FPCR rounding, NaNs, signed zero, and exceptions are not folded.
@@ -488,6 +515,13 @@ enum IrOperation {
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
     SimdLoad { destination: IrSimdRegister, address: IrMemoryAddress, writeback: Option<IrWriteback> },
     SimdStore { source: IrSimdRegister, address: IrMemoryAddress, writeback: Option<IrWriteback> },
+    /// Lane-wise vector bitwise operation. Registers carry the architectural
+    /// width: `Quad` for the 128-bit `Q` form and `Double` for the 64-bit `D`
+    /// form, because a `Q=0` encoding writes only the low 64 bits.
+    VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
+    /// `MOVI` of a replicated 8-bit immediate into a V register. The value is
+    /// the proven 128-bit bit pattern, so lane-exact folding can consume it.
+    VectorImmediate { destination: u8, value: u128, immediate: u8 },
     DirectCall { target: u64 },
     IndirectCall { target: IrRegister },
     Branch { target: u64 },
@@ -532,6 +566,9 @@ impl IrOperation {
             | Self::ScalarFloatBinary { .. } | Self::ScalarFloatUnary { .. }
             | Self::ScalarFloatMultiplyAdd(_) | Self::ScalarFloatSelect { .. } | Self::ScalarFloatCompare { .. }
             | Self::ScalarFloatConvert { .. } | Self::Branch { .. }
+            // Lane-wise vector bitwise operations write only their V-register
+            // destination and read no general-purpose register.
+            | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
             | Self::Return { target: None } => {}
             Self::Assign { destination, value } => {
                 effects.definitions = gpr_mask(destination);
@@ -675,6 +712,7 @@ impl IrOperation {
             | Self::ScalarFloatUnary { .. }
             | Self::ScalarFloatMultiplyAdd(..) | Self::ScalarFloatSelect { .. }
             | Self::SimdLoad { .. } | Self::SimdStore { .. }
+            | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
         );
         let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
         let consumed_flags = if consumes_flags {
@@ -1388,6 +1426,64 @@ impl IrOperation {
                 statement.push_str(&format!("*({ty} *)({expression}) = {};{}", simd_register_name(source), address_suffix(known.as_ref())));
                 if let Some((base, rendered, value)) = post_update { flow.write(base, value); statement.push_str(&format!(" {} = {rendered};", base.name())); }
                 Some(statement)
+            }
+            Self::VectorImmediate { destination, value, immediate } => {
+                flow.write_v(destination as u32, Some(VKnownValue { value, origins: vec![pc] }));
+                Some(format!("/* movi.2d v{destination}, #0x{immediate:02x} */"))
+            }
+            Self::VectorBitwise { destination, left, right, operator } => {
+                let left_value = flow.read_v(left.index as u32);
+                let right_value = flow.read_v(right.index as u32);
+                // The destination is also an input for the mask-driven forms.
+                let destination_value = flow.read_v(destination.index as u32);
+                // `Q=0` writes only the low 64 bits and preserves the rest of the
+                // register. Value tracking holds one known bit pattern per
+                // register, so a partial write cannot be represented exactly;
+                // the destination becomes unknown instead of claiming a value.
+                let full_register = destination.width == IrSimdWidth::Quad;
+                // Provenance uses the same bounded combination as every other
+                // fold, so an over-budget proof claims no constant at all.
+                let fold = |value: u128, operands: &[&VKnownValue]| {
+                    let rest: Vec<u64> = operands[1..].iter().flat_map(|operand| operand.origins.iter().copied()).collect();
+                    combine_origins(&operands[0].origins, &rest, pc).map(|origins| VKnownValue { value, origins })
+                };
+                let known = if !full_register {
+                    None
+                } else {
+                    match operator {
+                        IrVectorBitwiseOperator::Move => left_value.as_ref().and_then(|left| fold(left.value, &[left])),
+                        IrVectorBitwiseOperator::And => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value & right.value, &[left, right])),
+                        IrVectorBitwiseOperator::Or => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value | right.value, &[left, right])),
+                        IrVectorBitwiseOperator::ExclusiveOr => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value ^ right.value, &[left, right])),
+                        // Complement forms negate the second operand bitwise.
+                        IrVectorBitwiseOperator::AndNot => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value & !right.value, &[left, right])),
+                        IrVectorBitwiseOperator::OrNot => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value | !right.value, &[left, right])),
+                        // Both masked forms also consume the destination's prior bits.
+                        IrVectorBitwiseOperator::MaskSelect => left_value.as_ref().zip(right_value.as_ref()).zip(destination_value.as_ref())
+                            .and_then(|((left, right), destination)| fold((left.value & destination.value) | (right.value & !destination.value), &[left, right, destination])),
+                        IrVectorBitwiseOperator::BitInsert => left_value.as_ref().zip(right_value.as_ref()).zip(destination_value.as_ref())
+                            .and_then(|((left, right), destination)| fold((destination.value & !right.value) | (left.value & right.value), &[left, right, destination])),
+                        IrVectorBitwiseOperator::BitInsertIfFalse => left_value.as_ref().zip(right_value.as_ref()).zip(destination_value.as_ref())
+                            .and_then(|((left, right), destination)| fold((destination.value & right.value) | (left.value & !right.value), &[left, right, destination])),
+                    }
+                };
+                flow.write_v(destination.index as u32, known.clone());
+                let destination_name = simd_register_name(destination);
+                let left_name = simd_register_name(left);
+                let right_name = simd_register_name(right);
+                let expression = match operator {
+                    IrVectorBitwiseOperator::And => format!("{left_name} & {right_name}"),
+                    IrVectorBitwiseOperator::AndNot => format!("{left_name} & ~{right_name}"),
+                    IrVectorBitwiseOperator::Or => format!("{left_name} | {right_name}"),
+                    IrVectorBitwiseOperator::OrNot => format!("{left_name} | ~{right_name}"),
+                    IrVectorBitwiseOperator::ExclusiveOr => format!("{left_name} ^ {right_name}"),
+                    IrVectorBitwiseOperator::MaskSelect => format!("bsl({left_name}, {right_name}, {destination_name})"),
+                    IrVectorBitwiseOperator::BitInsert => format!("bit({left_name}, {right_name}, {destination_name})"),
+                    IrVectorBitwiseOperator::BitInsertIfFalse => format!("bif({left_name}, {right_name}, {destination_name})"),
+                    IrVectorBitwiseOperator::Move => left_name.clone(),
+                };
+                let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
+                Some(format!("{destination_name} = {expression};{evidence}"))
             }
             Self::DirectCall { target } => {
                 flow.clear();
@@ -2324,6 +2420,7 @@ enum Operation {
     },
     SimdLoad { destination: IrSimdRegister, base: Register, address: AddressForm },
     SimdStore { source: IrSimdRegister, base: Register, address: AddressForm },
+    VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
     LoadPair {
         dst1: Register,
         dst2: Register,
@@ -2722,6 +2819,14 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::SimdStore { source, base, address: form } => match address(base, form) {
             Some((address, writeback)) => IrOperation::SimdStore { source, address, writeback },
             None => IrOperation::TargetSpecific,
+        },
+        Operation::VectorBitwise { destination, left, right, operator } => {
+            IrOperation::VectorBitwise { destination, left, right, operator }
+        }
+        Operation::VMoveImm { vd, value } => IrOperation::VectorImmediate {
+            destination: vd,
+            value,
+            immediate: if value == 0 { 0 } else { 0xff },
         },
         Operation::LoadPair { dst1, dst2, base, offset, writeback, size, signed } => {
             let (form, update) = match writeback {
@@ -4826,6 +4931,34 @@ fn decode(word: u32, pc: u64) -> Operation {
             precision,
         };
     }
+    // Lane-wise vector bitwise data processing: `0 Q U 01110 opc 1 Rm 00011 1
+    // Rn Rd`. Bit 29 (`U`) and bits 23-22 (`opc`) select the operation —
+    // U=0 AND/BIC/ORR/ORN, U=1 EOR/BSL/BIT/BIF — and bits 15-10 are fixed at
+    // `000111`, which separates the three-same bitwise group from the
+    // three-different group sharing bits 23-22 (for example `MUL`) and from the
+    // two-register misc group. `Q` selects the 128-bit (`Q`) or 64-bit (`D`)
+    // destination view. `ORR` with `Rn == Rm` is the architectural `MOV`
+    // alias. No arrangement-dependent arithmetic or exception state is claimed.
+    if word & 0x9e20_fc00 == 0x0e20_1c00 {
+        let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
+        let destination = IrSimdRegister { index: (word & 31) as u8, width };
+        let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
+        let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
+        let float = word & 0x2000_0000 != 0;
+        let operator = match ((word >> 22) & 3, float) {
+            (0, false) => IrVectorBitwiseOperator::And,
+            (1, false) => IrVectorBitwiseOperator::AndNot,
+            (2, false) if left.index == right.index => IrVectorBitwiseOperator::Move,
+            (2, false) => IrVectorBitwiseOperator::Or,
+            (3, false) => IrVectorBitwiseOperator::OrNot,
+            (0, true) => IrVectorBitwiseOperator::ExclusiveOr,
+            (1, true) => IrVectorBitwiseOperator::MaskSelect,
+            (2, true) => IrVectorBitwiseOperator::BitInsert,
+            (3, true) => IrVectorBitwiseOperator::BitInsertIfFalse,
+            _ => return Operation::Opaque,
+        };
+        return Operation::VectorBitwise { destination, left, right, operator };
+    }
     // Vector (SIMD) data processing (0x0e...): modeled as a marker preserving
     // general-purpose value flow. These instructions operate on V registers,
     // which are not tracked precisely yet, but they do not touch the
@@ -6263,6 +6396,9 @@ impl Operation {
                     format!("{op}({}, {}, {});", base.name(), first.name(), second.name())
                 }
             }
+            Self::VectorBitwise { destination, left, right, operator } => {
+                IrOperation::VectorBitwise { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
+            }
             Self::SystemMarker { mnemonic, domain } => {
                 if mnemonic == "simd" { flow.v_registers.fill(None); }
                 match domain {
@@ -6357,18 +6493,7 @@ impl Operation {
                 )
             }
             Self::VMoveImm { vd, value } => {
-                flow.write_v(
-                    vd as u32,
-                    Some(VKnownValue {
-                        value,
-                        origins: vec![pc],
-                    }),
-                );
-                format!(
-                    "/* movi.2d v{}, #0x{:02x} */",
-                    vd,
-                    if value == 0 { 0u8 } else { 0xffu8 }
-                )
+                IrOperation::VectorImmediate { destination: vd, value, immediate: if value == 0 { 0 } else { 0xff } }.render(flow, pc).unwrap_or_default()
             }
             Self::FmovReg { dst, src_v } => {
                 let vval = flow.read_v(src_v as u32);
@@ -6741,12 +6866,8 @@ fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -
             flow.clear();
             continue;
         }
-        // SIMD immediate moves are still target-specific in the portable IR,
-        // but their tracked low lane is needed to prove scalar FP call args.
-        if matches!(operation, Operation::VMoveImm { .. }) {
-            let _ = operation.render(&mut flow, pc);
-            continue;
-        }
+        // SIMD immediate moves now lift to shared IR, so their tracked bit
+        // pattern flows through the ordinary render path.
         if matches!(operation, Operation::FmovToVector { .. }) {
             let _ = operation.render(&mut flow, pc);
             continue;
@@ -6855,7 +6976,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v51; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v52; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -9493,6 +9614,64 @@ mod reciprocal_tests {
             let report = render(&code, 0x1000, 0, &[0x1000], &[]);
             assert!(report.contains("if (eq) goto 0x1014; /* condition proven true */"), "{report}");
         }
+    }
+}
+
+#[cfg(test)]
+mod vector_bitwise_tests {
+    use super::*;
+
+    // Independently assembled with Apple's clang targeting arm64 macOS.
+    const CASES: [(u32, &str); 9] = [
+        (0x4e22_1c20, "q0 = q1 & q2;"),
+        (0x0e65_1c83, "d3 = d4 & ~d5;"),
+        (0x4ea8_1ce6, "q6 = q7 | q8;"),
+        (0x0eeb_1d49, "d9 = d10 | ~d11;"),
+        (0x6e2e_1dac, "q12 = q13 ^ q14;"),
+        (0x6e71_1e0f, "q15 = bsl(q16, q17, q15);"),
+        (0x6eb4_1e72, "q18 = bit(q19, q20, q18);"),
+        (0x6ef7_1ed5, "q21 = bif(q22, q23, q21);"),
+        (0x4eb9_1f38, "q24 = q25;"),
+    ];
+
+    #[test]
+    fn exact_vector_bitwise_encodings_lift_to_shared_ir() {
+        for (word, expected) in CASES {
+            let operation = decode(word, 0x1000);
+            let portable = lift_operation(operation, 0x1000);
+            assert!(matches!(portable, IrOperation::VectorBitwise { .. }), "{word:#x}");
+            assert_eq!(portable.render(&mut Flow::new(), 0x1000).unwrap(), expected);
+            assert!(!portable.gpr_effects().barrier);
+        }
+    }
+
+    #[test]
+    fn masked_forms_use_the_prior_destination_bits() {
+        for (word, destination, left, right, expected) in [
+            (0x6e71_1e0f, 15, 16, 17, 0xa5),
+            (0x6eb4_1e72, 18, 19, 20, 0xa0),
+            (0x6ef7_1ed5, 21, 22, 23, 0xfa),
+        ] {
+            let mut flow = Flow::new();
+            flow.write_v(destination, Some(VKnownValue { value: 0xaa, origins: vec![0xfe0] }));
+            flow.write_v(left, Some(VKnownValue { value: 0xf0, origins: vec![0xfe4] }));
+            flow.write_v(right, Some(VKnownValue { value: 0x0f, origins: vec![0xfe8] }));
+            lift_operation(decode(word, 0x1000), 0x1000).render(&mut flow, 0x1000);
+            let result = flow.read_v(destination).expect("proven vector result");
+            assert_eq!(result.value, expected, "{word:#x}");
+            assert_eq!(result.origins, vec![0xfe4, 0xfe8, 0xfe0, 0x1000]);
+        }
+    }
+
+    #[test]
+    fn low_64_bit_forms_do_not_claim_a_full_vector_constant() {
+        let mut flow = Flow::new();
+        flow.write_v(3, Some(VKnownValue { value: u128::MAX, origins: vec![0xfe0] }));
+        flow.write_v(4, Some(VKnownValue { value: 1, origins: vec![0xfe4] }));
+        flow.write_v(5, Some(VKnownValue { value: 2, origins: vec![0xfe8] }));
+        lift_operation(decode(0x0e65_1c83, 0x1000), 0x1000).render(&mut flow, 0x1000);
+        assert!(flow.read_v(3).is_none());
+        assert!(flow.read_v(4).is_some() && flow.read_v(5).is_some());
     }
 }
 

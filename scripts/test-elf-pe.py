@@ -103,8 +103,35 @@ def elf_symbols(bits=64, be=False):
     return data
 
 
+def elf_object():
+    """Minimal ELF64 ET_REL with one executable section and one function."""
+    data = bytearray(0x500)
+    data[:16] = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9)
+    struct.pack_into("<HHIQQQIHHHHHH", data, 16, 1, 62, 1, 0, 0, 0x300, 0, 64, 0, 0, 64, 6, 4)
+    data[0x100:0x108] = b"\x55\x48\x89\xe5\x5d\xc3\x90\x90"
+    strings = b"\0object_entry\0"
+    section_names = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.rela.text\0"
+    data[0x200:0x200 + len(strings)] = strings
+    data[0x240:0x240 + len(section_names)] = section_names
+
+    def section(index, name, kind, flags, offset, size, link=0, info=0, alignment=1, entry_size=0):
+        struct.pack_into("<IIQQQQIIQQ", data, 0x300 + index * 64,
+                         name, kind, flags, 0, offset, size, link, info, alignment, entry_size)
+
+    section(1, section_names.index(b".text"), 1, 6, 0x100, 8, alignment=4)
+    section(2, section_names.index(b".symtab"), 2, 0, 0x180, 48, link=3, info=1, alignment=8, entry_size=24)
+    section(3, section_names.index(b".strtab"), 3, 0, 0x200, len(strings))
+    section(4, section_names.index(b".shstrtab"), 3, 0, 0x240, len(section_names))
+    section(5, section_names.index(b".rela.text"), 4, 0, 0x220, 24, link=2, info=1, alignment=8, entry_size=24)
+    struct.pack_into("<IBBHQQ", data, 0x180 + 24, strings.index(b"object_entry"), 0x12, 0, 1, 0, 8)
+    struct.pack_into("<QQq", data, 0x220, 1, (1 << 32) | 2, -4)
+    return data
+
+
 def run(*args, env=None):
-    reply = subprocess.run([WORKER, *map(str, args)], capture_output=True, timeout=60, check=True, env=env)
+    reply = subprocess.run([WORKER, *map(str, args)], capture_output=True, timeout=60, env=env)
+    if reply.returncode != 0:
+        raise RuntimeError(f"worker exited {reply.returncode}: {reply.stderr.decode(errors='replace')}")
     stream = io.BytesIO(reply.stdout)
     # Analysis has a larger frame allowance than control replies.
     size = struct.unpack(">I", stream.read(4))[0]
@@ -166,6 +193,15 @@ with tempfile.TemporaryDirectory() as directory:
             assert "name=tls_slot value=0x0" in result["symbol_provenance"]
             assert "0x0000000000000000 name=tls_slot" not in result["symbol_provenance"]
             assert "missing_api" not in result["functions"] and "tls_slot" not in result["functions"]
+    result, args = analyze(elf_object(), "elf")
+    assert result["kind"] == "analysis_result", result
+    assert result["analyzed_instructions"] > 0
+    assert "0x0000000000010000 name=object_entry source=ELF static-symbol" in result["functions"], result["functions"]
+    assert "address=analysis-only-section-rebase" in result["symbol_provenance"]
+    assert "deterministic analysis-only addresses" in result["metadata"]
+    assert "0x0000000000010001 ELF relocation type=2 symbol-index=1 addend=-4 target-section=1 source=SHT_RELA" in result["relocations"]
+    page = run("--page-image", *args[:3], "0", args[3], "elf", "auto", "0", "0")
+    assert page["kind"] == "page_result" and int(page["section_address"]) == 0x10000, page
     for data, fmt in [(elf(), "elf"), (pe(), "pe")]:
         result, args = analyze(bytes(64) + data, fmt, offset="64")
         assert result["kind"] == "analysis_result", result
@@ -204,6 +240,16 @@ with tempfile.TemporaryDirectory() as directory:
         (0x500 + 24 + 16, "Q", 0xffffffffffffffff),
     ]:
         data = elf_symbols()
+        struct.pack_into("<" + kind, data, offset, value)
+        result, _ = analyze(data)
+        assert result["kind"] == "error", result
+    for offset, kind, value in [
+        (0x220, "Q", 8),
+        (0x228, "Q", (99 << 32) | 2),
+        (0x440 + 44, "I", 3),
+        (0x440 + 56, "Q", 16),
+    ]:
+        data = elf_object()
         struct.pack_into("<" + kind, data, offset, value)
         result, _ = analyze(data)
         assert result["kind"] == "error", result
