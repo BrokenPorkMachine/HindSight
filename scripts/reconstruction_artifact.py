@@ -21,6 +21,51 @@ MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_DEPTH = 64
 MAX_VALUES = 2_000_000
 MAX_QUERY_VISITS = 100_000
+MAX_SETTINGS_KEYS = 128
+SETTINGS_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}")
+PASS_VERSION = re.compile(r"[a-z0-9][a-z0-9.+-]{0,63}")
+# Record kinds whose source spans necessarily refer to the enclosing function.
+# Metadata, data, symbol and external evidence may legitimately refer elsewhere
+# in the captured image.
+LOCAL_SPAN_KINDS = {"decode", "ir-operation", "definition", "use", "phi",
+                    "cfg-block", "cfg-edge", "ast-node"}
+
+
+class AnalysisScope:
+    """Identity scope shared by every record in one reconstruction run.
+
+    Records are only comparable within a scope. Two runs that share a binary
+    and a function still produce different identities when they ran a
+    different pass version or under different analysis settings, so a cached
+    or replayed artifact cannot silently answer for the wrong analysis.
+    """
+
+    __slots__ = ("pass_version", "settings_digest")
+
+    def __init__(self, pass_version, settings_digest):
+        _require(isinstance(pass_version, str) and PASS_VERSION.fullmatch(pass_version) is not None,
+                 "malformed analysis pass version")
+        _require(isinstance(settings_digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", settings_digest) is not None,
+                 "malformed analysis settings digest")
+        self.pass_version = pass_version
+        self.settings_digest = settings_digest
+
+    @classmethod
+    def from_settings(cls, pass_version, settings):
+        """Derive the scope from the settings that actually shaped the run."""
+        return cls(pass_version, settings_digest(settings))
+
+    def key(self):
+        return [self.pass_version, self.settings_digest]
+
+    def __eq__(self, other):
+        return isinstance(other, AnalysisScope) and self.key() == other.key()
+
+    def __hash__(self):
+        return hash(tuple(self.key()))
+
+    def __repr__(self):
+        return f"AnalysisScope(pass_version={self.pass_version!r}, settings_digest={self.settings_digest!r})"
 
 
 class ArtifactError(ValueError):
@@ -94,10 +139,30 @@ def canonical_bytes(value):
         raise ArtifactError("value cannot be encoded canonically") from error
 
 
-def content_id(domain, source_sha256, function_id, record):
-    """Bind a record's content (excluding its id) to its input and function."""
+def settings_digest(settings):
+    """Content-derived identity of the analysis settings that shaped a run.
+
+    Settings are recorded as well as digested: the digest binds every identity
+    in the artifact, while the retained value keeps the run reproducible.
+    """
+    _require(isinstance(settings, dict), "analysis settings must be an object")
+    _require(0 < len(settings) <= MAX_SETTINGS_KEYS, "analysis settings key limit exceeded")
+    for key in settings:
+        _require(SETTINGS_KEY.fullmatch(key) is not None, f"malformed analysis settings key: {key}")
+    return "sha256:" + hashlib.sha256(canonical_bytes(["hindsight-settings-v1", settings])).hexdigest()
+
+
+def content_id(domain, source_sha256, function_id, record, scope):
+    """Bind a record's content to its binary, function, pass, and settings.
+
+    The scope is part of the identity, not merely metadata: without it, two
+    passes that emit byte-identical records for one function would share an
+    identity, and a consumer could not tell which analysis produced an answer.
+    """
+    _require(domain, "identity domain is required")
+    _require(scope is not None, "identity scope is required")
     body = {key: value for key, value in record.items() if key != "id"}
-    payload = ["hindsight-content-v1", domain, source_sha256, function_id, body]
+    payload = ["hindsight-content-v2", domain, source_sha256, function_id, scope.key(), body]
     return "sha256:" + hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
 
@@ -105,8 +170,10 @@ def reconstruction_digest(artifact):
     """Digest the candidate independently of validation observations.
 
     Validation results cannot hash themselves. Eligibility is derived from
-    results, so it is excluded as well. All source, function, evidence, AST,
-    alternatives, settings, budgets, and completeness content remains bound.
+    results, so it is excluded as well. The scope, source, function, evidence,
+    AST, alternatives, settings, budgets, and completeness content remains
+    bound, so two runs that differ only in pass version or settings digest
+    differently and cannot reuse each other's validation results.
     """
     candidate = {key: value for key, value in artifact.items() if key not in {"validation", "eligibility"}}
     return hashlib.sha256(canonical_bytes(["hindsight-candidate-v1", candidate])).hexdigest()
@@ -210,34 +277,50 @@ class ReconstructionArtifact:
     def _validate_graph(self):
         artifact = self._data
         source = artifact["source_sha256"]
+        scope_record = artifact["scope"]
+        self.scope = AnalysisScope(scope_record["pass_version"], scope_record["settings_digest"])
         function = artifact["function"]
         function_id = function["id"]
-        _require(function_id == content_id("function", source, None, function), "function content identity mismatch")
+        _require(function_id == content_id("function", source, None, function, self.scope), "function content identity mismatch")
         start, end = int(function["start"], 16), int(function["end"], 16)
         _require(start < end, "invalid function range")
 
         def check_record(domain, record):
-            _require(record["id"] == content_id(domain, source, function_id, record), f"{domain} content identity mismatch")
+            _require(record["id"] == content_id(domain, source, function_id, record, self.scope), f"{domain} content identity mismatch")
 
         def spans(record):
+            claimed = []
             for span in record["ranges"]:
                 lo, hi = int(span["start"], 16), int(span["end"], 16)
                 _require(lo < hi, "empty or reversed source span")
+                # A record cannot claim the same bytes twice or overlap itself:
+                # duplicated spans would inflate apparent evidence coverage
+                # without adding an independent observation.
+                _require(not any(lo < other_hi and other_lo < hi for other_lo, other_hi in claimed),
+                         "overlapping source span within one record")
+                claimed.append((lo, hi))
                 # Local executable spans refer to this function. Metadata and
                 # data nodes may refer elsewhere in the captured image.
-                if record.get("kind") in {"decode", "ir-operation", "definition", "use", "phi", "cfg-block", "cfg-edge", "ast-node"}:
+                if record.get("kind") in LOCAL_SPAN_KINDS:
                     _require(start <= lo < hi <= end, "source span outside function")
+
+        # One identity namespace spans every record kind. Two records that hash alike
+        # are the same record even if they sit in different arrays, so uniqueness
+        # is checked globally rather than once per kind.
+        identities = {}
+
+        def unique(identifier, domain):
+            _require(identifier not in identities, f"duplicate {domain} identity")
+            identities[identifier] = domain
 
         for node in artifact["nodes"]:
             check_record("evidence", node)
-            _require(node["id"] not in self._nodes, "duplicate evidence identity")
+            unique(node["id"], "evidence")
             spans(node)
             self._nodes[node["id"]] = node
-        edge_ids = set()
         for edge in artifact["edges"]:
             check_record("edge", edge)
-            _require(edge["id"] not in edge_ids, "duplicate edge identity")
-            edge_ids.add(edge["id"])
+            unique(edge["id"], "edge")
             _require(edge["source"] in self._nodes and edge["target"] in self._nodes, "dangling evidence edge")
             self._forward.setdefault(edge["source"], []).append(edge)
             self._reverse.setdefault(edge["target"], []).append(edge)
@@ -246,7 +329,7 @@ class ReconstructionArtifact:
         ast_nodes = {}
         for node in ast["nodes"]:
             check_record("ast", node)
-            _require(node["id"] not in ast_nodes, "duplicate AST identity")
+            unique(node["id"], "AST")
             _require(node["evidence"] and set(node["evidence"]) <= self._nodes.keys(), "missing AST evidence")
             _require(node["ranges"], "missing AST source spans")
             spans({**node, "kind": "ast-node"})
@@ -272,6 +355,7 @@ class ReconstructionArtifact:
 
         for alternative in artifact["alternatives"]:
             check_record("alternative", alternative)
+            unique(alternative["id"], "alternative")
             _require(alternative["subject"] in self._nodes, "unknown alternative subject")
             candidates = alternative["candidates"]
             _require(len(set(candidates)) == len(candidates) and set(candidates) <= self._nodes.keys(), "invalid alternative candidates")
@@ -286,11 +370,9 @@ class ReconstructionArtifact:
         _require(exhausted <= budgets["limits"].keys() and exceeded <= exhausted, "unreported/unknown budget exhaustion")
 
         digest = reconstruction_digest(artifact)
-        validation_ids = set()
         for run in artifact["validation"]:
             check_record("validation", run)
-            _require(run["id"] not in validation_ids, "duplicate validation identity")
-            validation_ids.add(run["id"])
+            unique(run["id"], "validation")
             _require(run["artifact_sha256"] == digest, "validation applies to a different reconstruction")
             _require(run["status"] != "passed" or not run["mismatches"], "passing validation contains mismatches")
         self._validate_eligibility(ast, exhausted)
@@ -356,3 +438,25 @@ class ReconstructionArtifact:
             "edges": [edges[key] for key in sorted(edges)],
             "truncated": truncated,
         }))
+
+    def why(self, identifier, max_depth=8, max_nodes=1000):
+        """Return the incoming support/derivation/render chain behind a node."""
+        return self.query(identifier, relation=None, direction="incoming",
+                         max_depth=max_depth, max_nodes=max_nodes)
+
+    def conflicts_with(self, identifier, max_depth=8, max_nodes=1000):
+        """Return competing claims linked by contradicts or alternative-to edges."""
+        result = self.query(identifier, relation="contradicts", direction="incoming",
+                           max_depth=max_depth, max_nodes=max_nodes)
+        alt = self.query(identifier, relation="alternative-to", direction="incoming",
+                        max_depth=max_depth, max_nodes=max_nodes)
+        merged_nodes = {node["id"]: node for node in result["nodes"] + alt["nodes"]}
+        merged_edges = {edge["id"]: edge for edge in result["edges"] + alt["edges"]}
+        return {"nodes": [merged_nodes[key] for key in sorted(merged_nodes)],
+                "edges": [merged_edges[key] for key in sorted(merged_edges)],
+                "truncated": result["truncated"] or alt["truncated"]}
+
+    def invalidated_by(self, identifier, max_depth=8, max_nodes=1000):
+        """Return the outgoing impact chain that an invalidation would reach."""
+        return self.query(identifier, relation=None, direction="outgoing",
+                         max_depth=max_depth, max_nodes=max_nodes)

@@ -80,7 +80,7 @@ Dependencies: current captured-source identity, normalized function boundaries, 
 
 - [~] Define versioned reconstruction AST, effects, types, variables, hypotheses, source spans, dependencies, and validation artifacts; reconcile the draft JSON schema with C17 and the worker transport. *(in progress — claimed)*
 - [~] Implement content-derived identities scoped to binary, function, pass version, and analysis settings; validate uniqueness, references, spans, graph integrity, limits, and artifact hashes. *(in progress — claimed)*
-- [ ] Separate observed facts, derivations, assumptions, analyst assertions, rejected alternatives, and conflicts; support bounded “why,” alternatives, dependency, contradiction, and invalidation queries.
+- [x] Separate observed facts, derivations, assumptions, analyst assertions, rejected alternatives, and conflicts; support bounded “why,” alternatives, dependency, contradiction, and invalidation queries.
 - [ ] Introduce per-function review/export/validation eligibility with explicit blockers and completeness; incomplete analysis cannot acquire an equivalence label.
 - [ ] Extend the redistributable corpus to `-O0/-O1/-O2/-Os`, stripped/symbol-rich builds, compiler variants, and per-feature ground truth. Keep scoring-only source/debug oracles out of the recovery path.
 
@@ -244,7 +244,8 @@ Acceptance: each language/ISA declares and passes its own supported matrix. Stru
 
 Dependencies: C00/C01 contracts; format work serves reconstruction after the first qualification milestone.
 
-- [ ] ELF sectionless dynamic linking and relocations; qualify Linux native attach with its process/ABI/image identity model.
+- [~] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers). *(in progress — claimed; do not start independently)*
+- [ ] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host).
 - [ ] Standalone COFF, PE imports/exports/base relocations, PDB and Authenticode validation.
 - [ ] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification.
 

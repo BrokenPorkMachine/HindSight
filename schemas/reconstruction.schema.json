@@ -6,7 +6,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema", "producer", "source_sha256", "analysis_engine", "function",
+    "schema", "producer", "source_sha256", "analysis_engine", "scope", "function",
     "eligibility", "nodes", "edges", "ast", "alternatives", "budgets",
     "validation", "truncated"
   ],
@@ -15,6 +15,7 @@
     "producer": { "type": "string", "const": "hindsight-reconstruction-v1" },
     "source_sha256": { "$ref": "#/$defs/sha256" },
     "analysis_engine": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "scope": { "$ref": "#/$defs/analysisScope" },
     "function": { "$ref": "#/$defs/functionIdentity" },
     "eligibility": {
       "type": "object",
@@ -70,6 +71,15 @@
         "architecture": { "enum": ["arm64", "arm64e", "x86_64"] },
         "abi": { "type": "string", "minLength": 1, "maxLength": 128 },
         "name": { "type": ["string", "null"], "maxLength": 4096 }
+      }
+    },
+    "analysisScope": {
+      "description": "Pass version and analysis settings that produced every record. Part of each record identity, so records from different analyses never share an identity.",
+      "type": "object", "additionalProperties": false,
+      "required": ["pass_version", "settings_digest"],
+      "properties": {
+        "pass_version": { "type": "string", "pattern": "^[a-z0-9][a-z0-9.+-]{0,63}$" },
+        "settings_digest": { "$ref": "#/$defs/contentId" }
       }
     },
     "reason": {

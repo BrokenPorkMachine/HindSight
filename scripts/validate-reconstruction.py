@@ -24,8 +24,9 @@ def main():
         else:
             data = artifact.data
             result = {"valid": True, "candidate_sha256": reconstruction_digest(data),
-                      "eligibility": data["eligibility"], "nodes": len(data["nodes"]),
-                      "edges": len(data["edges"]), "ast_nodes": len(data["ast"]["nodes"])}
+                      "scope": data["scope"], "eligibility": data["eligibility"],
+                      "nodes": len(data["nodes"]), "edges": len(data["edges"]),
+                      "ast_nodes": len(data["ast"]["nodes"])}
         print(json.dumps(result, sort_keys=True, indent=2))
         return 0
     except (ArtifactError, OSError) as error:

@@ -1023,10 +1023,10 @@ fn parameter_aliases_with_notes(
         }
     }
 
-    // Join-merge evidence: when a conditional's in-function successors saw
-    // disagreeing names for a register, record which identities met at the
-    // join leader. This keeps the source-name recovery auditable instead of
-    // silently reverting to machine registers.
+    // Join-merge evidence: when a join leader (a statement with more than one
+    // incoming edge) saw disagreeing names for a register, record which
+    // identities met there. This keeps the source-name recovery auditable
+    // instead of silently reverting to machine registers.
     let mut notes = BTreeMap::new();
     let predecessors = {
         let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); instructions.len()];
@@ -1035,11 +1035,10 @@ fn parameter_aliases_with_notes(
         }
         predecessors
     };
-    for (_index, (_, statement)) in instructions.iter().enumerate() {
-        if !statement.starts_with("if (") { continue; }
-        let Some(target) = branch_target(statement).filter(|target| address_to_index.contains_key(target)) else { continue };
+    for (index, preds) in predecessors.iter().enumerate() {
+        if preds.len() < 2 { continue; }
         let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for &pred in &predecessors[address_to_index[&target]] {
+        for &pred in preds {
             let state = incoming[pred].clone().unwrap_or_default();
             let (_, outgoing) = transfer(state, &instructions[pred].1);
             for (register, name) in outgoing {
@@ -1056,8 +1055,9 @@ fn parameter_aliases_with_notes(
             }
         }
         if !described.is_empty() {
-            notes.insert(target, format!(
-                "merge at {target:#x}: {}; machine registers retained after the join", described.join("; ")
+            let leader = instructions[index].0;
+            notes.insert(leader, format!(
+                "merge at {leader:#x}: {}; machine registers retained after the join", described.join("; ")
             ));
         }
     }
@@ -1876,7 +1876,7 @@ fn recover_internal(
         assert!(aliases.is_empty(), "{aliases:?}");
     }
     #[test] fn join_merges_record_conflicting_names_as_evidence() {
-        let signature = symbol("_CFRelease").unwrap();
+        let signature = objc_method("-[Widget setObject:]", "v24@0:8@16").unwrap();
         let conflicting = vec![
             (0x1000, "if (x1 == 0) goto 0x100c;".into()),
             (0x1004, "x2 = x0;".into()),
@@ -1889,8 +1889,8 @@ fn recover_internal(
         let note = notes.get(&0x1010).expect("conflicting join must be documented");
         assert!(note.contains("merge at 0x1010"), "{note}");
         assert!(note.contains("x2 reaches with conflicting names"), "{note}");
-        assert!(note.contains("cf"), "{note}");
-        assert!(note.contains("_cmd"), "{note}");
+        assert!(note.contains("self_copy_x2"), "{note}");
+        assert!(note.contains("_cmd_copy_x2"), "{note}");
 
         // A join that sees the same identity everywhere stays silent.
         let agreeing = vec![
@@ -1942,8 +1942,8 @@ fn recover_internal(
             .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         let body = render_arm64_body(0x1000, 0x1010, "_count", Some(&signature), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new()).unwrap();
         assert!(body.contains("while (!(value == 0))"), "{body}");
-        assert!(body.contains("value_copy_x2 = value + 4;"), "{body}");
-        assert!(!body.contains("0x1004: x2 = x0 + 4;"), "{body}");
+        assert!(body.contains("0x0000000000001004: x2 = value + 0x4;"), "{body}");
+        assert!(!body.contains("x0 + 0x4;"), "{body}");
     }
     #[test] fn scalar_fp_parameter_names_cover_single_and_double_register_views() {
         let signature = symbol("_CFNumberGetValue").unwrap();
