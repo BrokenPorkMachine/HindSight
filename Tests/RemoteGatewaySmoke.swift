@@ -23,6 +23,15 @@ guard status == errSecSuccess,
 }
 let identity = unsafeBitCast(item as CFTypeRef, to: SecIdentity.self)
 let token = String(repeating: "a", count: 64)
+for (address, origin) in [("0.0.0.0", ""), ("8.8.8.8", ""),
+                          ("192.168.1.2", ""), ("192.168.1.2", "https://client.example/path"),
+                          ("192.168.1.2", "http://client.example")] {
+    do {
+        try RemoteGateway(handle: { _, _ in }, status: { _ in })
+            .start(identity: identity, bindAddress: address, allowedOrigin: origin, port: port, token: token)
+        fatalError("accepted unsafe server binding/origin: \(address), \(origin)")
+    } catch { /* Invalid configuration is rejected before opening a socket. */ }
+}
 let gateway = RemoteGateway(handle: { request, reply in
     if request.method == "GET", request.path == "/v1/capabilities" {
         reply(.json("{\"ok\":true}"))
@@ -32,7 +41,7 @@ let gateway = RemoteGateway(handle: { request, reply in
         reply(.error("not found", code: 404))
     }
 }, status: { print($0); fflush(stdout) })
-try gateway.start(identity: identity, port: port, token: token)
+try gateway.start(identity: identity, allowedOrigin: "https://client.example", port: port, token: token)
 RunLoop.current.run(until: Date().addingTimeInterval(30))
 }
 }

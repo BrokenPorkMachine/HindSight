@@ -2,6 +2,22 @@ import Foundation
 
 @MainActor
 final class RemoteAnalysisTransactions {
+    private static let openAPI: String = { let raw = String(#"""
+    {"openapi":"3.1.0","info":{"title":"HindSight Remote API","version":"1.0.0"},"servers":[{"url":"/v1"}],"security":[{"BearerAuth":[]}],"components":{"securitySchemes":{"BearerAuth":{"type":"http","scheme":"bearer"}},"schemas":{"Error":{"type":"object","required":["error"],"properties":{"error":{"type":"string"}}},"Capabilities":{"type":"object","required":["protocol","server","features","execution"],"properties":{"protocol":{"const":1},"server":{"const":"HindSight"},"features":{"type":"array","items":{"type":"string","enum":["project_read","analysis_jobs","job_poll","job_cancel"]}},"execution":{"const":false}}},"Project":{"type":"object","description":"Current open ProjectSnapshot. Records include stable record IDs, captured source SHA-256 identities, and analysis metadata.","additionalProperties":true},"AnalysisJobRequest":{"type":"object","required":["request_id","project_path","record_id","source_sha256"],"properties":{"request_id":{"type":"string","format":"uuid"},"project_path":{"type":"string","description":"Exact path returned by GET /project."},"record_id":{"type":"string","format":"uuid"},"source_sha256":{"type":"string","pattern":"^[a-fA-F0-9]{64}$"}}},"JobAccepted":{"type":"object","required":["job_id","state"],"properties":{"job_id":{"type":"string","format":"uuid"},"state":{"type":"string","enum":["accepted","existing"]}}},"JobState":{"type":"object","required":["job_id","state"],"properties":{"job_id":{"type":"string","format":"uuid"},"state":{"type":"string","enum":["running","completed","failed"]}}},"AnalysisResult":{"type":"object","description":"Source-bound AnalysisReply envelope; includes analysis.request_id and analysis.source_sha256.","additionalProperties":true}}},"paths":{"/capabilities":{"get":{"operationId":"getCapabilities","responses":{"200":{"description":"Protocol version and implemented feature set","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Capabilities"}}}}}}},"/project":{"get":{"operationId":"getCurrentProject","responses":{"200":{"description":"Current project snapshot","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Project"}}}},"409":{"description":"No ready project","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/jobs/analysis":{"post":{"operationId":"submitAnalysis","description":"Submit or retry an analysis. Reusing a request ID with the same source returns the existing job for ten minutes; reuse with different input conflicts. At most two jobs run concurrently.","requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/AnalysisJobRequest"}}}},"responses":{"202":{"description":"Accepted or existing idempotent job","content":{"application/json":{"schema":{"$ref":"#/components/schemas/JobAccepted"}}}},"409":{"description":"Project, record, or captured source identity mismatch","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}},"429":{"description":"Active or retained job limit reached","content":{"application/json":{"schema":{"$ref":"#/components/schemas/Error"}}}}}}},"/jobs/{job_id}":{"parameters":[{"name":"job_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"get":{"operationId":"getAnalysisJob","responses":{"200":{"description":"Current job state","content":{"application/json":{"schema":{"$ref":"#/components/schemas/JobState"}}}},"404":{"description":"Unknown or expired job"},"409":{"description":"Project or source changed"},"503":{"description":"Coordinator status unavailable"}}},"delete":{"operationId":"cancelAnalysisJob","responses":{"200":{"description":"Cancellation request result"}},"404":{"description":"Unknown or expired job"},"409":{"description":"Job already terminal"},"503":{"description":"Coordinator cancellation unavailable"}}}},"/jobs/{job_id}/result":{"parameters":[{"name":"job_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"get":{"operationId":"getAnalysisResult","responses":{"200":{"description":"Source-bound analysis result","content":{"application/json":{"schema":{"$ref":"#/components/schemas/AnalysisResult"}}}},"404":{"description":"Unknown or expired job"},"409":{"description":"Not complete, failed, or project/source changed"}}}}}}
+    """#)
+        let nestedResponses = raw.replacingOccurrences(of: "\"Cancellation request result\"}},\"404\"",
+                                                       with: "\"Cancellation request result\"},\"404\"")
+        let phases = nestedResponses.replacingOccurrences(
+            of: "\"running\",\"completed\",\"failed\"",
+            with: "\"queued\",\"admitted\",\"checkingCache\",\"launching\",\"running\",\"receiving\",\"validating\",\"publishing\",\"cancelling\",\"completed\",\"failed\",\"cancelled\"")
+        let progress = phases.replacingOccurrences(
+            of: "\"state\":{\"type\":\"string\",\"enum\":[\"queued\",\"admitted\",\"checkingCache\",\"launching\",\"running\",\"receiving\",\"validating\",\"publishing\",\"cancelling\",\"completed\",\"failed\",\"cancelled\"]}",
+            with: "\"state\":{\"type\":\"string\",\"enum\":[\"queued\",\"admitted\",\"checkingCache\",\"launching\",\"running\",\"receiving\",\"validating\",\"publishing\",\"cancelling\",\"completed\",\"failed\",\"cancelled\"]},\"operation\":{\"type\":\"string\"},\"detail\":{\"type\":\"string\"},\"progress_percent\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100},\"progress_stage\":{\"type\":\"string\"},\"elapsed_ms\":{\"type\":\"string\",\"pattern\":\"^[0-9]+$\"},\"updated_at_ms\":{\"type\":\"string\",\"pattern\":\"^[0-9]+$\"}")
+        return progress.replacingOccurrences(
+            of: "\"200\":{\"description\":\"Cancellation request result\"}",
+            with: "\"200\":{\"description\":\"Cancellation request result\",\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"required\":[\"cancelled\"],\"properties\":{\"cancelled\":{\"type\":\"boolean\"}}}}}}")
+    }()
+
     struct Backend {
         let analyze: (_ recordID: String, _ requestID: String, _ done: @escaping (Result<String, Error>) -> Void) -> Void
         let status: (_ requestID: String, _ done: @escaping (Result<String, Error>) -> Void) -> Void
@@ -44,6 +60,10 @@ final class RemoteAnalysisTransactions {
         jobs = jobs.filter { Date().timeIntervalSince($0.value.created) < 600 }
         if request.method == "GET", request.path == "/v1/capabilities" {
             reply(.json("{\"protocol\":1,\"server\":\"HindSight\",\"features\":[\"project_read\",\"analysis_jobs\",\"job_poll\",\"job_cancel\"],\"execution\":false}"))
+            return
+        }
+        if request.method == "GET", request.path == "/v1/openapi.json" {
+            reply(.json(Self.openAPI))
             return
         }
         if request.method == "GET", request.path == "/v1/project" {
@@ -125,7 +145,25 @@ final class RemoteAnalysisTransactions {
             if job.failure != nil { reply(.json("{\"job_id\":\"\(id)\",\"state\":\"failed\"}")); return }
             backend.status(id) { result in
                 switch result {
-                case .success(let value): reply(.json(value))
+                case .success(let value):
+                    guard let data = value.data(using: .utf8),
+                          let statusReply = try? JSONDecoder().decode(InspectionStatusReply.self, from: data),
+                          statusReply.ok, let status = statusReply.status,
+                          status.request_id == id,
+                          let body = try? JSONSerialization.data(withJSONObject: [
+                            "job_id": id,
+                            "state": status.phase.rawValue,
+                            "operation": status.operation,
+                            "detail": status.detail,
+                            "progress_percent": status.progress_percent,
+                            "progress_stage": status.progress_stage,
+                            "elapsed_ms": String(status.elapsed_ms),
+                            "updated_at_ms": String(status.updated_at_ms),
+                            "diagnostic": status.diagnostic as Any? ?? NSNull()
+                          ]) else {
+                        reply(.error("invalid coordinator status", code: 503)); return
+                    }
+                    reply(.json(String(decoding: body, as: UTF8.self)))
                 case .failure: reply(.error("status unavailable", code: 503))
                 }
             }

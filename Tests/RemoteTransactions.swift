@@ -14,7 +14,7 @@ import Foundation
             if self.statusFails {
                 done(.failure(NSError(domain: "fixture", code: 1)))
             } else {
-                done(.success("{\"ok\":true,\"status\":{\"request_id\":\"\(id)\",\"phase\":\"running\"}}"))
+                done(.success("{\"ok\":true,\"message\":\"\",\"status\":{\"request_id\":\"\(id)\",\"operation\":\"analysis\",\"phase\":\"running\",\"detail\":\"fixture progress\",\"started_at_ms\":1,\"updated_at_ms\":2,\"elapsed_ms\":1,\"progress_percent\":33,\"progress_stage\":\"fixture\",\"diagnostic\":null}}"))
             }
         }, cancel: { id, done in
             self.cancellations.append(id)
@@ -94,6 +94,36 @@ import Foundation
 
         let capabilities = await response(jobs, "GET", "/v1/capabilities", project: nil)
         check(capabilities.code == 200 && capabilities.body.contains("analysis_jobs"), "capability contract")
+        let openAPI = await response(jobs, "GET", "/v1/openapi.json", project: nil)
+        check(openAPI.code == 200 && openAPI.body.contains("\"openapi\":\"3.1.0\""), "OpenAPI endpoint")
+        var parsedOpenAPI: [String: Any]?
+        do { parsedOpenAPI = try JSONSerialization.jsonObject(with: Data(openAPI.body.utf8)) as? [String: Any] }
+        catch {
+            let index = (error as NSError).userInfo["NSJSONSerializationErrorIndex"] as? Int ?? 0
+            let start = openAPI.body.index(openAPI.body.startIndex, offsetBy: min(index, openAPI.body.count))
+            let before = openAPI.body.index(start, offsetBy: -min(40, openAPI.body.distance(from: openAPI.body.startIndex, to: start)))
+            let after = openAPI.body.index(start, offsetBy: min(100, openAPI.body.distance(from: start, to: openAPI.body.endIndex)))
+            FileHandle.standardError.write(Data("OpenAPI JSON parse error: \(error); context=\(openAPI.body[before..<after])\n".utf8))
+            preconditionFailure("OpenAPI endpoint returns valid JSON")
+        }
+        for path in ["/capabilities", "/project", "/jobs/analysis", "/jobs/{job_id}", "/jobs/{job_id}/result"] {
+            check(openAPI.body.contains("\"\(path)\":"), "OpenAPI route \(path)")
+        }
+        let paths = parsedOpenAPI?["paths"] as? [String: Any]
+        let analysisPath = paths?["/jobs/analysis"] as? [String: Any]
+        let analysisPost = analysisPath?["post"] as? [String: Any]
+        let resultPath = paths?["/jobs/{job_id}/result"] as? [String: Any]
+        let resultGet = resultPath?["get"] as? [String: Any]
+        check(analysisPost?["operationId"] as? String == "submitAnalysis" &&
+              resultGet?["operationId"] as? String == "getAnalysisResult", "OpenAPI operation identifiers")
+        let components = parsedOpenAPI?["components"] as? [String: Any]
+        let schemas = components?["schemas"] as? [String: Any]
+        let jobState = schemas?["JobState"] as? [String: Any]
+        let jobProperties = jobState?["properties"] as? [String: Any]
+        let state = jobProperties?["state"] as? [String: Any]
+        let phases = state?["enum"] as? [String]
+        check(phases?.contains("checkingCache") == true && jobProperties?["progress_percent"] != nil,
+              "OpenAPI describes job phases and progress fields")
         check(await response(jobs, "GET", "/v1/project", project: nil).code == 409, "no project")
         check(await response(jobs, "GET", "/v1/project", project: source).code == 200, "project read")
         check(await response(jobs, "POST", "/v1/jobs/analysis", body: try body(id: first),
@@ -109,8 +139,11 @@ import Foundation
               "retry must not repeat analysis")
         check(await response(jobs, "GET", "/v1/jobs/\(first)/result", project: source).code == 409,
               "result cannot publish before completion")
-        check(await response(jobs, "GET", "/v1/jobs/\(first)", project: source).body.contains("running"),
-              "status polling")
+        let running = await response(jobs, "GET", "/v1/jobs/\(first)", project: source)
+        let runningJSON = try JSONSerialization.jsonObject(with: Data(running.body.utf8)) as? [String: Any]
+        check(running.code == 200 && runningJSON?["state"] as? String == "running" &&
+              runningJSON?["job_id"] as? String == first && runningJSON?["progress_percent"] as? Int == 33,
+              "status polling contract")
         fake.statusFails = true
         check(await response(jobs, "GET", "/v1/jobs/\(first)", project: source).code == 503,
               "status failure")

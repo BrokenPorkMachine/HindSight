@@ -467,6 +467,14 @@ enum IrVectorArithmeticOperator {
     /// `Vd = Vn * Vm` (`MUL`).
     Multiply,
 }
+/// Lane-wise vector floating-point unary operator (reciprocal estimate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrVectorFloatUnaryOperator {
+    /// `Vd = frecpe(Vn)` (`FRECPE`).
+    ReciprocalEstimate,
+    /// `Vd = frsqrte(Vn)` (`FRSQRTE`).
+    ReciprocalSqrtEstimate,
+}
 /// Lane-wise vector floating-point three-same binary operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrVectorFloatBinaryOperator {
@@ -586,6 +594,8 @@ enum IrOperation {
     /// double) is not tracked because the lane count is implied by the width
     /// and the instruction's arrangement.
     VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
+    /// Lane-wise vector floating-point unary operation (reciprocal estimate).
+    VectorFloatUnary { destination: IrSimdRegister, source: IrSimdRegister, operator: IrVectorFloatUnaryOperator },
     /// Lane-wise vector integer arithmetic. Registers carry the architectural
     /// width (`Quad`/`Double`); element size is not tracked because the lane
     /// count is implied by the width and the instruction's arrangement.
@@ -644,6 +654,7 @@ impl IrOperation {
             // destination and read no general-purpose register.
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
             | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
+            | Self::VectorFloatUnary { .. }
             | Self::Return { target: None } => {}
             Self::Assign { destination, value } => {
                 effects.definitions = gpr_mask(destination);
@@ -790,6 +801,7 @@ impl IrOperation {
             | Self::SimdLoad { .. } | Self::SimdStore { .. }
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
             | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
+            | Self::VectorFloatUnary { .. }
             | Self::VectorExtract { .. }
         );
         let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
@@ -1724,24 +1736,16 @@ impl IrOperation {
                 flow.clear();
                 Some(statement)
             }
-            Self::VectorFloatBinary { destination, left, right, operator } => {
-                let dest_name = simd_register_name(destination);
-                let left_name = simd_register_name(left);
-                let right_name = simd_register_name(right);
-                let op_str = match operator {
-                    IrVectorFloatBinaryOperator::Add => "fadd",
-                    IrVectorFloatBinaryOperator::Subtract => "fsub",
-                    IrVectorFloatBinaryOperator::Multiply => "fmul",
-                    IrVectorFloatBinaryOperator::Divide => "fdiv",
-                    IrVectorFloatBinaryOperator::Max => "fmax",
-                    IrVectorFloatBinaryOperator::Min => "fmin",
-                    IrVectorFloatBinaryOperator::MaxNum => "fmaxnm",
-                    IrVectorFloatBinaryOperator::MinNum => "fminnm",
+            Self::VectorFloatUnary { destination, source, operator } => {
+                flow.write_v(destination.index as u32, None);
+                let mnemonic = match operator {
+                    IrVectorFloatUnaryOperator::ReciprocalEstimate => "frecpe",
+                    IrVectorFloatUnaryOperator::ReciprocalSqrtEstimate => "frsqrte",
                 };
-                Some(format!("{} = {}({}, {});", dest_name, op_str, left_name, right_name))
+                Some(format!("{} = {}({});",
+                    simd_register_name(destination), mnemonic, simd_register_name(source)))
             }
             Self::TargetSpecific => None,
-            _ => unreachable!(),
         }
     }
 }
@@ -2623,6 +2627,7 @@ enum Operation {
     SimdStore { source: IrSimdRegister, base: Register, address: AddressForm },
     VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
     VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
+    VectorFloatUnary { destination: IrSimdRegister, source: IrSimdRegister, operator: IrVectorFloatUnaryOperator },
     VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorArithmeticOperator },
     VectorExtract { destination: Register, source: u8, lane: u8, bits: u8, signed: bool },
     LoadPair {
@@ -3032,6 +3037,9 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         }
         Operation::VectorFloatBinary { destination, left, right, operator } => {
             IrOperation::VectorFloatBinary { destination, left, right, operator }
+        }
+        Operation::VectorFloatUnary { destination, source, operator } => {
+            IrOperation::VectorFloatUnary { destination, source, operator }
         }
         Operation::VectorExtract { destination, source, lane, bits, signed } => {
             IrOperation::VectorExtract { destination: reg(destination), source, lane, bits, signed }
@@ -5211,6 +5219,19 @@ fn decode(word: u32, pc: u64) -> Operation {
             return Operation::VectorFloatBinary { destination, left, right, operator };
         }
     }
+    // Advanced SIMD two-register reciprocal estimate (FRECPE/FRSQRTE).
+    // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q=1 (vector); U=0 FRECPE, U=1 FRSQRTE.
+    if word & 0x9f00_fc00 == 0x0e00_d800 && word & 0x4000_0000 != 0 {
+        let operator = if word & 0x2000_0000 != 0 {
+            IrVectorFloatUnaryOperator::ReciprocalSqrtEstimate
+        } else {
+            IrVectorFloatUnaryOperator::ReciprocalEstimate
+        };
+        let width = IrSimdWidth::Quad;
+        let destination = IrSimdRegister { index: (word & 31) as u8, width };
+        let source = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
+        return Operation::VectorFloatUnary { destination, source, operator };
+    }
     // Lane-wise vector bitwise data processing: `0 Q U 01110 opc 1 Rm 00011 1
     // Rn Rd`. Bit 29 (`U`) and bits 23-22 (`opc`) select the operation —
     // U=0 AND/BIC/ORR/ORN, U=1 EOR/BSL/BIT/BIF — and bits 15-10 are fixed at
@@ -6698,6 +6719,9 @@ impl Operation {
             }
             Self::VectorFloatBinary { destination, left, right, operator } => {
                 IrOperation::VectorFloatBinary { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
+            }
+            Self::VectorFloatUnary { destination, source, operator } => {
+                IrOperation::VectorFloatUnary { destination, source, operator }.render(flow, pc).unwrap_or_default()
             }
             Self::VectorExtract { destination, source, lane, bits, signed } => {
                 IrOperation::VectorExtract { destination: destination.into(), source, lane, bits, signed }.render(flow, pc).unwrap_or_default()
@@ -10199,6 +10223,27 @@ mod reciprocal_tests {
             let report = render(&word.to_le_bytes(), 0x1000, 0, &[0x1000], &[]);
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("barrier=all_gprs"), "{report}");
+        }
+    }
+
+    #[test]
+    fn vector_reciprocal_estimate_lifts_to_shared_ir() {
+        let cases = [
+            (0x4ea1_d820, "q0 = frecpe(q1);"),
+            (0x4ee1_d820, "q0 = frecpe(q1);"),
+            (0x6ea1_d820, "q0 = frsqrte(q1);"),
+            (0x6ee1_d820, "q0 = frsqrte(q1);"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
+        // Q=0 (D) forms stay opaque
+        for word in [0x0ea1_d820u32, 0x0ee1_d820, 0x2ea1_d820, 0x2ee1_d820] {
+            assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
         }
     }
 

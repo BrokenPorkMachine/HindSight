@@ -46,6 +46,26 @@ for _ in {1..120}; do
   if ! kill -0 "$app_pid" 2>/dev/null; then sed -n '1,90p' "$fixture_dir/app.log"; exit 1; fi
   sleep 0.5
 done
+if ! jq -e '.records[0].result.captured == true' >/dev/null 2>&1 <<<"$project_json"; then
+  echo "App did not expose the imported project snapshot." >&2
+  sed -n '1,90p' "$fixture_dir/app.log" >&2
+  exit 1
+fi
+schema="$(curl --silent --show-error --cacert "$fixture_dir/cert.pem" \
+  -H "Authorization: Bearer $token" "$base/v1/openapi.json")"
+if ! jq -e '.openapi == "3.1.0" and (.paths | has("/jobs/analysis")) and (.paths | has("/jobs/{job_id}/result"))' \
+  >/dev/null <<<"$schema"; then
+  echo "Served OpenAPI contract failed client validation:" >&2
+  jq . <<<"$schema" >&2 || true
+  exit 1
+fi
+capabilities="$(curl --silent --show-error --cacert "$fixture_dir/cert.pem" \
+  -H "Authorization: Bearer $token" "$base/v1/capabilities")"
+if ! jq -e '.protocol == 1 and (.features | index("analysis_jobs")) != null and .execution == false' \
+  >/dev/null <<<"$capabilities"; then
+  echo "Served capability response failed client validation: $capabilities" >&2
+  exit 1
+fi
 record_id="$(jq -er '.records[0].id' <<<"$project_json")"
 digest="$(jq -er '.records[0].result.source_sha256' <<<"$project_json")"
 project_path="$(jq -er '.path' <<<"$project_json")"

@@ -390,6 +390,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private var applyingLaunchSession = false
     private let client = CoordinatorClient()
     @Published var remoteCertificateLabel = ""
+    @Published var remoteBindAddress = "127.0.0.1"
+    @Published var remoteAllowedOrigin = ""
     @Published var remotePort = "8443"
     @Published private(set) var remoteToken = ""
     @Published private(set) var remoteStatus = "Off"
@@ -436,7 +438,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         }
         let token = bytes.map { String(format: "%02x", $0) }.joined()
         do {
-            try remoteGateway.start(certificateLabel: remoteCertificateLabel, port: port, token: token)
+            try remoteGateway.start(certificateLabel: remoteCertificateLabel,
+                                    bindAddress: remoteBindAddress,
+                                    allowedOrigin: remoteAllowedOrigin,
+                                    port: port, token: token)
             remoteToken = token
             remoteStatus = "Starting…"
         } catch {

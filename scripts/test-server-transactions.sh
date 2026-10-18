@@ -35,9 +35,11 @@ if [[ "$mode" == --quick ]]; then
     bash "$project_root/scripts/test-app-typecheck.sh"
   echo "Server transactional quick gate passed. Full build and client interoperability remain separate."
 else
-  echo "[4/4] Building the app, embedded coordinator, and native worker"
+  echo "[4/5] Building the ordinary app, embedded coordinator, and native worker"
   xcodebuild -quiet -project "$project_root/HindSight.xcodeproj" -scheme HindSight \
     -configuration Debug -derivedDataPath /private/tmp/hindsight-server-build \
     build CODE_SIGNING_ALLOWED=NO
-  echo "Server transactional full gate passed. Client interoperability and release security remain separate."
+  echo "[5/5] Running the real app → XPC → worker → HTTPS client transaction"
+  bash "$project_root/scripts/test-server-client-integration.sh"
+  echo "Server transactional full gate passed. Cross-device/browser interoperability and release security remain separate."
 fi

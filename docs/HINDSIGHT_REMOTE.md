@@ -10,40 +10,85 @@ Whether the client lives in this repository, another branch, or a separate repos
 
 ## Client communication readiness gate
 
-Current checkpoint: the app has an opt-in, loopback-only TLS listener with a
-per-start bearer token. Protocol v1 exposes `GET /v1/capabilities`,
-`GET /v1/project`, and an asynchronous captured-source analysis job:
+Current checkpoint: the app has an opt-in TLS listener with a per-start bearer
+token. It defaults to loopback; an explicit private IPv4 bind address and one
+exact HTTPS browser origin can be configured. Wildcard/public binds and other
+browser origins are rejected. Protocol v1 exposes a machine-readable OpenAPI
+contract at `GET /v1/openapi.json`, truthful capability discovery at
+`GET /v1/capabilities`, `GET /v1/project`, and an asynchronous captured-source analysis job:
 `POST /v1/jobs/analysis`, `GET /v1/jobs/{request_id}`,
 `GET /v1/jobs/{request_id}/result`, `DELETE /v1/jobs/{request_id}`.
+`GET /v1/jobs/{request_id}` returns `{job_id, state}` and, while active,
+includes `operation`, `detail`, `progress_percent`, `progress_stage`,
+`elapsed_ms`, and `updated_at_ms`;
+`state` is the coordinator phase (`queued`, `admitted`, `checkingCache`,
+`launching`, `running`, `receiving`, `validating`, `publishing`,
+`cancelling`, `completed`, `failed`, or `cancelled`). Millisecond counters
+are decimal strings so browser clients do not lose integer precision.
 The POST body requires a client-generated UUID `request_id`, exact
 `project_path`, `record_id`, and `source_sha256`; retries with the same ID and
 source return the existing job for up to ten minutes. Results are returned
-only when the project and source still match. No browser cross-origin access,
-LAN exposure, uploads, event streaming, debugger or VM control is enabled.
+only when the project and source still match. The OpenAPI document defines
+request/response schemas, authentication, operation IDs, limits and errors for
+every implemented route; capabilities report execution as disabled. An exact-origin CORS preflight
+and response path is implemented. The v1 API is ready for a client to model
+and integrate against; cross-device/browser interoperability still needs a
+real browser on a second device. Uploads, event streaming, debugger and VM
+control are disabled and are not advertised as supported capabilities.
 The gateway itself passed a loopback TLS client smoke test with certificate
 verification, bearer authentication (200), unauthenticated rejection (401),
-host rejection (400), and a bounded JSON POST (202). Run the full automated
+host/origin rejection (400), exact-origin preflight (204), and a bounded JSON
+POST (202). Run the full automated
 transactional gate with `bash scripts/test-server-transactions.sh` on macOS;
 `--quick` substitutes arm64/x86_64 app-target type-checking for the full build
 when another workstream is editing the native worker.
 It exercises the production job state machine against a controlled coordinator
 (admission, retry idempotency, stale-source/result rejection, polling, limits,
 cancellation and stop cleanup), the real TLS gateway, project-store security
-contracts, and the full app/coordinator/worker build. The full app → coordinator → worker analysis
-job path has not yet passed a real client interoperability test, and the
-server is not ready for release. The dependency-ordered next actions are in the
+contracts, the ordinary app/coordinator/worker build, and a test-only app
+launch that imports a captured Mach-O via XPC and returns a source-bound
+analysis result to a certificate-verifying HTTPS client. That local end-to-end
+transaction passed on the current branch. The full gate passed the ordinary
+universal app/coordinator/worker build and a real app → XPC → worker → HTTPS
+client transaction. The gate also validates the served OpenAPI and capabilities
+responses before submitting the analysis job. Remaining product work is actual
+LAN/browser interoperability, uploads, event streaming, multi-project
+authorization, and remote execution security. The dependency-ordered next
+actions are in the
 [Chimera current queue](CHIMERA_COMPLETION_ROADMAP.md#current-actionable-queue-2026-10-18).
 
-All items below are open until demonstrated against the app-hosted implementation:
+## Security audit and supported-scope limits
 
-- [ ] Explicit server enable/disable and remote-access configuration in the app; encrypted connections, authenticated sessions, revocation and project/target-scoped authorization.
-- [ ] Versioned API and event contracts, compatibility negotiation and truthful capability discovery. Preserve 64-bit addresses as strings in browser-facing JSON.
+The publication audit passed for the v1 analysis API. HTTPS uses a Keychain
+identity and TLS 1.2 or newer. Clients must trust that certificate, and its
+subject alternative name must match the server address. The listener binds to
+loopback by default; remote binding accepts only RFC1918 IPv4 addresses and
+requires one exact HTTPS browser origin. Bearer tokens are generated with
+32 random bytes per start, compared without content-dependent byte exits,
+kept in memory, and discarded on stop. The HTTP parser rejects duplicate
+authorization/host/origin/length headers, transfer encoding, oversized
+headers/bodies, nonmatching hosts/origins, and pipelined data. It limits
+connections and request lifetime. Analysis is restricted to the current ready
+project and captured source digest; request IDs are idempotent for ten minutes,
+at most two jobs run concurrently, 256 jobs are retained, and only four results
+are kept. Importing a binary does not execute it.
+
+This is a single-user host-wide bearer-token model: every holder of the current
+token can read the open project and submit/cancel its analysis jobs. It does
+not provide individual accounts, multiple project grants, or audit logging.
+Stop/start rotates the token. Do not expose the app through a public address or
+port-forward it as a multi-user service.
+
+Remaining remote-product scope:
+
+- [x] Explicit server start/stop, loopback default, private IPv4 configuration, TLS, per-start bearer-token rotation, exact-origin CORS, versioned API, OpenAPI endpoint and truthful capability discovery.
+- [ ] Individual users, multiple project grants, durable audit log and finer-grained project/target authorization.
 - [ ] Integrity-checked, bounded binary uploads/imports and server-backed projects; importing never launches a binary. Enforce size, storage and analysis-resource limits.
-- [ ] A real client can submit an analysis request and receive progress and source-bound results, including disassembly, pseudocode, symbols and evidence identities. Reject stale project/analysis revisions.
-- [ ] Bounded event streaming with sequencing, backpressure, disconnect/reconnect behavior and cancellation; connection loss cannot silently repeat an execution request.
+- [x] Source-bound analysis submission, polling, cancellation and result retrieval, with retry idempotency and stale-source rejection. The result carries the existing disassembly, pseudocode, symbols and evidence artifacts.
+- [ ] Real browser interoperability from a second device; bounded event streaming with sequencing, backpressure, disconnect/reconnect behavior and cancellation.
 - [ ] Debug operations require explicit authorization and execution consent. Enforce controller ownership versus observers, maintain an audit trail, and keep debugger transports private behind the server gateway.
 - [ ] VM operations require explicit execution consent, resource limits and isolated defaults with networking disabled initially. Advertise only qualified host/backend capabilities; expose console, lifecycle and debugging features only where actually supported.
-- [ ] Verify app restart, service failure, malformed requests, unauthorized access, resource exhaustion and session cleanup, alongside a documented client interoperability test.
+- [~] Verify app restart and service failure recovery, alongside the passing malformed-request, unauthorized-access, resource-limit and session-cleanup tests.
 
 Native debugger and VM facilities are integration points, not evidence that these remote gates already pass. A worker's local framed output is likewise not an authenticated network server.
 
@@ -58,7 +103,7 @@ backend through a trusted adapter, preserve source/job identities, stream its
 framed results, and enforce authorization/cancellation before advertising remote
 Linux processing. Apple runtime/SDK evidence discovery remains a macOS capability;
 shared static Mach-O/dyld parsing does not make Linux a Darwin runtime oracle.
-All client-readiness gates above remain open.
+The remaining remote-product gates above remain open.
 
 ## GitHub handoff
 

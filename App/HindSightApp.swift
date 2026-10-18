@@ -123,15 +123,17 @@ private struct HindSightSettingsView: View {
                 }
                 settingsSection("Support & Readiness") {
                     TextField("Keychain TLS identity subject", text: $model.remoteCertificateLabel)
+                    TextField("Bind IPv4 address (127.0.0.1 or private LAN IP)", text: $model.remoteBindAddress)
+                    TextField("Allowed HTTPS browser origin (LAN only)", text: $model.remoteAllowedOrigin)
                     TextField("HTTPS port", text: $model.remotePort)
                     VGReadinessRow(label: "Remote gateway", value: model.remoteStatus)
-                    Button("Start local HTTPS gateway") { model.startRemoteGateway() }
+                    Button("Start HTTPS gateway") { model.startRemoteGateway() }
                     Button("Stop gateway") { model.stopRemoteGateway() }
                     if !model.remoteToken.isEmpty {
                         Text("Session token (copy now; regenerated on start)")
                         Text(model.remoteToken).textSelection(.enabled).font(.system(.caption, design: .monospaced))
                     }
-                    settingsNote("Loopback-only read-only preview. Uploads, analysis, debugging, and VM controls are not exposed yet.")
+                    settingsNote("Remote access requires a private LAN address, a trusted TLS certificate whose SAN matches the client address, and one exact HTTPS browser origin. Analysis jobs are available; uploads, event streaming, debugger and VM controls are not exposed yet.")
                     Divider()
                     VGReadinessRow(label: "Build", value: buildIdentity)
                     VGReadinessRow(label: "Host", value: hostIdentity)

@@ -41,6 +41,15 @@ request_code() {
 [[ "$(request_code -H "Authorization: Bearer $token" "$url")" == 200 ]]
 [[ "$(request_code "$url")" == 401 ]]
 [[ "$(request_code -H "Authorization: Bearer $token" -H 'Host: evil.invalid' "$url")" == 400 ]]
+[[ "$(request_code -H "Authorization: Bearer $token" -H 'Origin: https://evil.example' "$url")" == 400 ]]
+[[ "$(request_code -X OPTIONS -H 'Origin: https://client.example' \
+    -H 'Access-Control-Request-Method: POST' \
+    -H 'Access-Control-Request-Headers: authorization, content-type' "$url")" == 204 ]]
+[[ "$(request_code -X OPTIONS -H 'Origin: https://evil.example' \
+    -H 'Access-Control-Request-Method: POST' "$url")" == 400 ]]
+cors_headers="$(curl --silent --show-error --cacert "$fixture_dir/cert.pem" -D - -o /dev/null \
+  -H "Authorization: Bearer $token" -H 'Origin: https://client.example' "$url")"
+[[ "$cors_headers" == *$'Access-Control-Allow-Origin: https://client.example\r'* ]]
 [[ "$(request_code -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
     -d '{}' "https://127.0.0.1:$port/v1/jobs/analysis")" == 202 ]]
 echo "Remote gateway TLS/auth/host/body smoke passed."
