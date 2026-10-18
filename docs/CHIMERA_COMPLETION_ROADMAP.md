@@ -259,7 +259,7 @@ Dependencies: C00–C11 for the first supported slice.
 - [~] Qualify C and Objective-C on ARM64/ARM64e Mach-O under the full corpus, execution, fidelity, provenance, resource, and recovery gates. *(in progress — claimed)*
 - [~] Extend C++: Itanium ABI, receiver/aggregate recovery, vtables, templates/debug types, exceptions, thunks, and optimized fixtures. *(in progress — claimed)*
 - [~] Extend Swift: versioned ABI, signatures, metadata, generics/existentials, ownership, closures, async and runtime adapters with dedicated fixtures. *(in progress — claimed)*
-- [ ] Add the x86-64 Mach-O lifter, ABI, shared analyses and calling-convention/differential tests through the same reconstruction pipeline.
+- [~] Add the x86-64 Mach-O lifter, ABI, shared analyses and calling-convention/differential tests through the same reconstruction pipeline. *(in progress — claimed)*
 
 Acceptance: each language/ISA declares and passes its own supported matrix. Structural ingestion of a new ISA does not qualify reconstructed source.
 
