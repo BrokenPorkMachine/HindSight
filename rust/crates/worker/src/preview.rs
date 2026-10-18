@@ -217,26 +217,27 @@ fn flow_hint(w:u32)->Option<String>{
  if (w&0x3f000000)==0x39000000{let load=((w>>22)&3)!=0;return Some(if load{format!("def {} <- memory[use x{}]",reg_name(rd,(w>>30)==3),rn)}else{format!("memory[use x{}] <- use {}",rn,reg_name(rd,(w>>30)==3))});}
  None
 }
-fn printable_strings(file:&mut File,size:u64)->io::Result<String>{
+fn printable_strings(file:&mut File,size:u64,cfstring_ranges:&[(u64,u64)])->io::Result<String>{
  let budget=size.min(4*1024*1024) as usize;let data=read_exact_range(file,0,budget)?;let mut out=String::new();let mut start=0usize;let mut i=0usize;
  while i<=data.len(){let printable=i<data.len() && (data[i]==b'\t'||(0x20..=0x7e).contains(&data[i]));if printable{i+=1;continue}
-  if i.saturating_sub(start)>=5{let end=(start+512).min(i);let text=String::from_utf8_lossy(&data[start..end]);if out.len()<60_000{out.push_str(&format!("file+0x{start:08x}  {text}{}\n",if end<i{" …"}else{""}));}}
+  let overlaps_cfstring=|begin:usize,end:usize|cfstring_ranges.iter().any(|(base,length)|(begin as u64)<base.saturating_add(*length)&&(end as u64)>*base);
+  if i.saturating_sub(start)>=5&&!overlaps_cfstring(start,i){let end=(start+512).min(i);let text=String::from_utf8_lossy(&data[start..end]);if out.len()<60_000{out.push_str(&format!("file+0x{start:08x}  {text}{}\n",if end<i{" …"}else{""}));}}
   i+=1;start=i;
  }
  Ok(out)
 }
 
 fn object_detections(_file:&mut File,window:&[u8],size:u64,strings:&str,dyld_imports:&str)->io::Result<String>{
- let secs=sections(window);let mut out=String::new();let mut cstrings=0usize;let mut cdata=0usize;let mut cf=0usize;let mut foundation=0usize;
+ let secs=sections(window);let mut out=String::new();let mut cstrings=0usize;let mut cfstring_records=0usize;let mut cdata=0usize;let mut cf=0usize;let mut foundation=0usize;
  for sec in &secs{
   if sec.sect.starts_with("__objc_"){out.push_str(&format!("0x{:016x} section={} classification=Objective-C-runtime-object confidence=section-backed size={} bytes\n",sec.addr,sec.sect,sec.size));if out.len()>50_000{break}}
-  if sec.sect=="__cstring"||sec.sect=="__cfstring"{if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}out.push_str(&format!("0x{:016x} section={} classification=c-string confidence=section-backed size={} bytes\n",sec.addr,sec.sect,sec.size));cstrings+=1;
+  if sec.sect=="__cstring"||sec.sect=="__cfstring"{if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}if sec.sect=="__cfstring"{out.push_str(&format!("0x{:016x} section={} classification=cfstring-constant-record confidence=section-backed size={} bytes payload=unresolved\n",sec.addr,sec.sect,sec.size));cfstring_records+=1;}else{out.push_str(&format!("0x{:016x} section={} classification=c-string confidence=section-backed size={} bytes\n",sec.addr,sec.sect,sec.size));cstrings+=1;}
   }else if ["__const","__data","__data_const","__bss","__common"].contains(&sec.sect.as_str()){out.push_str(&format!("0x{:016x} section={} classification=c-data-object confidence=section-backed size={} bytes\n",sec.addr,sec.sect,sec.size));cdata+=1;}
   if out.len()>50_000{break}
  }
  let classify=|name:&str|->Option<&'static str>{let n=name.trim_matches('_').to_ascii_lowercase();if n.contains("cfstring")||n.contains("cfdata")||n.contains("cfarray")||n.contains("cfdictionary")||n.contains("cfset")||n.contains("cfurl")||n.contains("cfuuid")||n.contains("cfrunloop")||n.contains("cfnotification")||n.contains("cfallocator"){Some("CoreFoundation object")}else if n.contains("nsstring")||n.contains("nsdata")||n.contains("nsarray")||n.contains("nsdictionary")||n.contains("nsset")||n.contains("nsurl")||n.contains("nsnumber")||n.contains("nsdate")||n.contains("nsvalue")||n.contains("nserror")||n.contains("nsobject"){Some("Foundation object")}else{None}};
  for line in dyld_imports.lines().chain(strings.lines()){let lower=line.to_ascii_lowercase();let Some(kind)=classify(&lower) else{continue};let confidence=if line.contains("symbol=")||line.contains("import"){"symbol-backed"}else{"string-backed heuristic"};out.push_str(&format!("{} classification={} confidence={}\n",line,kind,confidence));if kind=="CoreFoundation object"{cf+=1}else{foundation+=1}if out.len()>60_000{break}}
- out.push_str(&format!("\nDetection totals: C strings={} C data sections={} CoreFoundation={} Foundation={}\nObject identity is not inferred from arbitrary bytes; C-string/data records are section-backed and Apple object records require matching runtime names or imports.\n",cstrings,cdata,cf,foundation));Ok(out)
+ out.push_str(&format!("\nDetection totals: C strings={} CFString constant-record sections={} C data sections={} CoreFoundation={} Foundation={}\nCFString section records are not C strings; payload decoding requires validated pointer/fixup and record-layout evidence. Object identity is not inferred from arbitrary bytes; Apple object records require matching runtime names or imports.\n",cstrings,cfstring_records,cdata,cf,foundation));Ok(out)
 }
 
 fn parse_text_relocations(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<(u64,String,u32,bool,u32,Option<u64>)>>{
@@ -1448,7 +1449,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
  let selector_xrefs=selector_call_xrefs(&relocations,&calls,&symbols);
  analysis_progress(92,"evidence","Formatting xrefs, call evidence, relocations, selectors, and bounded strings.");
- let strings=printable_strings(&mut file,size)?;let object_detections=object_detections(&mut file,&window,size,&strings,&dyld_imports)?;let mut runtime_records=runtime_records;runtime_records.push_str("\n\nC / Apple object detections\n===========================\n");runtime_records.push_str(&object_detections);
+ let cfstring_ranges=sections(&window).into_iter().filter(|section|section.sect=="__cfstring"&&section.offset<=size&&section.size<=size-section.offset).map(|section|(section.offset,section.size)).collect::<Vec<_>>();let strings=printable_strings(&mut file,size,&cfstring_ranges)?;let object_detections=object_detections(&mut file,&window,size,&strings,&dyld_imports)?;let mut runtime_records=runtime_records;runtime_records.push_str("\n\nC / Apple object detections\n===========================\n");runtime_records.push_str(&object_detections);
  let mut signature_symbols=symbols.clone();
  signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));

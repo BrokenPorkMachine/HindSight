@@ -56,6 +56,8 @@ An imported declaration supplies parameters, ABI locations, typed call arguments
 
 ## Target members in pseudocode
 
+The string inventory distinguishes `__cstring` payloads from `__cfstring` constant-object records. `__cfstring` is not a C string: its bytes encode an object record, and printable fragments inside its pointer/flags/length fields are deliberately not surfaced as literals. Payload decoding remains unresolved until the target's fixups, record layout, character pointer and length are independently validated. The same rule applies to Foundation collections: an import or nearby class-name string is API evidence, not proof that an arbitrary data object is an `NSString`, `NSArray` or `NSDictionary`.
+
 The worker decodes target-local class, property and ivar records into structured member layouts. LP64 class and metaclass method lists use the same RO offsets. Ivar offsets dereference a 32-bit slot, with encoded width/alignment and instance bounds checked. These layouts follow [Apple's objc4 definitions](https://github.com/apple-oss-distributions/objc4/blob/main/runtime/objc-runtime-new.h) and are tested against the helper's public libobjc results.
 
 Pseudocode includes `@interface`/`@property` declarations with custom accessors, ownership attributes, backing ivars and metadata addresses. An object property's class-qualified type can refine a getter/setter only when its own validated method encoding otherwise supplies generic `id`; explicit conflicting method types retain their original evidence.

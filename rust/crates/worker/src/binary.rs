@@ -1436,6 +1436,14 @@ fn entry_points(i: &Image) -> io::Result<Vec<u64>> {
     out.dedup();
     Ok(out)
 }
+fn string_section_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "__cstring" => Some("c-string"),
+        "__cfstring" => Some("cfstring-constant-record"),
+        _ => None,
+    }
+}
+
 fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
     let mut out = String::new();
     let mut remaining = SCAN;
@@ -1453,10 +1461,20 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
         limited |= (n as u64) < s.size;
         remaining -= n;
         let b = read(file, s.offset, n)?;
-        if s.name == "__cstring" || s.name == "__cfstring" {
-            push(&mut out, &format!("0x{:016x} classification=c-string confidence=section-backed section={} size={} bytes\n", s.address, s.name, s.size));
+        if s.name == "__cstring" {
+            push(&mut out, &format!("0x{:016x} classification={} confidence=section-backed section={} size={} bytes\n", s.address, string_section_kind(&s.name).unwrap(), s.name, s.size));
+        } else if s.name == "__cfstring" {
+            // __cfstring contains constant object records (isa/flags/value/length),
+            // not a byte string. Decode the referenced character payload only
+            // after relocations/fixups and record layout have been validated.
+            push(&mut out, &format!("0x{:016x} classification={} confidence=section-backed section={} size={} bytes payload=unresolved\n", s.address, string_section_kind(&s.name).unwrap(), s.name, s.size));
         } else if ["__const", "__data", "__data_const", "__bss", "__common"].contains(&s.name.as_str()) {
             push(&mut out, &format!("0x{:016x} classification=c-data-object confidence=section-backed section={} size={} bytes\n", s.address, s.name, s.size));
+        }
+        // Do not mine printable fragments out of CFString structures: pointer,
+        // flags and length fields can coincidentally look like text.
+        if s.name == "__cfstring" {
+            continue;
         }
         let mut at = 0;
         while at < b.len() {
@@ -2274,6 +2292,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     );
     let symbols = symbols(&mut file, &image)?;
     let mut functions: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    let mut rejected_function_symbols = Vec::new();
     for (address, name, source) in &image.foreign.functions {
         functions.entry(*address).or_insert((name.clone(), source.clone()));
     }
@@ -2288,8 +2307,20 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             } else {
                 s.address
             };
-            if !image.sections[s.section as usize - 1].contains(address) {
-                return Err(bad("Defined symbol address outside its section"));
+            let section = &image.sections[s.section as usize - 1];
+            if !section.contains(address) {
+                // A bad/out-of-range function-name candidate must not prevent
+                // analysis of otherwise valid code. Keep the discrepancy
+                // visible and do not use the symbol as a function boundary.
+                rejected_function_symbols.push(format!(
+                    "name={:?} address={:#x} section={} range={:#x}..{:#x}",
+                    s.name,
+                    s.address,
+                    s.section,
+                    section.address,
+                    section.address.saturating_add(section.size)
+                ));
+                continue;
             }
             functions.entry(address).or_insert((
                 s.name.clone(),
@@ -2312,6 +2343,12 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             .or_insert((format!("sub_{a:x}"), "LC_FUNCTION_STARTS".into()));
     }
     let mut metadata = metadata(&image);
+    for rejected in rejected_function_symbols.iter().take(256) {
+        push(
+            &mut metadata,
+            &format!("Rejected function-name candidate: {rejected}; symbol retained in raw nlist evidence, not used as a function boundary.\n"),
+        );
+    }
     for entry in entry_points(&image)? {
         push(
             &mut metadata,
@@ -2921,6 +2958,12 @@ pub fn arm64_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cfstring_sections_are_not_mislabeled_as_c_strings() {
+        assert_eq!(string_section_kind("__cstring"), Some("c-string"));
+        assert_eq!(string_section_kind("__cfstring"), Some("cfstring-constant-record"));
+        assert_eq!(string_section_kind("__const"), None);
+    }
     #[test]
     fn checked_branch_addresses() {
         assert_eq!(
