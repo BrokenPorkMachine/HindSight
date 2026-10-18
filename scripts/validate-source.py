@@ -362,7 +362,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v79-schema122"', 'analysisCacheProducerVersion = "0.5.12"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v89-schema122"', 'analysisCacheProducerVersion = "0.5.12"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -437,7 +437,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
-for token in ['AArch64 register semantics v45', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
+for token in ['AArch64 register semantics v54', 'AddExtended', '0x0b20_0000', 'MoveNot', 'MoveKeep', 'MoveZero',
               'LogicalImmediate', 'LogicalRegister', 'decode_bitmask', 'Address',
               'ConditionalBranch', 'IndirectBranch', 'IndirectCall', 'BranchTest',
               'ShiftKind', 'shift_value', 'MultiplyAdd', 'Extend', 'extend_value',
@@ -483,7 +483,9 @@ for token in ['AArch64 register semantics v45', 'AddExtended', '0x0b20_0000', 'M
               '0x0f20_0000', '0x0820_0000', 'x8 = ldapr(x8);',
               '/* casal x8, x24, x9 */',
               'VMoveImm', 'VKnownValue', 'v_registers', '0x6f00_e400',
-              '/* movi.2d v{}, #0x{:02x} */',
+              'VectorImmediate', '/* movi.2d v{destination}, #0x{immediate:02x} */',
+              'VectorBitwise', 'BitInsertIfFalse', '0x9f20_fc00',
+              'VectorExtract', '0xbfe0_fc00', '0x0e00_2c00', '0x0e00_3c00',
               'FmovReg', 'FmovImm', '0x9e66_0000', '0x6f03_f600',
               '{} = fmov(d{});{}', '/* fmov.{} v{}, #imm */',
               'merge_flow', 'flows_equal', 'block_starts', 'entry: std::collections::HashMap']:
@@ -513,7 +515,7 @@ assert (R/'docs/ANALYSIS_NAVIGATION_0.4.3.md').is_file()
 analysis_continuity=(R/'App/AnalysisContinuity.swift').read_text()
 for token in ['struct VGAnalysisPin', 'struct VGAnalysisVisit', 'struct VGAnalysisSnapshot', 'struct VGAnalysisDelta',
               'maximumBytes = 1 * 1024 * 1024', 'maximumPins = 128', 'maximumRecent = 96',
-              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v79-schema122']:
+              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v89-schema122']:
     assert token in analysis_continuity, token
 for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'Text("Changes").tag("Changes")',
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:

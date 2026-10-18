@@ -33,6 +33,15 @@ static int finish(Hash*h,unsigned char*out){unsigned n=0;return EVP_DigestFinal_
 static void release(Hash*h){if(*h)EVP_MD_CTX_free(*h);}
 #endif
 static int room(int fd,uint64_t required){struct statvfs v;if(fstatvfs(fd,&v))return 0;long double available=(long double)v.f_bavail*v.f_frsize;return available >= required;}
+int re_sha256_bytes(const unsigned char *data,size_t size,char digest[65]){
+ if(!digest||(!data&&size)||size>32u*1024u*1024u)return -1;
+ Hash hash={0};int result=-1;unsigned char bytes[32];digest[0]=0;
+ if(!init(&hash))goto done;
+ if(!update(&hash,data,size)||!finish(&hash,bytes))goto done;
+ for(size_t i=0;i<32;i++)snprintf(digest+2*i,3,"%02x",bytes[i]);
+ digest[64]=0;result=0;
+done: release(&hash);return result;
+}
 static int same(const struct stat*a,const struct stat*b){
  if(a->st_size!=b->st_size || a->st_ino!=b->st_ino || a->st_dev!=b->st_dev)return 0;
 #ifdef __APPLE__

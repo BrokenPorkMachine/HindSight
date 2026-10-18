@@ -220,6 +220,18 @@ final class WorkerSupervisor {
             }
         }
     }
+    func reconstruct(path: String, digest: String, size: String, start: UInt64, end: UInt64, id: String,
+                     completion: @escaping (Result<String, Error>) -> Void) {
+        run(path: path, arguments: ["--reconstruct", path, digest, size, String(format: "0x%llx", start), String(format: "0x%llx", end), id],
+            id: id, operation: "reconstruction", maxFrameBytes: ReconstructionArtifact.maxBytes,
+            deadlineSeconds: 120, admissionBytes: 256 * 1_048_576) { result in
+            completion(result.flatMap { data in Result {
+                guard let json = String(data: data, encoding: .utf8) else { throw WorkbenchError("Reconstruction is not UTF-8.") }
+                _ = try ReconstructionArtifact.decode(json, digest: digest, start: start, end: end)
+                return json
+            } })
+        }
+    }
     private static func captureResult(_ data: Data, id: String, options: BinaryImportOptions?) throws -> HeaderResult {
         guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw WorkbenchError("Invalid capture JSON.") }
                 let expected: Set<String> = ["protocol", "request_id", "kind", "file_kind", "architecture", "size", "header_hex", "captured", "source_sha256", "structure_status", "structure", "disassembly_status", "disassembly"]
@@ -519,7 +531,7 @@ final class WorkerSupervisor {
     private static func priority(for operation: String) -> TaskPriority {
         switch operation {
         case "page": return .interactive
-        case "analysis": return .userInitiated
+        case "analysis", "reconstruction": return .userInitiated
         case "capture": return .utility
         default: return .background
         }

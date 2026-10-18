@@ -21,7 +21,9 @@
 mod preview;
 mod binary;
 mod semantic;
+mod objc;
 mod signatures;
+mod reconstruction;
 use std::{fs::File,io::{self,Read}};
 use reworkbench_protocol::{read_frame,write_frame,write_frame_with_limit,MAX_ANALYSIS_FRAME};
 fn quote(text:&str)->String{
@@ -95,16 +97,19 @@ fn run()->io::Result<()>{
   while let Some(frame)=read_frame(&mut input)?{write_frame(&mut output,&frame)?;}return Ok(());
  }
  let is_analysis=(args.len()==6 && args[1]=="--analyze") || (args.len()==10 && args[1]=="--analyze-image");
+ let is_reconstruction=(args.len()==8 && args[1]=="--reconstruct") || (args.len()==9 && args[1]=="--interpret");
  let result=if args.len()==5 && args[1]=="--capture-inspect"{capture(&args[2],&args[3],&args[4])}
  else if args.len()==7 && args[1]=="--page"{preview::request(&args[2],&args[3],&args[4],&args[5],&args[6])}
  else if args.len()==9 && args[1]=="--capture-image"{binary::Options::parse(&args[5..]).and_then(|o|capture_image(&args[2],&args[3],&args[4],&o))}
  else if args.len()==11 && args[1]=="--page-image"{binary::Options::parse(&args[7..]).and_then(|o|binary::request(&args[2],&args[3],&args[4],&args[5],&args[6],&o))}
  else if args.len()==10 && args[1]=="--analyze-image"{binary::Options::parse(&args[6..]).and_then(|o|if binary::legacy_arm64(&args[2],&o){preview::analyze(&args[2],&args[3],&args[4],&args[5])}else{binary::analyze(&args[2],&args[3],&args[4],&args[5],&o)})}
+ else if args.len()==8 && args[1]=="--reconstruct"{preview::reconstruct(&args[2],&args[3],&args[4],&args[5],&args[6],&args[7])}
+ else if args.len()==9 && args[1]=="--interpret"{preview::interpret(&args[2],&args[3],&args[4],&args[5],&args[6],&args[7],&args[8])}
  else if is_analysis{preview::analyze(&args[2],&args[3],&args[4],&args[5])}
  else if args.len()==4 && args[1]=="--inspect-header"{inspect(&args[2],&args[3])}
  else{return Err(io::Error::new(io::ErrorKind::InvalidInput,"Invalid worker arguments"));};
  let response=match result{Ok(v)=>v,Err(e)=>format!("{{\"protocol\":1,\"kind\":\"error\",\"message\":{}}}",quote(&e.to_string()))};
- if is_analysis { write_frame_with_limit(&mut io::stdout().lock(),response.as_bytes(),MAX_ANALYSIS_FRAME) }
+ if is_analysis||is_reconstruction { write_frame_with_limit(&mut io::stdout().lock(),response.as_bytes(),MAX_ANALYSIS_FRAME) }
  else { write_frame(&mut io::stdout().lock(),response.as_bytes()) }
 }
 fn main(){if let Err(e)=run(){eprintln!("reworker: {e}");std::process::exit(1);}}

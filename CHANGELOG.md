@@ -7,6 +7,42 @@
 - Bound SwiftUI workspace type expansion to fix the reproduced Swift 6.4 SIL-generation crash in ContentView.
 - Regenerate consistent build settings and add clean, commit-based source recreation without Git metadata, DerivedData, or Xcode user state.
 
+# Unreleased — Decompiler SSA and scalar FP foundation
+
+- Lift half-precision scalar FP add, subtract, multiply, divide, minimum/maximum (`FMAX`/`FMIN`/`FMAXNM`/`FMINNM`), comparisons, and conditional select into shared IR with a `Half` precision variant; a manual f16→f32 bit conversion supports constant materialization and comparison. Also lift vector floating-point three-same arithmetic (`FADD`/`FSUB`/`FMUL`/`FDIV`/`FMAX`/`FMIN`/`FMAXNM`/`FMINNM` across `4s`/`2d` lanes) into shared IR with bounded constant folding for `Q=1` forms. Lift vector reciprocal estimate (`FRECPE`/`FRSQRTE` for both `Q=1` (Quad) and `Q=0` (Double) lanes) into shared IR. Lift vector FP compare (`FCMEQ`/`FCMGT`/`FCMGE`/`FCMLT`/`FCMLE` for `4s`/`2d` lanes) into shared IR with canonical operand ordering. Lift half-precision vector three-same arithmetic (`FADD`/`FSUB`/`FMUL`/`FDIV`/`FMAX`/`FMIN`/`FMAXNM`/`FMINNM` across `.4h`/`.8h` lanes) into shared IR. Lift scalar reciprocal exponent (`FRECPX` for single/double) into shared IR. Load/SimdLoad rendering now attempts string/integer reconstruction from `LC_DATA_IN_CODE` ranges when address provenance is known; `merge_flow` preserves render context for dataflow fixpoint. Remaining reciprocal-exponent forms and target-specific instructions stay opaque. No report field or engine-identity change.
+
+- Replace text-derived pseudocode parameter flow with bounded shared-IR entry identities, width-specific register views, CFG must-joins, frame spills/restores and paired-write invalidation. Separate input/output names and record join/limit reasons.
+- Correct scalar pre-indexed access rendering and capture original effective addresses for overlapping-base pair loads. Six Apple-assembled functions qualify pseudocode names/effects with 1,560 original-native result checks; reconstructed-source equivalence remains open.
+- Advance analysis/cache identity to `arm64-analysis-v89-schema122` and statement banner to v54; transport/cache schemas remain unchanged.
+
+- Lift all 82 legal integer SIMD-to-GPR lane forms (`UMOV`/`MOV`, `SMOV`) into shared IR with exact destination/extension effects and bounded vector-bit provenance. Apple-assembled fixtures and 42,640 native lane-result comparisons qualify the non-streaming EL0 result model.
+- Remove the broad SIMD preservation fallback and tighten the vector-bitwise fixed-bit mask. Reserved/unmodeled words invalidate unknown state instead of preserving stale constants, SSA identities or object receivers.
+- Advance analysis/cache identity to `arm64-analysis-v88-schema122` and statement banner to v53; report/cache schemas remain unchanged.
+
+- Join structured target-local Objective-C ivar/property layouts to AArch64 pseudocode. Proven instance-receiver memory accesses render named ivars; typed property declarations and object accessor signatures retain metadata provenance.
+- Correct LP64 class/metaclass RO member offsets and read ivar-offset variables as 32-bit values. Shared IMPs, overlapping/contradictory layouts, unknown receivers, calls, opaque effects and conflicting CFG paths withhold field substitutions.
+- Advance analysis/cache identity to `arm64-analysis-v87-schema122`; the 72-field report and v52 machine-statement banner remain unchanged.
+
+- Admit bounded ELF32/ELF64 relocatable objects, assign deterministic analysis-only addresses to allocatable sections, and rebase section-relative symbols without claiming loader placement or applying relocations.
+- Recover bounded section-backed ELF `SHT_REL`/`SHT_RELA` records with validated symbol-table links, target sections, sites, types, symbol indices, and addends; relocations remain unapplied evidence.
+- Recover dynamic-link evidence from `PT_DYNAMIC` for section-header-free ELF images: bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables with load-mapping/site/index validation, `DT_HASH`/`DT_GNU_HASH`-proven dynamic symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied and unrecovered.
+- Recover PE imports, exports and base relocations from data directories: DLL and symbol names, ordinals, hint/name tables, export addresses and base-relocation sites, with section-mapping and budget validation. PDB and Authenticode remain unavailable.
+- Admit standalone COFF objects (`.obj`) for i386, x86-64 and AArch64 with bounded section, symbol and relocation tables; sections receive deterministic analysis-only addresses, symbols supply names/function starts/imports/exports, and relocations remain unapplied evidence.
+- Admit PDB files (MSF 7.0) with validated superblock, block map and stream directory; stream count, sizes and well-known streams (PDB info, TPI, DBI) are reported as evidence.
+- Validate Authenticode (PKCS#7/CMS) security directories in PE files: WIN_CERTIFICATE structures, SignedData version, digest algorithm, certificate and signer counts reported as evidence. Full cryptographic verification is not performed.
+- Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.
+- Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
+- Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.
+- Lift scalar single/double reciprocal estimates and refinement steps (`FRECPE`, `FRSQRTE`, `FRECPS`, `FRSQRTS`) as named shared IR operations with unresolved FP behavior; only their destination values are invalidated.
+- Lift SIMD memory access into shared IR: every width of the Advanced SIMD load/store single-register group (`B`/`H`/`S`/`D` lanes and the full `Q` register) across unsigned-offset, unscaled, pre-indexed, post-indexed, unprivileged, register-offset, and PC-relative literal addressing, plus `LDP`/`STP` for signed offset, pre-index, and post-index over general-purpose and `S`/`D`/`Q` registers. Register-offset forms scale by the 128-bit access size when `S` is set.
+- Lift non-temporal `LDNP`/`STNP` pair accesses into the same shared memory IR while preserving their no-writeback behavior; invalid width/direction combinations remain opaque.
+- Lift lane-wise vector bitwise operations (`AND`, `BIC`, `ORR`, `ORN`, `EOR`, `BSL`, `BIT`, `BIF`, and `MOV`) plus replicated `MOVI` constants into shared IR with bounded V-register provenance and no spurious GPR barriers.
+- Correct `LDP`/`STP` decoding to use the architectural `opc`/`L`/width table; stores were previously read as loads, 64-bit pairs were reported through the 32-bit view, and signed-offset and post-index pairs were left opaque. Pre-indexed pairs now render both halves against the updated base, and the second half of a pair is addressed at the first half's offset plus the access size.
+- Vector memory access invalidates only its own V-register destinations, so instructions such as `ldr q0, [x0]` no longer discard unrelated proven general-purpose constants as an all-GPR barrier.
+- Advance the analysis/cache identity to `arm64-analysis-v83-schema122` and semantic preview banner to v49; the report schema is unchanged.
+- Advance the analysis/cache identity to `arm64-analysis-v85-schema122` and semantic preview banner to v51; the report schema is unchanged.
+- Advance the analysis/cache identity to `arm64-analysis-v86-schema122` and semantic preview banner to v52; the report schema is unchanged.
+
 # 0.5.12 — Objective-C/C Argument Reconstruction
 
 - Improve call parameter resolution for Objective-C and C using recovered prototypes and proven argument values.

@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import CryptoKit
 import Foundation
+import Security
 import UniformTypeIdentifiers
 
 private struct VGAnalysisDecodeResult: Sendable {
@@ -52,6 +53,9 @@ final class WorkbenchModel: ObservableObject {
     private var traversingPreviousPage = false
     @Published var instructionPage: InstructionPage?
     @Published var analysisReport: AnalysisReport?
+    @Published private(set) var reconstructionArtifact: ReconstructionArtifact?
+    @Published private(set) var reconstructionStatus = "Select a function and request reconstruction."
+    private var reconstructionContext: (project: String, record: String, analysis: String)?
     @Published private(set) var analysisEvidenceIndex: VGAnalysisEvidenceIndex?
     @Published private(set) var analysisEvidenceIndexing = false
     @Published private(set) var analysisEvidenceStatus = "Evidence index unavailable."
@@ -385,6 +389,144 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private var savedLaunchSession: LaunchSession?
     private var applyingLaunchSession = false
     private let client = CoordinatorClient()
+    @Published var remoteCertificateLabel = ""
+    @Published var remoteBindAddress = "127.0.0.1"
+    @Published var remoteAllowedOrigin = ""
+    @Published var remotePort = "8443"
+    @Published private(set) var remoteToken = ""
+    @Published private(set) var remoteStatus = "Off"
+    private lazy var remoteTransactions = RemoteAnalysisTransactions(backend: .init(
+        analyze: { [weak self] recordID, requestID, done in
+            guard let self else { return }
+            self.client.request(timeout: 260, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+                                invalidateConnectionOnTimeout: false,
+                                operation: { $0.analyzeRecord(recordID, requestID: requestID, withReply: $1) },
+                                completion: done)
+        },
+        status: { [weak self] requestID, done in
+            guard let self else { return }
+            self.client.request(timeout: 3, maxReplyBytes: 64 * 1024,
+                                invalidateConnectionOnTimeout: false,
+                                operation: { $0.inspectionStatus(requestID, withReply: $1) },
+                                completion: done)
+        },
+        cancel: { [weak self] requestID, done in
+            guard let self else { return }
+            self.client.request(timeout: 3, invalidateConnectionOnTimeout: false,
+                                operation: { service, finish in
+                service.cancelInspection(requestID) { finish($0 ? "true" : "false") }
+            }) { result in
+                done(result.flatMap { value in
+                    if value == "true" { return .success(true) }
+                    if value == "false" { return .success(false) }
+                    return .failure(NSError(domain: "HindSight", code: 5,
+                                            userInfo: [NSLocalizedDescriptionKey: "Invalid cancellation reply."]))
+                })
+            }
+        }
+    ))
+    private lazy var remoteGateway = RemoteGateway(handle: { [weak self] request, reply in
+        Task { @MainActor in self?.handleRemoteRequest(request, reply: reply) }
+    }, status: { [weak self] value in
+        Task { @MainActor in self?.remoteStatus = value }
+    })
+    func startRemoteGateway() {
+        guard let port = UInt16(remotePort), port > 0 else { remoteStatus = "Invalid port"; return }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            remoteStatus = "Token generation failed"; return
+        }
+        let token = bytes.map { String(format: "%02x", $0) }.joined()
+        do {
+            try remoteGateway.start(certificateLabel: remoteCertificateLabel,
+                                    bindAddress: remoteBindAddress,
+                                    allowedOrigin: remoteAllowedOrigin,
+                                    port: port, token: token)
+            remoteToken = token
+            remoteStatus = "Starting…"
+        } catch {
+            remoteToken = ""
+            remoteStatus = error.localizedDescription
+        }
+    }
+    func stopRemoteGateway() {
+        remoteGateway.stop()
+        remoteToken = ""
+        remoteTransactions.stop()
+    }
+    private func handleRemoteRequest(_ request: RemoteRequest, reply: @escaping (RemoteResponse) -> Void) {
+        remoteTransactions.handle(request, project: project, ready: projectSessionReady, reply: reply)
+    }
+#if HINDSIGHT_SERVER_TEST
+    private var remoteIntegrationSmokeStarted = false
+    private func runRemoteIntegrationSmokeIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard !remoteIntegrationSmokeStarted,
+              environment["HINDSIGHT_REMOTE_INTEGRATION_SMOKE"] == "1" else { return }
+        remoteIntegrationSmokeStarted = true
+        Task { await performRemoteIntegrationSmoke(environment) }
+    }
+    private func remoteSmokeRequest(timeout: UInt64 = 20,
+                                    _ operation: @escaping (CoordinatorProtocol, @escaping (String) -> Void) -> Void) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            client.request(timeout: timeout, operation: operation) { continuation.resume(with: $0) }
+        }
+    }
+    private func performRemoteIntegrationSmoke(_ environment: [String: String]) async {
+        do {
+            guard let projectPath = environment["HINDSIGHT_REMOTE_SMOKE_PROJECT"],
+                  let binaryPath = environment["HINDSIGHT_REMOTE_SMOKE_BINARY"],
+                  let identityPath = environment["HINDSIGHT_REMOTE_SMOKE_IDENTITY"],
+                  let password = environment["HINDSIGHT_REMOTE_SMOKE_PASSWORD"],
+                  let token = environment["HINDSIGHT_REMOTE_SMOKE_TOKEN"], token.utf8.count >= 32,
+                  let portText = environment["HINDSIGHT_REMOTE_SMOKE_PORT"],
+                  let port = UInt16(portText), port > 0 else {
+                throw NSError(domain: "HindSightSmoke", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Incomplete smoke configuration."])
+            }
+            let opened = try await remoteSmokeRequest { service, done in
+                service.openProject(projectPath, create: true, withReply: done)
+            }
+            guard let openedReply = try? JSONDecoder().decode(ServiceReply.self, from: Data(opened.utf8)),
+                  openedReply.ok, let openedProject = openedReply.project else {
+                throw NSError(domain: "HindSightSmoke", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "Project creation failed: \(opened)"])
+            }
+            project = openedProject
+            let options = String(decoding: try JSONEncoder().encode(BinaryImportOptions.automatic), as: UTF8.self)
+            let imported = try await remoteSmokeRequest(timeout: 150) { service, done in
+                service.importBinary(binaryPath, optionsJSON: options, requestID: UUID().uuidString, withReply: done)
+            }
+            guard let importedReply = try? JSONDecoder().decode(ServiceReply.self, from: Data(imported.utf8)),
+                  importedReply.ok, let importedProject = importedReply.project,
+                  importedProject.records.first?.result.captured == true else {
+                throw NSError(domain: "HindSightSmoke", code: 3,
+                              userInfo: [NSLocalizedDescriptionKey: "Binary import failed: \(imported)"])
+            }
+            project = importedProject
+            connected = true
+            projectSessionReady = true
+            let identityData = try Data(contentsOf: URL(fileURLWithPath: identityPath))
+            var items: CFArray?
+            let identityStatus = SecPKCS12Import(identityData as CFData,
+                [kSecImportExportPassphrase as String: password] as CFDictionary, &items)
+            guard identityStatus == errSecSuccess,
+                  let entries = items as? [[String: Any]],
+                  let item = entries.first?[kSecImportItemIdentity as String],
+                  CFGetTypeID(item as CFTypeRef) == SecIdentityGetTypeID() else {
+                throw NSError(domain: "HindSightSmoke", code: 4,
+                              userInfo: [NSLocalizedDescriptionKey: "TLS identity import failed: \(identityStatus)"])
+            }
+            let identity = unsafeBitCast(item as CFTypeRef, to: SecIdentity.self)
+            try remoteGateway.start(identity: identity, port: port, token: token)
+            print("HINDSIGHT_REMOTE_SMOKE_READY")
+            fflush(stdout)
+        } catch {
+            print("HINDSIGHT_REMOTE_SMOKE_FAILED: \(error.localizedDescription)")
+            fflush(stdout)
+        }
+    }
+#endif
     init() {
         if let saved = UserDefaults.standard.string(forKey: "HindSight.preferred-layout.v1"), VGWorkspaceCatalog.layouts.contains(saved) {
             preferredLayoutPreset = saved
@@ -628,6 +770,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         Date() < startupPressureUntil
     }
     func scheduleColdStart() {
+#if HINDSIGHT_SERVER_TEST
+        if ProcessInfo.processInfo.environment["HINDSIGHT_REMOTE_INTEGRATION_SMOKE"] == "1" {
+            runRemoteIntegrationSmokeIfRequested()
+            return
+        }
+#endif
         guard startupTask == nil, !connected, !connectingToCoordinator else { return }
         beginPressureObservation()
         startupPhase = "UI ready; coordinator pending"
@@ -931,11 +1079,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let alert = NSAlert()
         alert.messageText = "Import \(url.lastPathComponent)"
-        alert.informativeText = "Mach-O uses validated header addresses. Raw firmware needs an explicit architecture and load address. For composite SEPI, choose an image offset; Auto selects the first validated embedded Mach-O."
+        alert.informativeText = "Mach-O, ELF and PE use validated header addresses. Raw firmware needs an explicit architecture and load address. For composite SEPI, choose an image offset; Auto selects the first validated embedded Mach-O."
         alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
         let format = NSPopUpButton(frame: .zero, pullsDown: false)
-        let formats = ["auto", "macho", "sepos", "securerom", "iboot", "raw"]
-        format.addItems(withTitles: ["Auto / composite", "Mach-O", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary"])
+        let formats = ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"]
+        format.addItems(withTitles: ["Auto / composite", "Mach-O", "ELF (static)", "PE/COFF image (static)", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary"])
         let architecture = NSPopUpButton(frame: .zero, pullsDown: false)
         let architectures = ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
         architecture.addItems(withTitles: ["From header (ARM32 defaults to Thumb-2)", "AArch64", "Intel 32-bit", "Intel 64-bit", "ARM32", "Thumb-2"])
@@ -1079,6 +1227,59 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 self.triggerPluginEvent("on_analysis_complete")
             }
         }
+    }
+    var currentReconstruction: ReconstructionArtifact? {
+        guard let context = reconstructionContext, context.project == project?.path,
+              context.record == selectedID, context.analysis == currentAnalysis?.request_id,
+              reconstructionArtifact?.digest == selected?.result.source_sha256 else { return nil }
+        return reconstructionArtifact
+    }
+    func reconstructFunction(_ function: VGFunctionRecord) {
+        guard !busy, projectServiceReady, let record = selected, let digest = record.result.source_sha256,
+              let projectPath = project?.path, let analysis = currentAnalysis else { return }
+        let id = UUID().uuidString, generation = navigationGeneration
+        activeRequest = id; busy = true; reconstructionStatus = "Reconstructing the selected function…"
+        startAnalysisMonitor(requestID: id)
+        client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+                       operation: { $0.reconstructFunction(record.id, startAddress: String(function.start), endAddress: String(function.end), requestID: id, withReply: $1) }) { [weak self] result in
+            guard let self, self.activeRequest == id else { return }
+            self.stopAnalysisMonitor()
+            let text: String
+            do { text = try result.get() }
+            catch { self.busy = false; self.activeRequest = nil; self.reconstructionStatus = error.localizedDescription; return }
+            Task { [weak self] in
+                let decoded = await Task.detached(priority: .userInitiated) { () -> Result<ReconstructionArtifact, Error> in
+                    Result {
+                        let reply = try JSONDecoder().decode(ReconstructionReply.self, from: Data(text.utf8))
+                        guard reply.requestID == id, let artifact = reply.artifactJSON else { throw ReconstructionArtifact.Invalid(message: reply.message) }
+                        return try ReconstructionArtifact.decode(artifact, digest: digest, start: function.start, end: function.end)
+                    }
+                }.value
+                guard let self, self.activeRequest == id else { return }
+                self.busy = false; self.activeRequest = nil
+                guard self.navigationGeneration == generation, self.selectedID == record.id, self.project?.path == projectPath,
+                      self.currentAnalysis?.request_id == analysis.request_id else { self.reconstructionStatus = "Discarded reconstruction for an earlier project, artifact or analysis revision."; return }
+                switch decoded {
+                case .success(let artifact):
+                    self.reconstructionArtifact = artifact
+                    self.reconstructionContext = (projectPath, record.id, analysis.request_id)
+                    self.reconstructionStatus = "\(artifact.eligibility) · \(artifact.pass). Generated source has not been compiled or executed by the app."
+                case .failure(let error): self.reconstructionStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+    func exportReconstruction(_ function: VGFunctionRecord, source: ReconstructionSource?) {
+        guard let artifact = currentReconstruction, artifact.start == function.start, artifact.end == function.end,
+              source == nil || artifact.sources.contains(where: { $0.id == source?.id }) else { return }
+        let panel = NSSavePanel()
+        panel.title = source == nil ? "Export Reconstruction Evidence" : "Export Generated Source for Review"
+        panel.nameFieldStringValue = "function-\(String(function.start, radix: 16))" + (source == nil ? ".reconstruction.json" : ".c")
+        panel.message = "Generated source is not a compilation or equivalence guarantee. Its assumptions and evidence remain in the JSON artifact."
+        if source == nil { panel.allowedContentTypes = [.json] }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try (source?.text ?? artifact.json).write(to: url, atomically: true, encoding: .utf8); reconstructionStatus = "Exported \(url.lastPathComponent). No generated code was executed." }
+        catch { reconstructionStatus = error.localizedDescription }
     }
     func clearAnalysisCache() {
         guard !busy, projectServiceReady, project != nil else { return }

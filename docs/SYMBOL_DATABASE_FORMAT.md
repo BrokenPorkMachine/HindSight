@@ -20,7 +20,9 @@ Rules:
 - ARM32 Thumb address bit 0 is normalized;
 - nlist and export-trie names always outrank catalog names;
 - accepted names carry `source=external-symbol-db` provenance;
-- the file is capped at 200,000 records and is never downloaded automatically.
+- the file is capped at 16 MiB and 200,000 lines and is never downloaded automatically;
+- an optional `# source_sha256=<64 hex digits>` comment binds the catalog to the
+  verified captured artifact; a mismatch rejects analysis before names are applied.
 
 Example:
 
@@ -31,3 +33,26 @@ HINDSIGHT_SYMBOL_DB=/absolute/path/xnu-symbols.txt \
 
 This provides authoritative naming when the analyst supplies an authoritative
 catalog. It does not manufacture a complete Apple private XNU/SEP database.
+
+Catalogs apply to the structural analysis backend. The legacy ARM64 semantic
+backend does not read them. Function-name exchanges from other reversing tools
+can produce hash-bound catalogs; see [function exchange](REVERSING_INTEROP.md).
+
+## Project C prototype catalogs
+
+The Mach-O semantic backend accepts a separate, opt-in C prototype catalog via
+`HINDSIGHT_PROTOTYPE_DB`. This file must contain a matching SHA-256 binding and
+uses a tab between the exact Mach-O symbol and its declaration:
+
+```text
+# source_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+_custom_parse	int custom_parse(const char *bytes, size_t length);
+```
+
+The catalog is capped at 4 MiB and 20,000 lines. Symbols and declarations are
+bounded and validated; control characters, bodies, initializers, quoted text,
+preprocessor text, and unsupported nested declarators are rejected. The symbol
+must match the function name after the Mach-O leading underscore is removed.
+Catalog prototypes apply only when that exact symbol exists in the analyzed
+image. Exact built-in SDK declarations have higher precedence. Unknown parameter
+layouts stop subsequent ABI-location claims rather than guessing them.

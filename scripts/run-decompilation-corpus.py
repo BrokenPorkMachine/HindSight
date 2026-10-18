@@ -83,6 +83,11 @@ def score(source_type: str, report: dict) -> dict[str, int]:
     }
     pseudocode = semantic.split("Reconstructed pseudocode\n========================\n", 1)
     pseudocode = pseudocode[1] if len(pseudocode) == 2 else ""
+    address_rows = [
+        line.split("/*", 1)[0]
+        for line in pseudocode.splitlines()
+        if re.match(r"^\s+0x[0-9a-fA-F]+:", line)
+    ]
     pseudocode_sites = {
         int(match.group(1), 16)
         for line in pseudocode.splitlines()
@@ -109,6 +114,18 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         ),
         "pseudocode_address_rows": len(pseudocode_sites),
         "source_mapping_valid_rows": len(pseudocode_sites & ir_sites),
+        "expression_rows": sum(
+            1 for line in address_rows
+            if " = " in line or re.search(r"\b(?:cmp|tst|fcmp)\s*\(", line)
+        ),
+        "resolved_call_target_rows": sum(
+            1 for line in address_rows
+            if re.search(r"\b[A-Za-z_$][A-Za-z0-9_$:]*\s*\([^;]*\)\s*;", line)
+        ),
+        "type_evidence_rows": sum(
+            1 for line in (report.get("call_values") or "").splitlines()
+            if " declaration=" in line and " source=" in line and " language=" in line
+        ),
         "cpp_signature_records": (report.get("call_values") or "").count("Itanium mangled parameter types"),
         "function_rows": sum(1 for line in functions.splitlines() if "confidence=" in line),
         "cfg_blocks": sum(1 for line in cfg.splitlines() if line.startswith("block B")),
@@ -137,6 +154,8 @@ def score(source_type: str, report: dict) -> dict[str, int]:
         raise RuntimeError(f"{source_type} fixture did not reconstruct the Objective-C hidden ABI parameters: {metrics}")
     if source_type in {"c", "objective-c"} and metrics["resolved_parameter_name_uses"] < 1:
         raise RuntimeError(f"{source_type} fixture did not use a recovered parameter name in pseudocode: {metrics}")
+    if metrics["expression_rows"] < 1:
+        raise RuntimeError(f"{source_type} fixture produced no measurable pseudocode expressions: {metrics}")
     return metrics
 
 
@@ -170,7 +189,15 @@ def main() -> int:
                     report = analyze(worker, binary)
                     metrics = score(source_type, report)
                     rows.append({"language": source_type, "optimization": optimization, "stripped": stripped, **metrics})
-        print(json.dumps({"corpus": str(FIXTURES), "variants": len(rows), "results": rows}, indent=2, sort_keys=True))
+        totals = {
+            metric: sum(row[metric] for row in rows)
+            for metric in ("expression_rows", "resolved_call_target_rows", "type_evidence_rows", "source_mapping_valid_rows")
+        }
+        if totals["resolved_call_target_rows"] < 1:
+            raise RuntimeError(f"corpus produced no measurable resolved call targets: {totals}")
+        if totals["type_evidence_rows"] < 1:
+            raise RuntimeError(f"corpus produced no measurable type evidence: {totals}")
+        print(json.dumps({"corpus": str(FIXTURES), "variants": len(rows), "totals": totals, "results": rows}, indent=2, sort_keys=True))
         if args.keep:
             kept = pathlib.Path(tempfile.mkdtemp(prefix="hindsight-decompilation-corpus-kept-"))
             for item in directory.iterdir():

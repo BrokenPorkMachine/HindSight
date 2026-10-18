@@ -9,6 +9,7 @@ private enum VGBinaryCenterMode: String, CaseIterable, Identifiable {
 
 private enum VGBinarySemanticMode: String, CaseIterable, Identifiable {
     case pseudocode = "Pseudocode"
+    case source = "Source"
     case lifted = "Lifted"
     case ir = "IR"
     case cfg = "CFG"
@@ -40,6 +41,12 @@ struct VGBinaryWorkspace: View {
     let onSelectAddress: (String) -> Void
     let onSaveFunctionOverride: (UInt64, String, String, String, VGAnalysisConfidence) -> Void
     let onUndoFunctionOverride: (UInt64) -> Void
+    let reconstruction: ReconstructionArtifact?
+    let reconstructionStatus: String
+    let reconstructionBusy: Bool
+    let onReconstruct: (VGFunctionRecord) -> Void
+    let onCancelReconstruction: () -> Void
+    let onExportReconstruction: (VGFunctionRecord, ReconstructionSource?) -> Void
 
     @State private var functionQuery = ""
     @State private var selectedFunctionStart: UInt64?
@@ -55,6 +62,8 @@ struct VGBinaryWorkspace: View {
     @State private var overrideSignature = ""
     @State private var overrideNote = ""
     @State private var overrideConfidence: VGAnalysisConfidence = .unclassified
+    @State private var sourceSelection = "review"
+    @State private var expressionSelection: String?
 
     private var functions: [VGFunctionRecord] {
         VGGraphParser.functions(functionsText, symbolResolver: symbolResolverText, objcClasses: objcClassesText).map { function in
@@ -374,7 +383,7 @@ struct VGBinaryWorkspace: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 320)
+                .frame(width: 390)
                 .padding(.trailing, 8)
             }
             Divider()
@@ -382,6 +391,8 @@ struct VGBinaryWorkspace: View {
                 ScrollView([.horizontal, .vertical]) {
                     if semanticMode == .pseudocode {
                         pseudocodeContent
+                    } else if semanticMode == .source {
+                        reconstructionContent
                     } else if semanticMode == .lifted {
                         liftedContent
                     } else if semanticMode == .ir {
@@ -435,6 +446,80 @@ struct VGBinaryWorkspace: View {
         }
         .padding(12)
         .frame(minWidth: 760, alignment: .leading)
+    }
+
+    private var matchingReconstruction: ReconstructionArtifact? {
+        guard reconstruction?.start == selectedFunction?.start, reconstruction?.end == selectedFunction?.end else { return nil }
+        return reconstruction
+    }
+    private var chosenSource: ReconstructionSource? { matchingReconstruction?.sources.first { $0.id == sourceSelection } }
+    private var selectedExpression: ReconstructionExpression? { matchingReconstruction?.expressions.first { $0.id == expressionSelection } }
+    private var reconstructionContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button("Reconstruct function") { if let function = selectedFunction { onReconstruct(function) } }
+                    .disabled(reconstructionBusy || selectedFunction == nil)
+                if reconstructionBusy { Button("Cancel", action: onCancelReconstruction) }
+                if let function = selectedFunction, matchingReconstruction != nil {
+                    Button("Export evidence…") { onExportReconstruction(function, nil) }
+                    if let source = chosenSource { Button("Export source…") { onExportReconstruction(function, source) } }
+                }
+            }
+            Text(reconstructionStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            if let artifact = matchingReconstruction {
+                Text("\(artifact.eligibility) · source \(artifact.digest.prefix(16)) · \(artifact.pass)").font(.caption.monospaced())
+                Picker("Output", selection: $sourceSelection) {
+                    Text("Review tree").tag("review")
+                    ForEach(artifact.sources) { source in Text(source.kind == "recovered-source" ? "Recovered scalar source" : "Machine-state C").tag(source.id) }
+                }.pickerStyle(.menu)
+                Text(chosenSource?.status ?? "Review only; not compilable source").font(.caption).foregroundStyle(.orange)
+                if let source = chosenSource { Text(source.contract).font(.caption.monospaced()).textSelection(.enabled) }
+                Text(chosenSource?.text ?? artifact.review).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                if !artifact.blockers.isEmpty {
+                    DisclosureGroup("Limitations and source-recovery blockers (\(artifact.blockers.count))") {
+                        ForEach(artifact.blockers, id: \.self) { Text($0).font(.caption).textSelection(.enabled) }
+                    }
+                }
+                reconstructionEvidence
+            } else {
+                Text("Thin AArch64 Mach-O only. Reconstruction verifies captured bytes and canonical function bounds; unsupported effects remain explicit. This does not start a debugger, VM, compiler or imported binary.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }.padding(12).frame(minWidth: 760, alignment: .leading)
+    }
+    private var reconstructionEvidence: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let artifact = matchingReconstruction {
+                DisclosureGroup("AST expressions and instruction origins (\(artifact.expressions.count); first 512 shown)") {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(artifact.expressions.prefix(512))) { expression in
+                            Button { expressionSelection = expression.id } label: {
+                                Text("\(expression.kind) : \(expression.type) · \(expression.id.suffix(12))")
+                                    .font(.caption.monospaced()).foregroundStyle(expressionSelection == expression.id ? Color.accentColor : Color.primary)
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                }
+                if let expression = selectedExpression {
+                    Text(expression.description).font(.caption.monospaced()).textSelection(.enabled)
+                    Text("Instruction-dependency spans (entry-ABI bindings are labeled in the AST):").font(.caption)
+                    ForEach(expression.ranges, id: \.self) { span in
+                        HStack {
+                            Button(String(format: "0x%016llx", span.start)) { selectAddress(span.start) }
+                            Text("..< \(String(format: "0x%016llx", span.end))").font(.caption.monospaced())
+                        }
+                    }
+                    DisclosureGroup("Why: bounded dependency graph (up to 512 records)") {
+                        ForEach(artifact.why(expression.evidence)) { node in
+                            VStack(alignment: .leading) {
+                                Text("\(node.kind) · \(node.provenance) · \(node.id.suffix(12))").font(.caption.monospaced())
+                                Text(node.description).font(.caption.monospaced()).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private var liftedContent: some View {

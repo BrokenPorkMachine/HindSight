@@ -36,6 +36,15 @@ class AnalysisQualityContract(unittest.TestCase):
         self.assertIn('"source_mapping_valid_rows": len(pseudocode_sites & ir_sites)', source)
         self.assertIn("if not pseudocode_sites or pseudocode_sites - ir_sites:", source)
 
+    def test_decompilation_corpus_gates_expression_call_and_type_metrics(self):
+        source = (ROOT / "scripts/run-decompilation-corpus.py").read_text()
+        for metric in ["expression_rows", "resolved_call_target_rows", "type_evidence_rows"]:
+            self.assertIn(f'"{metric}"', source)
+        self.assertIn('if totals["resolved_call_target_rows"] < 1:', source)
+        self.assertIn('if totals["type_evidence_rows"] < 1:', source)
+        workflow = (ROOT / ".github/workflows/decompilation-corpus.yml").read_text()
+        self.assertIn("scripts/run-decompilation-corpus.py", workflow)
+
     def test_transport_and_ui_expose_quality_surfaces(self):
         messages = MESSAGES.read_text()
         content = CONTENT.read_text()

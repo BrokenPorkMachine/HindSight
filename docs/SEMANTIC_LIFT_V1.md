@@ -48,8 +48,105 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v45` banner identifies the statement set that
+`AArch64 register semantics v54` banner identifies the statement set that
 produced a preview.
+
+The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
+A value such as `x0@0x1004` names the definition at that instruction, while
+`x0@B3 = phi(B1:x0@0x1004, B2:x0@entry)` records the reaching values from each
+reachable predecessor. Entry values are unknown inputs. W/X register views
+share a physical identity, and SP has a distinct identity from the zero register.
+The original instruction retains the operand widths; SSA names imply no source
+name or type. Calls, data, and target-specific operations invalidate all GPR
+identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
+Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
+SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
+The analysis/cache identity is `arm64-analysis-v89-schema122`; the report fields
+and cache-envelope schema are unchanged.
+
+The [source-parameter identity pass](AARCH64_SOURCE_VARIABLES.md) now uses
+shared effects and decoded CFG edges rather than assignment/comment text.
+Width-specific parameter values can survive copies, agreeing joins and intact
+frame spills/restores. Input/output naming maps distinguish overwritten
+destinations and preserve multi-write/writeback order. Scalar pre-indexed
+accesses no longer apply offsets twice; overlapping-base pair loads capture
+their original effective address. General locals, canonical memory/FP/flags
+SSA, expression AST and executable source reconstruction remain open.
+
+Lane-wise vector bitwise `AND`/`BIC`/`ORR`/`ORN`/`EOR`/`BSL`/`BIT`/`BIF`
+and the `MOV` alias now use shared IR. Full-width operations can fold proven
+128-bit values with bounded instruction provenance; 64-bit forms invalidate the
+destination because the current V-register model cannot represent a partial
+write without inventing the preserved high half. Replicated `MOVI.2D` constants
+also enter shared IR and can feed these operations.
+
+Integer SIMD lane extracts (`UMOV`/its `MOV` alias and `SMOV`) now have
+shared `VectorExtract` records carrying destination width, source V register,
+lane, element width and sign/zero extension. They write exactly their GPR
+destination (W writes also replace its X identity), preserve NZCV and V
+registers, and fold complete known vector bits with bounded provenance.
+These are bit extractions, not floating conversions or source-variable copies.
+The fixed fields and allowed width/size combinations follow LLVM's
+[AArch64 instruction formats](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AArch64/AArch64InstrFormats.td).
+
+The old major-group `simd` preservation marker is removed: unmodeled SIMD/FP
+and reserved words are opaque barriers, not proof that general-purpose state
+survives. The vector-bitwise decoder also checks fixed bit 24 so neighboring
+encoding groups cannot be mistaken for bitwise operations. This does not
+complete SIMD/FP, system, trap or streaming-mode semantics.
+
+`python3 scripts/test-arm64-vector-extract.py /absolute/path/to/reworker`
+assembles all 82 legal size/lane/width forms with Apple Clang, checks worker
+expressions and known-bit results, and on Apple Silicon executes 42,640
+fixture comparisons against an independent byte-oriented C reference.
+The execution scope is normal EL0, non-streaming lane results; privileged
+access traps and SME configuration are not qualified. An Intel macOS host
+cross-assembles and checks the worker but explicitly reports no native execution.
+
+Non-temporal `LDNP`/`STNP` instructions use the shared pair-load/store IR. Their
+cache-policy hint does not change the represented register or memory effects,
+and their addressing remains no-writeback. Reserved width/direction encodings
+remain target-specific.
+
+Scalar single/double `FCSEL` now has shared IR. Its output names the condition
+and both FP register operands; the encoding's NV condition is normalized to AL
+because both always select the first source. Other predicates resolve only from
+tracked block-local NZCV. Selection copies the source bit pattern without FP
+arithmetic, preserving NaN payloads and signed zero. A recovered constant cites
+both the source definition and the comparison's input/condition provenance.
+Provenance remains bounded to eight distinct instruction sites; missing or
+exhausted provenance, unknown predicates, or unknown selected operands invalidate
+the destination value. GP registers, unrelated FP registers, and NZCV remain
+intact. Half precision and reserved encodings remain outside this shared lift.
+
+Scalar single/double `FRECPE`, `FRSQRTE`, `FRECPS`, and `FRSQRTS` now use
+shared unary/binary IR. Named calls retain the distinction between estimates,
+refinement steps, and ordinary division or square root. Their results remain
+unknown: estimate accuracy, FPCR rounding/modes, and FPSR exceptions are unresolved.
+Each operation invalidates only its destination FP value, preserving unrelated
+FP values, GP values, NZCV, and predicate provenance. FP16, vector, and integer forms retain their prior fallback. Scalar `FRECPX`
+now uses shared unary IR, rendering `frecpx` with unresolved FPCR/FPSR behavior. Narrow encoding masks are checked
+against independently assembled S/D instructions and adjacent unsupported forms.
+
+The Advanced SIMD load/store single-register group now uses shared memory IR
+for every width: one lane of `B`/`H`/`S`/`D` and the full 128-bit `Q` register,
+across unsigned-offset, unscaled (`LDUR`/`STUR`), pre-indexed, post-indexed,
+unprivileged (`LDTR`/`STTR`), register-offset, and PC-relative literal forms.
+`B` and `H` name an integer memory view only — no half-precision arithmetic is
+claimed — and the register-offset form scales its index by the 128-bit access
+size when `S` is set, as the architecture specifies, rather than by the `size`
+field. These instructions write V registers only, so they invalidate their own
+destination and preserve every general-purpose value: a `ldr q0, [x0]` no longer
+discards unrelated proven constants as an all-GPR barrier.
+
+`LDP`/`STP` now decode from the architectural `opc`/`L`/width table, so `bit 22`
+chooses store from load and `opc` chooses the access width. That covers signed
+offset, pre-index, and post-index for both general-purpose and SIMD registers,
+including `LDPSW`, plus the `S`/`D`/`Q` pair widths. The non-temporal
+`LDNP`/`STNP` hint and the reserved opcodes stay on the conservative fallback.
+A pre-indexed pair now renders both halves relative to the already-updated base
+instead of repeating the encoded offset, and the second half of every pair is
+addressed at the first half's offset plus the access size.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument

@@ -454,7 +454,7 @@ struct VGAnalysisContinuityDocument: Codable {
 }
 
 enum VGAnalysisContinuityStore {
-    static let engine = "arm64-analysis-v79-schema122"
+    static let engine = "arm64-analysis-v89-schema122"
     static let maximumBytes = 1 * 1024 * 1024
     static let maximumPins = 128
     static let maximumRecent = 96
@@ -1245,7 +1245,7 @@ extension WorkbenchModel {
 
     func recordAnalysisSnapshot(recordID: String, sourceSHA256: String, report: AnalysisReport) {
         guard let projectPath = project?.path else { return }
-        let engineIdentity = project?.records.first { $0.id == recordID }?.result.import_options?.cacheIdentity ?? (VGAnalysisContinuityStore.engine + "-patterns1")
+        let engineIdentity = project?.records.first { $0.id == recordID }?.result.import_options?.cacheIdentity ?? (VGAnalysisContinuityStore.engine + "-patterns1-" + BinaryImportOptions.analysisRevision)
         // Fingerprinting all bounded report channels can still touch several MiB.
         // Keep that deterministic CPU work off the SwiftUI main actor, then publish
         // the small snapshot/delta back into continuity state.

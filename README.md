@@ -6,6 +6,10 @@ The analysis worker now builds bounded C-like function bodies from modeled ARM64
 
 ## Build and launch
 
+Linux-native static processing is available as a Docker worker; see
+[Linux Docker setup and capability limits](docs/LINUX_DOCKER.md). The macOS app
+and its planned authenticated remote gateway remain separate from this image.
+
 On macOS, build HindSight from the project root with:
 
 ```sh

@@ -1082,7 +1082,13 @@ struct ContentView: View {
                         },
                         onUndoFunctionOverride: { address in
                             model.undoDecompilerFunctionOverride(recordID: record.id, address: address)
-                        }
+                        },
+                        reconstruction: model.currentReconstruction,
+                        reconstructionStatus: model.reconstructionStatus,
+                        reconstructionBusy: model.busy,
+                        onReconstruct: model.reconstructFunction,
+                        onCancelReconstruction: model.cancel,
+                        onExportReconstruction: { function, source in model.exportReconstruction(function, source: source) }
                     )
                     .frame(minHeight: 640)
                 } else {

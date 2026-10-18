@@ -18,6 +18,8 @@
     "App/HindSightApp.swift",
     "App/InvestigationLedgerModel.swift",
     "App/InvestigationLedgerWorkspace.swift",
+    "App/RemoteAnalysisTransactions.swift",
+    "App/RemoteGateway.swift",
     "App/RuntimeCorrelationModel.swift",
     "App/RuntimeCorrelationWorkspace.swift",
     "App/TargetWorkspace.swift",
@@ -47,6 +49,7 @@
     "Shared/FirmwareRuntimeMessages.swift",
     "Shared/HostPlatform.swift",
     "Shared/REAAgentMessages.swift",
+    "Shared/ReconstructionArtifact.swift",
     "Shared/ScriptingMessages.swift",
     "Shared/TargetModel.swift",
     "Shared/TerminalMessages.swift",
@@ -98,7 +101,10 @@
       "Shared/TerminalMessages.swift",
       "Shared/FirmwareRuntimeMessages.swift",
       "Shared/TargetModel.swift",
-      "Shared/HostPlatform.swift"
+      "Shared/HostPlatform.swift",
+      "Shared/ReconstructionArtifact.swift",
+      "App/RemoteGateway.swift",
+      "App/RemoteAnalysisTransactions.swift"
     ],
     "CoordinatorService": [
       "PlatformServices/CoordinatorService/VerifiedPageCache.swift",
@@ -123,9 +129,10 @@
       "native/debug/debug_server.c",
       "native/macho/decode.c",
       "native/virtualization/hv_vm.c",
-      "native/terminal/terminal_pty.c"
+      "native/terminal/terminal_pty.c",
+      "Shared/ReconstructionArtifact.swift"
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "ab8fedac68e34e2d3451dfdc8134953a3c8ac595dff599cbaaac18f2c2f2ed24"
+  "project_sha256": "2534ccf0c10a37ba6c35565feed0c815a891d0d5a232f01ed5b003ab27f0ada6"
 }

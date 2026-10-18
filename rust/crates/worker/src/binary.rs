@@ -15,6 +15,8 @@ use std::{
 };
 #[path = "compression.rs"]
 mod compression;
+#[path = "formats.rs"]
+mod formats;
 const SCAN: usize = 4 * 1024 * 1024;
 const TEXT: usize = 60_000;
 fn bad(s: &str) -> io::Error {
@@ -47,7 +49,7 @@ impl Options {
             base: number(&args[2])?,
             offset: number(&args[3])?,
         };
-        if !["auto", "macho", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
+        if !["auto", "macho", "elf", "pe", "coff", "pdb", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
             || !["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
                 .contains(&o.architecture.as_str())
         {
@@ -154,8 +156,20 @@ struct Symbol {
     kind: u8,
     desc: u16,
 }
+#[derive(Debug, Default)]
+struct FormatEvidence {
+    functions: Vec<(u64, String, String)>,
+    symbols: String,
+    imports: String,
+    exports: String,
+    relocations: String,
+    symbol_count: usize,
+}
 #[derive(Debug)]
 struct Image {
+    format: &'static str,
+    entries: Vec<u64>,
+    foreign: FormatEvidence,
     arch: Arch,
     origin: u64,
     length: u64,
@@ -270,6 +284,9 @@ fn thin(file: &mut File, origin: u64, length: u64, o: &Options) -> io::Result<Im
     range(header, nb, length)?;
     let window = read(file, origin + header, nb as usize)?;
     let mut image = Image {
+        format: "Mach-O",
+        entries: vec![],
+        foreign: FormatEvidence::default(),
         arch,
         origin,
         length,
@@ -496,6 +513,31 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     let size = file.metadata()?.len();
     range(o.offset, 1, size)?;
     let header = read(file, o.offset, (size - o.offset).min(32) as usize)?;
+    if matches!(o.format.as_str(), "auto" | "elf") && header.starts_with(b"\x7fELF") {
+        return formats::elf(file, o);
+    }
+    if matches!(o.format.as_str(), "auto" | "pe") && header.starts_with(b"MZ") {
+        return formats::pe(file, o);
+    }
+    if matches!(o.format.as_str(), "auto" | "coff") {
+        let machine = if header.len() >= 2 { u16::from_le_bytes([header[0], header[1]]) } else { 0 };
+        if matches!(machine, 0x014c | 0x8664 | 0xaa64) {
+            if let Ok(image) = formats::coff(file, o) {
+                return Ok(image);
+            }
+        }
+    }
+    if matches!(o.format.as_str(), "auto" | "pdb") {
+        const MSF_SIG: &[u8] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0";
+        if header.len() >= MSF_SIG.len() && &header[..MSF_SIG.len()] == MSF_SIG {
+            if let Ok(image) = formats::pdb(file, o) {
+                return Ok(image);
+            }
+        }
+    }
+    if matches!(o.format.as_str(), "elf" | "pe" | "coff" | "pdb") {
+        return Err(bad("Selected format does not match the image header"));
+    }
     if o.format != "raw" && magic(&header).is_some() {
         return thin(file, o.offset, size - o.offset, o);
     }
@@ -635,6 +677,9 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     }
     add(o.base, length)?;
     Ok(Image {
+        format: "Raw",
+        entries: vec![],
+        foreign: FormatEvidence::default(),
         arch,
         origin: o.offset,
         length,
@@ -746,7 +791,7 @@ fn code_ready(image: &Image) -> io::Result<()> {
         ));
     }
     if image.be {
-        return Err(bad("Big-endian Mach-O metadata parsed; instruction decoding for this byte order is unavailable"));
+        return Err(bad("Big-endian metadata parsed; instruction decoding for this byte order is unavailable"));
     }
     Ok(())
 }
@@ -864,7 +909,8 @@ pub fn describe(
             format!("{} raw image", o.format)
         } else {
             format!(
-                "Mach-O {} {}",
+                "{} {} {}",
+                i.format,
                 i.bits,
                 if i.be { "big-endian" } else { "little-endian" }
             )
@@ -1329,7 +1375,7 @@ fn function_starts(file: &mut File, i: &Image) -> io::Result<BTreeSet<u64>> {
     Ok(out)
 }
 fn entry_points(i: &Image) -> io::Result<Vec<u64>> {
-    let mut out = vec![];
+    let mut out = i.entries.clone();
     for (cmd, p) in &i.commands {
         if *cmd == 0x80000028 {
             if p.len() != 24 {
@@ -1390,6 +1436,14 @@ fn entry_points(i: &Image) -> io::Result<Vec<u64>> {
     out.dedup();
     Ok(out)
 }
+fn string_section_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "__cstring" => Some("c-string"),
+        "__cfstring" => Some("cfstring-constant-record"),
+        _ => None,
+    }
+}
+
 fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
     let mut out = String::new();
     let mut remaining = SCAN;
@@ -1407,10 +1461,20 @@ fn strings(file: &mut File, i: &Image) -> io::Result<(String, bool)> {
         limited |= (n as u64) < s.size;
         remaining -= n;
         let b = read(file, s.offset, n)?;
-        if s.name == "__cstring" || s.name == "__cfstring" {
-            push(&mut out, &format!("0x{:016x} classification=c-string confidence=section-backed section={} size={} bytes\n", s.address, s.name, s.size));
+        if s.name == "__cstring" {
+            push(&mut out, &format!("0x{:016x} classification={} confidence=section-backed section={} size={} bytes\n", s.address, string_section_kind(&s.name).unwrap(), s.name, s.size));
+        } else if s.name == "__cfstring" {
+            // __cfstring contains constant object records (isa/flags/value/length),
+            // not a byte string. Decode the referenced character payload only
+            // after relocations/fixups and record layout have been validated.
+            push(&mut out, &format!("0x{:016x} classification={} confidence=section-backed section={} size={} bytes payload=unresolved\n", s.address, string_section_kind(&s.name).unwrap(), s.name, s.size));
         } else if ["__const", "__data", "__data_const", "__bss", "__common"].contains(&s.name.as_str()) {
             push(&mut out, &format!("0x{:016x} classification=c-data-object confidence=section-backed section={} size={} bytes\n", s.address, s.name, s.size));
+        }
+        // Do not mine printable fragments out of CFString structures: pointer,
+        // flags and length fields can coincidentally look like text.
+        if s.name == "__cfstring" {
+            continue;
         }
         let mut at = 0;
         while at < b.len() {
@@ -1577,6 +1641,7 @@ fn function_name_guesses(
 fn external_symbol_database(
     image: &Image,
     functions: &mut BTreeMap<u64, (String, String)>,
+    source_sha256: &str,
 ) -> io::Result<usize> {
     let Some(path) = std::env::var_os("HINDSIGHT_SYMBOL_DB") else {
         return Ok(0);
@@ -1585,7 +1650,18 @@ fn external_symbol_database(
     if !path.is_absolute() || path.to_string_lossy().len() > 16 * 1024 {
         return Err(bad("HINDSIGHT_SYMBOL_DB must be an absolute path"));
     }
-    let contents = std::fs::read_to_string(path)?;
+    let mut contents = String::new();
+    File::open(path)?.take(16 * 1024 * 1024 + 1).read_to_string(&mut contents)?;
+    if contents.len() > 16 * 1024 * 1024 || contents.lines().count() > 200_000 {
+        return Err(bad("External symbol catalog exceeds byte/record budget"));
+    }
+    for line in contents.lines() {
+        if let Some(expected) = line.strip_prefix("# source_sha256=") {
+            if !expected.eq_ignore_ascii_case(source_sha256) {
+                return Err(bad("External symbol catalog source SHA-256 mismatch"));
+            }
+        }
+    }
     let mut applied = 0usize;
     for line in contents.lines().take(200_000) {
         if line.len() > 512 || line.trim_start().starts_with('#') {
@@ -1623,7 +1699,9 @@ fn external_symbol_database(
         let entry = functions.entry(address).or_insert_with(|| {
             (format!("sub_{address:x}"), "external-catalog-fallback".into())
         });
-        if entry.1 != "export-trie" && !entry.1.starts_with("nlist") {
+        if entry.1 != "export-trie" && !entry.1.starts_with("nlist")
+            && !entry.1.starts_with("ELF ") && entry.1 != "PE export"
+        {
             *entry = (
                 name.to_owned(),
                 format!("external-symbol-db section={}", section.name),
@@ -2214,6 +2292,10 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     );
     let symbols = symbols(&mut file, &image)?;
     let mut functions: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    let mut rejected_function_symbols = Vec::new();
+    for (address, name, source) in &image.foreign.functions {
+        functions.entry(*address).or_insert((name.clone(), source.clone()));
+    }
     for s in &symbols {
         if s.kind & 0xe == 0xe
             && s.section != 0
@@ -2225,8 +2307,20 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             } else {
                 s.address
             };
-            if !image.sections[s.section as usize - 1].contains(address) {
-                return Err(bad("Defined symbol address outside its section"));
+            let section = &image.sections[s.section as usize - 1];
+            if !section.contains(address) {
+                // A bad/out-of-range function-name candidate must not prevent
+                // analysis of otherwise valid code. Keep the discrepancy
+                // visible and do not use the symbol as a function boundary.
+                rejected_function_symbols.push(format!(
+                    "name={:?} address={:#x} section={} range={:#x}..{:#x}",
+                    s.name,
+                    s.address,
+                    s.section,
+                    section.address,
+                    section.address.saturating_add(section.size)
+                ));
+                continue;
             }
             functions.entry(address).or_insert((
                 s.name.clone(),
@@ -2249,6 +2343,12 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             .or_insert((format!("sub_{a:x}"), "LC_FUNCTION_STARTS".into()));
     }
     let mut metadata = metadata(&image);
+    for rejected in rejected_function_symbols.iter().take(256) {
+        push(
+            &mut metadata,
+            &format!("Rejected function-name candidate: {rejected}; symbol retained in raw nlist evidence, not used as a function boundary.\n"),
+        );
+    }
     for entry in entry_points(&image)? {
         push(
             &mut metadata,
@@ -2256,13 +2356,14 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         );
     }
     push(&mut metadata,"Instruction paging/CFG uses the selected primary executable section; other sections remain available as metadata, strings and table evidence.\n");
-    let relocation_text = relocations(&mut file, &image, &symbols)?;
+    let mut relocation_text = relocations(&mut file, &image, &symbols)?;
+    push(&mut relocation_text, &image.foreign.relocations);
     let indirect = indirect_symbols(&mut file, &image, &symbols)?;
     let (export_text, export_names) = exports(&mut file, &image)?;
     for (a, name) in export_names {
         functions.entry(a).or_insert((name, "export-trie".into()));
     }
-    let external_symbols = external_symbol_database(&image, &mut functions)?;
+    let external_symbols = external_symbol_database(&image, &mut functions, digest)?;
     if external_symbols != 0 {
         push(
             &mut metadata,
@@ -2457,6 +2558,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
                         .iter()
                         .find(|s| s.address == target)
                         .map(|s| s.name.as_str())
+                        .or_else(|| functions.get(&target).map(|entry| entry.0.as_str()))
                         .unwrap_or("<unnamed>");
                     push(
                         &mut calls,
@@ -2499,6 +2601,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             || v.1 == "LC_FUNCTION_STARTS"
             || v.1 == "export-trie"
             || v.1 == "entry-point metadata"
+            || v.1.starts_with("ELF ") || v.1 == "PE export"
             || boundaries.contains(a)
     });
     leaders.extend(functions.keys().filter(|a| boundaries.contains(a)).copied());
@@ -2643,6 +2746,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         })
         .collect::<String>();
     let mut symbol_text = symbol_text;
+    push(&mut symbol_text, &image.foreign.symbols);
     symbol_text.truncate(symbol_text.len().min(TEXT));
     let imports = symbols
         .iter()
@@ -2651,9 +2755,11 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         .map(|s| format!("name={} undefined nlist ordinal={}\n", s.name, s.desc >> 8))
         .collect::<String>();
     let mut imports = imports;
+    push(&mut imports, &image.foreign.imports);
     imports.truncate(imports.len().min(TEXT));
     let quality=format!("Selected decode: {} {state}\nCode bytes scanned: {scan_bytes} / {}\nDecoded instructions: {decode_count} / {}\nScan end: {scan_end:#x}\nCode scan budget: {SCAN} bytes / 262144 instructions. Data strings/tables each have a {SCAN}-byte budget. Text views are capped at {TEXT} bytes; counts can exceed displayed rows. Unknown instructions/data-in-code terminate inferred flow. No CFG edge is inferred from a pointer-table candidate.\n",image.arch.name(),s.size,instructions.len());
-    let summary=format!("{} structural analysis\nSelected image offset: {:#x}\nCode: {:#x}..{:#x}\nFunctions/named or candidate starts: {}\nNlist records: {}\nBasic blocks: {block_count}\nInstructions scanned: {}\n{}\nAdvanced ARM64 SSA/runtime reconstruction remains available through the original ARM64 analysis path. Multi-architecture structural analysis does not claim semantic lifting or decompilation.\n",image.arch.name(),image.origin,s.address,s.address+s.size,functions.len(),symbols.len(),instructions.len(),quality);
+    let symbol_count = symbols.len() + image.foreign.symbol_count;
+    let summary=format!("{} structural analysis\nSelected image offset: {:#x}\nCode: {:#x}..{:#x}\nFunctions/named or candidate starts: {}\nSymbol records: {}\nBasic blocks: {block_count}\nInstructions scanned: {}\n{}\nAdvanced ARM64 SSA/runtime reconstruction remains available through the original ARM64 analysis path. Multi-architecture structural analysis does not claim semantic lifting or decompilation.\n",image.arch.name(),image.origin,s.address,s.address+s.size,functions.len(),symbol_count,instructions.len(),quality);
     let mut values: BTreeMap<&str, String> = BTreeMap::new();
     for key in REPORT_TEXT_FIELDS {
         values.insert(
@@ -2666,6 +2772,8 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     let (signature_report,pseudocode) = super::signatures::recover(&signature_starts,&signature_symbols,"",&[],scan_end);
     values.insert("call_values", signature_report);
     values.insert("semantic_preview", format!("Reconstructed pseudocode\n========================\n{pseudocode}"));
+    let mut export_text = export_text;
+    push(&mut export_text, &image.foreign.exports);
     for (key,value) in [("functions",function_text),("metadata",metadata),("strings",strings),("relocations",relocation_text),("indirect_symbols",indirect),("export_trie",export_text),("pointer_slots",pointers.clone()),("data_references",code_references),("jump_tables",tables),("xrefs",direct),("call_graph",calls),("cfg",cfg),("annotated_disassembly",annotated),("function_intelligence",intelligence),("symbolication",symbol_text.clone()),("symbol_provenance",symbol_text),("dyld_imports",imports),("analysis_quality",quality),("analysis_insights","Review metadata-backed names first, then prologue/call/table candidates. Unresolved indirect transfers and mixed-mode firmware require analyst review.".into()),("summary",summary)]{values.insert(key,value);}
     for key in [
         "ir",
@@ -2713,7 +2821,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         }
     }
     eprintln!("VG_EVIDENCE_MANIFEST\t{{\"schema\":1,\"record_count\":{count},\"truncated\":{truncated},\"stage_fingerprints\":{{}}}}");
-    let mut out=format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{}",super::quote(id),super::quote(digest),functions.len(),symbols.len(),block_count,instructions.len(),truncated);
+    let mut out=format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{}",super::quote(id),super::quote(digest),functions.len(),symbol_count,block_count,instructions.len(),truncated);
     for (key, value) in values {
         out.push_str(&format!(",{}:{}", super::quote(key), super::quote(&value)));
     }
@@ -2790,7 +2898,7 @@ const REPORT_TEXT_FIELDS: &[&str] = &[
 pub fn legacy_arm64(path: &str, o: &Options) -> bool {
     if o.offset != 0
         || o.base != 0
-        || o.format == "raw"
+        || !matches!(o.format.as_str(), "auto" | "macho" | "sepos")
         || !matches!(o.architecture.as_str(), "auto" | "aarch64")
     {
         return false;
@@ -2850,6 +2958,12 @@ pub fn arm64_patterns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cfstring_sections_are_not_mislabeled_as_c_strings() {
+        assert_eq!(string_section_kind("__cstring"), Some("c-string"));
+        assert_eq!(string_section_kind("__cfstring"), Some("cfstring-constant-record"));
+        assert_eq!(string_section_kind("__const"), None);
+    }
     #[test]
     fn checked_branch_addresses() {
         assert_eq!(

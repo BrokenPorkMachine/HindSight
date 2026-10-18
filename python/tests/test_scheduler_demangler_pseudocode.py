@@ -40,7 +40,7 @@ class SchedulerDemanglePseudocodeContracts(unittest.TestCase):
         code = (ROOT/'PlatformServices/CoordinatorService/WorkerSupervisor.swift').read_text()
         policy = code.split('private static func priority(for operation: String)', 1)[1].split('private func updateQueuedPositions()', 1)[0]
         self.assertIn('case "page": return .interactive', policy)
-        self.assertIn('case "analysis": return .userInitiated', policy)
+        self.assertIn('case "analysis", "reconstruction": return .userInitiated', policy)
         self.assertIn('case "capture": return .utility', policy)
         self.assertIn('default: return .background', policy)
 
