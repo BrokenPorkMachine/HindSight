@@ -156,10 +156,19 @@ struct Symbol {
     kind: u8,
     desc: u16,
 }
+#[derive(Debug, Default)]
+struct FormatEvidence {
+    functions: Vec<(u64, String, String)>,
+    symbols: String,
+    imports: String,
+    exports: String,
+    symbol_count: usize,
+}
 #[derive(Debug)]
 struct Image {
     format: &'static str,
     entries: Vec<u64>,
+    foreign: FormatEvidence,
     arch: Arch,
     origin: u64,
     length: u64,
@@ -276,6 +285,7 @@ fn thin(file: &mut File, origin: u64, length: u64, o: &Options) -> io::Result<Im
     let mut image = Image {
         format: "Mach-O",
         entries: vec![],
+        foreign: FormatEvidence::default(),
         arch,
         origin,
         length,
@@ -652,6 +662,7 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     Ok(Image {
         format: "Raw",
         entries: vec![],
+        foreign: FormatEvidence::default(),
         arch,
         origin: o.offset,
         length,
@@ -1653,7 +1664,9 @@ fn external_symbol_database(
         let entry = functions.entry(address).or_insert_with(|| {
             (format!("sub_{address:x}"), "external-catalog-fallback".into())
         });
-        if entry.1 != "export-trie" && !entry.1.starts_with("nlist") {
+        if entry.1 != "export-trie" && !entry.1.starts_with("nlist")
+            && !entry.1.starts_with("ELF ") && entry.1 != "PE export"
+        {
             *entry = (
                 name.to_owned(),
                 format!("external-symbol-db section={}", section.name),
@@ -2244,6 +2257,9 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     );
     let symbols = symbols(&mut file, &image)?;
     let mut functions: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    for (address, name, source) in &image.foreign.functions {
+        functions.entry(*address).or_insert((name.clone(), source.clone()));
+    }
     for s in &symbols {
         if s.kind & 0xe == 0xe
             && s.section != 0
@@ -2487,6 +2503,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
                         .iter()
                         .find(|s| s.address == target)
                         .map(|s| s.name.as_str())
+                        .or_else(|| functions.get(&target).map(|entry| entry.0.as_str()))
                         .unwrap_or("<unnamed>");
                     push(
                         &mut calls,
@@ -2529,6 +2546,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
             || v.1 == "LC_FUNCTION_STARTS"
             || v.1 == "export-trie"
             || v.1 == "entry-point metadata"
+            || v.1.starts_with("ELF ") || v.1 == "PE export"
             || boundaries.contains(a)
     });
     leaders.extend(functions.keys().filter(|a| boundaries.contains(a)).copied());
@@ -2673,6 +2691,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         })
         .collect::<String>();
     let mut symbol_text = symbol_text;
+    push(&mut symbol_text, &image.foreign.symbols);
     symbol_text.truncate(symbol_text.len().min(TEXT));
     let imports = symbols
         .iter()
@@ -2681,9 +2700,11 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         .map(|s| format!("name={} undefined nlist ordinal={}\n", s.name, s.desc >> 8))
         .collect::<String>();
     let mut imports = imports;
+    push(&mut imports, &image.foreign.imports);
     imports.truncate(imports.len().min(TEXT));
     let quality=format!("Selected decode: {} {state}\nCode bytes scanned: {scan_bytes} / {}\nDecoded instructions: {decode_count} / {}\nScan end: {scan_end:#x}\nCode scan budget: {SCAN} bytes / 262144 instructions. Data strings/tables each have a {SCAN}-byte budget. Text views are capped at {TEXT} bytes; counts can exceed displayed rows. Unknown instructions/data-in-code terminate inferred flow. No CFG edge is inferred from a pointer-table candidate.\n",image.arch.name(),s.size,instructions.len());
-    let summary=format!("{} structural analysis\nSelected image offset: {:#x}\nCode: {:#x}..{:#x}\nFunctions/named or candidate starts: {}\nNlist records: {}\nBasic blocks: {block_count}\nInstructions scanned: {}\n{}\nAdvanced ARM64 SSA/runtime reconstruction remains available through the original ARM64 analysis path. Multi-architecture structural analysis does not claim semantic lifting or decompilation.\n",image.arch.name(),image.origin,s.address,s.address+s.size,functions.len(),symbols.len(),instructions.len(),quality);
+    let symbol_count = symbols.len() + image.foreign.symbol_count;
+    let summary=format!("{} structural analysis\nSelected image offset: {:#x}\nCode: {:#x}..{:#x}\nFunctions/named or candidate starts: {}\nSymbol records: {}\nBasic blocks: {block_count}\nInstructions scanned: {}\n{}\nAdvanced ARM64 SSA/runtime reconstruction remains available through the original ARM64 analysis path. Multi-architecture structural analysis does not claim semantic lifting or decompilation.\n",image.arch.name(),image.origin,s.address,s.address+s.size,functions.len(),symbol_count,instructions.len(),quality);
     let mut values: BTreeMap<&str, String> = BTreeMap::new();
     for key in REPORT_TEXT_FIELDS {
         values.insert(
@@ -2696,6 +2717,8 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     let (signature_report,pseudocode) = super::signatures::recover(&signature_starts,&signature_symbols,"",&[],scan_end);
     values.insert("call_values", signature_report);
     values.insert("semantic_preview", format!("Reconstructed pseudocode\n========================\n{pseudocode}"));
+    let mut export_text = export_text;
+    push(&mut export_text, &image.foreign.exports);
     for (key,value) in [("functions",function_text),("metadata",metadata),("strings",strings),("relocations",relocation_text),("indirect_symbols",indirect),("export_trie",export_text),("pointer_slots",pointers.clone()),("data_references",code_references),("jump_tables",tables),("xrefs",direct),("call_graph",calls),("cfg",cfg),("annotated_disassembly",annotated),("function_intelligence",intelligence),("symbolication",symbol_text.clone()),("symbol_provenance",symbol_text),("dyld_imports",imports),("analysis_quality",quality),("analysis_insights","Review metadata-backed names first, then prologue/call/table candidates. Unresolved indirect transfers and mixed-mode firmware require analyst review.".into()),("summary",summary)]{values.insert(key,value);}
     for key in [
         "ir",
@@ -2743,7 +2766,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
         }
     }
     eprintln!("VG_EVIDENCE_MANIFEST\t{{\"schema\":1,\"record_count\":{count},\"truncated\":{truncated},\"stage_fingerprints\":{{}}}}");
-    let mut out=format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{}",super::quote(id),super::quote(digest),functions.len(),symbols.len(),block_count,instructions.len(),truncated);
+    let mut out=format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{}",super::quote(id),super::quote(digest),functions.len(),symbol_count,block_count,instructions.len(),truncated);
     for (key, value) in values {
         out.push_str(&format!(",{}:{}", super::quote(key), super::quote(&value)));
     }

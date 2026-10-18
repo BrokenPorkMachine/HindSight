@@ -32,6 +32,7 @@ fn image(
     Ok(Image {
         format,
         entries: vec![],
+        foreign: FormatEvidence::default(),
         arch,
         bits,
         be,
@@ -304,6 +305,7 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
                 },
             )?;
         }
+        elf_symbols(file, &mut i, &headers, shsize as usize)?;
     } else if shnum != 0 || names_index != 0 {
         return Err(bad("ELF section count without section table"));
     }
@@ -339,8 +341,165 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
         }
     }
     entry(&mut i, address)?;
-    push(&mut i.inventory, "ELF static structural analysis; dynamic linking, symbols, relocations, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
+    push(&mut i.inventory, "ELF static structural analysis with section-backed symbol tables; sectionless dynamic symbols, runtime linking, relocations, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
     Ok(i)
+}
+
+fn elf_symbols(file: &mut File, i: &mut Image, headers: &[u8], stride: usize) -> io::Result<()> {
+    let wide = i.bits == 64;
+    let be = i.be;
+    let mut budget = 16 * 1024 * 1024usize;
+    let mut names_budget = 1024 * 1024usize;
+    let count = headers.len() / stride;
+    let extent = |s: &[u8]| -> (u64, u64) {
+        if wide {
+            (u64v(&s[24..], be), u64v(&s[32..], be))
+        } else {
+            (u32v(&s[16..], be) as u64, u32v(&s[20..], be) as u64)
+        }
+    };
+    for s in headers.chunks_exact(stride) {
+        let kind = u32v(&s[4..], be);
+        if !matches!(kind, 2 | 11) {
+            continue;
+        }
+        let (offset, size) = extent(s);
+        let link = u32v(&s[if wide { 40 } else { 24 }..], be) as usize;
+        let entry_size = if wide {
+            u64v(&s[56..], be)
+        } else {
+            u32v(&s[36..], be) as u64
+        };
+        let expected = if wide { 24 } else { 16 };
+        if entry_size != expected
+            || size % expected != 0
+            || size / expected > 200_000
+            || link == 0
+            || link >= count
+        {
+            return Err(bad("Invalid or over-budget ELF symbol table"));
+        }
+        let strings_header = &headers[link * stride..];
+        if u32v(&strings_header[4..], be) != 3 {
+            return Err(bad("ELF symbols do not link to a string table"));
+        }
+        let (strings_offset, strings_size) = extent(strings_header);
+        if strings_size > 8 * 1024 * 1024
+            || size + strings_size > budget as u64
+            || i.foreign.symbol_count + (size / expected) as usize > 200_000
+        {
+            return Err(bad("ELF symbol/string byte or record budget exceeded"));
+        }
+        budget -= (size + strings_size) as usize;
+        range(offset, size, i.length)?;
+        range(strings_offset, strings_size, i.length)?;
+        let strings = read(file, add(i.origin, strings_offset)?, strings_size as usize)?;
+        if strings.first() != Some(&0) || strings.last() != Some(&0) {
+            return Err(bad("Invalid ELF symbol string-table framing"));
+        }
+        let table = read(file, add(i.origin, offset)?, size as usize)?;
+        let source = if kind == 11 {
+            "ELF dynamic-symbol"
+        } else {
+            "ELF static-symbol"
+        };
+        for record in table.chunks_exact(expected as usize) {
+            i.foreign.symbol_count += 1;
+            let index = u32v(record, be) as usize;
+            let (value, symbol_size, info, visibility, section_index) = if wide {
+                (
+                    u64v(&record[8..], be),
+                    u64v(&record[16..], be),
+                    record[4],
+                    record[5] & 3,
+                    half(&record[6..], be) as usize,
+                )
+            } else {
+                (
+                    u32v(&record[4..], be) as u64,
+                    u32v(&record[8..], be) as u64,
+                    record[12],
+                    record[13] & 3,
+                    half(&record[14..], be) as usize,
+                )
+            };
+            if section_index == 0xffff {
+                return Err(bad("Extended ELF symbol section indexes are unsupported"));
+            }
+            if section_index != 0 && section_index < 0xff00 && section_index >= count {
+                return Err(bad("ELF symbol section index outside table"));
+            }
+            if index >= strings.len() {
+                return Err(bad("ELF symbol name outside string table"));
+            }
+            if index == 0 {
+                continue;
+            }
+            let tail = &strings[index..strings.len().min(index + 1025)];
+            let end = tail
+                .iter()
+                .position(|&b| b == 0)
+                .ok_or_else(|| bad("Unterminated or over-budget ELF symbol name"))?;
+            if end > names_budget {
+                return Err(bad("ELF symbol name budget exceeded"));
+            }
+            names_budget -= end;
+            let label = name(&tail[..end]);
+            if label.is_empty() {
+                continue;
+            }
+            let symbol_type = info & 15;
+            let binding = info >> 4;
+            if section_index == 0 {
+                if matches!(binding, 1 | 2) {
+                    push(&mut i.foreign.imports, &format!("name={label} undefined source={source} type={symbol_type} binding={binding} visibility={visibility}; runtime target unresolved\n"));
+                }
+                continue;
+            }
+            let mut proven_address = false;
+            if section_index < count {
+                let target = &headers[section_index * stride..];
+                let (flags, va) = if wide {
+                    (u64v(&target[8..], be), u64v(&target[16..], be))
+                } else {
+                    (
+                        u32v(&target[8..], be) as u64,
+                        u32v(&target[12..], be) as u64,
+                    )
+                };
+                let (_, section_size) = extent(target);
+                // TLS values are offsets, not preferred addresses.
+                if symbol_type != 6 && flags & 2 != 0 && value >= va && value - va < section_size {
+                    if symbol_size > section_size - (value - va) {
+                        return Err(bad("ELF symbol extent exceeds its section"));
+                    }
+                    proven_address = true;
+                    if symbol_type == 2
+                        && flags & 4 != 0
+                        && value % i.arch.unit() == 0
+                        && i.sections.iter().any(|s| s.executable && s.contains(value))
+                    {
+                        i.foreign
+                            .functions
+                            .push((value, label.clone(), source.into()));
+                    }
+                } else if symbol_type == 2 && flags & 2 != 0 {
+                    return Err(bad("ELF function symbol lies outside its declared section"));
+                }
+            }
+            let row = if proven_address {
+                format!("0x{value:016x} name={label} source={source} type={symbol_type} binding={binding} visibility={visibility} section={section_index}\n")
+            } else {
+                format!("name={label} value={value:#x} source={source} type={symbol_type} binding={binding} section={section_index}; address unresolved\n")
+            };
+            push(&mut i.foreign.symbols, &row);
+            if kind == 11 && matches!(binding, 1 | 2) && matches!(visibility, 0 | 3) {
+                push(&mut i.foreign.exports, &row);
+            }
+        }
+    }
+    push(&mut i.inventory, &format!("ELF symbol records={} (including unnamed records); undefined names remain address-free.\n", i.foreign.symbol_count));
+    Ok(())
 }
 
 pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {

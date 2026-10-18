@@ -67,6 +67,42 @@ def pe(bits=64, arm=False):
     return data
 
 
+def elf_symbols(bits=64, be=False):
+    data = elf(bits, be)
+    data.extend(bytes(0x900 - len(data)))
+    order = ">" if be else "<"
+    stride = 64 if bits == 64 else 40
+    symbol_stride = 24 if bits == 64 else 16
+    strings = b"\0named_entry\0missing_api\0tls_slot\0"
+    names = b"\0.text\0.rodata\0\0.shstrtab\0"
+    data[0x280:0x280 + len(names)] = names
+    data[0x700:0x700 + len(strings)] = strings
+    struct.pack_into(order + ("Q" if bits == 64 else "I"), data, 40 if bits == 64 else 32, 0x300)
+    struct.pack_into(order + "HHH", data, 58 if bits == 64 else 46, stride, 7, 3)
+
+    def section(index, name, kind, flags, address, offset, size, link=0, entry_size=0):
+        struct.pack_into(order + ("IIQQQQIIQQ" if bits == 64 else "IIIIIIIIII"), data, 0x300 + index * stride,
+                         name, kind, flags, address, offset, size, link, 0, 1, entry_size)
+
+    section(1, 1, 1, 6, 0x400100, 0x100, 8)
+    section(2, 7, 1, 2, 0x400200, 0x200, 32)
+    section(3, 15, 3, 0, 0, 0x280, len(names))
+    section(4, 0, 2, 0, 0, 0x500, symbol_stride * 4, 5, symbol_stride)
+    section(5, 0, 3, 0, 0, 0x700, len(strings))
+    section(6, 0, 11, 0, 0, 0x600, symbol_stride * 4, 5, symbol_stride)
+    for offset in [0x500, 0x600]:
+        for index, (label, value, size, info, target) in enumerate([
+                ("named_entry", 0x400100, 8, 0x12, 1),
+                ("missing_api", 0, 0, 0x22, 0),
+                ("tls_slot", 0, 8, 0x16, 2)], 1):
+            name = strings.index(label.encode())
+            if bits == 64:
+                struct.pack_into(order + "IBBHQQ", data, offset + index * symbol_stride, name, info, 0, target, value, size)
+            else:
+                struct.pack_into(order + "IIIBBH", data, offset + index * symbol_stride, name, value, size, info, 0, target)
+    return data
+
+
 def run(*args, env=None):
     reply = subprocess.run([WORKER, *map(str, args)], capture_output=True, timeout=60, check=True, env=env)
     stream = io.BytesIO(reply.stdout)
@@ -120,6 +156,16 @@ with tempfile.TemporaryDirectory() as directory:
         result, _ = analyze(elf(bits, be=True))
         assert result["kind"] == "analysis_result" and result["analyzed_instructions"] == 0
         assert "Big-endian" in result["function_intelligence"]
+        for be in [False, True]:
+            result, _ = analyze(elf_symbols(bits, be))
+            assert result["kind"] == "analysis_result", result
+            assert result["symbol_count"] == 8, result["symbol_count"]
+            assert "name=named_entry source=ELF static-symbol" in result["functions"], result["functions"]
+            assert "missing_api" in result["dyld_imports"] and "binding=2" in result["dyld_imports"]
+            assert "named_entry" in result["export_trie"]
+            assert "name=tls_slot value=0x0" in result["symbol_provenance"]
+            assert "0x0000000000000000 name=tls_slot" not in result["symbol_provenance"]
+            assert "missing_api" not in result["functions"] and "tls_slot" not in result["functions"]
     for data, fmt in [(elf(), "elf"), (pe(), "pe")]:
         result, args = analyze(bytes(64) + data, fmt, offset="64")
         assert result["kind"] == "analysis_result", result
@@ -147,6 +193,20 @@ with tempfile.TemporaryDirectory() as directory:
     for data in malformed:
         result, _ = analyze(data)
         assert result["kind"] == "error", result
+    # ELF symbol metadata cannot invent addresses or escape section/string bounds.
+    for offset, kind, value in [
+        (0x300 + 4 * 64 + 40, "I", 99),
+        (0x300 + 4 * 64 + 56, "Q", 16),
+        (0x500 + 24, "I", 0xffff),
+        (0x500 + 24 + 6, "H", 99),
+        (0x500 + 24 + 6, "H", 0xffff),
+        (0x500 + 24 + 8, "Q", 0x500000),
+        (0x500 + 24 + 16, "Q", 0xffffffffffffffff),
+    ]:
+        data = elf_symbols()
+        struct.pack_into("<" + kind, data, offset, value)
+        result, _ = analyze(data)
+        assert result["kind"] == "error", result
     data = elf()
     result, args = analyze(data)
     (root / "input.bin").write_bytes(data[:-1] + b"!")
@@ -167,5 +227,10 @@ with tempfile.TemporaryDirectory() as directory:
     names.write_text("# comment\n" * 200001)
     result = run("--analyze-image", *args, "elf", "auto", "0", "0", env=env)
     assert result["kind"] == "error" and "budget" in result["message"], result
+    result, args = analyze(elf_symbols())
+    names.write_text("# source_sha256=" + hashlib.sha256(elf_symbols()).hexdigest() + "\n0x400100 lower_priority_name\n")
+    result = run("--analyze-image", *args, "elf", "auto", "0", "0", env=env)
+    assert "name=named_entry source=ELF static-symbol" in result["functions"]
+    assert "lower_priority_name" not in result["functions"]
 
 print("ELF/PE capture, mappings, decode, evidence, paging, byte order, embedded offsets and malformed-input checks passed")

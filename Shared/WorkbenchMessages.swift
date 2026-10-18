@@ -19,7 +19,7 @@ struct BinaryImportOptions: Codable, Equatable {
                                    load_address: String(address), file_offset: String(offset))
     }
     var arguments: [String] { [format, architecture, load_address, file_offset] }
-    var cacheIdentity: String { "multiarch-v1:" + arguments.joined(separator: ":") }
+    var cacheIdentity: String { "multiarch-v2:" + arguments.joined(separator: ":") }
 }
 
 struct HeaderResult: Codable {

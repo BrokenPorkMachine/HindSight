@@ -9,6 +9,15 @@ can be selected using an explicit file offset.
 ELF executable/shared images support i386, x86-64 and AArch64, in 32/64-bit
 classes with matching machine widths. The parser validates program headers,
 load extents, section-to-load mapping consistency, names and entry points.
+Section-backed SHT_SYMTAB/SHT_DYNSYM records supply names, function starts,
+undefined imports and visible dynamic exports with table/binding/visibility
+provenance. Only STT_FUNC records in validated executable sections become
+function starts. TLS values remain offsets; undefined, absolute and special
+section symbols do not invent mapped addresses. Native symbol names outrank
+external catalogs. Symbol parsing has a 200,000-record, 16 MiB table-read and
+1 MiB aggregate-name budget. Multi-architecture cache identity advances to v2
+so old structural reports are reanalyzed.
+
 Images without section tables use PT_LOAD mappings. Big-endian headers can
 produce metadata, while instruction decoding remains disabled. Extended section
 numbering, relocatable objects, core files and other architectures are rejected.
@@ -27,7 +36,7 @@ mappings. ELF tables have a 256-entry limit; PE has a 96-section limit. Existing
 The structural backend supplies instruction previews, selected-section CFG and
 direct-call candidates, strings, pointer candidates, address-bearing evidence,
 and SHA-256-verified instruction paging. It does not apply relocations, recover
-foreign-format symbols/imports/exports, provide semantic decompilation, or
+PE symbols/imports/exports, sectionless ELF dynamic symbols, provide semantic decompilation, or
 execute/attach to Linux or Windows processes. PIE and ASLR addresses remain
 preferred image addresses until runtime mapping evidence exists. Decoding uses
 the existing LLVM availability requirements.
