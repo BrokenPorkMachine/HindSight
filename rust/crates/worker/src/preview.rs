@@ -539,9 +539,9 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
    // Keep the older layout as a fallback for pre-modern runtime records.
    let candidates=[(32usize,40usize,48usize,56usize,64usize),(24usize,32usize,40usize,48usize,56usize)];
    let (name_off,methods_off,protocols_off,ivars_off,properties_off)=candidates.into_iter().find(|(n,m,_,_,_)|{let nv=le64(&ro[*n..*n+8]);section_for_va(&secs,nv).and_then(|s|read_cstr_at(file,s,nv,512).ok().flatten()).is_some()&&section_for_va(&secs,le64(&ro[*m..*m+8])).is_some()}).unwrap_or(candidates[0]);
-   let name_va=le64(&ro[name_off..name_off+8]);let methods_va=le64(&ro[methods_off..methods_off+8]);let protocols_va=le64(&ro[protocols_off..protocols_off+8]);let ivars_va=le64(&ro[ivars_off..ivars_off+8]);let properties_va=le64(&ro[properties_off..properties_off+8]);let name=string_at_va(file,&secs,name_va,512)?.unwrap_or_else(||"<name unresolved>".into());
-   let conformances=objc_protocol_names(file,&secs,size,protocols_va)?;let conforms=if conformances.is_empty(){String::new()}else{format!("  conforms={}",conformances.join(","))};
-   out.push_str(&format!("reconstructed class {class_va:#018x}  name={name}  super={super_va:#018x}  ro={ro_va:#018x}{conforms}\n"));classes+=1;
+   let name_va=le64(&ro[name_off..name_off+8]);let methods_va=le64(&ro[methods_off..methods_off+8]);let protocols_va=le64(&ro[protocols_off..protocols_off+8]);let ivars_va=le64(&ro[ivars_off..ivars_off+8]);let properties_va=le64(&ro[properties_off..properties_off+8]);let name=string_at_va(file,&secs,name_va,512)?.or(objc_class_name(file,&secs,size,class_va)?).unwrap_or_else(||"<name unresolved>".into());
+   let conformances=objc_protocol_names(file,&secs,size,protocols_va)?;let conforms=if conformances.is_empty(){String::new()}else{format!("  conforms={}",conformances.join(","))};let super_name=objc_class_name(file,&secs,size,super_va)?.map(|value|format!("  super_name={value}")).unwrap_or_default();
+   out.push_str(&format!("reconstructed class {class_va:#018x}  name={name}  super={super_va:#018x}{super_name}  ro={ro_va:#018x}{conforms}\n"));classes+=1;
    let before=methods;objc_method_list(file,&secs,size,methods_va,"instance",Some(&name),&mut out,&mut methods)?; // class methods are discovered from metaclass records below.
    let _=before;
    // A class's isa points at its metaclass. Its class_ro_t carries the class-method list.

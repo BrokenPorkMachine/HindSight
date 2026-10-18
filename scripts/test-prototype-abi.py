@@ -88,6 +88,8 @@ def run(worker):
             # ld may merge a local category's protocols into the class RO list.
             assert re.search(r"class=ABISample conforms=[^\n]*ABICategory[^\n]* source=validated-class-ro-protocol-list", evidence), evidence[-12000:]
             assert "protocol=ABICategory membership=required-instance selector=categoryValue" in evidence
+            assert "class=ABIChild inherits-conformance=ABICategory,ABIRecovered via=ABISample source=validated-superclass-chain" in evidence, report["objc_classes"]
+            assert "@interface ABIChild : ABISample /* inherited protocols: ABICategory, ABIRecovered */" in evidence
             # Runtime `c` encodes char/signed-char without a source typedef name.
             assert "- (int)castValue:(char)arg0;" in evidence
             assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=optional-class selector=makeOptional" in evidence

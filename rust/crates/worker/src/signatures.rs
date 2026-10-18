@@ -227,7 +227,12 @@ pub fn protocol_signatures(records: &str) -> String {
 /// that any required method has a local implementation or resolve dispatch.
 pub fn objc_conformance_declarations(records: &str) -> String {
     let valid=|value:&str|!value.is_empty()&&value.len()<=256&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'));
-    let mut seen=std::collections::BTreeSet::new();let mut output=String::new();
+    let mut seen=std::collections::BTreeSet::new();let mut output=String::new();let mut parents=std::collections::BTreeMap::new();let mut direct=std::collections::BTreeMap::<String,Vec<String>>::new();
+    for line in records.lines().take(8192).map(str::trim).filter(|line|line.starts_with("reconstructed class ")&&line.len()<=4096) {
+        let Some(name)=line.split("  name=").nth(1).and_then(|tail|tail.split_whitespace().next()).filter(|name|valid(name))else{continue};
+        if let Some(parent)=line.split_whitespace().find_map(|field|field.strip_prefix("super_name=")).filter(|parent|valid(parent)){parents.insert(name.to_owned(),parent.to_owned());}
+        let protocols=line.split_whitespace().find_map(|field|field.strip_prefix("conforms=")).map(|values|values.split(',').filter(|protocol|valid(protocol)).take(32).map(str::to_owned).collect()).unwrap_or_default();direct.insert(name.to_owned(),protocols);
+    }
     for line in records.lines().take(8192) {
         let line=line.trim();if line.len()>4096{continue}
         let (name,category,source)=if line.starts_with("reconstructed class ") {
@@ -242,6 +247,7 @@ pub fn objc_conformance_declarations(records: &str) -> String {
         let row=format!("class={name}{category_evidence} conforms={} source={source} implementation-coverage=unproven dispatch-targets=unresolved\n@interface {name}{category_declaration} <{}>\n@end\n",conformances.join(","),conformances.join(", "));
         if output.len()+row.len()>12_000||seen.len()>128{output.push_str("Objective-C conformance output truncated at declaration/byte budget.\n");break}output.push_str(&row);
     }
+    for (name,parent) in &parents {let mut inherited=std::collections::BTreeSet::new();let mut chain=std::collections::BTreeSet::new();let mut ancestor=Some(parent.as_str());for _ in 0..64 {let Some(current)=ancestor else{break};if !chain.insert(current.to_owned()){break};if let Some(protocols)=direct.get(current){inherited.extend(protocols.iter().cloned());}ancestor=parents.get(current).map(String::as_str);}if let Some(own)=direct.get(name){for protocol in own{inherited.remove(protocol);}};if inherited.is_empty(){continue}let protocols=inherited.into_iter().collect::<Vec<_>>();let row=format!("class={name} inherits-conformance={} via={parent} source=validated-superclass-chain implementation-coverage=unproven dispatch-targets=unresolved\n@interface {name} : {parent} /* inherited protocols: {} */\n@end\n",protocols.join(","),protocols.join(", "));if output.len()+row.len()>12_000||seen.len()>128{output.push_str("Objective-C conformance output truncated at declaration/byte budget.\n");break}output.push_str(&row);}
     if !output.is_empty(){output.insert_str(0,"Objective-C class/category conformance evidence; conformance does not establish method implementations.\n")}output
 }
 
@@ -1514,14 +1520,15 @@ fn recover_internal(
         ] { assert!(protocol_signatures(records).is_empty(), "{records}"); }
     }
     #[test] fn class_conformance_declarations_preserve_protocol_sets_without_implementation_claims() {
-        let records="reconstructed class 0x0000000000001000  name=Worker  super=0x0  ro=0x2000  conforms=Primary,Tracing\nreconstructed class 0x0000000000003000  name=Plain  super=0x0  ro=0x4000\ncategory 0x5000 name=Extras class=0x1000 class_name=Worker conforms=Supplemental confidence=validated\n";
+        let records="reconstructed class 0x0000000000001000  name=Worker  super=0x0  ro=0x2000  conforms=Primary,Tracing\nreconstructed class 0x0000000000003000  name=Plain  super=0x1000  super_name=Worker  ro=0x4000\ncategory 0x5000 name=Extras class=0x1000 class_name=Worker conforms=Supplemental confidence=validated\n";
         let output=objc_conformance_declarations(&(records.to_string()+records));
         assert_eq!(output.matches("class=Worker conforms=Primary,Tracing").count(),1,"{output}");
         assert!(output.contains("@interface Worker <Primary, Tracing>"),"{output}");
         assert!(output.contains("implementation-coverage=unproven dispatch-targets=unresolved"),"{output}");
         assert_eq!(output.matches("class=Worker category=Extras conforms=Supplemental").count(),1,"{output}");
         assert!(output.contains("@interface Worker (Extras) <Supplemental>"),"{output}");
-        assert!(!output.contains("Plain"));
+        assert!(output.contains("class=Plain inherits-conformance=Primary,Tracing via=Worker source=validated-superclass-chain"),"{output}");
+        assert!(output.contains("@interface Plain : Worker /* inherited protocols: Primary, Tracing */"),"{output}");
         for invalid in ["reconstructed class 0x1  name=<bad>  conforms=Good\n","reconstructed class 0x1  name=Good  conforms=<bad>\n","category 0x1 name=Good conforms=Protocol\n"] {assert!(objc_conformance_declarations(invalid).is_empty(),"{invalid}")}
     }
     #[test] fn apple_scalar_abi_keeps_fp_and_gp_banks_independent() {

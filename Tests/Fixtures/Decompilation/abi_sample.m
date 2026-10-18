@@ -51,6 +51,12 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 }
 @end
 
+@interface ABIChild : ABISample
+@end
+
+@implementation ABIChild
+@end
+
 
 @interface ABISample (RecoveredCategory) <ABICategory>
 @end
@@ -61,7 +67,7 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 
 int main(void) {
     @autoreleasepool {
-        ABISample *sample = [ABISample new];
+        ABISample *sample = [ABIChild new];
         char buffer[8];
         known_memset(buffer, -1, sizeof(buffer));
         printf("%p %f\n", [sample pointer], [sample scalar]);
