@@ -5186,24 +5186,30 @@ fn decode(word: u32, pc: u64) -> Operation {
     // 64-bit (D) destination view.
     if word & 0x9f00_0000 == 0x0e00_0000 && word & 0x0020_0000 != 0 {
         let opcode = (word >> 11) & 0x1f;
-        let size = (word >> 22) & 3;
-        let vb = (size >> 1) & 1;
-        let operator = match (opcode, vb) {
-            (0b11010, 0) => IrVectorFloatBinaryOperator::Add,
-            (0b11010, 1) => IrVectorFloatBinaryOperator::Subtract,
-            (0b11011, _) => IrVectorFloatBinaryOperator::Multiply,
-            (0b11111, _) => IrVectorFloatBinaryOperator::Divide,
-            (0b11110, 0) => IrVectorFloatBinaryOperator::Max,
-            (0b11110, 1) => IrVectorFloatBinaryOperator::Min,
-            (0b11000, 0) => IrVectorFloatBinaryOperator::MaxNum,
-            (0b11000, 1) => IrVectorFloatBinaryOperator::MinNum,
-            _ => return Operation::Opaque,
-        };
-        let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
-        let destination = IrSimdRegister { index: (word & 31) as u8, width };
-        let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
-        let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
-        return Operation::VectorFloatBinary { destination, left, right, operator };
+        // Only recognized FP three-same opcodes proceed; others (including the
+        // bitwise group that shares bit 21) fall through to their own decoders.
+        if !matches!(opcode, 0b11010 | 0b11011 | 0b11111 | 0b11110 | 0b11000) {
+            // fall through
+        } else {
+            let size = (word >> 22) & 3;
+            let vb = (size >> 1) & 1;
+            let operator = match (opcode, vb) {
+                (0b11010, 0) => IrVectorFloatBinaryOperator::Add,
+                (0b11010, 1) => IrVectorFloatBinaryOperator::Subtract,
+                (0b11011, _) => IrVectorFloatBinaryOperator::Multiply,
+                (0b11111, _) => IrVectorFloatBinaryOperator::Divide,
+                (0b11110, 0) => IrVectorFloatBinaryOperator::Max,
+                (0b11110, 1) => IrVectorFloatBinaryOperator::Min,
+                (0b11000, 0) => IrVectorFloatBinaryOperator::MaxNum,
+                (0b11000, 1) => IrVectorFloatBinaryOperator::MinNum,
+                _ => return Operation::Opaque,
+            };
+            let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
+            let destination = IrSimdRegister { index: (word & 31) as u8, width };
+            let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
+            let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
+            return Operation::VectorFloatBinary { destination, left, right, operator };
+        }
     }
     // Lane-wise vector bitwise data processing: `0 Q U 01110 opc 1 Rm 00011 1
     // Rn Rd`. Bit 29 (`U`) and bits 23-22 (`opc`) select the operation —
