@@ -187,7 +187,7 @@ Verified progress: target-local structured property/ivar layouts now feed declar
 
 - [~] Complete Objective-C class/metaclass/superclass/category/protocol/ivar/property/IMP relationships, selector stubs, receiver classes, and dynamic dispatch candidate sets. *(in progress — claimed)*
 - [~] Render validated property/ivar access, class/instance method declarations and C-style prototypes with their owning image and type/layout evidence; retain property-accessor calls when an accessor rewrite has not been justified. *(in progress — claimed)*
-- [ ] Recover strings, pointer/string xrefs, CFString/CFData, globals, block captures, tagged pointers, bounds checks, ownership/runtime calls, and Foundation/CoreFoundation idioms from data flow.
+- [~] Recover strings, pointer/string xrefs, CFString/CFData, globals, block captures, tagged pointers, bounds checks, ownership/runtime calls, and Foundation/CoreFoundation idioms from data flow. *(in progress — claimed)*
 - [ ] Connect runtime observations and their validated image mappings to static hypotheses without promoting temporal proximity to causation.
 
 Acceptance: metadata, message sends, receiver/argument types, data references, and idiom rewrites have graph evidence and preserve machine effects; dynamic alternatives remain visible.
