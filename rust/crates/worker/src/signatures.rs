@@ -196,6 +196,23 @@ pub fn protocol_signatures(records: &str) -> String {
     output
 }
 
+/// A class RO protocol list proves a declared conformance. It does not prove
+/// that any required method has a local implementation or resolve dispatch.
+pub fn objc_conformance_declarations(records: &str) -> String {
+    let valid=|value:&str|!value.is_empty()&&value.len()<=256&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'));
+    let mut seen=std::collections::BTreeSet::new();let mut output=String::new();
+    for line in records.lines().take(8192) {
+        let line=line.trim();if line.len()>4096||!line.starts_with("reconstructed class "){continue}
+        let Some(name)=line.split("  name=").nth(1).and_then(|tail|tail.split_whitespace().next())else{continue};
+        let Some(protocols)=line.split_whitespace().find_map(|field|field.strip_prefix("conforms="))else{continue};
+        if !valid(name){continue}let conformances=protocols.split(',').filter(|protocol|valid(protocol)).take(32).collect::<Vec<_>>();
+        if conformances.is_empty(){continue}let key=(name.to_owned(),conformances.join(","));if !seen.insert(key){continue}
+        let row=format!("class={name} conforms={} source=validated-class-ro-protocol-list implementation-coverage=unproven dispatch-targets=unresolved\n@interface {name} <{}>\n@end\n",conformances.join(","),conformances.join(", "));
+        if output.len()+row.len()>12_000||seen.len()>128{output.push_str("Objective-C conformance output truncated at declaration/byte budget.\n");break}output.push_str(&row);
+    }
+    if !output.is_empty(){output.insert_str(0,"Objective-C class conformance evidence; conformance does not establish method implementations.\n")}output
+}
+
 // Exact SDK ABI declarations. No prefix or substring matching: unknown APIs stay unknown.
 fn api(name: &str) -> Option<(&'static str, &'static str)> {
     Some(match name {
@@ -1442,6 +1459,15 @@ fn recover_internal(
             "  protocol 0x4000 name=Known confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8  imp=0x0 confidence=validated\n",
             "  protocol 0x4000 name=Known confidence=validated\ncategory 0x5000 name=Other confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n",
         ] { assert!(protocol_signatures(records).is_empty(), "{records}"); }
+    }
+    #[test] fn class_conformance_declarations_preserve_protocol_sets_without_implementation_claims() {
+        let records="reconstructed class 0x0000000000001000  name=Worker  super=0x0  ro=0x2000  conforms=Primary,Tracing\nreconstructed class 0x0000000000003000  name=Plain  super=0x0  ro=0x4000\n";
+        let output=objc_conformance_declarations(&(records.to_string()+records));
+        assert_eq!(output.matches("class=Worker conforms=Primary,Tracing").count(),1,"{output}");
+        assert!(output.contains("@interface Worker <Primary, Tracing>"),"{output}");
+        assert!(output.contains("implementation-coverage=unproven dispatch-targets=unresolved"),"{output}");
+        assert!(!output.contains("Plain"));
+        for invalid in ["reconstructed class 0x1  name=<bad>  conforms=Good\n","reconstructed class 0x1  name=Good  conforms=<bad>\n","category 0x1 name=Good conforms=Protocol\n"] {assert!(objc_conformance_declarations(invalid).is_empty(),"{invalid}")}
     }
     #[test] fn apple_scalar_abi_keeps_fp_and_gp_banks_independent() {
         let signature = Signature { language: "C", source: "test",

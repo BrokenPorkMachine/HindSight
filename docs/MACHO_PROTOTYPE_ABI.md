@@ -4,7 +4,7 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v4` in analysis/cache/continuity identities.
+`prototype-abi-v5` in analysis/cache/continuity identities.
 
 Supported Apple ARM64 LP64 rules include:
 
@@ -64,6 +64,9 @@ supported selector/type encodings are checked before prototype reconstruction.
 Validated adopted-protocol lists preserve inheritance in declarations such as
 `@protocol Child <Parent>`. The edge establishes inherited requirements only;
 it does not establish class conformance, an IMP, or a dispatch target.
+Validated `class_ro_t` protocol lists now preserve class declarations such as
+`@interface Class <Protocol>`. Conformance does not establish that required or
+optional methods have local implementations, and does not select dispatch targets.
 
 Unknown typedefs and aggregate layouts can change both register banks and stack
 offsets. The unsupported parameter and subsequent bindings remain unresolved.
@@ -73,7 +76,7 @@ receiver; those argument bindings remain unresolved without membership evidence.
 This is progress toward complete resolution. It does not recover arbitrary C/C++
 layouts, Swift ABI, DWARF types, user header libraries, most stack-passed values,
 anonymous variadic values, hidden ABI attributes, or caller/callee constraints.
-Class conformance propagation, extended method-type tables and
+Superclass/category conformance propagation, extended method-type tables and
 conflict resolution across receiver hypotheses remain open.
 Unresolved GP return candidates and register-use arity evidence remain explicitly
 weaker than source declarations. Objective-C selector evidence alone does not

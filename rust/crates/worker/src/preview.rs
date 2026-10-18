@@ -533,7 +533,8 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
    let candidates=[(32usize,40usize,48usize,56usize,64usize),(24usize,32usize,40usize,48usize,56usize)];
    let (name_off,methods_off,protocols_off,ivars_off,properties_off)=candidates.into_iter().find(|(n,m,_,_,_)|{let nv=le64(&ro[*n..*n+8]);section_for_va(&secs,nv).and_then(|s|read_cstr_at(file,s,nv,512).ok().flatten()).is_some()&&section_for_va(&secs,le64(&ro[*m..*m+8])).is_some()}).unwrap_or(candidates[0]);
    let name_va=le64(&ro[name_off..name_off+8]);let methods_va=le64(&ro[methods_off..methods_off+8]);let protocols_va=le64(&ro[protocols_off..protocols_off+8]);let ivars_va=le64(&ro[ivars_off..ivars_off+8]);let properties_va=le64(&ro[properties_off..properties_off+8]);let name=string_at_va(file,&secs,name_va,512)?.unwrap_or_else(||"<name unresolved>".into());
-   out.push_str(&format!("reconstructed class {class_va:#018x}  name={name}  super={super_va:#018x}  ro={ro_va:#018x}\n"));classes+=1;
+   let conformances=objc_protocol_names(file,&secs,size,protocols_va)?;let conforms=if conformances.is_empty(){String::new()}else{format!("  conforms={}",conformances.join(","))};
+   out.push_str(&format!("reconstructed class {class_va:#018x}  name={name}  super={super_va:#018x}  ro={ro_va:#018x}{conforms}\n"));classes+=1;
    let before=methods;objc_method_list(file,&secs,size,methods_va,"instance",Some(&name),&mut out,&mut methods)?; // class methods are discovered from metaclass records below.
    let _=before;
    // A class's isa points at its metaclass. Its class_ro_t carries the class-method list.
@@ -1294,7 +1295,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
  let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols)?;
  let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls);
- let protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);
+ let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_signatures=super::signatures::objc_conformance_declarations(&objc_classes);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
  if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
