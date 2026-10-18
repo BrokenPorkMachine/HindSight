@@ -2027,8 +2027,6 @@ enum Writeback {
     Pre,
     /// Post-index `[Rn], #imm`: address is `base`, base is updated to `base + offset`.
     Post,
-    /// Reserved addressing-mode encoding; it has no shared-IR representation.
-    Reserved,
 }
 
 #[derive(Clone, Copy)]
@@ -2594,7 +2592,6 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 }, None)
             }
             AddressForm::Literal(offset) => (IrMemoryAddress::PcRelative { offset, target: pc.wrapping_add_signed(offset) }, None),
-            AddressForm::ImmediateSigned(_, _) => return None,
         })
     };
     match operation {
@@ -2731,7 +2728,6 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
                 Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
                 Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-                Writeback::Reserved => return IrOperation::TargetSpecific,
             };
             if update.is_some() && [dst1, dst2].iter().any(|dst| dst.index == base.index && dst.stack_pointer == base.stack_pointer) {
                 IrOperation::TargetSpecific
@@ -2744,7 +2740,6 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
                 Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
                 Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-                Writeback::Reserved => return IrOperation::TargetSpecific,
             };
             if update.is_some() && [src1, src2].iter().any(|src| src.index == base.index && src.stack_pointer == base.stack_pointer) {
                 IrOperation::TargetSpecific
@@ -2769,7 +2764,6 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
                 Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
                 Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-                Writeback::Reserved => return IrOperation::TargetSpecific,
             };
             if let Some((address, _)) = address(base, form) {
                 IrOperation::SimdPairLoad { first, second, address, bytes: first.width.bytes(), writeback: update }
@@ -2780,7 +2774,6 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
                 Writeback::None => (AddressForm::ImmediateSigned(offset, Writeback::None), None),
                 Writeback::Pre => (AddressForm::ImmediateSigned(offset, Writeback::Pre), Some(IrWriteback { base: reg(base), offset, pre_index: true })),
                 Writeback::Post => (AddressForm::ImmediateSigned(offset, Writeback::Post), Some(IrWriteback { base: reg(base), offset, pre_index: false })),
-                Writeback::Reserved => return IrOperation::TargetSpecific,
             };
             if let Some((address, _)) = address(base, form) {
                 IrOperation::SimdPairStore { first, second, address, bytes: first.width.bytes(), writeback: update }
@@ -3842,8 +3835,7 @@ fn decode(word: u32, pc: u64) -> Operation {
     }
     // Load/store register pair (LDP/STP): `opc:2 101 V:1 0 LL:2 L:1 imm7:7 Rt2:5
     // Rn:5 Rt:5`. Bit 22 (`L`) selects store from load; bits 24-23 (`LL`)
-    // select the addressing mode: 00 non-temporal (`LDNP`/`STNP`, left on the
-    // conservative fallback because the hint is not modelled), 01 post-index,
+    // select the addressing mode: 00 non-temporal (`LDNP`/`STNP`), 01 post-index,
     // 10 signed offset with no writeback, 11 pre-index. `opc` selects the
     // access width, not the direction: with V=0 it is `W`/`X` plus the
     // load-only `LDPSW`, and with V=1 it is `S`/`D`/`Q`. The `101` in bits
@@ -3858,13 +3850,18 @@ fn decode(word: u32, pc: u64) -> Operation {
         let rt = word & 31;
         let rt2 = (word >> 10) & 31;
         let imm7 = (word >> 15) & 0x7f;
+        // Non-temporal is a cache-policy hint and does not change the memory or
+        // register effects represented by the shared IR. Keep it as the same
+        // no-writeback pair operation; reserved width/direction combinations
+        // below still fail closed.
         let writeback = match mode {
+            0 => Writeback::None,
             1 => Writeback::Post,
             2 => Writeback::None,
             3 => Writeback::Pre,
-            _ => Writeback::Reserved, // 0 is the non-temporal hint pair
+            _ => unreachable!(),
         };
-        if !matches!(writeback, Writeback::Reserved) {
+        {
             // Access width in bytes, and the sign-extension `LDPSW` needs.
             let (size, extend) = if vector {
                 match opc {
@@ -6858,7 +6855,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v50; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v51; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -9614,12 +9611,16 @@ mod simd_memory_tests {
     }
 
     #[test]
-    fn non_temporal_and_reserved_pairs_retain_the_conservative_fallback() {
-        // `stnp`/`ldnp` (LL=00) hint non-temporal access that is not modelled,
-        // and the reserved opcodes stay opaque rather than widening the lift.
-        for word in [0x6c02_07e0, 0x6c42_07e0, 0x6802_07e0] {
-            assert_eq!(lift_operation(decode(word, 0x1000), 0x1000), IrOperation::TargetSpecific, "0x{word:08x}");
-        }
+    fn non_temporal_pairs_share_memory_semantics_and_reserved_forms_stay_opaque() {
+        // Cache policy does not alter the architectural register/memory effect.
+        assert_eq!(statement(0xa800_0440), "*(x2) = x0; *(x2 + 0x8) = x1;"); // stnp x0, x1, [x2]
+        assert_eq!(statement(0xa840_0440), "x0 = *(x2); x1 = *(x2 + 0x8);"); // ldnp x0, x1, [x2]
+        assert_eq!(statement(0x6c00_0440), "*(double *)(x2) = d0; *(double *)(x2 + 0x8) = d1;"); // stnp d0, d1, [x2]
+        assert_eq!(statement(0x6c40_0440), "d0 = *(double *)(x2); d1 = *(double *)(x2 + 0x8);"); // ldnp d0, d1, [x2]
+
+        // `opc=01` is only valid for the load-only LDPSW integer form, so its
+        // non-temporal store encoding remains target-specific.
+        assert_eq!(lift_operation(decode(0x6802_07e0, 0x1000), 0x1000), IrOperation::TargetSpecific);
     }
 
     #[test]

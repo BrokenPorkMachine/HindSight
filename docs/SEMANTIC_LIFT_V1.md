@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v50` banner identifies the statement set that
+`AArch64 register semantics v51` banner identifies the statement set that
 produced a preview.
 
 The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
@@ -61,8 +61,13 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v84-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v85-schema122`; the report fields
 and cache-envelope schema are unchanged.
+
+Non-temporal `LDNP`/`STNP` instructions use the shared pair-load/store IR. Their
+cache-policy hint does not change the represented register or memory effects,
+and their addressing remains no-writeback. Reserved width/direction encodings
+remain target-specific.
 
 Scalar single/double `FCSEL` now has shared IR. Its output names the condition
 and both FP register operands; the encoding's NV condition is normalized to AL
