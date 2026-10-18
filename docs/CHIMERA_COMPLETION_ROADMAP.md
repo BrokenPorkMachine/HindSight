@@ -152,7 +152,7 @@ Dependencies: C01, C02.
 - [~] Promote GPR SSA evidence to canonical structured definitions, uses, phis, and value IDs with W/X, SP, vector lanes, FP, and flags. *(in progress — claimed)*
 - [~] Add memory SSA, call clobbers, ordered/volatile/atomic effects, and conservative alias partitions for frame objects, globals, constants, heap, and escaped/unknown memory. *(in progress — claimed)*
 - [~] Prove frame adjustments and saved-register behavior; handle dynamic alignment, overlapping slots, spills, and lifetimes. *(in progress — claimed)*
-- [ ] Preserve instruction origins through SSA transforms, copies, merges, and dead-value elimination; bound fixed points and publish exhaustion reasons.
+- [~] Preserve instruction origins through SSA transforms, copies, merges, and dead-value elimination; bound fixed points and publish exhaustion reasons. *(in progress — claimed)*
 
 Acceptance: dominance, phi inputs, interference, def-use, memory versions, read-before-write, loops, aliasing, and unknown-effect fixtures agree with the reference model and traces.
 
