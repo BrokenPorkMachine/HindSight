@@ -31,8 +31,8 @@ These are the next bounded tasks within priority 1, not new completion claims or
 1. Keep the worker/decompilation/native-catalog/prototype-ABI gates green on the current tree. The parameter-name/frame-update regression now has a passing prologue test and unchanged 16-variant corpus gates; preserve negative clobber/join coverage as naming moves to structured IR.
 2. Audit broad SIMD/system fallbacks and reserved/neighboring encodings. Replace unsound no-effect classifications with exact effects or conservative unknown barriers, including GPR, vector, flags and memory invalidation. Protect every reconstruction consumer, not only member substitution.
 3. Parameter-name/copy/clobber decisions now use [bounded shared-effect identities](AARCH64_SOURCE_VARIABLES.md), including frame spills, paired writes and agreeing CFG paths. Next integrate these with canonical SSA/variable lifetimes, typed source AST and memory effects; rendered control-flow structuring and other text-derived reconstruction decisions still need migration.
-4. Publish worker-produced per-function evidence and eligibility for the supported slice: source/function/pass/settings identities, statement spans, metadata/type origins, unresolved effects and budget exhaustion. Offline schema tests alone do not finish this integration.
-5. Run one supported C function and one Objective-C method through pseudocode → typed AST → complete export → native recompilation → differential checks. Expand from this walking skeleton into priorities 2–7; do not hide unsupported effects behind stubs or postpone validation until general recovery is complete.
+4. Extend existing worker-produced function artifacts with richer native type/image origins and source/variable/effect evidence, preserving source/function/pass/settings identities, exact dependency spans, blockers and budget exhaustion. Join these records to coordinator/client review and export; offline schema tests alone do not finish that integration.
+5. Expand the now-qualified C/Objective-C scalar walking skeleton through loops, external memory, native calls and source-level layouts, while exposing its recovered-source view in the app. Preserve compile/native differential checks throughout; do not hide unsupported effects behind stubs or postpone validation until general recovery is complete.
 
 Darwin evidence is an early and continuous dependency, not a deferred catalog project. Use native dyld/Mach-O, libobjc, Foundation/CoreFoundation, Apple Clang SDK layouts, libSystem/dispatch and applicable Mach/XPC contracts. Keep target facts separate from helper-host observations. Qualify shared macOS/iOS dyld layouts and semantic contracts once at their demonstrated architecture/ABI/version scope; test only remaining platform-specific deltas separately. No blanket claim that macOS execution proves every iOS behavior.
 
@@ -123,6 +123,8 @@ Dependencies: C00. Extend semantics as each corpus slice requires; full ISA qual
 
 Verified progress: integer SIMD-to-GPR lane extracts now use explicit shared effects across all 82 legal forms. Apple-assembled fixtures and 42,640 Apple-Silicon comparisons qualify normal EL0 non-streaming lane results. The unsound broad SIMD preservation fallback is removed, and vector-bitwise decoding checks fixed bit 24. General SIMD/system effects, memory/flags SSA, strict emission and whole-function equivalence remain open.
 
+Executable progress: the [worker machine-state slice](WORKER_RECONSTRUCTION_ARTIFACTS.md#executable-machine-state-slice) now interprets shared-tree integer/branch/checked-memory semantics and emits complete C17 for supported captured functions. Native C/Objective-C/assembly `-O0/-O2` fixtures qualify bounded returns and explicit buffers; interpreter/generated runs additionally agree on the full modeled register/memory state. Graph-linked compilation/differential observations remain separate from recovered-source fidelity and formal equivalence. General instruction/call/FP/exception coverage and canonical flags/memory SSA remain open; this does not close C01 or C10.
+
 - [~] Inventory exact, intrinsic, privileged/runtime, and unsupported instruction families; finish shared ARM64/ARM64e semantics including vector/half FP, flags, partial lanes, SP, PAC, atomics, barriers, traps, and exception effects. *(in progress — claimed)*
 - [~] Specify typed bitvectors, modular arithmetic, comparisons, shifts, extensions, poison/unknowns, endianness, memory alignment, FP modes, and architectural aliases. *(in progress — claimed)*
 - [~] Build an IR interpreter and strict C17 emitter with checked guest-memory helpers and explicit imports/intrinsics. Preserve ordering and side effects. *(in progress — claimed)*
@@ -147,7 +149,7 @@ Acceptance: known-source fixture CFGs agree, including disconnected/unreachable 
 
 Dependencies: C01, C02.
 
-- [ ] Promote GPR SSA evidence to canonical structured definitions, uses, phis, and value IDs with W/X, SP, vector lanes, FP, and flags.
+- [~] Promote GPR SSA evidence to canonical structured definitions, uses, phis, and value IDs with W/X, SP, vector lanes, FP, and flags. *(in progress — claimed)*
 - [ ] Add memory SSA, call clobbers, ordered/volatile/atomic effects, and conservative alias partitions for frame objects, globals, constants, heap, and escaped/unknown memory.
 - [ ] Prove frame adjustments and saved-register behavior; handle dynamic alignment, overlapping slots, spills, and lifetimes.
 - [ ] Preserve instruction origins through SSA transforms, copies, merges, and dead-value elimination; bound fixed points and publish exhaustion reasons.
@@ -195,6 +197,8 @@ Acceptance: metadata, message sends, receiver/argument types, data references, a
 Dependencies: C03–C06.
 
 Verified progress: parameter identity flow no longer reparses machine statements. Entry-based identities, width-specific views, bounded frame saves/restores, paired writes and CFG must-joins feed separate input/output naming maps. Six Apple-assembled fixture functions and 1,560 original-native result checks supplement the existing corpus. This is not complete SSA-backed source-variable recovery, typed expression AST or reconstructed-source behavioral validation.
+
+Source progress: [named scalar recovery](WORKER_RECONSTRUCTION_ARTIFACTS.md#named-scalar-source-recovery) now joins exact C/Objective-C declarations to structured ABI inputs, produces an instruction/declaration-linked expression DAG, folds proven private-frame copies, handles acyclic return paths, and emits complete scalar C/C-style IMP adapters. The qualification matrix covers four optimization levels and symbol-rich/local-symbol-stripped fixtures, with native result comparisons and generated-source sanitization. Loops, external memory/calls, general SSA-backed lifetimes/layouts, modern chained Objective-C metadata joins, UI integration and broader source fidelity remain open; C07–C10 are not complete.
 
 - [ ] Recover parameters, locals, aggregates, fields, globals, captures, lifetimes, and coalesced SSA variables; name from factual evidence or deterministic role descriptions.
 - [ ] Form expression trees with use counts, dominance, effect ordering, widths, casts, lvalues, array/field access, and defined overflow/shift semantics.
@@ -356,8 +360,8 @@ An original checkbox closes only when all mapped work and its stated gate are pr
 
 ## Next executable work
 
-1. Bind real per-function AArch64 IR/CFG records to the implemented artifact/evidence gate; carry exact function and image identity into named pseudocode (C00/C01/C02).
-2. Implement the Darwin catalog helper and Apple Clang layout/declaration importer for images, functions/C declarations, classes, selectors/methods, properties, ivars, structs and types; join validated records to pseudocode (C00N).
-3. Generate the first machine-state C17 and IR-interpreter fixture, compile against applicable native Darwin libraries, run differential tests, and retain graph-linked results (C01/C10).
+1. Extend real per-function IR/CFG/SSA/AST artifacts through canonical flags/memory effects and exact native name/type evidence (C00–C07); preserve the passing source-bound artifact gate.
+2. Extend the existing Darwin helper and Apple Clang declaration importer with validated catalog-to-target joins for provider images, C declarations, classes/methods/properties/ivars and arbitrary struct layouts (C00N).
+3. Expand the passing machine-state C17/interpreter/native walking skeleton through native imports, broader semantics and recovered source; retain graph-linked compilation/behavior evidence with explicit limits (C01/C09/C10).
 4. Extend that same function path through memory/register SSA, ABI/type solving, recovered variables/expressions, nested control flow, compilable recovered source, and synchronized evidence review (C03–C11).
 5. Expand the AArch64 macOS/iOS shared corpus, enforce per-feature fidelity/behavior gates, and only then promote broader architecture/format/product work (C12–C16).
