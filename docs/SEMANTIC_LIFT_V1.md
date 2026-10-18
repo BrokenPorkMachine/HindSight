@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v48` banner identifies the statement set that
+`AArch64 register semantics v49` banner identifies the statement set that
 produced a preview.
 
 The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
@@ -61,7 +61,7 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v82-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v83-schema122`; the report fields
 and cache-envelope schema are unchanged.
 
 Scalar single/double `FCSEL` now has shared IR. Its output names the condition
@@ -83,6 +83,26 @@ Each operation invalidates only its destination FP value, preserving unrelated
 FP values, GP values, NZCV, and predicate provenance. FP16, vector/integer forms,
 and `FRECPX` retain their prior fallback. Narrow encoding masks are checked
 against independently assembled S/D instructions and adjacent unsupported forms.
+
+The Advanced SIMD load/store single-register group now uses shared memory IR
+for every width: one lane of `B`/`H`/`S`/`D` and the full 128-bit `Q` register,
+across unsigned-offset, unscaled (`LDUR`/`STUR`), pre-indexed, post-indexed,
+unprivileged (`LDTR`/`STTR`), register-offset, and PC-relative literal forms.
+`B` and `H` name an integer memory view only — no half-precision arithmetic is
+claimed — and the register-offset form scales its index by the 128-bit access
+size when `S` is set, as the architecture specifies, rather than by the `size`
+field. These instructions write V registers only, so they invalidate their own
+destination and preserve every general-purpose value: a `ldr q0, [x0]` no longer
+discards unrelated proven constants as an all-GPR barrier.
+
+`LDP`/`STP` now decode from the architectural `opc`/`L`/width table, so `bit 22`
+chooses store from load and `opc` chooses the access width. That covers signed
+offset, pre-index, and post-index for both general-purpose and SIMD registers,
+including `LDPSW`, plus the `S`/`D`/`Q` pair widths. The non-temporal
+`LDNP`/`STNP` hint and the reserved opcodes stay on the conservative fallback.
+A pre-indexed pair now renders both halves relative to the already-updated base
+instead of repeating the encoded offset, and the second half of every pair is
+addressed at the first half's offset plus the access size.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument

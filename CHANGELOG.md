@@ -13,7 +13,10 @@
 - Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
 - Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.
 - Lift scalar single/double reciprocal estimates and refinement steps (`FRECPE`, `FRSQRTE`, `FRECPS`, `FRSQRTS`) as named shared IR operations with unresolved FP behavior; only their destination values are invalidated.
-- Advance the analysis/cache identity to `arm64-analysis-v82-schema122` and semantic preview banner to v48; the report schema is unchanged.
+- Lift SIMD memory access into shared IR: every width of the Advanced SIMD load/store single-register group (`B`/`H`/`S`/`D` lanes and the full `Q` register) across unsigned-offset, unscaled, pre-indexed, post-indexed, unprivileged, register-offset, and PC-relative literal addressing, plus `LDP`/`STP` for signed offset, pre-index, and post-index over general-purpose and `S`/`D`/`Q` registers. Register-offset forms scale by the 128-bit access size when `S` is set.
+- Correct `LDP`/`STP` decoding to use the architectural `opc`/`L`/width table; stores were previously read as loads, 64-bit pairs were reported through the 32-bit view, and signed-offset and post-index pairs were left opaque. Pre-indexed pairs now render both halves against the updated base, and the second half of a pair is addressed at the first half's offset plus the access size.
+- Vector memory access invalidates only its own V-register destinations, so instructions such as `ldr q0, [x0]` no longer discard unrelated proven general-purpose constants as an all-GPR barrier.
+- Advance the analysis/cache identity to `arm64-analysis-v83-schema122` and semantic preview banner to v49; the report schema is unchanged.
 
 # 0.5.12 — Objective-C/C Argument Reconstruction
 
