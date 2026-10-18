@@ -4,6 +4,22 @@ This is the implementation order for the remaining work in [ROADMAP.md](ROADMAP.
 
 Inputs: the two existing roadmaps, the independent [reconstruction-first draft](RECONSTRUCTION_FIRST_ROADMAP.md), the [Apple Silicon application specification](Apple_Silicon_Reverse_Engineering_App_Spec_v1.md), and the current implementation. No separate replacement roadmap from the other model was available when this synthesis was written. The user directed work to proceed with these inputs.
 
+## Current actionable queue (2026-10-18)
+
+This short queue is the live handoff; C00–C16 below retain the full acceptance
+criteria. `[~]` means implemented in part or under verification, never complete.
+The first five items build one usable AArch64 source-recreation path. Server
+readiness and GitHub publication follow their own verified gate.
+
+1. [~] **Keep the current worker sound.** Qualify the newly lifted vector arithmetic with exact lane-width, partial-write and reserved-encoding tests; a full-register constant fold cannot prove lane-wise results. Preserve unknown-effect barriers and parameter identities across frame copies, joins and clobbers. Re-run Rust, native and corpus gates after overlapping IR edits settle. (C01–C03)
+2. [~] **Finish the per-function source review path in the macOS app.** The coordinator request and Source pane are wired in the working tree; exercise real worker → coordinator → app artifact decoding, source/function/revision checks, origin navigation, cancellation and reviewed export. Test malformed graphs and stale results before declaring the UI finished. (C00/C11/C15)
+3. [~] **Join exact Apple names and types to that path.** Extend the existing native dyld/libobjc/Foundation/CoreFoundation/Clang SDK catalog with target image/ABI/version checks; surface trusted class, selector, method, property, ivar, C declaration, struct and field evidence. Add a project type catalog and reject conflicting candidates. Reuse qualified shared macOS/iOS semantics at their actual ABI scope. (C00N/C04–C06)
+4. [~] **Extend structured SSA and the typed source AST.** Complete flags, vector and memory effects, stack/alias lifetimes, variables, expressions and type constraints without reparsing rendered text. Expand the bounded scalar walking skeleton through external memory, real calls, aggregates, loops and switches; unsupported reachable effects remain blockers. (C01–C08)
+5. [~] **Make supported source recompilable and test it.** Export dependencies and source maps with C17/Objective-C functions, compile against native Apple libraries where the recovered behavior requires them, and compare original/IR/generated behavior. Keep source resemblance, behavioral agreement and formal claims separate. Expand `-O0/-O1/-O2/-Os`, stripped/symbol-rich and macOS/iOS shared qualification. (C09/C10/C12)
+6. [~] **Qualify Linux static processing in Docker.** A non-root, read-only, no-network Rust/C worker image, one-shot launcher and amd64/arm64 CI jobs are in the working tree. The test stage (253 worker tests, five protocol tests, fixture suites) and restricted runtime smoke pass for Linux amd64 under Docker emulation on this Apple Silicon host. Native Linux amd64/arm64 CI results remain required. Then integrate a trusted scheduler adapter if the app-hosted server is to offer Linux jobs. This does not complete Linux process attach. ([Linux Docker contract](LINUX_DOCKER.md), C13/C15)
+7. [~] **Implement app-hosted remote communication.** A loopback-only, opt-in HTTPS read-only preview now exposes versioned capabilities and the open-project snapshot with a per-start bearer token; the macOS app owns the listener and requires a Keychain TLS identity. This is not yet client-ready: test a real TLS client, tighten identity selection and lifecycle, add authentication revocation, project-scoped authorization, bounded uploads, sequenced progress/events, analysis and cancellation/reconnect. Debugger and VM actions remain unavailable until ownership, consent and isolation are enforced. See the [remote acceptance gate](HINDSIGHT_REMOTE.md). (C14/C15)
+8. [ ] **Audit and publish only after client readiness.** Verify a real client against the running app server, audit correctness/completeness/security and recovery cases, then review the exact commit and push tested server scope to the configured GitHub destination. Notify Paul with the commit and any remaining limits. The conditional push is authorized; the server is not yet ready. (C15/C16)
+
 ## Active priority: AArch64 pseudocode and source reconstruction
 
 Re-plotted 2026-10-18. The next product outcome is dependable, named, typed AArch64 pseudocode for Apple binaries; the next is evidence-backed, recompilable C17/Objective-C reconstruction. Near-1:1 fidelity is a separate measured goal, not permission to invent erased source information. ARM64e uses this pipeline with authentication effects explicit until qualified.
@@ -267,6 +283,10 @@ Acceptance: each language/ISA declares and passes its own supported matrix. Stru
 
 Dependencies: C00/C01 contracts; format work serves reconstruction after the first qualification milestone.
 
+Linux static-processing packaging: [Docker worker](LINUX_DOCKER.md) adds a
+bounded one-shot Rust/C container and amd64/arm64 CI gates. This does not close
+Linux native attach or the app-hosted remote server integration gates.
+
 - [x] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers): bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied.
 - [~] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host). *(in progress — claimed)*
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
@@ -360,8 +380,7 @@ An original checkbox closes only when all mapped work and its stated gate are pr
 
 ## Next executable work
 
-1. Extend real per-function IR/CFG/SSA/AST artifacts through canonical flags/memory effects and exact native name/type evidence (C00–C07); preserve the passing source-bound artifact gate.
-2. Extend the existing Darwin helper and Apple Clang declaration importer with validated catalog-to-target joins for provider images, C declarations, classes/methods/properties/ivars and arbitrary struct layouts (C00N).
-3. Expand the passing machine-state C17/interpreter/native walking skeleton through native imports, broader semantics and recovered source; retain graph-linked compilation/behavior evidence with explicit limits (C01/C09/C10).
-4. Extend that same function path through memory/register SSA, ABI/type solving, recovered variables/expressions, nested control flow, compilable recovered source, and synchronized evidence review (C03–C11).
-5. Expand the AArch64 macOS/iOS shared corpus, enforce per-feature fidelity/behavior gates, and only then promote broader architecture/format/product work (C12–C16).
+Execute the [current actionable queue](#current-actionable-queue-2026-10-18) in order.
+Its early steps deliver a function end to end; the remote gateway and conditional
+GitHub push retain the explicit acceptance checks in
+[HINDSIGHT_REMOTE.md](HINDSIGHT_REMOTE.md).

@@ -293,6 +293,30 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             } catch { reply(AnalysisReply.encode(error: error.localizedDescription)) }
         }
     }
+    func reconstructFunction(_ recordID: String, startAddress: String, endAddress: String, requestID: String, withReply reply: @escaping (String) -> Void) {
+        queue.async { [self] in
+            do {
+                guard let current = store, UUID(uuidString: recordID) != nil, UUID(uuidString: requestID) != nil,
+                      let start = UInt64(startAddress), let end = UInt64(endAddress), start < end, end - start <= 4 * 1024 * 1024 else {
+                    throw WorkbenchError("Invalid per-function reconstruction request or no project.")
+                }
+                let source = try current.capturedSource(id: recordID)
+                let options = source.options ?? .automatic
+                guard ["auto", "macho"].contains(options.format), ["auto", "aarch64"].contains(options.architecture),
+                      options.load_address == "0", options.file_offset == "0" else {
+                    throw WorkbenchError("Reconstruction currently requires an unmapped thin AArch64 Mach-O; custom mappings and other formats remain unsupported.")
+                }
+                let before = try VerifiedPageCache.stamp(source.path)
+                supervisor.reconstruct(path: source.path, digest: source.digest, size: source.size, start: start, end: end, id: requestID) { [self] result in
+                    do {
+                        guard store === current, try VerifiedPageCache.stamp(source.path) == before else { throw WorkbenchError("Project or captured source changed during reconstruction.") }
+                        let artifact = try result.get()
+                        reply(ReconstructionReply.encode(id: requestID, artifact: artifact, message: "Function reconstructed with captured-source verification. Generated text was not compiled or executed."))
+                    } catch { reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription)) }
+                }
+            } catch { reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription)) }
+        }
+    }
     func cancelInspection(_ requestID: String, withReply reply: @escaping (Bool) -> Void) {
         queue.async { [self] in reply(supervisor.stop(id: requestID)) }
     }

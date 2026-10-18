@@ -1354,6 +1354,7 @@ pub fn reconstruct(path:&str,digest:&str,size:&str,start:&str,end:&str,id:&str)-
  reconstruction_request(path,digest,size,start,end,id,None)
 }
 pub fn interpret(path:&str,digest:&str,size:&str,start:&str,end:&str,inputs:&str,id:&str)->io::Result<String>{
+ if inputs.len()>151{return Err(io::Error::new(io::ErrorKind::InvalidInput,"Interpreter input budget exceeded"));}
  let values=inputs.split(',').map(|value|value.strip_prefix("0x").filter(|s|!s.is_empty()&&s.len()<=16).and_then(|s|u64::from_str_radix(s,16).ok()).ok_or_else(||io::Error::new(io::ErrorKind::InvalidInput,"Interpreter requires eight hexadecimal X0-X7 inputs"))).collect::<io::Result<Vec<_>>>()?;
  let registers:[u64;8]=values.try_into().map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"Interpreter requires eight hexadecimal X0-X7 inputs"))?;
  reconstruction_request(path,digest,size,start,end,id,Some(registers))
@@ -1389,7 +1390,9 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  if sources.is_empty(){sources.push("section-start fallback candidate".into());}
  let name=if names.len()==1{names.iter().next().copied()}else if names.is_empty(){facts.objc_function_names.get(&start).map(String::as_str)}else{None};
  let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources};
+ let external=super::signatures::external_prototype_database(digest)?;
+ let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)

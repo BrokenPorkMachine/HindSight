@@ -122,6 +122,17 @@ private struct HindSightSettingsView: View {
                         .disabled(!model.connected || model.busy || model.reaTargetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 settingsSection("Support & Readiness") {
+                    TextField("Keychain TLS identity subject", text: $model.remoteCertificateLabel)
+                    TextField("HTTPS port", text: $model.remotePort)
+                    VGReadinessRow(label: "Remote gateway", value: model.remoteStatus)
+                    Button("Start local HTTPS gateway") { model.startRemoteGateway() }
+                    Button("Stop gateway") { model.stopRemoteGateway() }
+                    if !model.remoteToken.isEmpty {
+                        Text("Session token (copy now; regenerated on start)")
+                        Text(model.remoteToken).textSelection(.enabled).font(.system(.caption, design: .monospaced))
+                    }
+                    settingsNote("Loopback-only read-only preview. Uploads, analysis, debugging, and VM controls are not exposed yet.")
+                    Divider()
                     VGReadinessRow(label: "Build", value: buildIdentity)
                     VGReadinessRow(label: "Host", value: hostIdentity)
                     VGReadinessRow(label: "Coordinator", value: coordinatorIdentity)

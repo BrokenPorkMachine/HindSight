@@ -3,6 +3,7 @@ use super::*;
 use crate::reconstruction::{address, array, object, ranges, Builder, Input, Value as V};
 use std::{collections::BTreeMap, io};
 mod executable;
+mod source;
 
 /// Source-tree vocabulary v1. Attributes carry explicit bit/memory contracts;
 /// these are machine-state expressions, not fabricated recovered source locals.
@@ -217,6 +218,43 @@ fn effective_address(address: IrMemoryAddress, update: Option<IrWriteback>) -> T
 }
 
 fn model(operation: IrOperation) -> Option<Tree> {
+    let overlaps = |base: IrRegister, value: IrRegister| {
+        base.class == IrRegisterClass::General && base.index == value.index
+    };
+    // Constrained-unpredictable writeback aliases have no single architectural
+    // result to export. Non-writeback pairs may alias the base and are handled
+    // by the evaluate-address-once node below.
+    match operation {
+        IrOperation::Load {
+            destination,
+            writeback: Some(update),
+            ..
+        } if overlaps(update.base, destination) => return None,
+        IrOperation::Store {
+            value: IrOperand::Register(value),
+            writeback: Some(update),
+            ..
+        } if overlaps(update.base, value) => return None,
+        IrOperation::LoadPair {
+            first,
+            second,
+            writeback,
+            ..
+        } if first.index == second.index
+            || writeback
+                .map(|update| overlaps(update.base, first) || overlaps(update.base, second))
+                .unwrap_or(false) =>
+        {
+            return None
+        }
+        IrOperation::StorePair {
+            first,
+            second,
+            writeback: Some(update),
+            ..
+        } if overlaps(update.base, first) || overlaps(update.base, second) => return None,
+        _ => {}
+    }
     let operator = |operator| match operator {
         IrBinaryOp::Add => "+",
         IrBinaryOp::Subtract => "-",
@@ -701,6 +739,49 @@ fn model(operation: IrOperation) -> Option<Tree> {
     })
 }
 
+/// Preserve the encoded NZCV write that the older shared GPR operation does
+/// not carry. Read original operands BEFORE writing an aliased destination.
+/// This is instruction-derived effect augmentation, never text reparsing.
+fn instruction_model(operation: Operation, portable: IrOperation, word: u32) -> Option<Tree> {
+    let value = model(portable)?;
+    let compare = match operation {
+        Operation::AddImmediate { subtract, .. } | Operation::AddRegister { subtract, .. }
+            if word & (1 << 29) != 0 =>
+        {
+            let expression = value.children.get(1)?;
+            tree(
+                "flags-compare",
+                None,
+                object([
+                    ("operator", if subtract { "cmp" } else { "cmn" }.into()),
+                    ("bits", num_bits(expression).into()),
+                ]),
+                expression.children.clone(),
+            )
+        }
+        Operation::LogicalImmediate { .. } | Operation::LogicalRegister { .. }
+            if word & 0x60000000 == 0x60000000 =>
+        {
+            let expression = value.children.get(1)?.clone();
+            let bits = num_bits(&expression);
+            tree(
+                "flags-compare",
+                None,
+                object([("operator", "tst".into()), ("bits", bits.into())]),
+                vec![expression, constant(u64::MAX, bits)],
+            )
+        }
+        _ => return Some(value),
+    };
+    Some(sequence(vec![compare, value]))
+}
+fn num_bits(value: &Tree) -> u8 {
+    match value.attributes.get("bits") {
+        Some(V::Int(bits)) => *bits as u8,
+        _ => 64,
+    }
+}
+
 fn text_attribute(tree: &Tree, key: &str) -> String {
     match tree.attributes.get(key) {
         Some(V::String(value)) => value.clone(),
@@ -846,6 +927,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         architecture,
         name,
         boundary_sources,
+        signatures,
     } = input;
     if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
         return Err(io::Error::new(
@@ -881,6 +963,21 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ("cfg_policy", "instruction-level-conservative".into()),
         ("source_export", false.into()),
         ("machine_contract", executable::CONTRACT.into()),
+        (
+            "source_contract",
+            "apple-aapcs64-lp64-pure-acyclic-v1".into(),
+        ),
+        (
+            "signature_candidates",
+            array(signatures.iter().map(|(name, signature)| {
+                object([
+                    ("name", name.clone().into()),
+                    ("language", signature.language.into()),
+                    ("declaration", signature.declaration.clone().into()),
+                    ("source", signature.source.into()),
+                ])
+            })),
+        ),
     ]);
     let mut builder = Builder::new(source, start, end, architecture, name, settings.clone())?;
     let scope = builder.record(
@@ -926,7 +1023,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         } else {
             lift_operation(operation, pc)
         };
-        let modeled = model(portable);
+        let modeled = instruction_model(operation, portable, word);
         let raw = builder.record(
             "bytes",
             "fact",
@@ -995,16 +1092,6 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }
         ) {
             reasons.push("unresolved-call-contract");
-        }
-        let unmodeled_flag_write = match operation {
-            Operation::AddImmediate { .. } | Operation::AddRegister { .. } => word & (1 << 29) != 0,
-            Operation::LogicalImmediate { .. } | Operation::LogicalRegister { .. } => {
-                word & 0x60000000 == 0x60000000
-            }
-            _ => false,
-        };
-        if unmodeled_flag_write {
-            reasons.push("shared-ir-nzcv-write-unresolved");
         }
         if matches!(portable, IrOperation::Marker { .. }) {
             reasons.push("runtime-marker-contract-unqualified");
@@ -1231,6 +1318,54 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             }
         }
     }
+    let mut recovered_source = None;
+    if !strict_blocked {
+        let recovery = if signatures.len() == 1 {
+            let (name, signature) = &signatures[0];
+            crate::signatures::source_signature(name, signature)
+                .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
+                .and_then(|signature| source::recover(start, &trees, &models, signature))
+        } else {
+            Err(if signatures.is_empty() {
+                "no exact source signature"
+            } else {
+                "conflicting exact source declarations"
+            }
+            .to_owned())
+        };
+        match recovery {
+            Ok(recovery) => {
+                let (_, signature) = &signatures[0];
+                let declaration = builder.record(
+                    "type",
+                    if signature.source.contains("analyst") {
+                        "analyst-assertion"
+                    } else {
+                        "derived"
+                    },
+                    object([
+                        ("declaration", signature.declaration.clone().into()),
+                        ("source", signature.source.into()),
+                    ]),
+                    array([]),
+                )?;
+                let (root, node) = recovery.emit(&mut builder, &declaration, &ir_ids, start)?;
+                statements.push(root);
+                recovered_source = Some(node);
+            }
+            Err(reason) => {
+                builder.record(
+                    "metadata",
+                    "derived",
+                    object([
+                        ("artifact_kind", "recovered-source-rejection".into()),
+                        ("reason", reason.into()),
+                    ]),
+                    array([]),
+                )?;
+            }
+        }
+    }
     let root = builder.ast(
         "machine-function",
         None,
@@ -1255,6 +1390,9 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ranges(start, end),
     )?;
     builder.edge(&bounds, &root_mirror, "supports")?;
+    if let Some(source) = recovered_source {
+        builder.edge(&root_mirror, &source, "renders-as")?;
+    }
     for mirror in statement_mirrors {
         builder.edge(&mirror, &root_mirror, "derives")?;
     }

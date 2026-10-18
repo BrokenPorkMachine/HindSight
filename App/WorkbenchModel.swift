@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import CryptoKit
 import Foundation
+import Security
 import UniformTypeIdentifiers
 
 private struct VGAnalysisDecodeResult: Sendable {
@@ -52,6 +53,9 @@ final class WorkbenchModel: ObservableObject {
     private var traversingPreviousPage = false
     @Published var instructionPage: InstructionPage?
     @Published var analysisReport: AnalysisReport?
+    @Published private(set) var reconstructionArtifact: ReconstructionArtifact?
+    @Published private(set) var reconstructionStatus = "Select a function and request reconstruction."
+    private var reconstructionContext: (project: String, record: String, analysis: String)?
     @Published private(set) var analysisEvidenceIndex: VGAnalysisEvidenceIndex?
     @Published private(set) var analysisEvidenceIndexing = false
     @Published private(set) var analysisEvidenceStatus = "Evidence index unavailable."
@@ -385,6 +389,44 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private var savedLaunchSession: LaunchSession?
     private var applyingLaunchSession = false
     private let client = CoordinatorClient()
+    @Published var remoteCertificateLabel = ""
+    @Published var remotePort = "8443"
+    @Published private(set) var remoteToken = ""
+    @Published private(set) var remoteStatus = "Off"
+    private lazy var remoteGateway = RemoteGateway(handle: { [weak self] request, reply in
+        Task { @MainActor in self?.handleRemoteRequest(request, reply: reply) }
+    }, status: { [weak self] value in
+        Task { @MainActor in self?.remoteStatus = value }
+    })
+    func startRemoteGateway() {
+        guard let port = UInt16(remotePort), port > 0 else { remoteStatus = "Invalid port"; return }
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+            remoteStatus = "Token generation failed"; return
+        }
+        let token = bytes.map { String(format: "%02x", $0) }.joined()
+        do {
+            try remoteGateway.start(certificateLabel: remoteCertificateLabel, port: port, token: token)
+            remoteToken = token
+            remoteStatus = "Starting…"
+        } catch {
+            remoteToken = ""
+            remoteStatus = error.localizedDescription
+        }
+    }
+    func stopRemoteGateway() {
+        remoteGateway.stop()
+        remoteToken = ""
+    }
+    private func handleRemoteRequest(_ request: String, reply: @escaping (String) -> Void) {
+        if request == "GET /v1/capabilities HTTP/1.1" {
+            reply("{\"protocol\":1,\"server\":\"HindSight\",\"features\":[\"project_read\"],\"execution\":false}")
+        } else if let project, let data = try? JSONEncoder().encode(project) {
+            reply(String(decoding: data, as: UTF8.self))
+        } else {
+            reply("{\"error\":\"no open project\"}")
+        }
+    }
     init() {
         if let saved = UserDefaults.standard.string(forKey: "HindSight.preferred-layout.v1"), VGWorkspaceCatalog.layouts.contains(saved) {
             preferredLayoutPreset = saved
@@ -1079,6 +1121,59 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 self.triggerPluginEvent("on_analysis_complete")
             }
         }
+    }
+    var currentReconstruction: ReconstructionArtifact? {
+        guard let context = reconstructionContext, context.project == project?.path,
+              context.record == selectedID, context.analysis == currentAnalysis?.request_id,
+              reconstructionArtifact?.digest == selected?.result.source_sha256 else { return nil }
+        return reconstructionArtifact
+    }
+    func reconstructFunction(_ function: VGFunctionRecord) {
+        guard !busy, projectServiceReady, let record = selected, let digest = record.result.source_sha256,
+              let projectPath = project?.path, let analysis = currentAnalysis else { return }
+        let id = UUID().uuidString, generation = navigationGeneration
+        activeRequest = id; busy = true; reconstructionStatus = "Reconstructing the selected function…"
+        startAnalysisMonitor(requestID: id)
+        client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+                       operation: { $0.reconstructFunction(record.id, startAddress: String(function.start), endAddress: String(function.end), requestID: id, withReply: $1) }) { [weak self] result in
+            guard let self, self.activeRequest == id else { return }
+            self.stopAnalysisMonitor()
+            let text: String
+            do { text = try result.get() }
+            catch { self.busy = false; self.activeRequest = nil; self.reconstructionStatus = error.localizedDescription; return }
+            Task { [weak self] in
+                let decoded = await Task.detached(priority: .userInitiated) { () -> Result<ReconstructionArtifact, Error> in
+                    Result {
+                        let reply = try JSONDecoder().decode(ReconstructionReply.self, from: Data(text.utf8))
+                        guard reply.requestID == id, let artifact = reply.artifactJSON else { throw ReconstructionArtifact.Invalid(message: reply.message) }
+                        return try ReconstructionArtifact.decode(artifact, digest: digest, start: function.start, end: function.end)
+                    }
+                }.value
+                guard let self, self.activeRequest == id else { return }
+                self.busy = false; self.activeRequest = nil
+                guard self.navigationGeneration == generation, self.selectedID == record.id, self.project?.path == projectPath,
+                      self.currentAnalysis?.request_id == analysis.request_id else { self.reconstructionStatus = "Discarded reconstruction for an earlier project, artifact or analysis revision."; return }
+                switch decoded {
+                case .success(let artifact):
+                    self.reconstructionArtifact = artifact
+                    self.reconstructionContext = (projectPath, record.id, analysis.request_id)
+                    self.reconstructionStatus = "\(artifact.eligibility) · \(artifact.pass). Generated source has not been compiled or executed by the app."
+                case .failure(let error): self.reconstructionStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+    func exportReconstruction(_ function: VGFunctionRecord, source: ReconstructionSource?) {
+        guard let artifact = currentReconstruction, artifact.start == function.start, artifact.end == function.end,
+              source == nil || artifact.sources.contains(where: { $0.id == source?.id }) else { return }
+        let panel = NSSavePanel()
+        panel.title = source == nil ? "Export Reconstruction Evidence" : "Export Generated Source for Review"
+        panel.nameFieldStringValue = "function-\(String(function.start, radix: 16))" + (source == nil ? ".reconstruction.json" : ".c")
+        panel.message = "Generated source is not a compilation or equivalence guarantee. Its assumptions and evidence remain in the JSON artifact."
+        if source == nil { panel.allowedContentTypes = [.json] }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try (source?.text ?? artifact.json).write(to: url, atomically: true, encoding: .utf8); reconstructionStatus = "Exported \(url.lastPathComponent). No generated code was executed." }
+        catch { reconstructionStatus = error.localizedDescription }
     }
     func clearAnalysisCache() {
         guard !busy, projectServiceReady, project != nil else { return }

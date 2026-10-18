@@ -10,6 +10,13 @@ Whether the client lives in this repository, another branch, or a separate repos
 
 ## Client communication readiness gate
 
+Current checkpoint: local NSXPC coordinator, bounded worker requests and an
+in-progress per-function reconstruction view exist. There is no app-hosted
+HTTPS listener, authenticated browser API, remote event stream or verified
+client connection in this tree yet. None of the boxes below is closed by Docker
+packaging, native XPC, or a static client preview. The dependency-ordered next
+actions are in the [Chimera current queue](CHIMERA_COMPLETION_ROADMAP.md#current-actionable-queue-2026-10-18).
+
 All items below are open until demonstrated against the app-hosted implementation:
 
 - [ ] Explicit server enable/disable and remote-access configuration in the app; encrypted connections, authenticated sessions, revocation and project/target-scoped authorization.
@@ -23,6 +30,19 @@ All items below are open until demonstrated against the app-hosted implementatio
 
 Native debugger and VM facilities are integration points, not evidence that these remote gates already pass. A worker's local framed output is likewise not an authenticated network server.
 
+## Linux processing backend
+
+[Docker worker support](LINUX_DOCKER.md) packages the portable Rust/C analysis
+engine for Linux amd64/arm64 with a bounded, non-root, network-disabled host-side
+launcher. This is one-shot static analysis/paging/reconstruction, not native
+target execution, Linux attach, a network service, or automatic coordinator
+scheduling. The app-hosted server must eventually discover and schedule this
+backend through a trusted adapter, preserve source/job identities, stream its
+framed results, and enforce authorization/cancellation before advertising remote
+Linux processing. Apple runtime/SDK evidence discovery remains a macOS capability;
+shared static Mach-O/dyld parsing does not make Linux a Darwin runtime oracle.
+All client-readiness gates above remain open.
+
 ## GitHub handoff
 
-The user has authorized a GitHub push once the server is complete and ready for client communication. At that point, verify the gate above, review the exact changes and destination, exclude credentials, captured binaries and unrelated work, then commit and push the tested server scope. The configured destination at the time of this decision is `BrokenPorkMachine/HindSight`, branch `main`; recheck before publishing. Do not hold server completion on the deferred client-repository decision, and do not treat analysis-engine-only progress as server readiness.
+The user has authorized a GitHub push once the server is complete and ready for client communication. Before pushing, audit correctness, completeness and security, record findings and resolve release-blocking issues, then demonstrate a real client connection against the app-hosted server. Verify the gate above, review the exact changes and destination, exclude credentials, captured binaries and unrelated work, then commit and push the tested server scope. The configured destination at the time of this decision is `BrokenPorkMachine/HindSight`, branch `main`; recheck before publishing. Do not hold server completion on the deferred client-repository decision, and do not treat analysis-engine-only progress as server readiness.

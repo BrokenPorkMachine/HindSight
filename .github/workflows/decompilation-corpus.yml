@@ -26,5 +26,9 @@ jobs:
         run: python3 scripts/test-arm64-nameflow.py rust/target/debug/reworker
       - name: Qualify worker reconstruction artifacts
         run: python3 scripts/test-worker-reconstruction.py rust/target/debug/reworker
+      - name: Qualify executable AArch64 machine-state slice (Apple Silicon host required)
+        run: python3 scripts/test-machine-state.py rust/target/debug/reworker
+      - name: Qualify recovered scalar source (Apple Silicon host required)
+        run: python3 scripts/test-recovered-source.py rust/target/debug/reworker
       - name: Score decompilation corpus
         run: python3 scripts/run-decompilation-corpus.py --worker rust/target/debug/reworker

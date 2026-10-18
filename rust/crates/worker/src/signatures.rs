@@ -10,6 +10,76 @@ pub struct Signature {
     pub source: &'static str,
 }
 
+/// Structured declaration/ABI input for source recovery. Machine analyses do
+/// not parse a rendered signature report to discover names or locations.
+#[derive(Clone, Debug)]
+pub struct SourceParameter { pub name:String, pub spelling:String, pub bits:u8, pub signed:bool, pub pointer:bool, pub register:u8 }
+#[derive(Clone, Debug)]
+pub struct SourceSignature {
+    pub signature:Signature, pub name:String, pub parameters:Vec<SourceParameter>,
+    pub result_spelling:String, pub result_bits:u8, pub result_signed:bool, pub result_pointer:bool,
+}
+
+fn c_identifier(name:&str)->bool {
+    let reserved=["auto","break","case","char","const","continue","default","do","double","else","enum","extern","float","for","goto","if","inline","int","long","register","restrict","return","short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void","volatile","while","_Alignas","_Alignof","_Atomic","_Bool","_Complex","_Generic","_Imaginary","_Noreturn","_Static_assert","_Thread_local"];
+    !name.is_empty()&&name.len()<=256&&!reserved.contains(&name)&&name.bytes().next().is_some_and(|b|b.is_ascii_alphabetic()||b==b'_')&&name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')
+}
+
+pub fn source_signature(name:&str,signature:&Signature)->Option<SourceSignature>{
+    if signature.declaration.contains("...")||signature.language=="C++ / Objective-C++"{return None}
+    let objc=signature.language=="Objective-C / Objective-C++";
+    let name=if objc {format!("hs_recovered_imp_{}",name.bytes().map(|b|if b.is_ascii_alphanumeric(){b as char}else{'_'}).collect::<String>())}
+        else{name.strip_prefix('_').unwrap_or(name).to_owned()};
+    if !c_identifier(&name){return None}
+    let scalar=|spelling:&str|{
+        let spelling=uncomment_type(spelling)?;
+        // These are declarations, not arbitrary C expressions. Complex
+        // declarators, block pointers and unvalidated typedefs stay unresolved.
+        if !spelling.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b' '|b'*')){return None}
+        let bare=spelling.split(|c:char|c.is_whitespace()||c=='*').filter(|s|!s.is_empty()&&!matches!(*s,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"|"__kindof")).collect::<Vec<_>>().join(" ");
+        let native=["void","char","signed char","unsigned char","short","short int","signed short","unsigned short","unsigned short int","int","signed","signed int","unsigned","unsigned int","long","long int","unsigned long","unsigned long int","long long","long long int","unsigned long long","unsigned long long int","int8_t","uint8_t","int16_t","uint16_t","int32_t","uint32_t","int64_t","uint64_t","intptr_t","uintptr_t","size_t","ssize_t","ptrdiff_t","id","Class","SEL","NSInteger","NSUInteger","CFIndex","CFTypeID","CFOptionFlags","CFStringEncoding","CFNumberType","CFURLPathStyle","CFPropertyListFormat","dispatch_once_t","CFTypeRef","CFAllocatorRef","CFStringRef","CFArrayRef","CFDictionaryRef","CFBooleanRef","CFNumberRef","CFDataRef","CFBundleRef","CFURLRef","CFPropertyListRef","CFErrorRef","CFRunLoopRef"];
+        if !native.contains(&bare.as_str()){return None}
+        let AbiType::Integer(bytes)=abi_type(&spelling)? else{return None};
+        let kind=abi_integer_kind(&spelling)?;
+        if kind==AbiIntegerKind::Boolean{return None}
+        Some((spelling.trim().to_owned(),bytes*8,kind==AbiIntegerKind::Signed,kind==AbiIntegerKind::Pointer))
+    };
+    let (result_spelling,result_bits,result_signed,result_pointer)=scalar(&signature_return_type(signature)?)?;
+    let mut parameters=Vec::new();let mut names=std::collections::BTreeSet::new();
+    for parameter in abi_parameters(Some(signature)){
+        let (spelling,bits,signed,pointer)=scalar(parameter.source_type.as_deref()?)?;
+        if !c_identifier(&parameter.name)||!names.insert(parameter.name.clone()){return None}
+        parameters.push(SourceParameter{name:parameter.name,spelling,bits,signed,pointer,register:parameter.general_register?});
+    }
+    Some(SourceSignature{signature:signature.clone(),name,parameters,result_spelling,result_bits,result_signed,result_pointer})
+}
+
+/// All exact declaration candidates for one admitted target start. Conflicts
+/// remain separate; callers must not silently choose one for source export.
+pub fn source_candidates(start:u64,names:&[&str],objc_records:&str,external:&BTreeMap<String,Signature>)->Vec<(String,Signature)>{
+    let mut candidates=Vec::new();
+    for &name in names {
+        if let Some(signature)=external.get(name).or_else(||external.get(name.strip_prefix('_').unwrap_or(name))){candidates.push((name.to_owned(),signature.clone()));}
+        if let Some(signature)=symbol(name){candidates.push((name.to_owned(),signature));}
+    }
+    // This is the existing bounded metadata parser, not pseudocode parsing.
+    for (address,(name,signature)) in objc_signature_candidates(objc_records){
+        if address==start{candidates.push((name,signature));}
+    }
+    candidates.sort_by(|a,b|a.0.cmp(&b.0).then_with(||a.1.declaration.cmp(&b.1.declaration)));
+    candidates.dedup_by(|a,b|a.0==b.0&&a.1==b.1);candidates
+}
+
+fn objc_signature_candidates(records:&str)->Vec<(u64,(String,Signature))>{
+    let mut result=Vec::new();
+    for line in records.lines().filter(|line|line.contains(" method ")&&line.contains("confidence=validated")){
+        let Some(imp)=line.split(" imp=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok())else{continue};
+        let Some(name)=line.split(" resolved=").nth(1).and_then(|s|s.split(" confidence=").next())else{continue};
+        let Some(encoding)=line.split(" types=").nth(1).and_then(|s|s.split(" imp=").next())else{continue};
+        if imp!=0{if let Some(signature)=objc_method(name.trim(),encoding.trim()){result.push((imp,(name.trim().to_owned(),signature)));}}
+    }result
+}
+
 fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTreeMap<String,Signature>, &'static str> {
     if contents.len()>4*1024*1024||contents.lines().count()>20_000{return Err("External prototype catalog exceeds byte/record budget")}
     let mut bound=false;let mut result=BTreeMap::new();
@@ -24,6 +94,7 @@ fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTree
         if !arguments.ends_with(')')||arguments[..arguments.len()-1].contains(['(',')']){return Err("External prototype declaration has unsupported nesting")}
         let declared=head.split_whitespace().last().map(|name|name.trim_start_matches('*')).unwrap_or("");
         if declared.is_empty()||!declared.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_')||symbol.trim_start_matches('_')!=declared{return Err("External prototype symbol and declaration name differ")}
+        if result.get(symbol).is_some_and(|old:&Signature|old.declaration!=declaration){return Err("External prototype catalog contains conflicting declarations for one symbol")}
         result.insert(symbol.to_owned(),Signature{language:"C",declaration:declaration.to_owned(),source:"hash-bound analyst C prototype catalog"});
     }
     if !bound{return Err("External prototype catalog requires source_sha256 binding")}Ok(result)
@@ -1432,13 +1503,7 @@ fn recover_internal(
         if *address == 0 { name_only.insert(name.clone(),sig); }
         else { by_address.insert(*address,(name.clone(),sig)); }
     } }
-    for line in objc_records.lines().filter(|line| line.contains(" method ") && line.contains("confidence=validated")) {
-        let Some(imp) = line.split(" imp=").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"),16).ok()) else { continue };
-        if imp == 0 { continue }
-        let Some(name) = line.split(" resolved=").nth(1).and_then(|s| s.split(" confidence=").next()) else { continue };
-        let Some(encoding) = line.split(" types=").nth(1).and_then(|s| s.split(" imp=").next()) else { continue };
-        if let Some(sig) = objc_method(name.trim(),encoding.trim()) { by_address.insert(imp,(name.trim().into(),sig)); }
-    }
+    for (imp,signature) in objc_signature_candidates(objc_records) {by_address.insert(imp,signature);}
     let object_models=arm64.as_ref().map(|context|context.objc_layouts).unwrap_or(&[]);
     refine_property_signatures(&mut by_address,object_models);
     let declarations=object_declarations(object_models);
@@ -1605,6 +1670,7 @@ fn recover_internal(
             format!("# source_sha256={digest}\n_custom int custom(int value);\n"),
             format!("# source_sha256={digest}\n_other\tint custom(int value);\n"),
             format!("# source_sha256={digest}\n_custom\tint custom(int value) {{ return value; }}\n"),
+            format!("# source_sha256={digest}\n_custom\tint custom(int value);\n_custom\tdouble custom(double value);\n"),
         ] {assert!(parse_prototype_database(&invalid,digest).is_err(),"{invalid}")}
     }
     #[test] fn typed_argument_casts_use_prototype_width_signedness_and_pointer_evidence() {

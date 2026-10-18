@@ -1,7 +1,7 @@
 //! Versioned reconstruction records. No dependency on report/pseudocode parsing.
 use std::{collections::BTreeMap, io};
 
-pub const PASS: &str = "arm64-reconstruction-2";
+pub const PASS: &str = "arm64-reconstruction-3";
 pub const ENGINE: &str = "arm64-analysis-v89-schema122";
 
 pub struct Input<'a> {
@@ -15,6 +15,7 @@ pub struct Input<'a> {
     pub architecture: &'a str,
     pub name: Option<&'a str>,
     pub boundary_sources: Vec<String>,
+    pub signatures: Vec<(String, crate::signatures::Signature)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -271,12 +272,30 @@ impl Builder {
         span: (u64, u64),
         attributes: Value,
     ) -> io::Result<String> {
+        self.ast_spans(
+            kind,
+            ty,
+            children,
+            &[evidence.to_owned()],
+            ranges(span.0, span.1),
+            attributes,
+        )
+    }
+    pub fn ast_spans(
+        &mut self,
+        kind: &str,
+        ty: Option<&str>,
+        children: Vec<String>,
+        evidence: &[String],
+        spans: Value,
+        attributes: Value,
+    ) -> io::Result<String> {
         let mut record = object([
             ("kind", kind.into()),
             ("type", ty.map(Value::from).unwrap_or(Value::Null)),
             ("children", array(children.into_iter().map(Value::from))),
-            ("evidence", array([evidence.into()])),
-            ("ranges", ranges(span.0, span.1)),
+            ("evidence", array(evidence.iter().cloned().map(Value::from))),
+            ("ranges", spans),
             ("confidence", 1u64.into()),
             ("attributes", attributes),
         ]);

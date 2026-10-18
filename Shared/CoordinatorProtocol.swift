@@ -6,6 +6,7 @@ import Foundation
     func importBinary(_ path: String, optionsJSON: String, requestID: String, withReply reply: @escaping (String) -> Void)
     func instructionPage(_ recordID: String, startWord: String, forceVerify: Bool, requestID: String, withReply reply: @escaping (String) -> Void)
     func analyzeRecord(_ recordID: String, requestID: String, withReply reply: @escaping (String) -> Void)
+    func reconstructFunction(_ recordID: String, startAddress: String, endAddress: String, requestID: String, withReply reply: @escaping (String) -> Void)
     func clearAnalysisCache(withReply reply: @escaping (String) -> Void)
     func cancelInspection(_ requestID: String, withReply reply: @escaping (Bool) -> Void)
     func inspectionStatus(_ requestID: String, withReply reply: @escaping (String) -> Void)

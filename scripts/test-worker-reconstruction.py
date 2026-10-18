@@ -18,10 +18,12 @@ from reconstruction_artifact import (AnalysisScope, ArtifactError, Reconstructio
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def request(worker, binary, command, *arguments, digest=None):
+def request(worker, binary, command, *arguments, digest=None, prototypes=None):
     raw = binary.read_bytes()
     environment = dict(os.environ)
     environment.pop("HINDSIGHT_PROTOTYPE_DB", None)
+    if prototypes:
+        environment["HINDSIGHT_PROTOTYPE_DB"]=str(prototypes)
     result = subprocess.run([str(worker), command, str(binary), digest or hashlib.sha256(raw).hexdigest(),
                              str(len(raw)), *arguments, str(uuid.uuid4())],
                             check=True, capture_output=True, env=environment, timeout=120)
@@ -109,7 +111,9 @@ _hs_ast_large:
         assert artifacts["identity"]["eligibility"]["state"] == "review-only"
         assert artifacts["sum"]["eligibility"]["state"] == "review-only"
         assert any(node["kind"] == "phi" for node in artifacts["join"]["nodes"])
-        for name in ["opaque", "flags"]:
+        assert artifacts["flags"]["eligibility"]["state"] == "review-only"
+        assert any(node["kind"]=="flags-compare" for node in artifacts["flags"]["ast"]["nodes"])
+        for name in ["opaque"]:
             assert artifacts[name]["eligibility"]["state"] == "blocked"
             assert any(node["kind"] == "unsupported-effect" for node in artifacts[name]["nodes"])
         assert artifacts["large"]["truncated"]

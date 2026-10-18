@@ -1,0 +1,27 @@
+name: Linux Docker worker
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test bounded Docker launch contract
+        run: python3 -m unittest discover -s python/tests -p test_docker_worker.py -v
+      - name: Qualify the worker natively inside Linux
+        run: docker build --target test -t hindsight-worker:test .
+      - name: Build minimal runtime image
+        run: docker build -t hindsight-worker:local .
+      - name: Qualify hardened packaged runtime
+        run: python3 scripts/test-docker-worker.py
