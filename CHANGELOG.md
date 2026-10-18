@@ -27,6 +27,7 @@
 - Recover PE imports, exports and base relocations from data directories: DLL and symbol names, ordinals, hint/name tables, export addresses and base-relocation sites, with section-mapping and budget validation. PDB and Authenticode remain unavailable.
 - Admit standalone COFF objects (`.obj`) for i386, x86-64 and AArch64 with bounded section, symbol and relocation tables; sections receive deterministic analysis-only addresses, symbols supply names/function starts/imports/exports, and relocations remain unapplied evidence.
 - Admit PDB files (MSF 7.0) with validated superblock, block map and stream directory; stream count, sizes and well-known streams (PDB info, TPI, DBI) are reported as evidence.
+- Validate Authenticode (PKCS#7/CMS) security directories in PE files: WIN_CERTIFICATE structures, SignedData version, digest algorithm, certificate and signer counts reported as evidence. Full cryptographic verification is not performed.
 - Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.
 - Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
 - Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.

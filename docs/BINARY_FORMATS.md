@@ -52,7 +52,8 @@ and PE signatures, COFF and optional headers, directory-table framing, alignment
 section extents, preferred image base and entry point. File alignment padding is
 excluded from code, and virtual zero-fill tails are separate from captured bytes.
 PE imports, exports and base relocations are recovered from data directories as
-bounded evidence.
+bounded evidence. Authenticode (PKCS#7/CMS) security directories are validated
+structurally and reported as evidence.
 
 Standalone COFF objects (`.obj`) are admitted for i386, x86-64 and AArch64 with
 bounded section, symbol and relocation tables. Section contents receive

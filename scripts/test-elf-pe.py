@@ -202,6 +202,35 @@ def pdb_file():
     return data
 
 
+def pe_authenticode():
+    """Minimal PE32+ with an Authenticode (PKCS#7) security directory."""
+    signed_data = bytes.fromhex("30130201013100300b06092a864886f70d0107013100")
+    dw_length = 8 + len(signed_data)
+    win_cert = struct.pack("<IHH", dw_length, 0x0200, 0x0002) + signed_data
+    if len(win_cert) % 8 != 0:
+        win_cert += b"\x00" * (8 - len(win_cert) % 8)
+    data = bytearray(0xb00)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 60, 0x80)
+    data[0x80:0x84] = b"PE\x00\x00"
+    optional = 240
+    struct.pack_into("<HHIIIHH", data, 0x84, 0x8664, 1, 0, 0, 0, optional, 2)
+    start = 0x98
+    struct.pack_into("<H", data, start, 0x20b)
+    struct.pack_into("<I", data, start + 16, 0x1000)
+    struct.pack_into("<Q", data, start + 24, 0x140000000)
+    struct.pack_into("<II", data, start + 32, 0x1000, 0x200)
+    struct.pack_into("<II", data, start + 56, 0x3000, 0x400)
+    struct.pack_into("<I", data, start + 108, 16)
+    table = start + optional
+    struct.pack_into("<8sIIIIIIHHI", data, table, b".text", 8, 0x1000, 0x200, 0x400, 0, 0, 0, 0, 0x60000020)
+    data[0x400:0x408] = b"\x55\x48\x89\xe5\x5d\xc3\x90\x90"
+    sec_offset = 0xa00
+    struct.pack_into("<II", data, start + 112 + 4 * 8, sec_offset, len(win_cert))
+    data[sec_offset:sec_offset + len(win_cert)] = win_cert
+    return data
+
+
 def elf_sectionless_dynamic(gnu_hash=False):
     """Section-header-free ELF64 AArch64 ET_DYN with PT_DYNAMIC-derived evidence."""
     data = bytearray(0x400)
@@ -480,5 +509,11 @@ with tempfile.TemporaryDirectory() as directory:
     assert "PDB MSF 7.0 block_size=512" in result["metadata"], result["metadata"]
     assert "PDB info stream version=19990903" in result["metadata"], result["metadata"]
     assert "PDB MSF container validated with stream directory and known streams." in result["metadata"], result["metadata"]
+
+    # Authenticode (PKCS#7) security directories are validated as evidence.
+    result, _ = analyze(pe_authenticode(), "pe")
+    assert result["kind"] == "analysis_result", result
+    assert "PE Authenticode certificate 1: PKCS#7 SignedData" in result["metadata"], result["metadata"]
+    assert "PE Authenticode evidence recovered." in result["metadata"], result["metadata"]
 
 print("ELF/PE capture, mappings, decode, evidence, paging, byte order, embedded offsets, malformed-input and sectionless dynamic-link checks passed")

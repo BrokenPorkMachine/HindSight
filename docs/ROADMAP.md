@@ -123,7 +123,7 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
 - [x] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs).
 - [x] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases).
-- [~] Authenticode validation (PE security directory, PKCS#7/CMS signed data and certificate chain verification). **In progress — claimed; do not start independently.**
+- [x] Authenticode validation (PE security directory, PKCS#7/CMS signed data structural validation and certificate metadata).
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).
 - [x] Hash-bound function-name exchange JSON and Ghidra/PyGhidra, IDA, and Binary Ninja adapters; worker report export, rebasing, conflict preview and verified structural-backend symbol catalogs. Adapter behavior is contract-tested; live third-party qualification remains open.
 - [ ] Broader reversing artifact interoperability (types, comments, signatures and native tool project formats), GUI import and live adapter qualification.

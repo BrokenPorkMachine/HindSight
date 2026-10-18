@@ -1538,6 +1538,313 @@ pub(super) fn pdb(file: &mut File, o: &Options) -> io::Result<Image> {
     Ok(i)
 }
 
+// Minimal DER TLV reader for Authenticode PKCS#7 SignedData.
+fn der_read_tlv(data: &[u8], pos: &mut usize) -> io::Result<(u8, Vec<u8>)> {
+    if *pos >= data.len() {
+        return Err(bad("DER: unexpected end"));
+    }
+    let tag = data[*pos];
+    *pos += 1;
+    if *pos >= data.len() {
+        return Err(bad("DER: truncated length"));
+    }
+    let first = data[*pos];
+    *pos += 1;
+    let len = if first < 0x80 {
+        first as usize
+    } else {
+        let num_bytes = (first & 0x7f) as usize;
+        if num_bytes == 0 || num_bytes > 4 || *pos + num_bytes > data.len() {
+            return Err(bad("DER: invalid length encoding"));
+        }
+        let mut len = 0usize;
+        for _ in 0..num_bytes {
+            len = (len << 8) | (data[*pos] as usize);
+            *pos += 1;
+        }
+        len
+    };
+    if *pos + len > data.len() {
+        return Err(bad("DER: value exceeds data"));
+    }
+    let value = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Ok((tag, value))
+}
+
+fn der_skip(data: &[u8], pos: &mut usize, count: usize) -> io::Result<()> {
+    for _ in 0..count {
+        let (_, value) = der_read_tlv(data, pos)?;
+        let _ = value;
+    }
+    Ok(())
+}
+
+fn oid_to_string(oid_bytes: &[u8]) -> String {
+    // Decode OID bytes to dotted string.
+    if oid_bytes.is_empty() {
+        return String::new();
+    }
+    let mut result = String::new();
+    let first = oid_bytes[0];
+    result.push_str(&format!("{}", first / 40));
+    result.push('.');
+    result.push_str(&format!("{}", first % 40));
+    let mut value = 0u64;
+    for &b in &oid_bytes[1..] {
+        value = (value << 7) | ((b & 0x7f) as u64);
+        if b & 0x80 == 0 {
+            result.push('.');
+            result.push_str(&value.to_string());
+            value = 0;
+        }
+    }
+    result
+}
+
+fn pe_authenticode(
+    file: &mut File,
+    i: &mut Image,
+    base: u64,
+    extents: &[(u64, u64, u64, u64)],
+    p: &[u8],
+    directory_offset: u64,
+    directories: u64,
+) -> io::Result<bool> {
+    let resolve_rva = |rva: u64, bytes: u64| -> io::Result<u64> {
+        for &(s_rva, mem_size, file_off, raw_size) in extents {
+            let back = if raw_size > 0 { raw_size.min(mem_size) } else { mem_size };
+            if rva >= s_rva && bytes <= back && rva - s_rva <= back - bytes {
+                return add(file_off, rva - s_rva);
+            }
+        }
+        Err(bad("PE data outside section mappings"))
+    };
+    let read_cstr = |rva: u64, max: usize| -> io::Result<String> {
+        let mut avail = 0u64;
+        for &(s_rva, mem_size, _, raw_size) in extents {
+            if rva >= s_rva && rva < s_rva + mem_size {
+                let back = if raw_size > 0 { raw_size.min(mem_size) } else { mem_size };
+                avail = (s_rva + back) - rva;
+                break;
+            }
+        }
+        if avail == 0 {
+            return Err(bad("PE data outside section mappings"));
+        }
+        let n = avail.min(max as u64) as usize;
+        let rel = resolve_rva(rva, n as u64)?;
+        let buf = read(file, add(i.origin, rel)?, n)?;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        Ok(String::from_utf8_lossy(&buf[..end]).to_string())
+    };
+    let dir = |index: usize| -> (u64, u64) {
+        if (index as u64) >= directories {
+            return (0, 0);
+        }
+        let off = (directory_offset + (index as u64) * 8) as usize;
+        if off + 8 > p.len() {
+            return (0, 0);
+        }
+        (u32v(&p[off..], false) as u64, u32v(&p[off + 4..], false) as u64)
+    };
+    // Security directory is index 4.
+    let (sec_rva, sec_size) = dir(4);
+    if sec_rva == 0 || sec_size == 0 {
+        // No security directory - not an error, just no Authenticode.
+        return Ok(false);
+    }
+    // Security directory RVA is actually a file offset (special case in PE).
+    // Read WIN_CERTIFICATE structures.
+    let mut off = 0u64;
+    let mut cert_count = 0usize;
+    let mut any_recovered = false;
+    while off + 8 <= sec_size {
+        // WIN_CERTIFICATE: dwLength (4), wRevision (2), wCertificateType (2), bCertificate (dwLength - 8)
+        let cert_offset = sec_rva + off; // file offset
+        if cert_offset + 8 > (file.metadata()?.len() - i.origin) {
+            return Err(bad("PE security directory extends beyond file"));
+        }
+        let header = read(file, add(i.origin, cert_offset)?, 8)?;
+        let dw_length = u32v(&header[0..4], false) as u64;
+        let w_revision = u16::from_le_bytes([header[4], header[5]]);
+        let w_cert_type = u16::from_le_bytes([header[6], header[7]]);
+        if dw_length < 8 || dw_length > sec_size - off {
+            return Err(bad("Invalid WIN_CERTIFICATE length"));
+        }
+        if off + dw_length > sec_size {
+            return Err(bad("WIN_CERTIFICATE extends beyond security directory"));
+        }
+        cert_count += 1;
+        if cert_count > 256 {
+            return Err(bad("PE certificate count over budget"));
+        }
+        // Read the certificate blob.
+        let blob_size = (dw_length - 8) as usize;
+        let blob = if blob_size > 0 {
+            read(file, add(i.origin, cert_offset + 8)?, blob_size)?
+        } else {
+            Vec::new()
+        };
+        // Validate revision.
+        let rev_ok = w_revision == 0x0200;
+        // Process based on type.
+        if w_cert_type == 0x0002 {
+            // WIN_CERT_TYPE_PKCS_SIGNED_DATA
+            // Parse the DER SignedData.
+            let mut pos = 0usize;
+            // Outer SEQUENCE.
+            if blob.is_empty() || blob[0] != 0x30 {
+                push(&mut i.inventory, &format!("PE Authenticode cert {}: invalid DER (not SEQUENCE)\n", cert_count));
+                off += dw_length;
+                // Align to 8 bytes.
+                if off % 8 != 0 {
+                    off += 8 - (off % 8);
+                }
+                continue;
+            }
+            let (tag, signed_data) = match der_read_tlv(&blob, &mut pos) {
+                Ok(v) => v,
+                Err(_) => {
+                    push(&mut i.inventory, &format!("PE Authenticode cert {}: DER parse error\n", cert_count));
+                    off += dw_length;
+                    if off % 8 != 0 {
+                        off += 8 - (off % 8);
+                    }
+                    continue;
+                }
+            };
+            if tag != 0x30 {
+                push(&mut i.inventory, &format!("PE Authenticode cert {}: not a SEQUENCE\n", cert_count));
+                off += dw_length;
+                if off % 8 != 0 {
+                    off += 8 - (off % 8);
+                }
+                continue;
+            }
+            // Parse SignedData fields.
+            let mut sp = 0usize;
+            // version INTEGER
+            let (vtag, vval) = match der_read_tlv(&signed_data, &mut sp) {
+                Ok(v) => v,
+                Err(_) => {
+                    push(&mut i.inventory, &format!("PE Authenticode cert {}: truncated SignedData\n", cert_count));
+                    off += dw_length;
+                    if off % 8 != 0 { off += 8 - (off % 8); }
+                    continue;
+                }
+            };
+            let version = if vtag == 0x02 && !vval.is_empty() {
+                // Parse integer.
+                let mut v = 0u64;
+                for &b in &vval {
+                    v = (v << 8) | (b as u64);
+                }
+                v
+            } else {
+                0
+            };
+            // digestAlgorithms SET
+            let mut digest_alg = String::new();
+            if sp < signed_data.len() {
+                let (dtag, dval) = match der_read_tlv(&signed_data, &mut sp) {
+                    Ok(v) => v,
+                    Err(_) => (0, Vec::new()),
+                };
+                if dtag == 0x31 {
+                    // SET OF AlgorithmIdentifier - read first one.
+                    let mut ap = 0usize;
+                    if !dval.is_empty() {
+                        if let Ok((atag, aval)) = der_read_tlv(&dval, &mut ap) {
+                            if atag == 0x30 {
+                                // AlgorithmIdentifier SEQUENCE: OID + params.
+                                let mut aip = 0usize;
+                                if let Ok((oid_tag, oid_val)) = der_read_tlv(&aval, &mut aip) {
+                                    if oid_tag == 0x06 {
+                                        digest_alg = oid_to_string(&oid_val);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // encapContentInfo SEQUENCE (skip).
+            if sp < signed_data.len() {
+                let _ = der_read_tlv(&signed_data, &mut sp);
+            }
+            // certificates [0] IMPLICIT (optional) - count SET members.
+            let mut cert_count_inner = 0usize;
+            if sp < signed_data.len() && (signed_data[sp] & 0xe0) == 0xa0 && (signed_data[sp] & 0x1f) == 0 {
+                // Context tag 0.
+                let (ctag, cval) = match der_read_tlv(&signed_data, &mut sp) {
+                    Ok(v) => v,
+                    Err(_) => (0, Vec::new()),
+                };
+                if ctag == 0xa0 {
+                    // Count certificates (each is a SEQUENCE).
+                    let mut cp = 0usize;
+                    while cp < cval.len() {
+                        if cval[cp] == 0x30 {
+                            let (_, _) = match der_read_tlv(&cval, &mut cp) {
+                                Ok(v) => v,
+                                Err(_) => break,
+                            };
+                            cert_count_inner += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            // crls [1] IMPLICIT (optional) - skip.
+            if sp < signed_data.len() && (signed_data[sp] & 0xe0) == 0xa0 && (signed_data[sp] & 0x1f) == 1 {
+                let _ = der_read_tlv(&signed_data, &mut sp);
+            }
+            // signerInfos SET - count.
+            let mut signer_count = 0usize;
+            if sp < signed_data.len() {
+                if let Ok((stag, sval)) = der_read_tlv(&signed_data, &mut sp) {
+                    if stag == 0x31 {
+                        let mut sip = 0usize;
+                        while sip < sval.len() {
+                            if sval[sip] == 0x30 {
+                                let (_, _) = match der_read_tlv(&sval, &mut sip) {
+                                    Ok(v) => v,
+                                    Err(_) => break,
+                                };
+                                signer_count += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            push(&mut i.foreign.imports, &format!(
+                "Authenticode version={} digest={} certificates={} signers={} revision={:#x} type={:#x}\n",
+                version, digest_alg, cert_count_inner, signer_count, w_revision, w_cert_type
+            ));
+            push(&mut i.inventory, &format!(
+                "PE Authenticode certificate {}: PKCS#7 SignedData version={} digest={} certificates={} signers={} revision={:#x}\n",
+                cert_count, version, digest_alg, cert_count_inner, signer_count, w_revision
+            ));
+            any_recovered = true;
+        } else {
+            push(&mut i.inventory, &format!("PE Authenticode certificate {}: type={:#x} revision={:#x} (not PKCS#7 SignedData)\n", cert_count, w_cert_type, w_revision));
+        }
+        off += dw_length;
+        // Align to 8 bytes.
+        if off % 8 != 0 {
+            off += 8 - (off % 8);
+        }
+    }
+    if any_recovered {
+        push(&mut i.inventory, "PE Authenticode evidence recovered.\n");
+    }
+    Ok(any_recovered)
+}
+
 pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
     let length = file.metadata()?.len() - o.offset;
     range(0, 64, length)?;
@@ -1675,10 +1982,12 @@ pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
         entry(&mut i, add(base, rva)?)?;
     }
     let pe_recovered = pe_data_directories(file, &mut i, base, &extents, &p, directory_offset, directories, bits)?;
-    if pe_recovered {
-        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis with recovered imports, exports and base relocations; PDB, Authenticode validation, Windows execution and semantic lifting remain unavailable. Standalone COFF objects are unsupported.\n"));
+    let auth_recovered = pe_authenticode(file, &mut i, base, &extents, &p, directory_offset, directories)?;
+    let any_recovered = pe_recovered || auth_recovered;
+    if any_recovered {
+        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis with recovered imports, exports, base relocations and Authenticode evidence; PDB validation, Windows execution and semantic lifting remain unavailable.\n"));
     } else {
-        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis; imports/exports and base relocations recovered; PDB, Authenticode validation, Windows execution and semantic lifting remain unavailable.\n"));
+        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis; imports/exports, PDB, relocations, Authenticode validation, Windows execution and semantic lifting remain unavailable.\n"));
     }
     Ok(i)
 }
