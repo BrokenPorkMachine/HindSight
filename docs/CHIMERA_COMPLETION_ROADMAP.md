@@ -109,7 +109,7 @@ Acceptance: native fixtures exercise images, C functions, classes/metaclasses, i
 Dependencies: C00. Extend semantics as each corpus slice requires; full ISA qualification continues throughout C02–C12.
 
 - [~] Inventory exact, intrinsic, privileged/runtime, and unsupported instruction families; finish shared ARM64/ARM64e semantics including vector/half FP, flags, partial lanes, SP, PAC, atomics, barriers, traps, and exception effects. *(in progress — claimed)*
-- [ ] Specify typed bitvectors, modular arithmetic, comparisons, shifts, extensions, poison/unknowns, endianness, memory alignment, FP modes, and architectural aliases.
+- [~] Specify typed bitvectors, modular arithmetic, comparisons, shifts, extensions, poison/unknowns, endianness, memory alignment, FP modes, and architectural aliases. *(in progress — claimed)*
 - [ ] Build an IR interpreter and strict C17 emitter with checked guest-memory helpers and explicit imports/intrinsics. Preserve ordering and side effects.
 - [ ] Connect the Darwin native support runtime and record reusable macOS/iOS semantic qualifications with explicit ABI/environment deltas.
 - [ ] Differential-test semantics against hardware or a qualified independent engine; exercise reserved and neighboring encodings and architectural edge cases.
