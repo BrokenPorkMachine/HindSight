@@ -118,6 +118,7 @@
 - [ ] Broader reversing artifact interoperability (types, comments, signatures and native tool project formats), GUI import and live adapter qualification.
 
 ### 0.6.2 — Decompiler Track P1/P2 (in progress — see [DECOMPILER_GAP_ROADMAP.md](DECOMPILER_GAP_ROADMAP.md))
+- [x] [Mach-O prototype ABI foundation](MACHO_PROTOTYPE_ABI.md): Apple ARM64 GP/FP bank allocation, packed scalar stack locations, supported SDK aggregates and Objective-C encodings, typed return locations, callback/array pointers, explicit variadic/unknown-layout boundaries, and real compiled regression fixtures.
 - [ ] **P1 Types:** Function signatures (Swift, broader C/C++), stack locals/aggregate layouts, project type library (SDK headers, user C declarations), Objective-C dispatch/object model (class_ro_t, selector stubs, message sends), type propagation/casts, analyst overrides (persisted per-function revisions).
 - [ ] **P2 Coverage:** Data references/strings (pointer/string xrefs, CFString/CFData, globals), library idiom recognition (bounds checks, tagged pointers, dispatch blocks), switch tables/indirect control flow (case-range proof, index normalization, vtable recovery), x86-64 Mach-O lifter through shared IR, stripped/optimized code handling (unwind metadata, thunk recognition, prologue evidence, call graph constraints), function/call graphs with confidence and navigation.
 

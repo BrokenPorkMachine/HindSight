@@ -3,6 +3,7 @@ set -euo pipefail
 source "$(dirname "$0")/common.sh"
 "$ROOT/scripts/doctor.sh"
 "$ROOT/scripts/test-portable.sh"
+python3 "$ROOT/scripts/test-prototype-abi.py" "$ROOT/build/rust/debug/reworker"
 "$ROOT/scripts/test-app-typecheck.sh"
 "$ROOT/scripts/test-coordinator-typecheck.sh"
 python3 "$ROOT/scripts/test-rea-bridge.py"

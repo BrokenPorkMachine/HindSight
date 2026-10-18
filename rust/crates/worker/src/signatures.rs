@@ -36,9 +36,21 @@ fn objc_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
         }
         b'#' => "Class".into(), b':' => "SEL".into(), b'*' => "char *".into(),
         b'^' => format!("{} *", objc_type(bytes, at, depth + 1)?),
+        b'{' => {
+            // Require the complete Apple LP64 encoding, not just a familiar
+            // struct name. Anonymous/custom/quoted-field layouts stay unknown.
+            let start = *at - 1;
+            let known = [
+                ("{CGPoint=dd}", "CGPoint"), ("{CGSize=dd}", "CGSize"),
+                ("{CGRect={CGPoint=dd}{CGSize=dd}}", "CGRect"),
+                ("{_NSRange=QQ}", "NSRange"), ("{CFRange=qq}", "CFRange"),
+            ].into_iter().find(|(encoding, _)| bytes[start..].starts_with(encoding.as_bytes()))?;
+            *at = start + known.0.len();
+            known.1.into()
+        }
         // Aggregates and unknown encodings cannot safely be rendered as a
         // pointer: their ABI passing convention may be different.
-        b'?' | b'{' | b'(' | b'[' => return None,
+        b'?' | b'(' | b'[' => return None,
         _ => return None,
     };
     Some(ty)
@@ -186,6 +198,11 @@ fn api(name: &str) -> Option<(&'static str, &'static str)> {
         "_strcmp" => ("int strcmp(const char *left, const char *right);", "C library"),
         "_strncmp" => ("int strncmp(const char *left, const char *right, size_t n);", "C library"),
         "_strdup" => ("char *strdup(const char *s);", "C library"),
+        "_printf" => ("int printf(const char *format, ...);", "C library"),
+        "_fprintf" => ("int fprintf(FILE *stream, const char *format, ...);", "C library"),
+        "_sprintf" => ("int sprintf(char *buffer, const char *format, ...);", "C library"),
+        "_snprintf" => ("int snprintf(char *buffer, size_t size, const char *format, ...);", "C library"),
+        "_NSLog" => ("void NSLog(NSString *format, ...);", "Foundation"),
         "_abort" => ("void abort(void);", "C library"),
         "_exit" => ("void _exit(int status);", "C library"),
         "_dispatch_async" => ("void dispatch_async(dispatch_queue_t queue, dispatch_block_t block);", "libdispatch"),
@@ -345,6 +362,27 @@ fn split_declarators(arguments: &str) -> Vec<&str> {
 }
 
 fn named_declarator(value: &str, fallback: usize) -> (String, String) {
+    // Parameter arrays decay to pointers. Preserve the declarator's source name.
+    if let Some(open) = value.find('[') {
+        let head = value[..open].trim_end();
+        if let Some(split) = head.rfind(char::is_whitespace) {
+            let name = head[split..].trim();
+            if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return (format!("{} *", head[..split].trim()), name.into());
+            }
+        }
+    }
+    for marker in ["(*", "(^", "(&"] {
+        if let Some(open) = value.find(marker) {
+            let start = open + marker.len();
+            if let Some(end) = value[start..].find(')') {
+                let name = value[start..start + end].trim();
+                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    return (format!("{}{}", &value[..start], &value[start + end..]), name.into());
+                }
+            }
+        }
+    }
     let token = value.split_whitespace().last().unwrap_or("").trim_start_matches('*');
     let token = token.trim_end_matches("[]");
     if !token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -390,33 +428,134 @@ fn objc_parameters(signature: &Signature) -> Vec<(String, String)> {
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbiType { Integer(u8), Float(u8), IntegerAggregate(u8), FloatAggregate(u8) }
+
+/// Apple arm64 LP64 scalar ABI. Unknown typedefs/aggregates do not receive
+/// guessed locations: their layout can change both banks and the stack cursor.
+fn abi_type(ty: &str) -> Option<AbiType> {
+    let mut normalized = String::new();
+    let mut rest = ty;
+    while let Some((head, tail)) = rest.split_once("/*") {
+        normalized.push_str(head);
+        rest = tail.split_once("*/")?.1;
+    }
+    normalized.push_str(rest);
+    let ty = normalized.trim();
+    if ty.contains('{') || ty.contains('}') || ty.contains('[') { return None; }
+    if ty.contains('*') || ty.contains('&') || ty.contains("(^") { return Some(AbiType::Integer(8)); }
+    let ty = ty.split_whitespace().filter(|word| !matches!(*word,
+        "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable" | "__kindof"
+    )).collect::<Vec<_>>().join(" ");
+    Some(match ty.as_str() {
+        "CFRange" | "NSRange" => AbiType::IntegerAggregate(2),
+        "CGPoint" | "CGSize" => AbiType::FloatAggregate(2), "CGRect" => AbiType::FloatAggregate(4),
+        "float" => AbiType::Float(4), "double" | "long double" | "CGFloat" => AbiType::Float(8),
+        "bool" | "_Bool" | "BOOL" | "Boolean" | "char" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" | "Int8" | "UInt8" => AbiType::Integer(1),
+        "short" | "short int" | "signed short" | "unsigned short" | "unsigned short int" | "int16_t" | "uint16_t" | "Int16" | "UInt16" | "unichar" => AbiType::Integer(2),
+        "int" | "signed" | "signed int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t" | "Int32" | "UInt32" | "CFStringEncoding" => AbiType::Integer(4),
+        "long" | "long int" | "unsigned long" | "unsigned long int" | "long long" | "long long int" | "unsigned long long" | "unsigned long long int" |
+        "int64_t" | "uint64_t" | "Int64" | "UInt64" | "intptr_t" | "uintptr_t" | "size_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "NSUInteger" |
+        "CFIndex" | "CFTypeID" | "CFOptionFlags" | "CFNumberType" | "CFURLPathStyle" | "CFPropertyListFormat" | "dispatch_once_t" => AbiType::Integer(8),
+        "id" | "Class" | "SEL" | "instancetype" | "dispatch_queue_t" | "dispatch_block_t" |
+        "CFTypeRef" | "CFAllocatorRef" | "CFStringRef" | "CFArrayRef" | "CFDictionaryRef" | "CFBooleanRef" | "CFNumberRef" | "CFDataRef" |
+        "CFBundleRef" | "CFURLRef" | "CFPropertyListRef" | "CFErrorRef" | "CFRunLoopRef" => AbiType::Integer(8),
+        _ => return None,
+    })
+}
+
 fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let Some(signature) = signature else { return Vec::new() };
     let is_objc = signature.language == "Objective-C / Objective-C++";
     let parameters = if is_objc { objc_parameters(signature) } else { c_parameters(signature) };
     let mut gp = if is_objc { 2u8 } else { 0u8 };
     let mut fp = 0u8;
-    let mut stack_slot = 0u8;
+    let mut stack_slot = 0usize;
+    let mut stack_offset = 0usize;
+    let mut blocked = signature.language == "C++ / Objective-C++" && signature.declaration.contains("::");
     let mut result = Vec::new();
     if is_objc {
         result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0) });
         result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1) });
     }
     for (ty, name) in parameters {
-        if (ty.contains("float") || ty.contains("double")) && fp < 8 {
-            let register = format!("{}{fp}", if ty.contains("float") && !ty.contains("double") { "s" } else { "d" });
+        let scalar = abi_type(&ty);
+        if blocked || scalar.is_none() {
+            let reason = if blocked { "earlier layout or implicit C++ receiver unresolved" } else { "type layout unresolved" };
+            result.push(AbiParameter { name, register: format!("unresolved_argument /* {reason}: {ty} */"), general_register: None });
+            blocked = true;
+            continue;
+        }
+        let scalar = scalar.unwrap_or(AbiType::Integer(8));
+        if let AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words) = scalar {
+            let (bank, prefix) = if matches!(scalar, AbiType::FloatAggregate(_)) { (&mut fp, "d") } else { (&mut gp, "x") };
+            if *bank + words <= 8 {
+                let registers = (*bank..*bank + words).map(|index| format!("{prefix}{index}")).collect::<Vec<_>>().join(", ");
+                result.push(AbiParameter { name, register: format!("aggregate<{ty}>({registers})"), general_register: None });
+                *bank += words;
+            } else {
+                // Darwin does not split these SDK aggregates between registers
+                // and memory. A failed allocation exhausts the relevant bank.
+                *bank = 8;
+                stack_offset = (stack_offset + 7) & !7;
+                let bytes = words as usize * 8;
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None });
+                stack_offset += bytes;
+                stack_slot += 1;
+            }
+            continue;
+        }
+        if let AbiType::Float(bytes) = scalar {
+            if fp < 8 {
+            let register = format!("{}{fp}", if bytes == 4 { "s" } else { "d" });
             result.push(AbiParameter { name, register, general_register: None });
             fp += 1;
+            continue;
+            }
         } else if gp < 8 {
             result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp) });
             gp += 1;
-        } else {
-            let offset = stack_slot as usize * 8;
-            result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{offset:x})"), general_register: None });
-            stack_slot += 1;
+            continue;
         }
+        let bytes = match scalar { AbiType::Integer(bytes) | AbiType::Float(bytes) => bytes as usize, _ => continue };
+        stack_offset = (stack_offset + bytes - 1) & !(bytes - 1);
+        result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64)"), general_register: None });
+        stack_offset += bytes;
+        stack_slot += 1;
     }
     result
+}
+
+fn signature_return_type(signature: &Signature) -> Option<String> {
+    if signature.declaration.starts_with("/*") { return None; }
+    if signature.language == "Objective-C / Objective-C++" {
+        return Some(signature.declaration.split_once('(')?.1.split_once(')')?.0.trim().into());
+    }
+    let head = signature.declaration.split_once('(')?.0.trim();
+    let name = head.split_whitespace().last()?.trim_start_matches('*');
+    Some(head.strip_suffix(name)?.trim().into())
+}
+
+fn signature_returns_void(signature: Option<&Signature>) -> bool {
+    signature.and_then(signature_return_type).as_deref() == Some("void")
+}
+
+fn render_signature_return(signature: Option<&Signature>) -> String {
+    let Some(ty) = signature.and_then(signature_return_type) else {
+        return "return x0; /* inferred ABI result; source return type unresolved */".into();
+    };
+    if ty == "void" { return "return; /* void return supported by recovered signature */".into(); }
+    let register = match abi_type(&ty) {
+        Some(AbiType::Float(4)) => "s0", Some(AbiType::Float(_)) => "d0",
+        Some(AbiType::Integer(bytes)) if bytes <= 4 => "w0", Some(AbiType::Integer(_)) => "x0",
+        Some(AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words)) => {
+            let prefix = if matches!(abi_type(&ty), Some(AbiType::FloatAggregate(_))) { "d" } else { "x" };
+            let registers = (0..words).map(|index| format!("{prefix}{index}")).collect::<Vec<_>>().join(", ");
+            return format!("return aggregate<{ty}>({registers}); /* Apple arm64 known SDK aggregate result */");
+        }
+        None => return format!("return /* result ABI unresolved for {ty}; aggregate/HFA/indirect-result layout required */;"),
+    };
+    format!("return {register}; /* Apple arm64 result for recovered type {ty} */")
 }
 
 fn abi_parameter_bindings(signature: Option<&Signature>, candidates: &[String]) -> Vec<String> {
@@ -689,7 +828,7 @@ fn render_linear_statement(
                     let args=target_signature.map(|signature|abi_parameters(Some(signature))).unwrap_or_else(||candidate_abi_parameters(parameter_evidence,target));
                     let bindings=args.iter().map(|argument|format!("{}={}",argument.name,argument.register)).collect::<Vec<_>>().join(", ");
                     let mut evidence=Vec::new();
-                    let rendered=args.iter().map(|argument|{
+                    let mut rendered=args.iter().map(|argument|{
                         if let Some(register)=argument.general_register {
                             if let Some((value,provenance))=values.get(&register){
                                 evidence.push(format!("{}({})={value:#x} {provenance}",argument.name,argument.register));return format!("{value:#x}")
@@ -706,6 +845,9 @@ fn render_linear_statement(
                         }
                         argument.register.clone()
                     }).collect::<Vec<_>>();
+                    if target_signature.is_some_and(|sig| sig.declaration.contains("...")) {
+                        rendered.push("/* variadic arguments unresolved; Apple arm64 stack ABI */".into());
+                    }
                     let arguments=if args.is_empty()&&target_signature.is_none(){if known_values.is_empty(){"/* prototype and ABI arguments unresolved */".into()}else{format!("/* prototype unresolved; known ABI register values: {} */",known_values.join(", "))}}else{rendered.join(", ")};
                     let resolved=evidence.join(", ");
                     let binding_note=if bindings.is_empty(){"argument register bindings unresolved".into()}else if target_signature.is_some(){format!("argument bindings: {bindings}")}else{format!("candidate ABI argument bindings: {bindings}; callee types unresolved")};
@@ -716,10 +858,7 @@ fn render_linear_statement(
         }
     }
     if statement.starts_with("return /* ABI result register x0"){
-        if signature.is_some_and(|sig|sig.declaration.starts_with("- (void)")||sig.declaration.starts_with("+ (void)")||sig.declaration.starts_with("void ")){
-            return "return; /* void return supported by recovered signature */".into();
-        }
-        return "return x0; /* inferred ABI result; source return type unresolved */".into();
+        return render_signature_return(signature);
     }
     let _=(address,start);
     if stable_stack{localize_stack_slot_accesses(statement)}else{statement.to_string()}
@@ -922,11 +1061,10 @@ fn render_arm64_body(
                 {
                     let after_return = return_address.saturating_add(4);
                     if target == after_return && return_statement.starts_with("return ") {
-                        let return_statement = if return_statement.starts_with("return /* ABI result register x0")
-                            && signature.is_some_and(|sig| sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)") || sig.declaration.starts_with("void "))
-                        { "return;" }
-                        else { return_statement.trim_end_matches(';') };
-                        out.push_str(&format!("    if (!({condition})) {return_statement}; /* structured from {address:#x} and {return_address:#x} */\n"));
+                        let return_statement = if return_statement.starts_with("return /* ABI result register x0") {
+                            render_signature_return(signature)
+                        } else { return_statement.to_string() };
+                        out.push_str(&format!("    if (!({condition})) {return_statement} /* structured from {address:#x} and {return_address:#x} */\n"));
                         instruction_index += 2;
                         continue;
                     }
@@ -955,7 +1093,7 @@ fn render_arm64_body(
                         let args = abi_parameters(target_signature);
                         let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers unresolved */".into() } else { args.iter().map(|argument|argument.register.as_str()).collect::<Vec<_>>().join(", ") };
                         let callee = callable_name(name,target_signature);
-                        if target_signature.is_some_and(|sig| sig.declaration.starts_with("void ") || sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)")) {
+                        if signature_returns_void(target_signature) {
                             format!("{callee}({arguments}); return; /* cross-function B tail-call candidate */")
                         } else {
                             format!("return {callee}({arguments}); /* cross-function B tail-call candidate; return compatibility unresolved */")
@@ -967,11 +1105,7 @@ fn render_arm64_body(
         } else if statement.starts_with("goto x") {
             format!("{} /* indirect target unresolved; no bounded table evidence proved a structured target set */",statement.split(" /*").next().unwrap_or(statement))
         } else if statement.starts_with("return /* ABI result register x0") {
-            if signature.is_some_and(|sig| sig.declaration.starts_with("- (void)") || sig.declaration.starts_with("+ (void)") || sig.declaration.starts_with("void ")) {
-                "return; /* void return supported by recovered signature */".into()
-            } else {
-                "return x0; /* inferred ABI result; source return type unresolved */".into()
-            }
+            render_signature_return(signature)
         } else { statement.to_string() };
         let statement = substitute_parameter_names(&statement, parameter_aliases.get(&address).unwrap_or(&BTreeMap::new()));
         let statement=if stable_stack{localize_stack_slot_accesses(&statement)}else{statement};
@@ -1007,7 +1141,12 @@ fn recover_internal(
     }
     let mut signatures = String::from("Signature evidence: exact SDK ABI declarations, validated Objective-C type encodings, and supported Itanium mangled parameter types. Unknown source types remain unresolved.\n");
     for (address,(name,sig)) in by_address.iter().take(700) {
-        let row = format!("{address:#018x} {name} language={} source={} declaration={}\n",sig.language,sig.source,sig.declaration);
+        let abi = if arm64.is_some() {
+            format!("    ABI profile=Apple-arm64-LP64 bindings=[{}] result={}{}\n",
+                abi_parameter_bindings(Some(sig), &[]).join(", "), render_signature_return(Some(sig)),
+                if sig.declaration.contains("...") { " variadic-arguments=unresolved" } else { "" })
+        } else { String::new() };
+        let row = format!("{address:#018x} {name} language={} source={} declaration={}\n{abi}",sig.language,sig.source,sig.declaration);
         if signatures.len()+row.len() > 60_000 { break } signatures.push_str(&row);
     }
     for (name,sig) in name_only.iter().take(200) {
@@ -1061,13 +1200,101 @@ fn recover_internal(
         let s=objc_method("-[NSString substringFromIndex:]", "@\"NSString\"24@0:8Q16").unwrap();
         assert_eq!(s.declaration,"- (NSString *)substringFromIndex:(NSUInteger)from;");
         assert!(objc_method("-[A x:]", "v24@0:8").is_none());
-        assert!(objc_method("-[A rect:]", "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").is_none());
+        assert_eq!(objc_method("-[A rect:]", "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").unwrap().declaration, "- (void)rect:(CGRect)arg0;");
+        assert!(objc_method("-[A rect:]", "v48@0:8{CGRect=qqqq}16").is_none());
     }
     #[test] fn exact_catalog_and_cpp() {
         assert_eq!(symbol("_CFRelease").unwrap().declaration,"void CFRelease(CFTypeRef cf);");
         assert!(symbol("_CFReleaseExtra").is_none());
         assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
+    }
+    #[test] fn apple_scalar_abi_keeps_fp_and_gp_banks_independent() {
+        let signature = Signature { language: "C", source: "test",
+            declaration: "void mixed(double *pointer, double a, double b, double c, double d, double e, double f, double g, double h, float ninth, float tenth, int count);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert_eq!(args[0].register, "x0");
+        assert_eq!(args[1].register, "d0");
+        assert_eq!(args[8].register, "d7");
+        assert!(args[9].register.contains("sp+0x0, 4 bytes"));
+        assert!(args[10].register.contains("sp+0x4, 4 bytes"));
+        assert_eq!(args[11].register, "x1");
+        assert_eq!(abi_type("const float *"), Some(AbiType::Integer(8)));
+        assert_eq!(abi_type("volatile CGFloat"), Some(AbiType::Float(8)));
+        assert_eq!(abi_type("long double"), Some(AbiType::Float(8)));
+        assert_eq!(abi_type("CFStringEncoding"), Some(AbiType::Integer(4)));
+    }
+    #[test] fn apple_stack_arguments_are_naturally_packed_not_eight_byte_slots() {
+        let signature = Signature { language: "C", source: "test",
+            declaration: "void packed(long a,long b,long c,long d,long e,long f,long g,long h,char byte,short half,int word,double *pointer);".into() };
+        let args = abi_parameters(Some(&signature));
+        for (index, offset, size) in [(8,0,1), (9,2,2), (10,4,4), (11,8,8)] {
+            assert!(args[index].register.contains(&format!("sp+0x{offset:x}, {size} bytes")), "{:?}", args[index]);
+            assert_eq!(args[index].general_register, None);
+        }
+    }
+    #[test] fn callbacks_blocks_and_array_parameters_decay_to_gp_pointers() {
+        let signature = Signature { language: "C", source: "test",
+            declaration: "void callbacks(void (*handler)(int, double), void (^block)(float), float values[4], double ratio);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert_eq!(args.iter().map(|arg|arg.name.as_str()).collect::<Vec<_>>(), vec!["handler", "block", "values", "ratio"]);
+        assert_eq!(args.iter().map(|arg|arg.register.as_str()).collect::<Vec<_>>(), vec!["x0", "x1", "x2", "d0"]);
+    }
+    #[test] fn unknown_aggregate_layout_and_cpp_receivers_withhold_abi_claims() {
+        let signature = Signature { language: "C", source: "test", declaration: "void aggregate(int first, CustomRange range, double after);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert_eq!(args[0].register, "x0");
+        assert!(args[1].register.contains("type layout unresolved"));
+        assert!(args[2].register.contains("earlier layout"));
+        let nested = symbol("__ZN3Foo3barEi").unwrap();
+        assert!(abi_parameters(Some(&nested))[0].register.contains("implicit C++ receiver"));
+        let global = symbol("__Z3fooi").unwrap();
+        assert_eq!(abi_parameters(Some(&global))[0].register, "x0");
+    }
+    #[test] fn known_sdk_aggregates_use_register_groups_and_spill_without_splitting() {
+        let signature = symbol("_CFArrayContainsValue").unwrap();
+        let args = abi_parameters(Some(&signature));
+        assert_eq!(args[0].register, "x0");
+        assert_eq!(args[1].register, "aggregate<CFRange>(x1, x2)");
+        assert_eq!(args[2].register, "x3");
+        let signature = Signature { language: "C", source: "test",
+            declaration: "void ranges(long a,long b,long c,long d,long e,long f,long g,CFRange range,long tail);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert!(args[7].register.contains("sp+0x0, 16 bytes"), "{:?}", args[7]);
+        assert!(args[8].register.contains("sp+0x10, 8 bytes"), "{:?}", args[8]);
+        let signature = Signature { language: "C", source: "test",
+            declaration: "void hfa(double a,double b,double c,double d,double e,CGRect rectangle,double tail,int count);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert!(args[5].register.contains("sp+0x0, 32 bytes"));
+        assert!(args[6].register.contains("sp+0x20, 8 bytes"));
+        assert_eq!(args[7].register, "x0");
+        let objc = objc_method("-[View bounds]", "{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8").unwrap();
+        assert!(render_signature_return(Some(&objc)).starts_with("return aggregate<CGRect>(d0, d1, d2, d3);"));
+        let range = objc_method("-[View range:]", "{_NSRange=QQ}32@0:8{_NSRange=QQ}16").unwrap();
+        assert_eq!(abi_parameters(Some(&range))[2].register, "aggregate<NSRange>(x2, x3)");
+        assert!(render_signature_return(Some(&range)).starts_with("return aggregate<NSRange>(x0, x1);"));
+        assert_eq!(abi_type("CustomRange /* not a pointer */"), None);
+    }
+    #[test] fn recovered_returns_select_scalar_fp_gp_void_and_unresolved_layouts() {
+        for (ty, expected) in [("void", "return;"), ("void *", "return x0;"), ("double", "return d0;"),
+            ("float", "return s0;"), ("BOOL", "return w0;"), ("uint64_t", "return x0;"), ("CustomRange", "return /* result ABI unresolved")] {
+            let signature = Signature { language: "C", source: "test", declaration: format!("{ty} result(void);") };
+            assert!(render_signature_return(Some(&signature)).starts_with(expected), "{ty}: {}", render_signature_return(Some(&signature)));
+        }
+        let objc = objc_method("-[NSNumber doubleValue]", "d16@0:8").unwrap();
+        assert!(render_signature_return(Some(&objc)).starts_with("return d0;"));
+        let pointer = Signature { language: "C", source: "test", declaration: "void *pointer(void);".into() };
+        assert!(!signature_returns_void(Some(&pointer)));
+        let code = 0xd65f03c0u32.to_le_bytes();
+        let body = render_arm64_body(0x1000, 0x1004, "_pointer", Some(&pointer), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new()).unwrap();
+        assert!(body.contains("return x0;"), "{body}");
+        assert!(!body.contains("void return supported"), "{body}");
+    }
+    #[test] fn variadic_calls_show_fixed_prototype_and_unknown_anonymous_arguments() {
+        let signature = symbol("_printf").unwrap();
+        let signatures = BTreeMap::from([(0x2000, ("_printf".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("printf(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */);"), "{call}");
     }
     #[test] fn abi_parameters_resolve_objc_hidden_arguments_and_fp_register_banks() {
         let objc = objc_method("-[RoadmapScorer score:]", "q24@0:8q16").unwrap();

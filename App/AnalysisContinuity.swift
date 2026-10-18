@@ -1245,7 +1245,7 @@ extension WorkbenchModel {
 
     func recordAnalysisSnapshot(recordID: String, sourceSHA256: String, report: AnalysisReport) {
         guard let projectPath = project?.path else { return }
-        let engineIdentity = project?.records.first { $0.id == recordID }?.result.import_options?.cacheIdentity ?? (VGAnalysisContinuityStore.engine + "-patterns1")
+        let engineIdentity = project?.records.first { $0.id == recordID }?.result.import_options?.cacheIdentity ?? (VGAnalysisContinuityStore.engine + "-patterns1-" + BinaryImportOptions.analysisRevision)
         // Fingerprinting all bounded report channels can still touch several MiB.
         // Keep that deterministic CPU work off the SwiftUI main actor, then publish
         // the small snapshot/delta back into continuity state.

@@ -6,6 +6,7 @@ struct BinaryImportOptions: Codable, Equatable {
     var load_address: String = "0"
     var file_offset: String = "0"
     static let automatic = BinaryImportOptions()
+    static let analysisRevision = "prototype-abi-v1"
     private static func number(_ text: String) -> UInt64? {
         if text.hasPrefix("0x") { return UInt64(text.dropFirst(2), radix: 16) }
         return UInt64(text)
@@ -19,7 +20,7 @@ struct BinaryImportOptions: Codable, Equatable {
                                    load_address: String(address), file_offset: String(offset))
     }
     var arguments: [String] { [format, architecture, load_address, file_offset] }
-    var cacheIdentity: String { "multiarch-v2:" + arguments.joined(separator: ":") }
+    var cacheIdentity: String { "multiarch-v2:" + Self.analysisRevision + ":" + arguments.joined(separator: ":") }
 }
 
 struct HeaderResult: Codable {

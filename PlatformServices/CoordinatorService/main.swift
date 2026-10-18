@@ -227,7 +227,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     throw WorkbenchError("Invalid analysis request or no open project.")
                 }
                 let source = try current.capturedSource(id: recordID)
-                let engineIdentity = source.options.map { "multiarch-v1:" + SHA256.hash(data: Data($0.cacheIdentity.utf8)).map { String(format: "%02x", $0) }.joined().prefix(48) } ?? (analysisCacheEngineVersion + "-patterns1")
+                let engineIdentity = source.options.map { "multiarch-v1:" + SHA256.hash(data: Data($0.cacheIdentity.utf8)).map { String(format: "%02x", $0) }.joined().prefix(48) } ?? (analysisCacheEngineVersion + "-patterns1-" + BinaryImportOptions.analysisRevision)
                 let before = try VerifiedPageCache.stamp(source.path)
                 supervisor.recordStatus(id: requestID, operation: "analysis", phase: .checkingCache,
                                         detail: "Checking project-local analysis cache against source and engine identity.",
