@@ -221,7 +221,7 @@ Acceptance: nested and optimized fixtures retain all reachable exits and side ef
 
 Dependencies: C04–C08 and the machine-state emitter from C01.
 
-- [ ] Emit deterministic compilable recovered C17/Objective-C from the typed AST, with declarations, dependencies, globals, runtime adapters, helpers, ABI annotations, and source maps.
+- [~] Emit deterministic compilable recovered C17/Objective-C from the typed AST, with declarations, dependencies, globals, runtime adapters, helpers, ABI annotations, and source maps. *(in progress — claimed)*
 - [ ] Define/parse the restricted pseudocode grammar with typed diagnostics and explicit arithmetic/memory semantics; generated supported text round-trips to the same AST.
 - [ ] Offer readable pseudocode, machine-state C, and recovered source with independent completeness/validation labels and exact unresolved dependency manifests.
 - [ ] Preserve packing, alignment, volatility, atomic ordering, signed behavior, FP assumptions, and authentication effects; reject export where a reachable dependency is unresolved.
