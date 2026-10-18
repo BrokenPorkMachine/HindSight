@@ -305,7 +305,7 @@ Acceptance: interruption/corruption/migration tests preserve completed evidence 
 Dependencies: reconstruction qualification, C13–C15 and all applicable release gates.
 
 - [~] Universal signed/notarized distribution, qualified updater/rollback, entitlements, and update authenticity. *(in progress — claimed)*
-- [ ] Licensing tiers that preserve offline/local analysis and documented license-state recovery.
+- [~] Licensing tiers that preserve offline/local analysis and documented license-state recovery. *(in progress — claimed)*
 - [ ] Guided labs, redistributable datasets, onboarding, complete documentation, and enterprise deployment material.
 - [ ] Re-run the original 0.1, 0.5, 1.0, native execution, signing/notarization, universal-build, and memory-pressure gates against current artifacts.
 
