@@ -783,12 +783,31 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
  let section_entries=((section.addr+section.size).saturating_sub(table_address)/(width as u64))as usize;let count=section_entries.min(32);
  if count==0{return Ok(None)}
  let index_register=(le32(&code[load_index*4..load_index*4+4])>>16)&31;
- let mut out=format!("table={table_address:#018x} format={} entry_width={width} table_index=x{index_register} scan_limit=32 confidence=candidate\n",if signed{"table-relative signed offsets"}else{"absolute pointers"});let mut valid=0usize;let mut stopped=None;
+ let index_provenance = if index_register != 31 {
+  // Check nearby loads for index register origin
+  let mut origin = String::new();
+  for li in (load_index.saturating_sub(4)..load_index).rev() {
+    let w = le32(&code[li*4..li*4+4]);
+    let rn = (w >> 5) & 31;
+    // LDR (indexed) pattern: 0xF8xxxxxx with Rn in bits 20-16
+    if (w & 0xfc00_0000) == 0xf800_0000 {
+      let imm = ((w & 0x03ff_0000) >> 10) as i64;
+      if rn == index_register { origin = format!("LDRw-indexed@{imm:#x}"); break; }
+    }
+    // LDR (literal) pattern: 0xF950xxxx
+    if (w & 0xf000_0000) == 0xf900_0000 && (w & 0x00f0_0000) == 0x0050_0000 {
+      let imm = (w & 0x000fffff) as i32;
+      if rn == index_register { origin = format!("LDRw-literal@{imm:#x}"); break; }
+    }
+  }
+  if origin.is_empty() { "unknown".into() } else { origin }
+} else { "x31".into() };
+ let mut out=format!("table={table_address:#018x} format={} entry_width={width} table_index=x{index_register} index-provenance={} scan_limit=32 confidence=candidate\n",index_provenance,if signed{"table-relative signed offsets"}else{"absolute pointers"});let mut valid=0usize;let mut stopped=None;
  for case in 0..count{let Some(offset)=table_offset.checked_add(case as u64*width as u64)else{stopped=Some((case,"file offset overflow"));break};if offset>size||width as u64>size-offset{stopped=Some((case,"entry exceeds file"));break}let entry=read_exact_range(file,offset,width as usize)?;let raw=if width==8{le64(&entry)}else{le32(&entry)as u64};let target=if signed{table_address.checked_add_signed((raw as u32 as i32)as i64)}else{Some(raw)};
   let Some(target)=target.filter(|target|*target>=base&&*target<scan_end&&(*target-base)%4==0)else{stopped=Some((case,"entry target is outside admitted executable bytes or is unaligned"));break};valid+=1;out.push_str(&format!("  case-index={case} entry={offset:#x} target={target:#018x} validation=executable-aligned\n"));
  }
  if valid==0{return Ok(None)}
- if let Some((case,reason))=stopped{out.push_str(&format!("unresolved-entry case-index={case} reason={reason}\n"));}else if section_entries>32{out.push_str("unresolved-entry case-index=32 reason=32-entry analysis cap reached\n");}else{out.push_str("enumeration stopped at containing-section boundary\n");}
+ if let Some((case,reason))=stopped{out.push_str(&format!("unresolved-entry case-index={case} reason={reason} index-provenance={}\n",index_provenance));}else if section_entries>32{out.push_str(&format!("unresolved-entry case-index=32 reason=32-entry analysis cap reached index-provenance={}\n",index_provenance));}else{out.push_str(&format!("enumeration stopped at containing-section boundary index-provenance={}\n",index_provenance));}
  out.push_str(&format!("validated_entries={valid}; table extent is bounded by its containing section and 32-entry scan cap; case mapping and original source switch remain unproven."));
  Ok(Some(out))
 }
