@@ -281,7 +281,7 @@ Acceptance: malformed/overflow/ambiguous fixtures fail with bounded diagnostics;
 
 Dependencies: C00 identities, C11 artifacts, C15 persistence/protocols.
 
-- [ ] Shareable investigation bundles with content hashing and replayable experiment recipes.
+- [~] Shareable investigation bundles with content hashing and replayable experiment recipes. *(in progress — claimed)*
 - [ ] Findings, review/comment state, evidence links, and reproducible experiment records.
 - [ ] Extension signatures, capability policy, allowlists, trust and organization settings.
 - [ ] Optional on-premises execution node with versioned authenticated headless jobs and returned evidence identities.
