@@ -1595,6 +1595,7 @@ fn function_name_guesses(
 fn external_symbol_database(
     image: &Image,
     functions: &mut BTreeMap<u64, (String, String)>,
+    source_sha256: &str,
 ) -> io::Result<usize> {
     let Some(path) = std::env::var_os("HINDSIGHT_SYMBOL_DB") else {
         return Ok(0);
@@ -1603,7 +1604,18 @@ fn external_symbol_database(
     if !path.is_absolute() || path.to_string_lossy().len() > 16 * 1024 {
         return Err(bad("HINDSIGHT_SYMBOL_DB must be an absolute path"));
     }
-    let contents = std::fs::read_to_string(path)?;
+    let mut contents = String::new();
+    File::open(path)?.take(16 * 1024 * 1024 + 1).read_to_string(&mut contents)?;
+    if contents.len() > 16 * 1024 * 1024 || contents.lines().count() > 200_000 {
+        return Err(bad("External symbol catalog exceeds byte/record budget"));
+    }
+    for line in contents.lines() {
+        if let Some(expected) = line.strip_prefix("# source_sha256=") {
+            if !expected.eq_ignore_ascii_case(source_sha256) {
+                return Err(bad("External symbol catalog source SHA-256 mismatch"));
+            }
+        }
+    }
     let mut applied = 0usize;
     for line in contents.lines().take(200_000) {
         if line.len() > 512 || line.trim_start().starts_with('#') {
@@ -2280,7 +2292,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     for (a, name) in export_names {
         functions.entry(a).or_insert((name, "export-trie".into()));
     }
-    let external_symbols = external_symbol_database(&image, &mut functions)?;
+    let external_symbols = external_symbol_database(&image, &mut functions, digest)?;
     if external_symbols != 0 {
         push(
             &mut metadata,

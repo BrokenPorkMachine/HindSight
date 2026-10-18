@@ -113,7 +113,8 @@
 - [x] Bounded PE32/PE32+ image ingestion for Windows-oriented static projects (i386, x86-64, AArch64): preferred-base mappings, entry points, file-backed/zero-fill separation, disassembly, CFG candidates, strings and verified paging.
 - [ ] Standalone COFF objects, PE imports/exports/relocations, PDB and Authenticode validation.
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).
-- [ ] Import/export of common reversing artifacts (Ghidra/IDA/Binary Ninja interop) rather than forced ecosystem lock-in.
+- [x] Hash-bound function-name exchange JSON and Ghidra/PyGhidra, IDA, and Binary Ninja adapters; worker report export, rebasing, conflict preview and verified structural-backend symbol catalogs. Adapter behavior is contract-tested; live third-party qualification remains open.
+- [ ] Broader reversing artifact interoperability (types, comments, signatures and native tool project formats), GUI import and live adapter qualification.
 
 ### 0.6.2 — Decompiler Track P1/P2 (in progress — see [DECOMPILER_GAP_ROADMAP.md](DECOMPILER_GAP_ROADMAP.md))
 - [ ] **P1 Types:** Function signatures (Swift, broader C/C++), stack locals/aggregate layouts, project type library (SDK headers, user C declarations), Objective-C dispatch/object model (class_ro_t, selector stubs, message sends), type propagation/casts, analyst overrides (persisted per-function revisions).

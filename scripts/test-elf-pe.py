@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+import os
 import pathlib
 import struct
 import subprocess
@@ -66,8 +67,8 @@ def pe(bits=64, arm=False):
     return data
 
 
-def run(*args):
-    reply = subprocess.run([WORKER, *map(str, args)], capture_output=True, timeout=60, check=True)
+def run(*args, env=None):
+    reply = subprocess.run([WORKER, *map(str, args)], capture_output=True, timeout=60, check=True, env=env)
     stream = io.BytesIO(reply.stdout)
     # Analysis has a larger frame allowance than control replies.
     size = struct.unpack(">I", stream.read(4))[0]
@@ -150,5 +151,21 @@ with tempfile.TemporaryDirectory() as directory:
     result, args = analyze(data)
     (root / "input.bin").write_bytes(data[:-1] + b"!")
     assert run("--analyze-image", *args, "elf", "auto", "0", "0")["kind"] == "error"
+
+    # Exchange-derived catalogs remain bound to the verified artifact in the worker.
+    result, args = analyze(elf())
+    names = root / "names.txt"
+    digest = hashlib.sha256(elf()).hexdigest()
+    env = dict(os.environ, HINDSIGHT_SYMBOL_DB=str(names))
+    names.write_text(f"# source_sha256={digest}\n0x400100 imported_entry\n")
+    result = run("--analyze-image", *args, "elf", "auto", "0", "0", env=env)
+    assert result["kind"] == "analysis_result" and "imported_entry" in result["functions"], result
+    assert "source=external-symbol-db" in result["functions"]
+    names.write_text("# source_sha256=" + "0" * 64 + "\n0x400100 wrong_image\n")
+    result = run("--analyze-image", *args, "elf", "auto", "0", "0", env=env)
+    assert result["kind"] == "error" and "SHA-256 mismatch" in result["message"], result
+    names.write_text("# comment\n" * 200001)
+    result = run("--analyze-image", *args, "elf", "auto", "0", "0", env=env)
+    assert result["kind"] == "error" and "budget" in result["message"], result
 
 print("ELF/PE capture, mappings, decode, evidence, paging, byte order, embedded offsets and malformed-input checks passed")
