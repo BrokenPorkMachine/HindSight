@@ -1323,32 +1323,80 @@ fn analysis_insights_report(functions:&str,data_refs:&str,quality:&str,calls:&[(
  out.push_str("\nInterpretation guardrail: this view prioritizes proven structural evidence for navigation. Tail-call rows remain candidates; decoder coverage is not semantic completeness. HindSight does not infer intent, vulnerability, maliciousness, or runtime reachability.\n");out
 }
 
+struct FunctionBoundaryFacts{
+ symbols:Vec<(u64,String)>,starts:Vec<u64>,lc_function_starts:Vec<u64>,
+ direct_call_starts:std::collections::BTreeSet<u64>,unwind_starts:Vec<u64>,
+ objc_classes:String,objc_layouts:Vec<super::objc::ClassLayout>,
+ objc_function_names:std::collections::BTreeMap<u64,String>,objc_starts:Vec<u64>,
+ export_trie:String,export_starts:Vec<u64>,
+}
+
+/// Shared admission path for ordinary reports and reconstruction artifacts.
+fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,code:&[u8],data_ranges:&[(u64,u64,u16)])->io::Result<FunctionBoundaryFacts>{
+ let (symbols,mut starts,lc_function_starts)=parse_metadata(file,window,map,size)?;
+ let scan_end=map.address+code.len() as u64;
+ if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
+ let mut direct_call_starts=std::collections::BTreeSet::new();
+ if !map.encrypted{for (index,chunk) in code.chunks_exact(4).enumerate(){let pc=map.address+(index as u64)*4;let position=map.offset+(index as u64)*4;if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}}}
+ starts.extend(direct_call_starts.iter().copied());
+ let unwind_starts=if map.encrypted{Vec::new()}else{unwind_info_function_starts(file,window,size,map.address,scan_end)?};starts.extend(unwind_starts.iter().copied());
+ let (objc_classes,objc_layouts)=objc_class_graph(file,window,size)?;
+ let objc_function_names=objc_imp_names(&objc_classes);
+ let objc_starts=objc_function_names.keys().copied().filter(|address|*address>=map.address&&*address<scan_end&&(*address-map.address)%4==0).collect::<Vec<_>>();
+ if !map.encrypted{starts.extend(objc_starts.iter().copied());}
+ let export_trie=export_trie_records(file,window,size)?;
+ let export_starts=if map.encrypted{Vec::new()}else{export_function_starts(&export_trie,window,map.address,scan_end)};
+ starts.extend(export_starts.iter().copied());starts.sort_unstable();starts.dedup();
+ Ok(FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts})
+}
+
+pub fn reconstruct(path:&str,digest:&str,size:&str,start:&str,end:&str,id:&str)->io::Result<String>{
+ let invalid=|message|io::Error::new(io::ErrorKind::InvalidInput,message);
+ if path.len()>16384||!std::path::Path::new(path).is_absolute()||digest.len()!=64||!digest.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte))||id.len()!=36||!id.bytes().all(|byte|byte.is_ascii_hexdigit()||byte==b'-'){return Err(invalid("Invalid reconstruction identity"));}
+ let size:u64=size.parse().map_err(|_|invalid("Invalid captured source size"))?;
+ let parse_address=|value:&str|value.strip_prefix("0x").filter(|value|!value.is_empty()&&value.len()<=16).and_then(|value|u64::from_str_radix(value,16).ok()).ok_or_else(||invalid("Addresses must be bounded hexadecimal values"));
+ let start=parse_address(start)?;let end=parse_address(end)?;
+ let cpath=CString::new(path)?;let expected=CString::new(digest)?;
+ let fd=unsafe{re_open_source(cpath.as_ptr())};if fd<0{return Err(invalid("Cannot open captured regular file without following symlinks"));}
+ let mut file=unsafe{File::from_raw_fd(fd)};let before=file.metadata()?;let mut error=[0 as c_char;512];
+ if unsafe{re_verify_fd(file.as_raw_fd(),expected.as_ptr(),size,error.as_mut_ptr(),error.len())}!=0{return Err(io::Error::new(io::ErrorKind::InvalidData,unsafe{CStr::from_ptr(error.as_ptr())}.to_string_lossy().into_owned()));}
+ let window=read_window(&mut file,size)?;
+ if window.len()<32||&window[..4]!=[0xcf,0xfa,0xed,0xfe]||le32(&window[4..8])!=0x0100000c{return Err(invalid("Reconstruction currently requires a thin little-endian AArch64 Mach-O"));}
+ let map=mapping(&window,size).map_err(|message|io::Error::new(io::ErrorKind::InvalidData,message))?;if map.encrypted{return Err(invalid("Encrypted code cannot be reconstructed"));}
+ let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
+ let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
+ let facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let index=facts.starts.binary_search(&start).map_err(|_|invalid("Start is not an admitted function boundary"))?;
+ if index+1==facts.starts.len()&&(code.len() as u64)<map.bytes{return Err(invalid("Final function bound is outside the code scan budget"));}
+ let canonical_end=facts.starts.get(index+1).copied().unwrap_or(map.address+map.bytes);
+ if end!=canonical_end||end<=start{return Err(invalid("End does not match the canonical function boundary"));}
+ let mut sources=Vec::new();
+ if facts.lc_function_starts.contains(&start){sources.push("LC_FUNCTION_STARTS".into());}
+ if facts.unwind_starts.contains(&start){sources.push("__unwind_info".into());}
+ if facts.direct_call_starts.contains(&start){sources.push("direct BL target candidate".into());}
+ let names=facts.symbols.iter().filter(|(address,_)|*address==start).map(|(_,name)|name.as_str()).collect::<std::collections::BTreeSet<_>>();
+ if !names.is_empty(){sources.push("exact nlist symbol".into());}
+ if facts.objc_starts.contains(&start){sources.push("validated Objective-C IMP".into());}
+ if facts.export_starts.contains(&start){sources.push("export trie".into());}
+ if sources.is_empty(){sources.push("section-start fallback candidate".into());}
+ let name=if names.len()==1{names.iter().next().copied()}else if names.is_empty(){facts.objc_function_names.get(&start).map(String::as_str)}else{None};
+ let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
+ let artifact=super::semantic::reconstruct_artifact(super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources})?;
+ if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
+ if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)
+}
+
 pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(2,"verify","Validating analysis identity and opening the captured artifact.");
  if path.len()>16384||!std::path::Path::new(path).is_absolute()||digest.len()!=64||!digest.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||id.len()!=36||!id.bytes().all(|b|b.is_ascii_hexdigit()||b==b'-'){return Err(io::Error::new(io::ErrorKind::InvalidInput,"Invalid analysis identity"));}
  let size:u64=size.parse().map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"Invalid source size"))?;let cpath=CString::new(path)?;let hash=CString::new(digest)?;let fd=unsafe{re_open_source(cpath.as_ptr())};if fd<0{return Err(io::Error::new(io::ErrorKind::InvalidInput,"Cannot open captured source"));}
  let mut file=unsafe{File::from_raw_fd(fd)};let before=file.metadata()?;let mut error=[0 as c_char;512];if unsafe{re_verify_fd(file.as_raw_fd(),hash.as_ptr(),size,error.as_mut_ptr(),error.len())}!=0{return Err(io::Error::new(io::ErrorKind::InvalidData,unsafe{CStr::from_ptr(error.as_ptr())}.to_string_lossy().into_owned()));}
  analysis_progress(8,"mapping","Source hash verified; reading bounded Mach-O layout and metadata.");
- let window=read_window(&mut file,size)?;let map=mapping(&window,size).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;let(symbols,mut starts,lc_function_starts)=parse_metadata(&mut file,&window,&map,size)?;let relocations=parse_text_relocations(&mut file,&window,size)?;let metadata=platform_metadata(&window);let runtime_records=runtime_records(&mut file,&window,size)?;let swift_types=swift_nominal_types(&mut file,&window,size)?;let runtime_graph=runtime_reference_graph(&mut file,&window,size)?;let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
+ let window=read_window(&mut file,size)?;let map=mapping(&window,size).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;let relocations=parse_text_relocations(&mut file,&window,size)?;let metadata=platform_metadata(&window);let runtime_records=runtime_records(&mut file,&window,size)?;let swift_types=swift_nominal_types(&mut file,&window,size)?;let runtime_graph=runtime_reference_graph(&mut file,&window,size)?;let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  analysis_progress(20,"metadata","Mach-O, symbol, runtime, relocation, and data-in-code metadata recovered.");
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
- if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
- let mut direct_call_starts=std::collections::BTreeSet::new();
- if !map.encrypted{for (index,chunk) in code.chunks_exact(4).enumerate(){let pc=map.address+(index as u64)*4;let file_position=map.offset+(index as u64)*4;if data_ranges.iter().any(|(start,end,_)|file_position<*end&&file_position.saturating_add(4)>*start){continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}}}
- starts.extend(direct_call_starts.iter().copied());
- let unwind_starts=if map.encrypted{Vec::new()}else{unwind_info_function_starts(&mut file,&window,size,map.address,scan_end)?};
- starts.extend(unwind_starts.iter().copied());
- let (objc_classes,objc_layouts)=objc_class_graph(&mut file,&window,size)?;
- let objc_function_names=objc_imp_names(&objc_classes);
- let objc_starts=objc_function_names.keys().copied().filter(|address|*address>=map.address&&*address<scan_end&&(*address-map.address)%4==0).collect::<Vec<_>>();
- if !map.encrypted{
-  starts.extend(objc_starts.iter().copied());
- }
- let export_trie=export_trie_records(&mut file,&window,size)?;
- let export_starts=if map.encrypted{Vec::new()}else{export_function_starts(&export_trie,&window,map.address,scan_end)};
- starts.extend(export_starts.iter().copied());
- starts.sort_unstable();starts.dedup();
+ let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
  for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
  for address in &unwind_starts{boundary_sources.entry(*address).or_default().insert("__unwind_info");}

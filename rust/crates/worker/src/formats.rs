@@ -212,6 +212,12 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
         };
         range(offset, filesz, length)?;
         add(va, memsz)?;
+        if kind == 2 {
+            if dynamic_segment.is_some() {
+                return Err(bad("Multiple ELF PT_DYNAMIC segments"));
+            }
+            dynamic_segment = Some((offset, filesz, va));
+        }
         if kind != 1 {
             continue;
         }
@@ -366,11 +372,23 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
             }
         }
     }
+    let mut dynamic_evidence = false;
+    if shoff == 0 && !relocatable {
+        if let Some((doffset, dsize, dva)) = dynamic_segment {
+            if dsize > 0 {
+                dynamic_evidence = elf_dynamic(file, &mut i, &loads, doffset, dsize, dva)?;
+            }
+        }
+    }
     entry(&mut i, address)?;
     if relocatable {
         push(&mut i.inventory, "ELF relocatable object sections use deterministic analysis-only addresses; symbols are rebased from section-relative values. No loader placement or relocation application is claimed.\n");
     }
-    push(&mut i.inventory, "ELF static structural analysis with section-backed symbol and relocation tables; sectionless dynamic symbols/relocations, runtime linking, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
+    if dynamic_evidence {
+        push(&mut i.inventory, "ELF static structural analysis with PT_DYNAMIC-derived dynamic-link evidence for a section-header-free image; runtime linking, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
+    } else {
+        push(&mut i.inventory, "ELF static structural analysis with section-backed symbol and relocation tables; sectionless dynamic symbols/relocations, runtime linking, Linux native attach and semantic lifting remain unavailable. PIE addresses are preferred addresses without a runtime slide.\n");
+    }
     Ok(i)
 }
 
@@ -604,6 +622,332 @@ fn elf_relocations(file: &mut File, i: &mut Image, headers: &[u8], stride: usize
     }
     if records > 0 { push(&mut i.inventory, &format!("ELF relocation records={records}; references remain unapplied.\n")); }
     Ok(())
+}
+
+fn elf_dynamic(
+    file: &mut File,
+    i: &mut Image,
+    loads: &[(u64, u64, u64, u64, u32)],
+    offset: u64,
+    size: u64,
+    va: u64,
+) -> io::Result<bool> {
+    let wide = i.bits == 64;
+    let be = i.be;
+    let entry = if wide { 16u64 } else { 8u64 };
+    if size == 0 || size % entry != 0 || size / entry > 8192 {
+        return Err(bad("Invalid or over-budget ELF PT_DYNAMIC segment"));
+    }
+    let resolve = |want: u64, bytes: u64| -> io::Result<u64> {
+        for &(a, _, off, filesz, _) in loads {
+            if want >= a && bytes <= filesz && want - a <= filesz - bytes {
+                return add(off, want - a);
+            }
+        }
+        Err(bad("ELF dynamic table address outside file-backed load mappings"))
+    };
+    if resolve(va, size)? != offset {
+        return Err(bad("ELF PT_DYNAMIC address disagrees with its load mapping"));
+    }
+    let bytes = read(file, add(i.origin, offset)?, size as usize)?;
+    let mut entries: Vec<(i64, u64)> = Vec::new();
+    for record in bytes.chunks_exact(entry as usize) {
+        let tag = if wide { u64v(record, be) as i64 } else { u32v(record, be) as i32 as i64 };
+        if tag == 0 {
+            break;
+        }
+        let value = if wide { u64v(&record[8..], be) } else { u32v(&record[4..], be) as u64 };
+        entries.push((tag, value));
+    }
+    if entries.len() as u64 == size / entry {
+        return Err(bad("ELF PT_DYNAMIC is missing its DT_NULL terminator"));
+    }
+    let take = |wanted: i64| -> io::Result<Option<u64>> {
+        let mut found = None;
+        for &(tag, value) in &entries {
+            if tag == wanted {
+                if found.is_some() {
+                    return Err(bad("Duplicate ELF dynamic tag"));
+                }
+                found = Some(value);
+            }
+        }
+        Ok(found)
+    };
+    let rela = take(7)?;
+    let relasz = take(8)?;
+    let relaent = take(9)?;
+    let rel = take(17)?;
+    let relsz = take(18)?;
+    let relent = take(19)?;
+    let pltrelsz = take(2)?;
+    let hash = take(4)?;
+    let strtab = take(5)?;
+    let symtab = take(6)?;
+    let strsz = take(10)?;
+    let syment = take(11)?;
+    let pltrel = take(20)?;
+    let jmprel = take(23)?;
+    let gnu_hash = take(0x6ffffef5)?;
+    if rela.is_some() != relasz.is_some() {
+        return Err(bad("ELF DT_RELA relocation tags are incomplete"));
+    }
+    if rel.is_some() != relsz.is_some() {
+        return Err(bad("ELF DT_REL relocation tags are incomplete"));
+    }
+    if jmprel.is_some() && (pltrelsz.is_none() || pltrel.is_none()) {
+        return Err(bad("ELF DT_JMPREL relocation tags are incomplete"));
+    }
+    if pltrelsz.unwrap_or(0) > 0 && jmprel.is_none() {
+        return Err(bad("ELF DT_PLTRELSZ without DT_JMPREL"));
+    }
+    let expected_rela = if wide { 24u64 } else { 12 };
+    let expected_rel = if wide { 16u64 } else { 8 };
+    if let Some(v) = relaent {
+        if v != expected_rela {
+            return Err(bad("Invalid ELF DT_RELAENT entry size"));
+        }
+    }
+    if let Some(v) = relent {
+        if v != expected_rel {
+            return Err(bad("Invalid ELF DT_RELENT entry size"));
+        }
+    }
+    if let Some(v) = pltrel {
+        if jmprel.is_some() && v != 7 && v != 17 {
+            return Err(bad("ELF DT_PLTREL requires DT_RELA or DT_REL"));
+        }
+    }
+    push(&mut i.inventory, &format!("ELF PT_DYNAMIC VA={va:#x} file={offset:#x} bytes={size} entries={}\n", entries.len()));
+    if [35i64, 36, 37].iter().any(|tag| entries.iter().any(|&(t, _)| t == *tag)) {
+        push(&mut i.inventory, "ELF DT_RELR relative-relocation records are unsupported; references remain unapplied.\n");
+    }
+
+    let mut symbol_count: Option<u64> = None;
+    let mut hash_kind = None;
+    if let Some(h) = hash {
+        let at = resolve(h, 8)?;
+        let raw = read(file, add(i.origin, at)?, 8)?;
+        let nbucket = u32v(&raw[..4], be) as u64;
+        let nchain = u32v(&raw[4..], be) as u64;
+        if nbucket == 0 || nbucket > 200_000 || nchain == 0 || nchain > 200_000 {
+            return Err(bad("Invalid ELF DT_HASH dynamic symbol count"));
+        }
+        symbol_count = Some(nchain);
+        hash_kind = Some("DT_HASH");
+    } else if let Some(g) = gnu_hash {
+        let header_at = resolve(g, 16)?;
+        let header = read(file, add(i.origin, header_at)?, 16)?;
+        let nbuckets = u32v(&header[..4], be) as u64;
+        let symoffset = u32v(&header[4..8], be) as u64;
+        let bloom_size = u32v(&header[8..12], be) as u64;
+        if nbuckets == 0 || nbuckets > 200_000 || bloom_size == 0 || bloom_size > 4096 || symoffset == 0 || symoffset > 200_000 {
+            return Err(bad("Invalid ELF DT_GNU_HASH header"));
+        }
+        let word = if wide { 8u64 } else { 4 };
+        let prefix = 16 + bloom_size * word + nbuckets * 4;
+        let prefix_at = resolve(g, prefix)?;
+        let prefix_bytes = read(file, add(i.origin, prefix_at)?, prefix as usize)?;
+        let buckets = &prefix_bytes[(16 + bloom_size * word) as usize..];
+        let chains_va = g + prefix;
+        let map = loads.iter().find(|&&(a, _, _, filesz, _)| g >= a && g - a < filesz);
+        if map.is_none() {
+            return Err(bad("ELF dynamic table address outside file-backed load mappings"));
+        }
+        let (map_a, map_filesz) = (map.unwrap().0, map.unwrap().3);
+        let chains_available = map_filesz - (chains_va - map_a);
+        let chains_bytes = chains_available.min(800_000);
+        let chains_at = resolve(chains_va, chains_bytes)?;
+        let chains = read(file, add(i.origin, chains_at)?, chains_bytes as usize)?;
+        let mut count = symoffset;
+        for slot in 0..nbuckets {
+            let start = u32v(&buckets[slot as usize * 4..], be) as u64;
+            if start == 0 {
+                continue;
+            }
+            if start < symoffset {
+                return Err(bad("ELF DT_GNU_HASH bucket below its symbol offset"));
+            }
+            let mut index = start;
+            loop {
+                let chain_slot = index - symoffset;
+                let at = chain_slot * 4;
+                if at + 4 > chains.len() as u64 {
+                    return Err(bad("ELF DT_GNU_HASH chain outside its bounded window"));
+                }
+                let chain = u32v(&chains[at as usize..], be);
+                index += 1;
+                if index > 200_000 {
+                    return Err(bad("ELF DT_GNU_HASH dynamic symbol budget exceeded"));
+                }
+                if chain & 1 != 0 {
+                    break;
+                }
+            }
+            if index > count {
+                count = index;
+            }
+        }
+        if count == 0 || count > 200_000 {
+            return Err(bad("Invalid ELF DT_GNU_HASH dynamic symbol count"));
+        }
+        symbol_count = Some(count);
+        hash_kind = Some("DT_GNU_HASH");
+    }
+
+    let mut recovered_symbols = false;
+    if let Some(nchain) = symbol_count {
+        let symtab_va = symtab.ok_or_else(|| bad("ELF DT_HASH/DT_GNU_HASH without DT_SYMTAB"))?;
+        let strtab_va = strtab.ok_or_else(|| bad("ELF dynamic symbols without DT_STRTAB"))?;
+        let strsz = strsz.ok_or_else(|| bad("ELF dynamic symbols without DT_STRSZ"))?;
+        let syment = syment.ok_or_else(|| bad("ELF dynamic symbols without DT_SYMENT"))?;
+        if syment != if wide { 24u64 } else { 16 } {
+            return Err(bad("Invalid ELF DT_SYMENT entry size"));
+        }
+        let symtab_bytes = nchain * syment;
+        if symtab_bytes > 16 * 1024 * 1024 || strsz > 8 * 1024 * 1024 {
+            return Err(bad("ELF dynamic symbol/string byte budget exceeded"));
+        }
+        if i.foreign.symbol_count.saturating_add(nchain as usize) > 200_000 {
+            return Err(bad("ELF dynamic symbol record budget exceeded"));
+        }
+        let sym_at = resolve(symtab_va, symtab_bytes)?;
+        let str_at = resolve(strtab_va, strsz)?;
+        let strings = read(file, add(i.origin, str_at)?, strsz as usize)?;
+        if strings.first() != Some(&0) || strings.last() != Some(&0) {
+            return Err(bad("Invalid ELF dynamic string-table framing"));
+        }
+        let table = read(file, add(i.origin, sym_at)?, symtab_bytes as usize)?;
+        let source = "ELF dynamic-symbol";
+        let mut names_budget = 1024 * 1024usize;
+        for record in table.chunks_exact(syment as usize) {
+            i.foreign.symbol_count += 1;
+            let index = u32v(record, be) as usize;
+            let (value, symbol_size, info, visibility, section_index) = if wide {
+                (u64v(&record[8..], be), u64v(&record[16..], be), record[4], record[5] & 3, half(&record[6..], be) as usize)
+            } else {
+                (u32v(&record[4..], be) as u64, u32v(&record[8..], be) as u64, record[12], record[13] & 3, half(&record[14..], be) as usize)
+            };
+            if section_index == 0xffff {
+                return Err(bad("Extended ELF symbol section indexes are unsupported"));
+            }
+            if index >= strings.len() {
+                return Err(bad("ELF symbol name outside string table"));
+            }
+            if index == 0 {
+                continue;
+            }
+            let tail = &strings[index..strings.len().min(index + 1025)];
+            let end = tail.iter().position(|&b| b == 0).ok_or_else(|| bad("Unterminated or over-budget ELF symbol name"))?;
+            if end > names_budget {
+                return Err(bad("ELF symbol name budget exceeded"));
+            }
+            names_budget -= end;
+            let label = name(&tail[..end]);
+            if label.is_empty() {
+                continue;
+            }
+            let symbol_type = info & 15;
+            let binding = info >> 4;
+            if section_index == 0 {
+                if matches!(binding, 1 | 2) {
+                    push(&mut i.foreign.imports, &format!("name={label} undefined source={source} type={symbol_type} binding={binding} visibility={visibility}; runtime target unresolved\n"));
+                }
+                continue;
+            }
+            let mut proven_address = false;
+            if symbol_type != 6 && section_index < 0xff00 {
+                if let Some(&(a, m, _, _, _)) = loads.iter().find(|&&(a, m, _, _, _)| value >= a && value - a < m) {
+                    if symbol_size > 0 && value - a + symbol_size > m {
+                        return Err(bad("ELF dynamic symbol extent exceeds its load mapping"));
+                    }
+                    proven_address = true;
+                    if symbol_type == 2
+                        && value % i.arch.unit() == 0
+                        && i.sections.iter().any(|s| s.executable && s.contains(value))
+                    {
+                        i.foreign.functions.push((value, label.clone(), source.into()));
+                    }
+                }
+            }
+            let row = if proven_address {
+                format!("0x{value:016x} name={label} source={source} type={symbol_type} binding={binding} visibility={visibility} section={section_index}\n")
+            } else {
+                format!("name={label} value={value:#x} source={source} type={symbol_type} binding={binding} section={section_index}; address unresolved\n")
+            };
+            push(&mut i.foreign.symbols, &row);
+            if matches!(binding, 1 | 2) && matches!(visibility, 0 | 3) {
+                push(&mut i.foreign.exports, &row);
+            }
+        }
+        recovered_symbols = true;
+        let kind = hash_kind.unwrap_or("DT_HASH");
+        push(&mut i.inventory, &format!("ELF dynamic-symbol records={nchain} (including unnamed records); undefined names remain address-free; {kind} proven symbol count={nchain}.\n"));
+    } else {
+        push(&mut i.inventory, "DT_HASH and DT_GNU_HASH are absent; dynamic symbol names/counts remain unrecovered and relocation symbol indices are transcribed without a proven dynamic symbol count.\n");
+    }
+
+    let mut records = 0usize;
+    let mut table_bytes = 0usize;
+    let mut tables: Vec<(u64, u64, bool, &'static str)> = Vec::new();
+    if let Some(at) = rela {
+        let sz = relasz.unwrap_or(0);
+        if sz > 0 {
+            tables.push((at, sz, true, "DT_RELA"));
+        }
+    }
+    if let Some(at) = rel {
+        let sz = relsz.unwrap_or(0);
+        if sz > 0 {
+            tables.push((at, sz, false, "DT_REL"));
+        }
+    }
+    if let Some(at) = jmprel {
+        let sz = pltrelsz.unwrap_or(0);
+        if sz > 0 {
+            tables.push((at, sz, pltrel == Some(7), "DT_JMPREL"));
+        }
+    }
+    for (want, sz, explicit, source) in tables {
+        let entsize = if explicit { expected_rela } else { expected_rel };
+        if sz % entsize != 0 {
+            return Err(bad("Invalid ELF dynamic relocation table extent"));
+        }
+        let count = sz / entsize;
+        if records.saturating_add(count as usize) > 200_000
+            || table_bytes.saturating_add(sz as usize) > 16 * 1024 * 1024
+        {
+            return Err(bad("ELF dynamic relocation record or byte budget exceeded"));
+        }
+        let at = resolve(want, sz)?;
+        let raw = read(file, add(i.origin, at)?, sz as usize)?;
+        for record in raw.chunks_exact(entsize as usize) {
+            let site = if wide { u64v(record, be) } else { u32v(record, be) as u64 };
+            let info = if wide { u64v(&record[8..], be) } else { u32v(&record[4..], be) as u64 };
+            let symbol = if wide { info >> 32 } else { info >> 8 };
+            let relocation_type = if wide { info & 0xffff_ffff } else { info & 0xff };
+            if !loads.iter().any(|&(a, m, _, _, _)| site >= a && site - a < m) {
+                return Err(bad("ELF dynamic relocation site outside load mappings"));
+            }
+            if let Some(nchain) = symbol_count {
+                if symbol >= nchain {
+                    return Err(bad("ELF dynamic relocation symbol index outside dynamic symbol count"));
+                }
+            }
+            let addend = if explicit {
+                if wide { u64v(&record[16..], be) as i64 } else { u32v(&record[8..], be) as i32 as i64 }
+            } else {
+                0
+            };
+            push(&mut i.foreign.relocations, &format!("0x{site:016x} ELF relocation type={relocation_type} symbol-index={symbol} addend={addend} source={source}\n"));
+            records += 1;
+        }
+        table_bytes += sz as usize;
+    }
+    if records > 0 {
+        push(&mut i.inventory, &format!("ELF dynamic relocation records={records}; references remain unapplied.\n"));
+    }
+    Ok(records > 0 || recovered_symbols)
 }
 
 pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {

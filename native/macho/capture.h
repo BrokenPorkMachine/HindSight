@@ -7,4 +7,6 @@
 int re_capture(const char *source,const char *destination,uint64_t maximum,uint64_t reserve,char digest[65],char *error,size_t capacity);
 int re_open_source(const char *path);
 int re_verify_fd(int fd,const char *expected,uint64_t expected_size,char *error,size_t capacity);
+/* Hash bounded in-memory artifact content with the platform crypto provider. */
+int re_sha256_bytes(const unsigned char *data,size_t size,char digest[65]);
 #endif

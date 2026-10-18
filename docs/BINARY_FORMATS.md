@@ -27,7 +27,23 @@ type, symbol index, explicit addend, and target-section provenance under a
 200,000-record/16 MiB budget. Object relocation sites use the analysis-only
 section mapping. Relocations are evidence only and are never applied.
 
-Images without section tables use PT_LOAD mappings. Big-endian headers can
+Section-header-free images additionally recover dynamic-link evidence from
+`PT_DYNAMIC`: `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables are resolved
+through load mappings with validated entry sizes, sites, symbol indices, and
+addends; symbol indices are bounded by the `DT_HASH` chain count when present,
+or by the `DT_GNU_HASH` bucket/chain structure. When `DT_HASH` or
+`DT_GNU_HASH` and the dynamic string table are proven, `DT_SYMTAB` records
+supply defined dynamic symbols, function starts, undefined imports and visible
+exports with table/binding/visibility provenance; a missing hash table leaves
+symbol counts and names unrecovered and relocation symbol indices transcribed
+as raw evidence. `DT_RELR` records are noted but remain unapplied. The same
+200,000-record/16 MiB budgets apply. Relocations remain evidence only and are
+never applied.
+
+Images without section tables use PT_LOAD mappings and, when present, recover
+dynamic-link evidence from `PT_DYNAMIC` (`DT_RELA`/`DT_REL`/`DT_JMPREL`
+relocation records, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and
+`DT_SYMTAB` names, imports, exports and function starts). Big-endian headers can
 produce metadata, while instruction decoding remains disabled. Extended section
 numbering, core files and other architectures are rejected.
 
@@ -53,7 +69,7 @@ the existing LLVM availability requirements.
 Run `python3 scripts/test-elf-pe.py rust/target/debug/reworker` after building
 the worker. The portable release gate runs this suite alongside existing
 Mach-O/firmware format checks. It tests capture, analysis, paging, byte order,
-32/64-bit layouts, AArch64, relocatable objects, sectionless images, embedded offsets, malformed
+32/64-bit layouts, AArch64, relocatable objects, sectionless images with dynamic-link evidence, embedded offsets, malformed
 ranges, overlaps, architecture mismatches and changed-source rejection.
 
 Layout references: [ELF ABI header specification](https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html)

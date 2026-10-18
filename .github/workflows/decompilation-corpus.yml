@@ -24,5 +24,7 @@ jobs:
         run: python3 scripts/test-arm64-vector-extract.py rust/target/debug/reworker
       - name: Qualify structured AArch64 parameter identities
         run: python3 scripts/test-arm64-nameflow.py rust/target/debug/reworker
+      - name: Qualify worker reconstruction artifacts
+        run: python3 scripts/test-worker-reconstruction.py rust/target/debug/reworker
       - name: Score decompilation corpus
         run: python3 scripts/run-decompilation-corpus.py --worker rust/target/debug/reworker

@@ -23,6 +23,7 @@
 
 - Admit bounded ELF32/ELF64 relocatable objects, assign deterministic analysis-only addresses to allocatable sections, and rebase section-relative symbols without claiming loader placement or applying relocations.
 - Recover bounded section-backed ELF `SHT_REL`/`SHT_RELA` records with validated symbol-table links, target sections, sites, types, symbol indices, and addends; relocations remain unapplied evidence.
+- Recover dynamic-link evidence from `PT_DYNAMIC` for section-header-free ELF images: bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables with load-mapping/site/index validation, `DT_HASH`/`DT_GNU_HASH`-proven dynamic symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied and unrecovered.
 - Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.
 - Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
 - Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.

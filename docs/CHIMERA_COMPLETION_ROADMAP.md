@@ -97,7 +97,7 @@ Dependencies: current captured-source identity, normalized function boundaries, 
 
 Acceptance: real worker artifacts pass structural and semantic validation; mutations of content, references, provenance, completeness, or eligibility are rejected. Reports distinguish decoded coverage, semantic coverage, fidelity, compilation, and tested behavior.
 
-Current progress: a C17 artifact schema, offline content/reference/AST/eligibility validator, and bounded evidence-query implementation exist with executable positive/adversarial tests. Worker-produced artifacts and native catalog integration remain open; this does not close C00.
+Current progress: a C17 artifact schema, offline content/reference/AST/eligibility validator, and bounded evidence-query implementation exist with executable positive/adversarial tests. The worker now produces bounded, review-only AArch64 machine-state AST/evidence artifacts directly from shared IR, normalized function boundaries, conservative instruction CFG and structured register SSA. Cross-language content-ID, mutation, truncation and captured-source checks qualify this first transport slice; recovered-source compilation, memory/type semantics, native catalog joins and general semantic validation remain open. See [worker artifact scope](WORKER_RECONSTRUCTION_ARTIFACTS.md); this does not close C00.
 
 ## C00N — Darwin native naming, declarations, images, and type evidence
 
@@ -263,7 +263,7 @@ Acceptance: each language/ISA declares and passes its own supported matrix. Stru
 
 Dependencies: C00/C01 contracts; format work serves reconstruction after the first qualification milestone.
 
-- [~] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers). *(in progress — claimed; do not start independently)*
+- [x] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers): bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied.
 - [ ] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host).
 - [ ] Standalone COFF, PE imports/exports/base relocations, PDB and Authenticode validation.
 - [ ] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification.
@@ -282,6 +282,8 @@ Dependencies: C00 identities, C11 artifacts, C15 persistence/protocols.
 Acceptance: bundle tampering and dependency changes are detected; team assertions retain authorship; extension and remote execution permissions enforce their declared capabilities.
 
 ## C15 — Persistence, resource, and recovery prerequisites
+
+Remote integration companion: [app-hosted server contract and client-readiness/push gate](HINDSIGHT_REMOTE.md). The HindSight application owns the heavy work and streams results to authenticated clients. Client repository/branch placement is deferred until server completion; no remote-server completion is claimed here.
 
 Dependencies: existing project/cache/job model. Implement affected portions with each reconstruction pass.
 
