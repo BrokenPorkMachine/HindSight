@@ -138,7 +138,7 @@ Acceptance: eligible machine-state C recompiles and agrees with original executi
 Dependencies: C00 and C00N seed identity/boundaries; C01 effects complete the CFG for the supported slice. Initial function parsing proceeds using the existing decoder/IR while semantics expand.
 
 - [~] Reconcile symbol, unwind, export, runtime, direct-call, prologue, thunk, tail-call, and cross-reference evidence for stripped/optimized code; retain competing boundaries and cold fragments. *(in progress — claimed)*
-- [ ] Canonicalize per-function CFG with reachability, dominators/post-dominators, loop forest, control dependence, exceptional exits, and unknown successors.
+- [~] Canonicalize per-function CFG with reachability, dominators/post-dominators, loop forest, control dependence, exceptional exits, and unknown successors. *(in progress — claimed)*
 - [ ] Recover indirect destinations and switch data paths with bounds/range/index-normalization proof; retain explicit unresolved targets.
 
 Acceptance: known-source fixture CFGs agree, including disconnected/unreachable code, tails, exceptional paths, and optimized switch lowering; no missing path is silently treated as a function return.
@@ -265,7 +265,10 @@ Dependencies: C00/C01 contracts; format work serves reconstruction after the fir
 
 - [x] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers): bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied.
 - [ ] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host).
-- [ ] Standalone COFF, PE imports/exports/base relocations, PDB and Authenticode validation.
+- [~] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). *(in progress — claimed; do not start independently)*
+- [ ] Standalone COFF objects.
+- [ ] PDB validation.
+- [ ] Authenticode validation.
 - [ ] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification.
 
 Acceptance: malformed/overflow/ambiguous fixtures fail with bounded diagnostics; live and static mappings retain exact identity; round trips preserve supported artifacts and conflicts.
