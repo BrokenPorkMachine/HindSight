@@ -5225,6 +5225,10 @@ fn decode(word: u32, pc: u64) -> Operation {
     // Advanced SIMD two-register reciprocal estimate (FRECPE/FRSQRTE).
     // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q=1 (vector); U=0 FRECPE, U=1 FRSQRTE.
     if word & 0x9f00_fc00 == 0x0e00_d800 && word & 0x4000_0000 != 0 {
+        // This lift models only the architecturally encoded single- and
+        // double-precision arrangements (size=10/11). Half-precision and
+        // reserved size encodings must not inherit this operation's effects.
+        if (word >> 22) & 3 < 2 { return Operation::Opaque; }
         let operator = if word & 0x2000_0000 != 0 {
             IrVectorFloatUnaryOperator::ReciprocalSqrtEstimate
         } else {
@@ -7979,6 +7983,22 @@ mod tests {
         // Q=0 (D) forms stay opaque
         for word in [0x0ea1_d820u32, 0x0ee1_d820, 0x2ea1_d820, 0x2ee1_d820] {
             assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
+        }
+    }
+
+    #[test]
+    fn vector_reciprocal_estimate_rejects_half_and_reserved_size_encodings() {
+        // The instruction family uses size=10/11 for the modeled S/D forms.
+        // Neighboring size=00/01 encodings are not silently assigned those
+        // semantics, even though the broad opcode bits otherwise match.
+        for size in 0..2 {
+            for base in [0x4ea1_d820u32, 0x6ea1_d820] {
+                let word = (base & !(3 << 22)) | (size << 22);
+                assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
+            }
+        }
+        for word in [0x4ea1_d820u32, 0x4ee1_d820, 0x6ea1_d820, 0x6ee1_d820] {
+            assert!(matches!(decode(word, 0x1000), Operation::VectorFloatUnary { .. }), "{word:#x}");
         }
     }
 
