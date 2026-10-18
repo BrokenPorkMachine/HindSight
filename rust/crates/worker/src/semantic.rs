@@ -16,6 +16,7 @@ struct BasicBlock {
     backedges: Vec<usize>,
     reachable: bool,
     dominators: Vec<usize>,
+    dominance_frontiers: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +75,18 @@ impl FunctionCfg {
                 .collect::<Vec<_>>();
             blocks[source].backedges = backedges;
         }
+
+        // Include loop headers in their own frontier and ignore unreachable
+        // predecessors. Numeric block order does not imply dominance order.
+        for a in 0..blocks.len() {
+            blocks[a].dominance_frontiers = (0..blocks.len()).filter(|&b| {
+                blocks[a].reachable && blocks[b].reachable
+                    && (a == b || !blocks[b].dominators.contains(&a))
+                    && blocks[b].predecessors.iter().any(|&pred| {
+                        blocks[pred].reachable && blocks[pred].dominators.contains(&a)
+                    })
+            }).collect();
+        }
     }
 }
 
@@ -93,10 +106,10 @@ struct FunctionIr {
     cfg: FunctionCfg,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum IrRegisterClass { General, StackPointer, Zero, ProgramCounter }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct IrRegister { class: IrRegisterClass, index: u8, bits: u8 }
 
 impl From<Register> for IrRegister {
@@ -331,6 +344,11 @@ fn float_register_name(register: IrFloatRegister) -> String {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatBinaryOperator { Add, Subtract, Multiply, Divide, Max, Min, MaxNum, MinNum }
+/// Scalar fused multiply-add: optionally subtract the product from the addend,
+/// then optionally negate the result. Rendering retains the instruction name
+/// because FPCR rounding, NaNs, signed zero, and exceptions are not folded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IrFloatMultiplyAdd { destination: u8, left: u8, right: u8, addend: u8, precision: IrFloatPrecision, subtract_product: bool, negate_result: bool }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrConversionRegister { Float { index: u8, precision: IrFloatPrecision }, Integer { index: u8, wide: bool } }
 
@@ -407,6 +425,7 @@ enum IrOperation {
     ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
     ScalarFloatBinary { destination: u8, left: u8, right: u8, precision: IrFloatPrecision, operator: IrFloatBinaryOperator },
     ScalarFloatUnary { destination: u8, source: u8, precision: IrFloatPrecision, operator: IrFloatUnaryOperator },
+    ScalarFloatMultiplyAdd(IrFloatMultiplyAdd),
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -419,6 +438,148 @@ enum IrOperation {
     IndirectBranch { target: IrRegister },
     Return { target: Option<IrRegister> },
     TargetSpecific,
+}
+
+/// Physical GPR effects used by SSA. Wn and Xn share one identity; slot 31
+/// represents SP, while ZR and PC never participate. FP and memory SSA remain
+/// outside this pass. Unsupported operations conservatively replace every GPR.
+#[derive(Clone, Copy, Debug, Default)]
+struct GprEffects { uses: u32, definitions: u32, barrier: bool }
+
+fn gpr_mask(register: IrRegister) -> u32 {
+    match register.class {
+        IrRegisterClass::General if register.index < 31 => 1u32 << register.index,
+        IrRegisterClass::StackPointer => 1u32 << 31,
+        _ => 0,
+    }
+}
+
+fn operand_gpr_mask(operand: IrOperand) -> u32 {
+    match operand { IrOperand::Register(register) => gpr_mask(register), IrOperand::Constant(_) => 0 }
+}
+
+fn address_gpr_mask(address: IrMemoryAddress) -> u32 {
+    match address {
+        IrMemoryAddress::BaseOffset { base, .. } => gpr_mask(base),
+        IrMemoryAddress::BaseIndex { base, index, .. } => gpr_mask(base) | gpr_mask(index),
+        IrMemoryAddress::PcRelative { .. } => 0,
+    }
+}
+
+impl IrOperation {
+    fn gpr_effects(self) -> GprEffects {
+        let mut effects = GprEffects::default();
+        match self {
+            Self::Nop | Self::Marker { .. }
+            | Self::ScalarFloatImmediate { .. } | Self::ScalarFloatMove { .. }
+            | Self::ScalarFloatBinary { .. } | Self::ScalarFloatUnary { .. }
+            | Self::ScalarFloatMultiplyAdd(_) | Self::ScalarFloatCompare { .. }
+            | Self::ScalarFloatConvert { .. } | Self::Branch { .. }
+            | Self::Return { target: None } => {}
+            Self::Assign { destination, value } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = operand_gpr_mask(value);
+            }
+            Self::Address { destination, .. } => effects.definitions = gpr_mask(destination),
+            Self::Binary { destination, left, right, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = operand_gpr_mask(left) | operand_gpr_mask(right);
+            }
+            Self::LogicalRegister { destination, left, right, .. }
+            | Self::ShiftedArithmetic { destination, left, right, .. }
+            | Self::ExtractConcat { destination, left, right, .. }
+            | Self::AddCarry { destination, left, right, .. }
+            | Self::ConditionalSelect { destination, if_true: left, if_false: right, .. }
+            | Self::AddExtended { destination, left, right, .. }
+            | Self::Divide { destination, left, right, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = gpr_mask(left) | gpr_mask(right);
+            }
+            Self::MoveKeep { destination, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = gpr_mask(destination);
+            }
+            Self::Shift { destination, source, .. }
+            | Self::OneSource { destination, source, .. }
+            | Self::Extend { destination, source, .. }
+            | Self::Extract { destination, source, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = gpr_mask(source);
+            }
+            Self::VariableShift { destination, source, amount, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = gpr_mask(source) | gpr_mask(amount);
+            }
+            Self::Insert { destination, source, kind, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = gpr_mask(source) | if matches!(kind, IrInsertKind::Bfi | IrInsertKind::Bfxil) { gpr_mask(destination) } else { 0 };
+            }
+            Self::MultiplyAdd { destination, left, right, addend, .. }
+            | Self::WideningMultiply { destination, left, right, addend, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = gpr_mask(left) | gpr_mask(right) | addend.map(gpr_mask).unwrap_or(0);
+            }
+            Self::Compare { left, right, .. } | Self::ConditionalCompare { left, right, .. } => {
+                effects.uses = gpr_mask(left) | match right {
+                    IrCompareOperand::Register { register, .. } | IrCompareOperand::Extended { register, .. } => gpr_mask(register),
+                    IrCompareOperand::Immediate(_) => 0,
+                };
+            }
+            Self::Load { destination, address, writeback, .. } => {
+                effects.definitions = gpr_mask(destination) | writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address);
+            }
+            Self::Store { value, address, writeback, .. } => {
+                effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address) | operand_gpr_mask(value);
+            }
+            Self::LoadPair { first, second, address, writeback, .. } => {
+                effects.definitions = gpr_mask(first) | gpr_mask(second) | writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address);
+            }
+            Self::StorePair { first, second, address, writeback, .. } => {
+                effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address) | gpr_mask(first) | gpr_mask(second);
+            }
+            Self::FloatLoad { address, writeback, .. } | Self::FloatStore { address, writeback, .. } => {
+                effects.definitions = writeback.map(|update| gpr_mask(update.base)).unwrap_or(0);
+                effects.uses = address_gpr_mask(address);
+            }
+            Self::AtomicLoad { destination, address, .. } => {
+                effects.definitions = gpr_mask(destination);
+                effects.uses = address_gpr_mask(address);
+            }
+            Self::AtomicStore { status, address, value, .. } => {
+                effects.definitions = status.map(gpr_mask).unwrap_or(0);
+                effects.uses = address_gpr_mask(address) | gpr_mask(value);
+            }
+            Self::ScalarIntFloatConvert { destination, source, .. } => {
+                let integer = |register| match register {
+                    IrConversionRegister::Integer { index, wide } => gpr_mask(Register { index: index as u32, wide, stack_pointer: false }.into()),
+                    IrConversionRegister::Float { .. } => 0,
+                };
+                effects.definitions = integer(destination);
+                effects.uses = integer(source);
+            }
+            Self::ConditionalBranch { condition, .. } => {
+                effects.uses = match condition {
+                    IrCondition::Zero { register, .. } | IrCondition::Bit { register, .. } => gpr_mask(register),
+                    IrCondition::Flags(_) => 0,
+                };
+            }
+            Self::IndirectBranch { target } | Self::Return { target: Some(target) } => effects.uses = gpr_mask(target),
+            Self::IndirectCall { target } => {
+                effects.uses = gpr_mask(target);
+                effects.barrier = true;
+            }
+            Self::DirectCall { .. } | Self::TargetSpecific => effects.barrier = true,
+        }
+        // Calls do not yet have a proven side-effect summary. Treat all GPRs
+        // as unknown, including callee-saved registers, rather than infer ABI
+        // compliance. Target-specific operations and data use the same barrier.
+        if effects.barrier { effects.definitions = u32::MAX; }
+        effects
+    }
 }
 
 impl IrOperation {
@@ -444,6 +605,7 @@ impl IrOperation {
             | Self::ScalarFloatMove { .. }
             | Self::ScalarFloatBinary { .. }
             | Self::ScalarFloatUnary { .. }
+            | Self::ScalarFloatMultiplyAdd(..)
             | Self::FloatLoad { .. } | Self::FloatStore { .. }
         );
         let consumed_flags = if consumes_flags {
@@ -1021,6 +1183,16 @@ impl IrOperation {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
                 let function = match operator { IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint" };
                 Some(format!("{} = {function}({});", register(destination), register(source)))
+            }
+            Self::ScalarFloatMultiplyAdd(operation) => {
+                flow.write_v(operation.destination as u32, None);
+                let IrFloatMultiplyAdd { destination, left, right, addend, precision, subtract_product, negate_result } = operation;
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let function = match (subtract_product, negate_result) {
+                    (false, false) => "fmadd", (true, false) => "fmsub",
+                    (false, true) => "fnmadd", (true, true) => "fnmsub",
+                };
+                Some(format!("{} = {function}({}, {}, {});", register(destination), register(left), register(right), register(addend)))
             }
             Self::ScalarFloatCompare { left, right, precision } => {
                 let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
@@ -2206,6 +2378,7 @@ enum Operation {
     },
     ScalarFloatMove { destination: u8, source: u8, precision: IrFloatPrecision },
     ScalarFloatUnary { destination: u8, source: u8, precision: IrFloatPrecision, operator: IrFloatUnaryOperator },
+    ScalarFloatMultiplyAdd(IrFloatMultiplyAdd),
     ScalarFloatCompare { left: u8, right: Option<u8>, precision: IrFloatPrecision },
     ScalarFloatConvert { destination: u8, destination_precision: IrFloatPrecision, source: u8, source_precision: IrFloatPrecision },
     ScalarIntFloatConvert { destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8> },
@@ -2447,6 +2620,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::ScalarFloatBinary { destination, left, right, precision, operator } => IrOperation::ScalarFloatBinary { destination, left, right, precision, operator },
         Operation::ScalarFloatMove { destination, source, precision } => IrOperation::ScalarFloatMove { destination, source, precision },
         Operation::ScalarFloatUnary { destination, source, precision, operator } => IrOperation::ScalarFloatUnary { destination, source, precision, operator },
+        Operation::ScalarFloatMultiplyAdd(operation) => IrOperation::ScalarFloatMultiplyAdd(operation),
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
         Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
@@ -4363,9 +4537,29 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
         return Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits: None };
     }
+    // Scalar fused multiply-add group (`FMADD`/`FMSUB`/`FNMADD`/`FNMSUB`):
+    // Bit 15 subtracts the product from Ra; bit 21 negates the fused result.
+    // Bits 31-23 fix the scalar group, so vector forms stay with the SIMD
+    // fallback. Only single and double precision are modeled.
+    if word & 0xff80_0000 == 0x1f00_0000 {
+        let precision = match (word >> 22) & 3 {
+            0 => IrFloatPrecision::Single,
+            1 => IrFloatPrecision::Double,
+            _ => return Operation::Opaque,
+        };
+        return Operation::ScalarFloatMultiplyAdd(IrFloatMultiplyAdd {
+            destination: (word & 31) as u8,
+            left: ((word >> 5) & 31) as u8,
+            right: ((word >> 16) & 31) as u8,
+            addend: ((word >> 10) & 31) as u8,
+            precision,
+            subtract_product: word & (1 << 15) != 0,
+            negate_result: word & (1 << 21) != 0,
+        });
+    }
     // Scalar single/double two-source arithmetic and minimum/maximum. Keep the
-    // whitelist narrow: other FP data-processing encodings (FCSel, the fused
-    // multiply-add group, and the estimate forms) remain explicit
+    // whitelist narrow: other FP data-processing encodings (FCSEL and the
+    // estimate forms) remain explicit
     // target-specific IR. FMAX/FMIN propagate NaN and raise the FP exception
     // flags; FMAXNM/FMINNM implement the IEEE 754-2008 minNum/maxNum selection.
     if matches!(word & 0xff20_fc00, 0x1e20_0800 | 0x1e20_1800 | 0x1e20_2800 | 0x1e20_3800 | 0x1e20_4800 | 0x1e20_5800 | 0x1e20_6800 | 0x1e20_7800) {
@@ -5939,6 +6133,18 @@ impl Operation {
                 let op = match operator { IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint" };
                 format!("{} = {}({});{}", register(destination), op, register(source), source_value.map(|_| String::new()).unwrap_or_default())
             }
+            Self::ScalarFloatMultiplyAdd(operation) => {
+                // The preview does not fold fused multiply-adds, so the destination
+                // becomes an unknown barrier; provenance is not carried.
+                flow.write_v(operation.destination as u32, None);
+                let IrFloatMultiplyAdd { destination, left, right, addend, precision, subtract_product, negate_result } = operation;
+                let register = |index: u8| format!("{}{index}", match precision { IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' });
+                let function = match (subtract_product, negate_result) {
+                    (false, false) => "fmadd", (true, false) => "fmsub",
+                    (false, true) => "fnmadd", (true, true) => "fnmsub",
+                };
+                format!("{} = {function}({}, {}, {});", register(destination), register(left), register(right), register(addend))
+            }
             Self::ScalarFloatImmediate { destination, precision, bits, immediate } => {
                 flow.write_v(destination as u32, Some(VKnownValue { value: bits as u128, origins: vec![pc] }));
                 let register = match precision { IrFloatPrecision::Single => format!("s{destination}"), IrFloatPrecision::Double => format!("d{destination}") };
@@ -6091,6 +6297,158 @@ fn flows_equal(a: &Flow, b: &Flow) -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SsaOrigin { Entry, Instruction(u64), Phi(usize), Barrier(u64) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SsaValue { register: u8, origin: SsaOrigin }
+
+impl SsaValue {
+    fn name(self) -> String {
+        let register = if self.register == 31 { "sp".into() } else { format!("x{}", self.register) };
+        match self.origin {
+            SsaOrigin::Entry => format!("{register}@entry"),
+            SsaOrigin::Instruction(pc) => format!("{register}@{pc:#x}"),
+            SsaOrigin::Phi(block) => format!("{register}@B{block}"),
+            SsaOrigin::Barrier(pc) => format!("{register}@unknown({pc:#x})"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SsaPhi { value: SsaValue, incoming: Vec<(Option<usize>, SsaValue)> }
+
+#[derive(Debug)]
+struct SsaInstruction { uses: Vec<SsaValue>, definitions: Vec<SsaValue>, barrier: bool }
+
+#[derive(Debug)]
+struct SsaAnalysis {
+    phis: Vec<Vec<SsaPhi>>,
+    instructions: std::collections::BTreeMap<u64, SsaInstruction>,
+}
+
+fn registers_in(mask: u32) -> impl Iterator<Item = u8> {
+    (0..32u8).filter(move |register| mask & (1u32 << register) != 0)
+}
+
+fn instruction_gpr_effects(instruction: &LiftedInstruction) -> GprEffects {
+    if instruction.data { GprEffects { definitions: u32::MAX, barrier: true, ..GprEffects::default() } }
+    else { instruction.portable.gpr_effects() }
+}
+
+/// Pruned GPR SSA over the bounded preview CFG (at most 128 instructions).
+/// Definitions and uses retain instruction addresses; phi inputs retain their
+/// predecessor. Entry values are unknown inputs, never recovered parameters.
+fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    let blocks = &function.cfg.blocks;
+    let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new() };
+    if blocks.is_empty() { return result; }
+    let instruction_at = |pc: u64| &function.instructions[((pc - function.start) / 4) as usize];
+    let mut definitions = vec![0u32; blocks.len()];
+    let mut uses = vec![0u32; blocks.len()];
+    for (index, block) in blocks.iter().enumerate().filter(|(_, block)| block.reachable) {
+        for &pc in &block.instructions {
+            let effects = instruction_gpr_effects(instruction_at(pc));
+            uses[index] |= effects.uses & !definitions[index];
+            definitions[index] |= effects.definitions;
+        }
+    }
+    // Monotone bitsets: each of the 32 bits can enter each block once.
+    let mut live_in = uses.clone();
+    loop {
+        let mut changed = false;
+        for index in (0..blocks.len()).rev().filter(|&index| blocks[index].reachable) {
+            let live_out = blocks[index].successors.iter().fold(0, |mask, &successor| mask | live_in[successor]);
+            let next = uses[index] | (live_out & !definitions[index]);
+            changed |= next != live_in[index];
+            live_in[index] = next;
+        }
+        if !changed { break; }
+    }
+    for register in 0..32u8 {
+        let mask = 1u32 << register;
+        // The synthetic entry definition matters when only one branch writes
+        // the register, and for loop-carried values with an external input.
+        let mut work = VecDeque::from([0usize]);
+        let mut visited = BTreeSet::from([0usize]);
+        for (index, block) in blocks.iter().enumerate() {
+            if block.reachable && definitions[index] & mask != 0 && visited.insert(index) { work.push_back(index); }
+        }
+        let mut placed = BTreeSet::new();
+        while let Some(index) = work.pop_front() {
+            for &frontier in &blocks[index].dominance_frontiers {
+                if live_in[frontier] & mask == 0 || !placed.insert(frontier) { continue; }
+                result.phis[frontier].push(SsaPhi { value: SsaValue { register, origin: SsaOrigin::Phi(frontier) }, incoming: Vec::new() });
+                if visited.insert(frontier) { work.push_back(frontier); }
+            }
+        }
+    }
+    // Select the deepest strict dominator, irrespective of address order.
+    let mut children = vec![Vec::new(); blocks.len()];
+    for (index, block) in blocks.iter().enumerate().skip(1).filter(|(_, block)| block.reachable) {
+        if let Some(&parent) = block.dominators.iter().filter(|&&dominator| dominator != index)
+            .max_by_key(|&&dominator| blocks[dominator].dominators.len()) {
+            children[parent].push(index);
+        }
+    }
+    let mut current = [SsaOrigin::Entry; 32];
+    // Iterative dominator-tree traversal avoids recursion. Restoring the array
+    // on exit keeps sibling definitions from leaking into one another.
+    enum Visit { Enter(usize), Exit(Box<[SsaOrigin; 32]>) }
+    let mut pending = vec![Visit::Enter(0)];
+    while let Some(visit) = pending.pop() {
+        let index = match visit {
+            Visit::Exit(saved) => { current = *saved; continue; }
+            Visit::Enter(index) => index,
+        };
+        pending.push(Visit::Exit(Box::new(current)));
+        for phi in &mut result.phis[index] {
+            if index == 0 {
+                phi.incoming.push((None, SsaValue { register: phi.value.register, origin: SsaOrigin::Entry }));
+            }
+            current[phi.value.register as usize] = phi.value.origin;
+        }
+        for &pc in &blocks[index].instructions {
+            let effects = instruction_gpr_effects(instruction_at(pc));
+            let uses = registers_in(effects.uses).map(|register| SsaValue { register, origin: current[register as usize] }).collect();
+            let definitions = registers_in(effects.definitions).map(|register| {
+                let origin = if effects.barrier { SsaOrigin::Barrier(pc) } else { SsaOrigin::Instruction(pc) };
+                current[register as usize] = origin;
+                SsaValue { register, origin }
+            }).collect();
+            result.instructions.insert(pc, SsaInstruction { uses, definitions, barrier: effects.barrier });
+        }
+        for &successor in &blocks[index].successors {
+            for phi in &mut result.phis[successor] {
+                phi.incoming.push((Some(index), SsaValue { register: phi.value.register, origin: current[phi.value.register as usize] }));
+            }
+        }
+        pending.extend(children[index].iter().rev().map(|&child| Visit::Enter(child)));
+    }
+    for phis in &mut result.phis {
+        for phi in phis { phi.incoming.sort_by_key(|(predecessor, _)| *predecessor); }
+    }
+    result
+}
+
+/// Keep SSA evidence from consuming the instruction preview's output budget.
+/// Parsers continue to use the original statement before `// word=`.
+struct SsaOutputBudget { remaining: usize, exhausted: bool }
+
+impl SsaOutputBudget {
+    fn emit(&mut self, out: &mut String, evidence: &str) {
+        if self.exhausted { return; }
+        if evidence.len() <= self.remaining {
+            out.push_str(evidence);
+            self.remaining -= evidence.len();
+        } else {
+            out.push_str("  // SSA evidence truncated at per-function output budget\n");
+            self.exhausted = true;
+        }
+    }
+}
+
 /// Resolve only call argument registers defined by modeled instructions in the
 /// same bounded straight-line region. A branch in the scan window rejects the
 /// entire result because its target could skip definitions; calls and opaque
@@ -6183,7 +6541,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v45; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v46; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -6275,6 +6633,7 @@ pub fn render(
                 backedges: Vec::new(),
                 reachable: false,
                 dominators: Vec::new(),
+                dominance_frontiers: Vec::new(),
             });
         }
         if blocks.is_empty() {
@@ -6414,8 +6773,17 @@ pub fn render(
             }
         }
 
+        // SSA construction: place phi nodes and rename registers.
+        let ssa = build_ssa(&function_ir);
+        let mut ssa_budget = SsaOutputBudget { remaining: 4_000, exhausted: false };
+        out.push_str("  // GPR SSA: W/X share an identity; entry/unknown values carry no source type; FP, flags, memory SSA, and implicit call arguments unresolved\n");
+
         // Render phase: render each block in address order using final entry flows.
         for (bi, block) in blocks.iter().enumerate() {
+            for phi in &ssa.phis[bi] {
+                let incoming = phi.incoming.iter().map(|(predecessor, value)| format!("{}:{}", predecessor.map(|index| format!("B{index}")).unwrap_or_else(|| "entry".into()), value.name())).collect::<Vec<_>>().join(", ");
+                ssa_budget.emit(&mut out, &format!("  // ssa {} = phi({incoming})\n", phi.value.name()));
+            }
             let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
             for &p in &block.instructions {
                 let instruction = &function_ir.instructions[((p - function_ir.start) / 4) as usize];
@@ -6427,6 +6795,14 @@ pub fn render(
                         .unwrap_or_else(|| instruction.operation.render(&mut flow, instruction.address))
                 };
                 out.push_str(&format!("  {:#018x}  {statement} // word={:08x}\n", instruction.address, instruction.word));
+                if let Some(values) = ssa.instructions.get(&p) {
+                    if values.barrier {
+                        ssa_budget.emit(&mut out, &format!("  // ssa {p:#x} barrier=all_gprs; prior value identities invalidated\n"));
+                    } else if !values.uses.is_empty() || !values.definitions.is_empty() {
+                        let names = |values: &[SsaValue]| values.iter().map(|value| value.name()).collect::<Vec<_>>().join(",");
+                        ssa_budget.emit(&mut out, &format!("  // ssa {p:#x} uses=[{}] defs=[{}]\n", names(&values.uses), names(&values.definitions)));
+                    }
+                }
                 if out.len() >= MAX_OUTPUT {
                     break;
                 }
@@ -6503,6 +6879,47 @@ mod tests {
             let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
             assert!(report.contains(expected), "{report}");
             assert!(!report.contains("target-specific"), "{report}");
+        }
+    }
+
+    #[test]
+    fn scalar_float_fma_lifts_to_shared_ir() {
+        let cases = [
+            (0x1f02_0c20, "s0 = fmadd(s1, s2, s3);"),
+            (0x1f06_9ca4, "s4 = fmsub(s5, s6, s7);"),
+            (0x1f2a_2d28, "s8 = fnmadd(s9, s10, s11);"),
+            (0x1f2e_bdac, "s12 = fnmsub(s13, s14, s15);"),
+            (0x1f42_0c20, "d0 = fmadd(d1, d2, d3);"),
+            (0x1f46_9ca4, "d4 = fmsub(d5, d6, d7);"),
+            (0x1f6a_2d28, "d8 = fnmadd(d9, d10, d11);"),
+            (0x1f6e_bdac, "d12 = fnmsub(d13, d14, d15);"),
+        ];
+        for (word, expected) in cases {
+            assert_eq!(lift(word, 0x1000), expected);
+            let code = word.to_le_bytes();
+            let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("target-specific"), "{report}");
+        }
+    }
+
+    #[test]
+    fn scalar_float_fma_invalidates_only_destination_and_rejects_other_precisions() {
+        use super::{lift_operation, IrOperation, IrFloatMultiplyAdd, KnownValue, Register, VKnownValue};
+        let operation = lift_operation(decode(0x1f42_0c20, 0x1000), 0x1000);
+        assert!(matches!(operation, IrOperation::ScalarFloatMultiplyAdd(IrFloatMultiplyAdd { destination: 0, left: 1, right: 2, addend: 3, .. })));
+        let mut flow = Flow::new();
+        flow.flags = Some(0b0110);
+        for index in 0..4 { flow.write_v(index, Some(VKnownValue { value: 1, origins: vec![0xffc] })); }
+        let x0 = Register { index: 0, wide: true, stack_pointer: false };
+        flow.write(x0, Some(KnownValue { value: 7, origins: vec![0xffc] }));
+        operation.render(&mut flow, 0x1000);
+        assert!(flow.read_v(0).is_none());
+        assert!(flow.read_v(1).is_some());
+        assert_eq!(flow.read(x0).map(|value| value.value), Some(7));
+        assert_eq!(flow.flags, Some(0b0110));
+        for word in [0x1f82_0c20, 0x1fc2_0c20, 0x9f42_0c20] {
+            assert!(!matches!(lift_operation(decode(word, 0x1000), 0x1000), IrOperation::ScalarFloatMultiplyAdd(_)));
         }
     }
 
@@ -8350,5 +8767,163 @@ mod tests {
         assert!(report.contains("/* msr TPIDR_EL0, x0 */"));
         assert!(report.contains("x1 = x0 + 0x1;"));
         assert!(report.contains("constant=0x6"));
+    }
+}
+
+#[cfg(test)]
+mod ssa_tests {
+    use super::*;
+
+    fn reg(index: u8, bits: u8) -> IrRegister {
+        IrRegister { class: IrRegisterClass::General, index, bits }
+    }
+    fn define(index: u8) -> IrOperation {
+        IrOperation::Assign { destination: reg(index, 64), value: IrOperand::Constant(1) }
+    }
+    fn copy(destination: u8, source: u8, bits: u8) -> IrOperation {
+        IrOperation::Assign { destination: reg(destination, bits), value: IrOperand::Register(reg(source, bits)) }
+    }
+    fn fixture(operations: &[Vec<IrOperation>], successors: &[Vec<usize>]) -> FunctionIr {
+        let mut instructions = Vec::new();
+        let mut blocks = Vec::new();
+        for (index, operations) in operations.iter().enumerate() {
+            let start = 0x1000 + instructions.len() as u64 * 4;
+            let mut pcs = Vec::new();
+            for &portable in operations {
+                let address = 0x1000 + instructions.len() as u64 * 4;
+                pcs.push(address);
+                instructions.push(LiftedInstruction { address, word: 0, portable, operation: Operation::Opaque, data: false });
+            }
+            blocks.push(BasicBlock { start, instructions: pcs, successors: successors[index].clone(), predecessors: Vec::new(),
+                backedges: Vec::new(), reachable: false, dominators: Vec::new(), dominance_frontiers: Vec::new() });
+        }
+        for (index, edges) in successors.iter().enumerate() {
+            for &target in edges { blocks[target].predecessors.push(index); }
+        }
+        FunctionCfg::analyze(&mut blocks);
+        FunctionIr { start: 0x1000, end: 0x1000 + instructions.len() as u64 * 4, instructions, cfg: FunctionCfg { blocks } }
+    }
+    fn value(register: u8, origin: SsaOrigin) -> SsaValue { SsaValue { register, origin } }
+
+    #[test]
+    fn versions_preserve_w_x_aliases_and_read_before_write() {
+        let function = fixture(&[vec![define(0), copy(0, 0, 32), copy(1, 0, 64)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.instructions[&0x1004].uses, [value(0, SsaOrigin::Instruction(0x1000))]);
+        assert_eq!(ssa.instructions[&0x1004].definitions, [value(0, SsaOrigin::Instruction(0x1004))]);
+        assert_eq!(ssa.instructions[&0x1008].uses, [value(0, SsaOrigin::Instruction(0x1004))]);
+    }
+
+    #[test]
+    fn one_arm_definition_merges_with_unknown_entry_at_a_diamond() {
+        let function = fixture(&[vec![IrOperation::Nop], vec![define(0)], vec![IrOperation::Nop], vec![copy(1, 0, 64)]],
+            &[vec![1, 2], vec![3], vec![3], vec![]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.phis[3].len(), 1);
+        assert_eq!(ssa.phis[3][0].incoming, [(Some(1), value(0, SsaOrigin::Instruction(0x1004))), (Some(2), value(0, SsaOrigin::Entry))]);
+        assert_eq!(ssa.instructions[&0x100c].uses, [value(0, SsaOrigin::Phi(3))]);
+    }
+
+    #[test]
+    fn two_arm_definitions_create_one_phi_with_distinct_predecessor_values() {
+        let function = fixture(&[vec![IrOperation::Nop], vec![define(0)], vec![define(0)], vec![copy(1, 0, 64)]],
+            &[vec![1, 2], vec![3], vec![3], vec![]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.phis[3].len(), 1);
+        assert_eq!(ssa.phis[3][0].incoming, [(Some(1), value(0, SsaOrigin::Instruction(0x1004))), (Some(2), value(0, SsaOrigin::Instruction(0x1008)))]);
+    }
+
+    #[test]
+    fn entry_loop_phi_retains_external_input_and_backedge_definition() {
+        let function = fixture(&[vec![copy(1, 0, 64)], vec![define(0)], vec![copy(2, 0, 64)]],
+            &[vec![1, 2], vec![0], vec![]]);
+        assert!(function.cfg.blocks[0].dominance_frontiers.contains(&0));
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.phis[0].len(), 1);
+        assert_eq!(ssa.phis[0][0].incoming, [(None, value(0, SsaOrigin::Entry)), (Some(1), value(0, SsaOrigin::Instruction(0x1004)))]);
+        assert_eq!(ssa.instructions[&0x1000].uses, [value(0, SsaOrigin::Phi(0))]);
+        assert_eq!(ssa.instructions[&0x1008].uses, [value(0, SsaOrigin::Phi(0))]);
+    }
+
+    #[test]
+    fn loop_header_phi_retains_preheader_and_backedge_definitions() {
+        let function = fixture(&[vec![define(0)], vec![copy(1, 0, 64)], vec![define(0)], vec![copy(2, 0, 64)]],
+            &[vec![1], vec![2, 3], vec![1], vec![]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.phis[1].len(), 1);
+        assert_eq!(ssa.phis[1][0].incoming, [(Some(0), value(0, SsaOrigin::Instruction(0x1000))), (Some(2), value(0, SsaOrigin::Instruction(0x1008)))]);
+        assert_eq!(ssa.instructions[&0x100c].uses, [value(0, SsaOrigin::Phi(1))]);
+    }
+
+    #[test]
+    fn renaming_uses_dominator_depth_when_address_order_differs() {
+        let function = fixture(&[vec![IrOperation::Nop], vec![define(0)], vec![copy(1, 0, 64)], vec![define(0)]],
+            &[vec![3], vec![2], vec![], vec![1]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.instructions[&0x1008].uses, [value(0, SsaOrigin::Instruction(0x1004))]);
+    }
+
+    #[test]
+    fn unreachable_predecessors_and_dead_values_do_not_create_phis() {
+        let function = fixture(&[vec![IrOperation::Nop], vec![define(0), define(2)], vec![define(0), define(2)], vec![copy(1, 0, 64)], vec![define(0)]],
+            &[vec![1, 2], vec![3], vec![3], vec![], vec![3]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.phis[3].len(), 1);
+        assert_eq!(ssa.phis[3][0].incoming.len(), 2);
+        assert!(!ssa.instructions.contains_key(&0x1018));
+    }
+
+    #[test]
+    fn calls_unknown_instructions_and_data_replace_prior_identities() {
+        for operation in [IrOperation::DirectCall { target: 0x2000 }, IrOperation::IndirectCall { target: reg(0, 64) }, IrOperation::TargetSpecific, IrOperation::Nop] {
+            let mut function = fixture(&[vec![define(0), operation, copy(1, 0, 64)]], &[vec![]]);
+            if matches!(operation, IrOperation::Nop) { function.instructions[1].data = true; }
+            let ssa = build_ssa(&function);
+            assert!(ssa.instructions[&0x1004].barrier);
+            assert_eq!(ssa.instructions[&0x1004].definitions.len(), 32);
+            assert_eq!(ssa.instructions[&0x1008].uses, [value(0, SsaOrigin::Barrier(0x1004))]);
+            if matches!(operation, IrOperation::IndirectCall { .. }) {
+                assert_eq!(ssa.instructions[&0x1004].uses, [value(0, SsaOrigin::Instruction(0x1000))]);
+            }
+        }
+    }
+
+    #[test]
+    fn gpr_effects_include_address_indices_writeback_status_and_read_modify_write() {
+        let sp = IrRegister { class: IrRegisterClass::StackPointer, index: 31, bits: 64 };
+        let address = IrMemoryAddress::BaseIndex { base: sp, index: reg(2, 32), extension: Some(IrExtension::Zero(32)), scale: 3 };
+        let operations = [
+            (IrOperation::Address { destination: reg(0, 64), value: 0x2000, page: false }, 0, 1),
+            (IrOperation::MoveKeep { destination: reg(0, 64), value: 1, shift: 16 }, 1, 1),
+            (IrOperation::VariableShift { destination: reg(0, 64), source: reg(1, 64), amount: reg(2, 64), kind: IrVariableShiftKind::Left }, 6, 1),
+            (IrOperation::Insert { destination: reg(0, 64), source: reg(1, 64), lsb: 8, width: 8, kind: IrInsertKind::Bfi }, 3, 1),
+            (IrOperation::Insert { destination: reg(0, 64), source: reg(1, 64), lsb: 8, width: 8, kind: IrInsertKind::Ubfiz }, 2, 1),
+            (IrOperation::Load { destination: reg(0, 64), address, bytes: 8, signed: false, writeback: None }, (1 << 31) | 4, 1),
+            (IrOperation::FloatStore { source: IrFloatRegister { index: 0, precision: IrFloatPrecision::Double }, address: IrMemoryAddress::BaseOffset { base: sp, offset: 8 }, bytes: 8, writeback: Some(IrWriteback { base: sp, offset: 8, pre_index: false }) }, 1 << 31, 1 << 31),
+            (IrOperation::AtomicStore { status: Some(reg(0, 32)), address, value: reg(1, 64), bytes: 8, ordering: IrAtomicOrdering::Release, exclusive: true }, (1 << 31) | 6, 1),
+            (IrOperation::Compare { kind: IrCompareKind::Compare, left: reg(0, 64), right: IrCompareOperand::Extended { register: reg(2, 32), extension: Some(IrExtension::Sign(32)), shift: None } }, 5, 0),
+            (IrOperation::ConditionalBranch { target: 0x2000, condition: IrCondition::Bit { register: reg(1, 64), bit: 0, nonzero: true } }, 2, 0),
+        ];
+        for (operation, uses, definitions) in operations {
+            let effects = operation.gpr_effects();
+            assert_eq!((effects.uses, effects.definitions), (uses, definitions), "{operation:?}");
+        }
+        assert_eq!(gpr_mask(IrRegister { class: IrRegisterClass::Zero, index: 31, bits: 64 }), 0);
+    }
+
+    #[test]
+    fn reports_publish_deterministic_ssa_evidence_without_hiding_instructions() {
+        // cbz x2, join; mov w0, #1; join: mov x1, x0; ret
+        let words = [0xb400_0042u32, 0x5280_0020, 0xaa00_03e1, 0xd65f_03c0];
+        let code = words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let report = render(&code, 0x1000, 0, &[0x1000], &[]);
+        assert!(report.contains("x0@B2 = phi(B0:x0@entry, B1:x0@0x1004)"), "{report}");
+        assert!(report.contains("ssa 0x1008 uses=[x0@B2] defs=[x1@0x1008]"), "{report}");
+        assert_eq!(report, render(&code, 0x1000, 0, &[0x1000], &[]));
+        let long_code = (0..MAX_WORDS_PER_FUNCTION).flat_map(|_| 0x9100_0400u32.to_le_bytes()).collect::<Vec<_>>();
+        let report = render(&long_code, 0x1000, 0, &[0x1000], &[]);
+        assert_eq!(report.matches("SSA evidence truncated").count(), 1);
+        assert_eq!(report.lines().filter(|line| line.trim_start().starts_with("0x")).count(), MAX_WORDS_PER_FUNCTION);
+        assert!(report.len() < MAX_OUTPUT);
     }
 }

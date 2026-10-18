@@ -48,8 +48,21 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v45` banner identifies the statement set that
+`AArch64 register semantics v46` banner identifies the statement set that
 produced a preview.
+
+The v46 preview includes bounded GPR SSA evidence in separate `// ssa` lines.
+A value such as `x0@0x1004` names the definition at that instruction, while
+`x0@B3 = phi(B1:x0@0x1004, B2:x0@entry)` records the reaching values from each
+reachable predecessor. Entry values are unknown inputs. W/X register views
+share a physical identity, and SP has a distinct identity from the zero register.
+The original instruction retains the operand widths; SSA names imply no source
+name or type. Calls, data, and target-specific operations invalidate all GPR
+identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
+Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
+SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
+The analysis/cache identity is `arm64-analysis-v80-schema122`; the report fields
+and cache-envelope schema are unchanged.
 
 Statements name machine registers. `RET` labels x0 only as an ABI result-register
 candidate because the return type is unknown. `BL` does not infer argument
