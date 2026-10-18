@@ -4,8 +4,20 @@
 #include <stdio.h>
 
 static volatile long argument_sink;
+extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 
-@interface ABISample : NSObject
+@protocol ABIParent
+- (NSInteger)parentValue;
+@end
+
+@protocol ABIRecovered <ABIParent>
+- (int)castValue:(signed char)value;
+@optional
++ (id)makeOptional;
+- (double)optionalRatio:(float)ratio;
+@end
+
+@interface ABISample : NSObject <ABIRecovered>
 - (void *)pointer;
 - (double)scalar;
 - (float)single;
@@ -18,6 +30,8 @@ static volatile long argument_sink;
 @end
 
 @implementation ABISample
+- (NSInteger)parentValue { return 3; }
+- (int)castValue:(signed char)value { return value; }
 - (void *)pointer { return (void *)0x1234; }
 - (double)scalar { return 1.5; }
 - (float)single { return 2.5f; }
@@ -36,6 +50,8 @@ static volatile long argument_sink;
 int main(void) {
     @autoreleasepool {
         ABISample *sample = [ABISample new];
+        char buffer[8];
+        known_memset(buffer, -1, sizeof(buffer));
         printf("%p %f\n", [sample pointer], [sample scalar]);
         return 0;
     }

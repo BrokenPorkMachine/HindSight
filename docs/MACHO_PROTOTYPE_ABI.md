@@ -4,7 +4,7 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v1` in analysis/cache/continuity identities.
+`prototype-abi-v2` in analysis/cache/continuity identities.
 
 Supported Apple ARM64 LP64 rules include:
 
@@ -35,6 +35,26 @@ indirect calls and returns, including structured conditional returns. The API
 catalog includes printf/fprintf/sprintf/snprintf and NSLog fixed prototypes;
 anonymous variadic arguments carry an explicit unresolved marker.
 
+Proven GP argument constants now retain the formal source type. Pseudocode casts
+interpret the low ABI bits at the declared width, including signed narrow
+integers, unsigned values, pointer aliases and booleans. Evidence keeps the raw
+register value and instruction provenance beside the cast. Pointer casts do not
+assert pointee validity. Noncanonical bool representations remain explicit
+bitcasts instead of silently becoming true. Arguments without a supported
+prototype retain raw machine values.
+
+Foundation catalog refinements must agree with the runtime encoding's ABI
+width, register class and integer interpretation. A conflicting encoding keeps
+its own declaration and reports the SDK conflict instead of adopting the catalog.
+
+Validated protocol objects now contribute scoped method declarations to Call
+Values, preserving required/optional and class/instance membership. Each
+prototype retains its protocol name and ABI interpretation, and explicitly marks
+its implementation as unproven. A selector shared by different protocols does
+not establish one dispatch signature. Missing protocol implementations do not
+create functions, call targets or function boundaries. Object size/extents and
+supported selector/type encodings are checked before prototype reconstruction.
+
 Unknown typedefs and aggregate layouts can change both register banks and stack
 offsets. The unsupported parameter and subsequent bindings remain unresolved.
 Nested Itanium names do not prove whether a function needs an implicit C++
@@ -43,6 +63,8 @@ receiver; those argument bindings remain unresolved without membership evidence.
 This is progress toward complete resolution. It does not recover arbitrary C/C++
 layouts, Swift ABI, DWARF types, user header libraries, stack-passed values,
 anonymous variadic values, hidden ABI attributes, or caller/callee constraints.
+Protocol inheritance/conformance propagation, extended method-type tables and
+conflict resolution across receiver hypotheses remain open.
 Unresolved GP return candidates and register-use arity evidence remain explicitly
 weaker than source declarations. Objective-C selector evidence alone does not
 establish a receiver class or uniquely select a method prototype.

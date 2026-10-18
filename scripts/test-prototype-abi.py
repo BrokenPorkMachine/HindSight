@@ -13,6 +13,36 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+def analyze(worker, binary):
+    data = binary.read_bytes()
+    reply = subprocess.run([str(worker), "--analyze", str(binary), hashlib.sha256(data).hexdigest(),
+                            str(len(data)), str(uuid.uuid4())], capture_output=True, check=True, timeout=120)
+    length = struct.unpack(">I", reply.stdout[:4])[0]
+    assert length <= 32 * 1024 * 1024 and len(reply.stdout) == length + 4
+    report = json.loads(reply.stdout[4:])
+    assert report["kind"] == "analysis_result", report
+    return report
+
+
+def file_offset(data, address):
+    # The fixture compiler emits a thin, little-endian 64-bit Mach-O.
+    assert data[:4] == bytes.fromhex("cffaedfe")
+    count = struct.unpack_from("<I", data, 16)[0]
+    at = 32
+    for _ in range(count):
+        command, size = struct.unpack_from("<II", data, at)
+        assert size >= 8 and at + size <= len(data)
+        if command == 0x19:
+            sections = struct.unpack_from("<I", data, at + 64)[0]
+            for index in range(sections):
+                section = at + 72 + index * 80
+                va, extent, offset = struct.unpack_from("<QQI", data, section + 32)
+                if va <= address < va + extent:
+                    return offset + address - va
+        at += size
+    raise AssertionError("protocol VA has no fixture section mapping")
+
+
 def run(worker):
     if sys.platform != "darwin":
         print("Apple prototype ABI fixture requires macOS; skipped")
@@ -24,13 +54,7 @@ def run(worker):
                             "-fobjc-arc", "-Wl,-no_fixup_chains", "-framework", "Foundation", "-framework", "CoreGraphics",
                             str(ROOT / "Tests/Fixtures/Decompilation/abi_sample.m"), "-o", str(binary)],
                            capture_output=True, check=True, timeout=60)
-            data = binary.read_bytes()
-            reply = subprocess.run([str(worker), "--analyze", str(binary), hashlib.sha256(data).hexdigest(),
-                                    str(len(data)), str(uuid.uuid4())], capture_output=True, check=True, timeout=120)
-            length = struct.unpack(">I", reply.stdout[:4])[0]
-            assert length <= 32 * 1024 * 1024 and len(reply.stdout) == length + 4
-            report = json.loads(reply.stdout[4:])
-            assert report["kind"] == "analysis_result", report
+            report = analyze(worker, binary)
             evidence = report["call_values"]
             pseudocode = report["semantic_preview"]
 
@@ -54,10 +78,34 @@ def run(worker):
             packed = abi("packed:b:c:d:e:f:byte:half:word:pointer:")
             for index, offset, size in [(6, 0, 1), (7, 2, 2), (8, 4, 4), (9, 8, 8)]:
                 assert re.search(rf"arg{index}=stack argument \(slot \d+, sp\+0x{offset:x}, {size} bytes", packed), packed
+            assert "protocol=ABIParent membership=required-instance selector=parentValue" in evidence, evidence[-12000:]
+            assert "protocol=ABIRecovered membership=required-instance selector=castValue:" in evidence, evidence[-12000:]
+            # Runtime `c` encodes char/signed-char without a source typedef name.
+            assert "- (int)castValue:(char)arg0;" in evidence
+            assert "protocol=ABIRecovered membership=optional-class selector=makeOptional" in evidence
+            assert "@optional\n+ (id)makeOptional;" in evidence
+            assert "protocol=ABIRecovered membership=optional-instance selector=optionalRatio:" in evidence
+            assert "- (double)optionalRatio:(float)arg0;" in evidence
+            assert "implementation=unproven" in evidence
+            assert "source-cast=signed<int>; low-bits=32; raw-register=0xffffffff" in pseudocode, pseudocode[-8000:]
+            assert "(int)-1" in pseudocode and "(size_t)0x8" in pseudocode
             for declaration, returned in [("- (void *)pointer", "return x0;"), ("- (double)scalar", "return d0;"), ("- (float)single", "return s0;")]:
                 body = pseudocode.split(declaration + " {", 1)[1].split("\n}", 1)[0]
                 assert returned in body, body
             print(f"Mach-O prototype/ABI metadata and pseudocode checks passed ({optimization})")
+            if optimization == "-O2":
+                match = re.search(r"protocol (0x[0-9a-f]+) name=ABIRecovered confidence=validated", report["objc_protocols"])
+                assert match, report["objc_protocols"]
+                data = binary.read_bytes()
+                offset = file_offset(data, int(match[1], 16))
+                for bad_size in [0, 71, 0xffffffff]:
+                    malformed = bytearray(data)
+                    struct.pack_into("<I", malformed, offset + 64, bad_size)
+                    binary.write_bytes(malformed)
+                    rejected = analyze(worker, binary)
+                    assert "protocol=ABIRecovered " not in rejected["call_values"]
+                    assert "protocol=ABIParent " in rejected["call_values"]
+                print("Malformed protocol extents do not produce prototype claims")
 
 
 if __name__ == "__main__":

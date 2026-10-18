@@ -498,7 +498,7 @@ fn objc_ivar_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut St
  Ok(())
 }
 fn objc_protocol_object(file:&mut File,secs:&[SectionInfo],size:u64,pva:u64,out:&mut String,limit:&mut usize)->io::Result<()> {
- if pva==0||section_for_va(secs,pva).is_none(){return Ok(())}let Some(ph)=read_va(file,secs,size,pva,16)? else{return Ok(())};let name_va=le64(&ph[8..16]);let name=if name_va!=0{if let Some(s)=section_for_va(secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<protocol name unresolved>".into())}else{"<protocol name unresolved>".into()}}else{"<protocol name unresolved>".into()};out.push_str(&format!("  protocol {pva:#018x} name={name} confidence=validated\n"));*limit+=1;if out.len()>60_000{return Ok(())}
+ if pva==0||section_for_va(secs,pva).is_none(){return Ok(())}let Some(ph)=read_va(file,secs,size,pva,72)? else{return Ok(())};let declared_size=le32(&ph[64..68]) as usize;if !(72..=4096).contains(&declared_size)||read_va(file,secs,size,pva,declared_size)?.is_none(){return Ok(())}let name_va=le64(&ph[8..16]);let name=if name_va!=0{if let Some(s)=section_for_va(secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<protocol name unresolved>".into())}else{"<protocol name unresolved>".into()}}else{"<protocol name unresolved>".into()};let confidence=if name.starts_with('<'){"candidate"}else{"validated"};out.push_str(&format!("  protocol {pva:#018x} name={name} confidence={confidence}\n"));*limit+=1;if out.len()>60_000{return Ok(())}
  // protocol_t method-list fields follow the isa/name/protocol-list pair on 64-bit Mach-O.
  for (label,off) in [("required-instance",24usize),("required-class",32),("optional-instance",40),("optional-class",48)] {if let Some(bytes)=read_va(file,secs,size,pva,off+8)?{let list=le64(&bytes[off..off+8]);objc_method_list(file,secs,size,list,label,None,out,limit)?;}}
  Ok(())
@@ -1288,7 +1288,9 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
  let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols)?;
- let (signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls);
+ let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls);
+ let protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);
+ if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
  for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}

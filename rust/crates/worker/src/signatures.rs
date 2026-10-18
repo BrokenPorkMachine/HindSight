@@ -132,10 +132,62 @@ pub fn objc_method(name: &str, encoding: &str) -> Option<Signature> {
         }
     }
     declaration.push(';');
-    if let Some(declaration) = foundation_method(name) {
-        return Some(Signature { language: "Objective-C / Objective-C++", declaration: declaration.into(), source: "exact Foundation SDK method declaration; encoding arity validated" });
+    if let Some(sdk_declaration) = foundation_method(name) {
+        let catalog = Signature { language: "Objective-C / Objective-C++", declaration: sdk_declaration.into(), source: "exact Foundation SDK method declaration; encoding ABI validated" };
+        let mut encoded = Signature { language: "Objective-C / Objective-C++", declaration, source: "validated Objective-C method type encoding" };
+        let expected_parameters = objc_parameters(&catalog);
+        let actual_parameters = objc_parameters(&encoded);
+        let compatible = signature_return_type(&catalog).zip(signature_return_type(&encoded))
+            .is_some_and(|(expected, actual)| abi_types_agree(&expected, &actual))
+            && expected_parameters.len() == actual_parameters.len()
+            && expected_parameters.iter().zip(&actual_parameters).all(|((expected,_),(actual,_))| abi_types_agree(expected,actual));
+        if compatible { return Some(catalog); }
+        encoded.source = "validated Objective-C encoding; exact SDK declaration conflicts";
+        return Some(encoded);
     }
     Some(Signature { language: "Objective-C / Objective-C++", declaration, source: "validated Objective-C method type encoding" })
+}
+
+/// Protocol declarations carry selector/type evidence but never prove an IMP,
+/// a receiver class, or that an optional method is implemented.
+pub fn protocol_signatures(records: &str) -> String {
+    let mut owner = None::<String>;
+    let mut output = String::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for line in records.lines().take(8192) {
+        let line = line.trim();
+        if line.len() > 4096 { owner = None; continue; }
+        if line.starts_with("protocol ") {
+            owner = line.split(" name=").nth(1).and_then(|tail| tail.split_once(" confidence=")).and_then(|(name, confidence)| {
+                (confidence == "validated" && !name.is_empty() && name.len() <= 256 &&
+                    name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.'))).then(||name.to_string())
+            });
+            continue;
+        }
+        if line.starts_with("category ") || line.starts_with("reference ") { owner = None; }
+        let Some(owner) = owner.as_deref() else { continue; };
+        let Some((kind, _)) = line.split_once(" method ") else { continue; };
+        if !matches!(kind, "required-instance" | "required-class" | "optional-instance" | "optional-class") || !line.ends_with("confidence=validated") { continue; }
+        let Some((selector, tail)) = line.split(" name=").nth(1).and_then(|tail| tail.split_once("  types=")) else { continue; };
+        if selector.is_empty() || selector.len() > 512 || !selector.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':')) { continue; }
+        let Some((encoding, _)) = tail.split_once("  imp=") else { continue; };
+        let class_method = kind.ends_with("-class");
+        // Deliberately avoid the Foundation class-name catalog for protocols.
+        let synthetic = format!("{}[__protocol__{owner} {selector}]", if class_method { '+' } else { '-' });
+        let Some(signature) = objc_method(&synthetic, encoding) else { continue; };
+        let key = (owner.to_owned(), kind.to_owned(), selector.to_owned(), encoding.to_owned());
+        if !seen.insert(key) { continue; }
+        let row = format!("protocol={owner} membership={kind} selector={selector} source=validated-protocol-method-encoding implementation=unproven\n@protocol {owner}\n@{}\n{}\n@end\n    ABI profile=Apple-arm64-LP64 bindings=[{}] result={}\n",
+            if kind.starts_with("optional-") { "optional" } else { "required" }, signature.declaration,
+            abi_parameter_bindings(Some(&signature), &[]).join(", "), render_signature_return(Some(&signature)));
+        if output.len() + row.len() > 20_000 || seen.len() > 128 {
+            output.push_str("Protocol prototype output truncated at declaration/byte budget.\n");
+            break;
+        }
+        output.push_str(&row);
+    }
+    if !output.is_empty() { output.insert_str(0, "Protocol prototype evidence; declarations do not establish implementations or dispatch targets.\n"); }
+    output
 }
 
 // Exact SDK ABI declarations. No prefix or substring matching: unknown APIs stay unknown.
@@ -347,7 +399,7 @@ fn callable_name(name: &str, signature: Option<&Signature>) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AbiParameter { name: String, register: String, general_register: Option<u8> }
+struct AbiParameter { name: String, register: String, general_register: Option<u8>, source_type: Option<String> }
 
 fn split_declarators(arguments: &str) -> Vec<&str> {
     let mut result = Vec::new();
@@ -433,7 +485,7 @@ enum AbiType { Integer(u8), Float(u8), IntegerAggregate(u8), FloatAggregate(u8) 
 
 /// Apple arm64 LP64 scalar ABI. Unknown typedefs/aggregates do not receive
 /// guessed locations: their layout can change both banks and the stack cursor.
-fn abi_type(ty: &str) -> Option<AbiType> {
+fn uncomment_type(ty: &str) -> Option<String> {
     let mut normalized = String::new();
     let mut rest = ty;
     while let Some((head, tail)) = rest.split_once("/*") {
@@ -441,6 +493,11 @@ fn abi_type(ty: &str) -> Option<AbiType> {
         rest = tail.split_once("*/")?.1;
     }
     normalized.push_str(rest);
+    Some(normalized)
+}
+
+fn abi_type(ty: &str) -> Option<AbiType> {
+    let normalized = uncomment_type(ty)?;
     let ty = normalized.trim();
     if ty.contains('{') || ty.contains('}') || ty.contains('[') { return None; }
     if ty.contains('*') || ty.contains('&') || ty.contains("(^") { return Some(AbiType::Integer(8)); }
@@ -464,6 +521,42 @@ fn abi_type(ty: &str) -> Option<AbiType> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbiIntegerKind { Pointer, Boolean, Signed, Unsigned }
+
+fn abi_integer_kind(ty: &str) -> Option<AbiIntegerKind> {
+    if !matches!(abi_type(ty), Some(AbiType::Integer(_))) { return None; }
+    let normalized = uncomment_type(ty)?;
+    let simple = normalized.split_whitespace().filter(|word| !matches!(*word,
+        "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable" | "__kindof"
+    )).collect::<Vec<_>>().join(" ");
+    let pointer = normalized.contains('*') || normalized.contains('&') || normalized.contains("(^") || matches!(simple.as_str(),
+        "id" | "Class" | "SEL" | "instancetype" | "dispatch_queue_t" | "dispatch_block_t" |
+        "CFTypeRef" | "CFAllocatorRef" | "CFStringRef" | "CFArrayRef" | "CFDictionaryRef" | "CFBooleanRef" | "CFNumberRef" | "CFDataRef" |
+        "CFBundleRef" | "CFURLRef" | "CFPropertyListRef" | "CFErrorRef" | "CFRunLoopRef");
+    if pointer { return Some(AbiIntegerKind::Pointer); }
+    if matches!(simple.as_str(), "bool" | "_Bool" | "BOOL") { return Some(AbiIntegerKind::Boolean); }
+    let signed = matches!(simple.as_str(), "char" | "signed char" | "short" | "short int" | "signed short" |
+        "int" | "signed" | "signed int" | "long" | "long int" | "long long" | "long long int" |
+        "int8_t" | "int16_t" | "int32_t" | "int64_t" | "Int8" | "Int16" | "Int32" | "Int64" |
+        "intptr_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "CFIndex" | "dispatch_once_t" |
+        "CFNumberType" | "CFURLPathStyle" | "CFPropertyListFormat");
+    Some(if signed { AbiIntegerKind::Signed } else { AbiIntegerKind::Unsigned })
+}
+
+fn abi_types_agree(expected: &str, actual: &str) -> bool {
+    if expected == "void" || actual == "void" { return expected == actual; }
+    let (Some(left), Some(right)) = (abi_type(expected), abi_type(actual)) else { return false; };
+    if left != right { return false; }
+    if matches!(left, AbiType::IntegerAggregate(_) | AbiType::FloatAggregate(_)) { return expected == actual; }
+    if matches!(left, AbiType::Integer(_)) {
+        // Recover the interpretation class independently of width. Pointer,
+        // boolean, signed and unsigned encodings must not silently coerce.
+        return abi_integer_kind(expected).zip(abi_integer_kind(actual)).is_some_and(|(left,right)|left==right);
+    }
+    true
+}
+
 fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let Some(signature) = signature else { return Vec::new() };
     let is_objc = signature.language == "Objective-C / Objective-C++";
@@ -475,14 +568,14 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let mut blocked = signature.language == "C++ / Objective-C++" && signature.declaration.contains("::");
     let mut result = Vec::new();
     if is_objc {
-        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0) });
-        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1) });
+        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), source_type: Some("id".into()) });
+        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), source_type: Some("SEL".into()) });
     }
     for (ty, name) in parameters {
         let scalar = abi_type(&ty);
         if blocked || scalar.is_none() {
             let reason = if blocked { "earlier layout or implicit C++ receiver unresolved" } else { "type layout unresolved" };
-            result.push(AbiParameter { name, register: format!("unresolved_argument /* {reason}: {ty} */"), general_register: None });
+            result.push(AbiParameter { name, register: format!("unresolved_argument /* {reason}: {ty} */"), general_register: None, source_type: Some(ty) });
             blocked = true;
             continue;
         }
@@ -491,7 +584,7 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
             let (bank, prefix) = if matches!(scalar, AbiType::FloatAggregate(_)) { (&mut fp, "d") } else { (&mut gp, "x") };
             if *bank + words <= 8 {
                 let registers = (*bank..*bank + words).map(|index| format!("{prefix}{index}")).collect::<Vec<_>>().join(", ");
-                result.push(AbiParameter { name, register: format!("aggregate<{ty}>({registers})"), general_register: None });
+                result.push(AbiParameter { name, register: format!("aggregate<{ty}>({registers})"), general_register: None, source_type: Some(ty) });
                 *bank += words;
             } else {
                 // Darwin does not split these SDK aggregates between registers
@@ -499,7 +592,7 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
                 *bank = 8;
                 stack_offset = (stack_offset + 7) & !7;
                 let bytes = words as usize * 8;
-                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None });
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None, source_type: Some(ty) });
                 stack_offset += bytes;
                 stack_slot += 1;
             }
@@ -508,18 +601,18 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
         if let AbiType::Float(bytes) = scalar {
             if fp < 8 {
             let register = format!("{}{fp}", if bytes == 4 { "s" } else { "d" });
-            result.push(AbiParameter { name, register, general_register: None });
+            result.push(AbiParameter { name, register, general_register: None, source_type: Some(ty) });
             fp += 1;
             continue;
             }
         } else if gp < 8 {
-            result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp) });
+            result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp), source_type: Some(ty) });
             gp += 1;
             continue;
         }
         let bytes = match scalar { AbiType::Integer(bytes) | AbiType::Float(bytes) => bytes as usize, _ => continue };
         stack_offset = (stack_offset + bytes - 1) & !(bytes - 1);
-        result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64)"), general_register: None });
+        result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64)"), general_register: None, source_type: Some(ty) });
         stack_offset += bytes;
         stack_slot += 1;
     }
@@ -534,6 +627,37 @@ fn signature_return_type(signature: &Signature) -> Option<String> {
     let head = signature.declaration.split_once('(')?.0.trim();
     let name = head.split_whitespace().last()?.trim_start_matches('*');
     Some(head.strip_suffix(name)?.trim().into())
+}
+
+/// Interpret low ABI bits, not a C arithmetic conversion of the full X view.
+/// Casts describe source-type evidence; they do not assert pointer validity or
+/// invent aggregate/enum layouts that the prototype cannot establish.
+fn typed_gp_argument(value: u64, ty: Option<&str>) -> (String, Option<String>) {
+    let raw = format!("{value:#x}");
+    let Some(ty) = ty else { return (raw, None); };
+    let Some(AbiType::Integer(bytes)) = abi_type(ty) else { return (raw, None); };
+    let Some(kind) = abi_integer_kind(ty) else { return (raw, None); };
+    if kind == AbiIntegerKind::Pointer {
+        let rendered = if value == 0 { format!("({ty})0") } else { format!("({ty}){raw}") };
+        return (rendered, Some(format!("source-cast=pointer<{ty}>; raw-register={raw}; pointee validity unresolved")));
+    }
+    let width = u32::from(bytes) * 8;
+    let low = if width == 64 { value } else { value & ((1u64 << width) - 1) };
+    if kind == AbiIntegerKind::Boolean {
+        if low <= 1 {
+            return (format!("({ty}){}", if low == 0 { "false" } else { "true" }),
+                Some(format!("source-cast=boolean<{ty}>; low-bits={width}; raw-register={raw}")));
+        }
+        // Invalid ABI bool representations must not silently become `true`.
+        return (format!("bitcast<{ty}>({low:#x})"), Some(format!("source-cast=boolean<{ty}>; noncanonical representation; raw-register={raw}")));
+    }
+    let signed = kind == AbiIntegerKind::Signed;
+    let literal = if signed {
+        let shift = 64 - width;
+        let signed_value = ((low << shift) as i64) >> shift;
+        if signed_value < 0 { signed_value.to_string() } else { format!("{low:#x}") }
+    } else { format!("{low:#x}") };
+    (format!("({ty}){literal}"), Some(format!("source-cast={}<{ty}>; low-bits={width}; raw-register={raw}", if signed { "signed" } else { "unsigned" })))
 }
 
 fn signature_returns_void(signature: Option<&Signature>) -> bool {
@@ -601,7 +725,7 @@ fn candidate_abi_parameters(report: &str, address: u64) -> Vec<AbiParameter> {
     let candidates = incoming_parameter_candidates(report, address);
     let highest = candidates.iter().filter_map(|register| register.strip_prefix('x')?.parse::<u8>().ok()).max();
     highest.map(|highest| (0..=highest.min(7)).map(|index| AbiParameter {
-        name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index),
+        name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), source_type: None,
     }).collect()).unwrap_or_default()
 }
 
@@ -668,7 +792,7 @@ fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) ->
     let parameters = signature.map(|signature| abi_parameters(Some(signature))).unwrap_or_else(|| {
         incoming_parameter_candidates(report, address).into_iter().filter_map(|register| {
             let index = register.strip_prefix('x')?.parse::<u8>().ok()?;
-            (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index) })
+            (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), source_type: None })
         }).collect()
     });
     let mut names = BTreeMap::new();
@@ -831,7 +955,10 @@ fn render_linear_statement(
                     let mut rendered=args.iter().map(|argument|{
                         if let Some(register)=argument.general_register {
                             if let Some((value,provenance))=values.get(&register){
-                                evidence.push(format!("{}({})={value:#x} {provenance}",argument.name,argument.register));return format!("{value:#x}")
+                                let (rendered, cast) = typed_gp_argument(*value, argument.source_type.as_deref());
+                                evidence.push(format!("{}({})={value:#x} {provenance}{}",argument.name,argument.register,
+                                    cast.map(|cast| format!(" [{cast}]")).unwrap_or_default()));
+                                return rendered;
                             }
                         }
                         if let Some((prefix, index)) = argument.register.as_bytes().split_first().and_then(|(prefix, rest)| std::str::from_utf8(rest).ok()?.parse::<u8>().ok().map(|index| (*prefix, index))) {
@@ -1203,11 +1330,72 @@ fn recover_internal(
         assert_eq!(objc_method("-[A rect:]", "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").unwrap().declaration, "- (void)rect:(CGRect)arg0;");
         assert!(objc_method("-[A rect:]", "v48@0:8{CGRect=qqqq}16").is_none());
     }
+    #[test] fn sdk_method_names_cannot_override_conflicting_runtime_types() {
+        let pointer_conflict = objc_method("-[NSString length]", "@16@0:8").unwrap();
+        assert_eq!(pointer_conflict.declaration, "- (id)length;");
+        assert!(pointer_conflict.source.contains("conflicts"));
+        let width_conflict = objc_method("-[NSString substringFromIndex:]", "@20@0:8i16").unwrap();
+        assert_eq!(width_conflict.declaration, "- (id)substringFromIndex:(int)arg0;");
+        assert!(width_conflict.source.contains("conflicts"));
+        let signed_conflict = objc_method("-[NSString substringFromIndex:]", "@24@0:8q16").unwrap();
+        assert_eq!(signed_conflict.declaration, "- (id)substringFromIndex:(long long)arg0;");
+        assert!(signed_conflict.source.contains("conflicts"));
+        let matched = objc_method("-[NSString substringFromIndex:]", "@24@0:8Q16").unwrap();
+        assert!(matched.source.contains("encoding ABI validated"));
+        assert_eq!(matched.declaration, "- (NSString *)substringFromIndex:(NSUInteger)from;");
+    }
     #[test] fn exact_catalog_and_cpp() {
         assert_eq!(symbol("_CFRelease").unwrap().declaration,"void CFRelease(CFTypeRef cf);");
         assert!(symbol("_CFReleaseExtra").is_none());
         assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
+    }
+    #[test] fn typed_argument_casts_use_prototype_width_signedness_and_pointer_evidence() {
+        for (value, ty, expected) in [
+            (0xffff_ffff, "int", "(int)-1"), (0x1ffff, "short", "(short)-1"),
+            (0x180, "signed char", "(signed char)-128"), (0x1ff, "uint8_t", "(uint8_t)0xff"),
+            (0x1_0000_0001, "uint32_t", "(uint32_t)0x1"), (u64::MAX, "CFIndex", "(CFIndex)-1"),
+            (0, "BOOL", "(BOOL)false"), (1, "bool", "(bool)true"),
+            (2, "BOOL", "bitcast<BOOL>(0x2)"), (0, "id", "(id)0"),
+            (0x1234, "const float *", "(const float *)0x1234"),
+        ] {
+            let (rendered, evidence) = typed_gp_argument(value, Some(ty));
+            assert_eq!(rendered, expected);
+            assert!(evidence.unwrap().contains(&format!("raw-register={value:#x}")));
+        }
+        assert_eq!(typed_gp_argument(0xffff_ffff, None), ("0xffffffff".into(), None));
+        assert_eq!(typed_gp_argument(1, Some("UnknownAggregate")), ("0x1".into(), None));
+        assert_eq!(abi_integer_kind("int /* pointer * is only a comment */"), Some(AbiIntegerKind::Signed));
+        assert_eq!(typed_gp_argument(0xffff_ffff, Some("int /* pointer * is only a comment */")).0,
+            "(int /* pointer * is only a comment */)-1");
+        let signature = Signature { language: "C", source: "test prototype", declaration: "void consume(int negative, uint8_t byte, void *pointer);".into() };
+        let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
+        let code = [0x12800000u32, 0x52803fe1, 0xd2800002].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("consume((int)-1, (uint8_t)0xff, (void *)0);"), "{call}");
+        assert!(call.contains("source-cast=signed<int>; low-bits=32; raw-register=0xffffffff"), "{call}");
+        assert!(call.contains("proven_by=[0x1000]"), "{call}");
+    }
+    #[test] fn protocol_prototypes_keep_scope_optionality_and_implementation_uncertainty() {
+        let records = "  protocol 0x4000 name=First confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n  optional-class method 0x4200  name=factory  types=@16@0:8  imp=0x9999 confidence=validated\n  protocol 0x5000 name=Second confidence=validated\n  required-instance method 0x5100  name=accept:  types=v24@0:8d16  imp=0x0 confidence=validated\n";
+        let output = protocol_signatures(records);
+        assert!(output.contains("protocol=First membership=required-instance selector=accept:"), "{output}");
+        assert!(output.contains("- (void)accept:(int)arg0;"), "{output}");
+        assert!(output.contains("@optional\n+ (id)factory;"), "{output}");
+        assert!(output.contains("protocol=Second") && output.contains("- (void)accept:(double)arg0;"));
+        assert!(output.contains("arg0=d0"));
+        assert!(output.contains("implementation=unproven"));
+        assert!(!output.contains("0x9999"));
+        assert_eq!(protocol_signatures(&(records.to_string()+records)).matches("protocol=First membership=required-instance").count(), 1);
+    }
+    #[test] fn protocol_prototypes_reject_unvalidated_unsupported_and_unscoped_records() {
+        for records in [
+            "  protocol 0x4000 name=Unknown confidence=candidate\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n",
+            "  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n",
+            "  protocol 0x4000 name=Known confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8{Unknown=ii}16  imp=0x0 confidence=validated\n",
+            "  protocol 0x4000 name=Known confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8  imp=0x0 confidence=validated\n",
+            "  protocol 0x4000 name=Known confidence=validated\ncategory 0x5000 name=Other confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n",
+        ] { assert!(protocol_signatures(records).is_empty(), "{records}"); }
     }
     #[test] fn apple_scalar_abi_keeps_fp_and_gp_banks_independent() {
         let signature = Signature { language: "C", source: "test",
