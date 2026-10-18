@@ -201,7 +201,7 @@ Verified progress: parameter identity flow no longer reparses machine statements
 Source progress: [named scalar recovery](WORKER_RECONSTRUCTION_ARTIFACTS.md#named-scalar-source-recovery) now joins exact C/Objective-C declarations to structured ABI inputs, produces an instruction/declaration-linked expression DAG, folds proven private-frame copies, handles acyclic return paths, and emits complete scalar C/C-style IMP adapters. The qualification matrix covers four optimization levels and symbol-rich/local-symbol-stripped fixtures, with native result comparisons and generated-source sanitization. Loops, external memory/calls, general SSA-backed lifetimes/layouts, modern chained Objective-C metadata joins, UI integration and broader source fidelity remain open; C07–C10 are not complete.
 
 - [~] Recover parameters, locals, aggregates, fields, globals, captures, lifetimes, and coalesced SSA variables; name from factual evidence or deterministic role descriptions. *(in progress — claimed)*
-- [ ] Form expression trees with use counts, dominance, effect ordering, widths, casts, lvalues, array/field access, and defined overflow/shift semantics.
+- [~] Form expression trees with use counts, dominance, effect ordering, widths, casts, lvalues, array/field access, and defined overflow/shift semantics. *(in progress — claimed)*
 - [ ] Recognize induction variables, accumulators, state variables, and compiler temporaries with retained supporting facts.
 - [ ] Persist analyst variable/type edits, split/merge, switch marking, and cross-function undo/redo; invalidate and recompute dependent hypotheses by analysis revision.
 
