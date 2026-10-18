@@ -351,6 +351,10 @@ fn cpp_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
         b'R' => format!("{} &", cpp_type(bytes, at, depth + 1)?),
         b'O' => format!("{} &&", cpp_type(bytes, at, depth + 1)?),
         b'K' => format!("const {}", cpp_type(bytes, at, depth + 1)?),
+        b'V' => format!("volatile {}", cpp_type(bytes, at, depth + 1)?),
+        b'r' => format!("restrict {}", cpp_type(bytes, at, depth + 1)?),
+        b'N' => {let mut names=Vec::new();while bytes.get(*at)!=Some(&b'E'){names.push(cpp_component(bytes,at)?);if names.len()>16{return None}}*at+=1;names.join("::")},
+        digit if digit.is_ascii_digit() => {*at-=1;cpp_component(bytes,at)?},
         _ => return None,
     })
 }
@@ -1434,6 +1438,9 @@ fn recover_internal(
         assert_eq!(symbol("_CFRelease").unwrap().declaration,"void CFRelease(CFTypeRef cf);");
         assert!(symbol("_CFReleaseExtra").is_none());
         assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
+        assert_eq!(symbol("__Z7consumeP6Widget").unwrap().declaration,"/* return type unresolved */ consume(Widget * arg0);");
+        assert_eq!(symbol("__Z7consumeRN3API6WidgetE").unwrap().declaration,"/* return type unresolved */ consume(API::Widget & arg0);");
+        assert_eq!(abi_parameters(symbol("__Z7consumeP6Widget").as_ref())[0].register,"x0");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
     }
     #[test] fn hash_bound_external_c_prototypes_supply_types_and_reject_unsafe_records() {

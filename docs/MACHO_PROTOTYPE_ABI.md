@@ -4,7 +4,7 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v9` in analysis/cache/continuity identities.
+`prototype-abi-v10` in analysis/cache/continuity identities.
 
 Supported Apple ARM64 LP64 rules include:
 
@@ -95,6 +95,9 @@ Unknown typedefs and aggregate layouts can change both register banks and stack
 offsets. The unsupported parameter and subsequent bindings remain unresolved.
 Nested Itanium names do not prove whether a function needs an implicit C++
 receiver; those argument bindings remain unresolved without membership evidence.
+Itanium free-function parameters preserve bounded unqualified and nested record
+names behind pointers/references, plus const, volatile, and restrict qualifiers.
+Templates, substitutions, member pointers, and implicit receivers remain unresolved.
 
 This is progress toward complete resolution. It does not recover arbitrary C/C++
 layouts, Swift ABI, DWARF types, user header libraries, most stack-passed values,

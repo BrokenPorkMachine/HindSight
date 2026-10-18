@@ -128,6 +128,7 @@
 - [x] Bounded, cycle-checked Objective-C superclass protocol propagation with inherited conformance distinguished from direct declarations and implementation claims.
 - [x] Protocol-qualified Objective-C object types from validated runtime encodings, preserving `id<Protocol>` and `Class<Protocol> *` through declarations and Apple ARM64 pointer ABI placement.
 - [x] Bounded Objective-C protocol `extendedMethodTypes` recovery, joined in validated runtime method-list order so qualifiers lost from base encodings survive prototype and ABI reconstruction.
+- [x] Bounded Itanium named-record pointer/reference parameter recovery for free functions, including nested names and CV/restrict qualifiers with Apple ARM64 pointer ABI placement.
 - [ ] **P1 Types:** Function signatures (Swift, broader C/C++), stack locals/aggregate layouts, project type library (SDK headers, user C declarations), Objective-C dispatch/object model (class_ro_t, selector stubs, message sends), type propagation/casts, analyst overrides (persisted per-function revisions).
 - [ ] **P2 Coverage:** Data references/strings (pointer/string xrefs, CFString/CFData, globals), library idiom recognition (bounds checks, tagged pointers, dispatch blocks), switch tables/indirect control flow (case-range proof, index normalization, vtable recovery), x86-64 Mach-O lifter through shared IR, stripped/optimized code handling (unwind metadata, thunk recognition, prologue evidence, call graph constraints), function/call graphs with confidence and navigation.
 
