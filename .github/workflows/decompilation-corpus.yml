@@ -16,5 +16,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build analysis worker
         run: cargo build -p reworkbench-worker --manifest-path rust/Cargo.toml
+      - name: Qualify Darwin runtime and SDK evidence
+        run: |
+          python3 -m unittest discover -s python/tests -p test_darwin_catalog.py -v
+          python3 scripts/test-darwin-catalog.py rust/target/debug/reworker
+      - name: Qualify AArch64 SIMD-to-GPR lane effects
+        run: python3 scripts/test-arm64-vector-extract.py rust/target/debug/reworker
+      - name: Qualify structured AArch64 parameter identities
+        run: python3 scripts/test-arm64-nameflow.py rust/target/debug/reworker
       - name: Score decompilation corpus
         run: python3 scripts/run-decompilation-corpus.py --worker rust/target/debug/reworker

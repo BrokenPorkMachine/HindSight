@@ -183,6 +183,103 @@ pub fn objc_method(name: &str, encoding: &str) -> Option<Signature> {
     Some(Signature { language: "Objective-C / Objective-C++", declaration, source: "validated Objective-C method type encoding" })
 }
 
+fn objc_value_type(encoding: &str) -> Option<String> {
+    let mut at = 0;
+    let result = objc_type(encoding.as_bytes(), &mut at, 0)?;
+    (at == encoding.len()).then_some(result)
+}
+
+fn object_declarations(layouts: &[super::objc::ClassLayout]) -> String {
+    let mut output = String::new();
+    for layout in layouts.iter().take(64).filter(|layout|super::objc::identifier(&layout.name)) {
+        let mut declaration = format!("// target class metadata={:#x}; static instance size={} bytes\n@interface {} {{\n", layout.address, layout.instance_size, layout.name);
+        if !layout.ivars_complete||!layout.properties_complete{declaration.push_str("    /* partial member metadata; missing members/layout remain unresolved */\n")}
+        for ivar in &layout.ivars {
+            let Some(ty) = objc_value_type(&ivar.encoding) else { continue };
+            declaration.push_str(&format!("    {ty} {}; /* ivar={:#x}; offset_slot={:#x}; declared_offset={:#x}; size={}; alignment={} */\n",
+                ivar.name, ivar.record, ivar.offset_pointer, ivar.offset, ivar.size, ivar.alignment));
+        }
+        declaration.push_str("}\n");
+        for property in &layout.properties {
+            let Some(ty) = objc_value_type(&property.encoding) else { continue };
+            let mut attributes = Vec::new();
+            if property.readonly { attributes.push("readonly".to_owned()); }
+            if property.nonatomic { attributes.push("nonatomic".to_owned()); }
+            if let Some(ownership) = property.ownership { attributes.push(ownership.to_owned()); }
+            if property.getter != property.name { attributes.push(format!("getter={}",property.getter)); }
+            if let Some(setter) = &property.setter { attributes.push(format!("setter={setter}")); }
+            let attributes = if attributes.is_empty() { String::new() } else { format!("({}) ",attributes.join(", ")) };
+            declaration.push_str(&format!("@property {attributes}{ty} {}; /* property={:#x}; backing_ivar={} */\n",
+                property.name,property.record,property.ivar.as_deref().unwrap_or("unresolved")));
+        }
+        declaration.push_str("@end\n\n");
+        if output.len()+declaration.len()>12_000 { break; }
+        output.push_str(&declaration);
+    }
+    output
+}
+
+fn object_layout_for_imp<'a>(layouts:&'a [super::objc::ClassLayout], address:u64, name:&str, signature:Option<&Signature>)->Option<&'a super::objc::ClassLayout>{
+    if !signature.is_some_and(|signature|signature.language=="Objective-C / Objective-C++"){return None}
+    let class_name=name.strip_prefix("-[")?.split_once(' ')?.0;
+    let mut owners=layouts.iter().filter(|layout|layout.methods.iter().any(|method|method.implementation==address));
+    let owner=owners.next()?;
+    if owners.next().is_some()||owner.name!=class_name||!owner.methods.iter().any(|method|!method.class_method&&method.implementation==address){return None}
+    Some(owner)
+}
+
+fn refine_property_signatures(signatures:&mut BTreeMap<u64,(String,Signature)>, layouts:&[super::objc::ClassLayout]) {
+    for (address,(name,signature)) in signatures.iter_mut() {
+        let Some(layout)=object_layout_for_imp(layouts,*address,name,Some(signature))else{continue};
+        if !layout.properties_complete{continue}
+        let mut proposals=std::collections::BTreeSet::new();
+        let mut incompatible=false;
+        for property in &layout.properties {
+            let relevant=name==&format!("-[{} {}]",layout.name,property.getter)
+                ||property.setter.as_ref().is_some_and(|setter|name==&format!("-[{} {setter}]",layout.name));
+            if !relevant{continue}
+            let Some(ty)=objc_value_type(&property.encoding)else{incompatible=true;continue};
+            if !matches!(abi_type(&ty),Some(AbiType::Integer(8)))||abi_integer_kind(&ty)!=Some(AbiIntegerKind::Pointer){incompatible=true;continue}
+            if name==&format!("-[{} {}]",layout.name,property.getter)
+                &&signature_return_type(signature).as_deref()==Some("id")&&objc_parameters(signature).is_empty(){
+                proposals.insert(format!("- ({ty}){};",property.getter));
+            }else if property.setter.as_ref().is_some_and(|setter|name==&format!("-[{} {setter}]",layout.name))
+                &&signature_return_type(signature).as_deref()==Some("void"){
+                let parameters=objc_parameters(signature);
+                if parameters.len()==1&&parameters[0].0=="id"{
+                    let setter=property.setter.as_ref().unwrap().trim_end_matches(':');
+                    proposals.insert(format!("- (void){setter}:({ty})arg0;"));
+                }
+            }
+        }
+        if !incompatible&&proposals.len()==1 {
+            signature.declaration=proposals.into_iter().next().unwrap();
+            signature.source="validated target property object type and accessor method encoding";
+        }
+    }
+}
+
+fn object_member_statements(code:&[u8],base:u64,start:u64,end:u64,file_offset:u64,data_ranges:&[(u64,u64,u16)],layout:&super::objc::ClassLayout) -> BTreeMap<u64,String> {
+    let slots=layout.ivars.iter().map(|ivar|ivar.offset_pointer).collect();
+    super::semantic::object_member_accesses(code,base,start,end,file_offset,data_ranges,&slots).into_iter().filter_map(|(site,access)|{
+        let offset=if let Some(slot)=access.offset_pointer {
+            let mut candidates=layout.ivars.iter().filter(|ivar|ivar.offset_pointer==slot);
+            let field=candidates.next()?;if candidates.next().is_some(){return None}u64::from(field.offset)
+        }else{access.offset?};
+        let field=layout.member(offset,access.bytes,access.floating)?;
+        let ty=objc_value_type(&field.encoding)?;
+        let expected=match abi_type(&ty)? { AbiType::Integer(width)=>width,AbiType::Float(width)=>width,_=>return None };
+        if expected!=access.bytes{return None}
+        let expression=format!("self->{}",field.name);
+        let statement=if access.write {format!("{expression} = ({ty}){};",access.register)}
+            else if access.signed&&access.result_bits==64&&access.bytes<8 {
+                if !matches!(abi_integer_kind(&ty),Some(AbiIntegerKind::Signed)){return None}
+                format!("{} = (int64_t){expression};",access.register)
+            }else{format!("{} = {expression};",access.register)};
+        Some((site,format!("{statement} /* ivar metadata={:#x}; offset_slot={:#x}; type={}; receiver proven from instance IMP x0 */",field.record,field.offset_pointer,field.encoding)))
+    }).collect()
+}
+
 /// Protocol declarations carry selector/type evidence but never prove an IMP,
 /// a receiver class, or that an optional method is implemented.
 pub fn protocol_signatures(records: &str) -> String {
@@ -403,6 +500,7 @@ struct Arm64RenderContext<'a> {
     tail_calls: &'a [(u64,u64,u64)],
     jump_tables: &'a str,
     objc_selectors: &'a BTreeMap<u64,String>,
+    objc_layouts: &'a [super::objc::ClassLayout],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,10 +508,10 @@ pub fn recover_arm64(
     starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
     calls: &[(u64,u64,u64)], scan_end: u64, code: &[u8], base: u64,
     file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
-    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, external_prototypes:&BTreeMap<String,Signature>,
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, external_prototypes:&BTreeMap<String,Signature>, objc_layouts:&[super::objc::ClassLayout],
 ) -> (String, String) {
     recover_internal(starts, symbols, objc_records, calls, scan_end, external_prototypes,
-        Some(Arm64RenderContext { code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors }))
+        Some(Arm64RenderContext { code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors, objc_layouts }))
 }
 
 #[derive(Default)]
@@ -802,8 +900,13 @@ fn candidate_abi_parameters(report: &str, address: u64) -> Vec<AbiParameter> {
     }).collect()).unwrap_or_default()
 }
 
-fn replace_register_names(statement: &str, names: &BTreeMap<String, String>) -> String {
+/// Presentation-only substitution. Shared IR determines input/output identities;
+/// token positions merely select those maps. Publish writes at each semicolon
+/// so pre/post-writeback statements cannot reuse an old base name.
+fn replace_instruction_register_names(statement: &str, names: &BTreeMap<String, String>, outputs: Option<&BTreeMap<String, String>>) -> String {
     let bytes = statement.as_bytes();
+    let mut names = names.clone();
+    let mut written = Vec::<String>::new();
     let mut output = String::with_capacity(statement.len());
     let mut cursor = 0;
     let mut in_block_comment = false;
@@ -825,263 +928,73 @@ fn replace_register_names(statement: &str, names: &BTreeMap<String, String>) -> 
             output.push_str(&statement[cursor..]);
             break;
         }
-        if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
+        if matches!(bytes[cursor], b'\"' | b'\'') {
+            let start = cursor;
+            let quote = bytes[cursor];
+            cursor += 1;
+            while cursor < bytes.len() {
+                if bytes[cursor] == b'\\' { cursor = (cursor + 2).min(bytes.len()); }
+                else if bytes[cursor] == quote { cursor += 1; break; }
+                else { cursor += 1; }
+            }
+            output.push_str(&statement[start..cursor]);
+        } else if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
             let start = cursor;
             cursor += 1;
             while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') { cursor += 1; }
             let token = &statement[start..cursor];
-            output.push_str(names.get(token).map(String::as_str).unwrap_or(token));
+            let tail = statement[cursor..].trim_start();
+            if tail.starts_with('(') { output.push_str(token); continue; }
+            let definition = outputs.is_some() && tail.starts_with('=') && !tail.starts_with("==");
+            if definition { written.push(token.to_owned()); }
+            let map = if definition { outputs.unwrap() } else { &names };
+            output.push_str(map.get(token).map(String::as_str).unwrap_or(token));
         } else {
             let ch = statement[cursor..].chars().next().unwrap();
             output.push(ch);
             cursor += ch.len_utf8();
+            if ch == ';' {
+                if let Some(outputs) = outputs {
+                    for register in written.drain(..) {
+                        let physical = register.get(1..).unwrap_or("");
+                        let prefixes: &[char] = match register.as_bytes().first() {
+                            Some(b'x' | b'w') => &['x', 'w'],
+                            Some(b's' | b'd' | b'q' | b'v' | b'b' | b'h') => &['s', 'd', 'q', 'v', 'b', 'h'],
+                            _ => &[],
+                        };
+                        for prefix in prefixes {
+                            let key = format!("{prefix}{physical}");
+                            if let Some(name) = outputs.get(&key) { names.insert(key, name.clone()); }
+                            else { names.remove(&key); }
+                        }
+                    }
+                }
+            }
         }
     }
     output
 }
 
-fn assigned_register(statement: &str) -> Option<String> {
-    let lhs = statement.split_once('=')?.0.trim();
-    let register = lhs.split_whitespace().last()?;
-    if register.len() >= 2 && matches!(register.as_bytes()[0], b'x' | b'w' | b's' | b'd' | b'v')
-        && register[1..].bytes().all(|byte| byte.is_ascii_digit()) {
-        Some(register.to_string())
-    } else { None }
-}
-
-fn copied_register(statement: &str) -> Option<String> {
-    let (_, rhs) = statement.split_once('=')?;
-    let source = rhs.split_once(';').map_or(rhs, |(expression, _)| expression).trim();
-    let bytes = source.as_bytes();
-    if bytes.len() < 2 || !matches!(bytes[0], b'x' | b'w' | b's' | b'd' | b'v')
-        || !bytes[1..].iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some(source.to_string())
-}
-
-fn register_bank(register: &str) -> Option<u8> {
-    match register.as_bytes().first()? {
-        b'x' | b'w' => Some(0),
-        b's' | b'd' | b'v' => Some(1),
-        _ => None,
-    }
-}
-
-fn bind_register_name(names: &mut BTreeMap<String, String>, destination: &str, name: String) {
-    if let Some(index) = destination.strip_prefix('x').or_else(|| destination.strip_prefix('w')) {
-        names.insert(format!("x{index}"), name.clone());
-        names.insert(format!("w{index}"), name);
-    } else if let Some(index) = destination.strip_prefix('s').or_else(|| destination.strip_prefix('d')).or_else(|| destination.strip_prefix('v')) {
-        names.insert(format!("s{index}"), name.clone());
-        names.insert(format!("d{index}"), name.clone());
-        names.insert(format!("v{index}"), name);
-    }
-}
-
-fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) -> BTreeMap<String, String> {
-    let parameters = signature.map(|signature| abi_parameters(Some(signature))).unwrap_or_else(|| {
-        incoming_parameter_candidates(report, address).into_iter().filter_map(|register| {
-            let index = register.strip_prefix('x')?.parse::<u8>().ok()?;
-            (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), stack_scalar: None, source_type: None })
-        }).collect()
-    });
-    let mut names = BTreeMap::new();
-    for parameter in parameters {
-        if let Some(index) = parameter.general_register {
-            names.insert(format!("x{index}"), parameter.name.clone());
-            names.insert(format!("w{index}"), parameter.name);
-        } else if let Some(index) = parameter.register.strip_prefix('s').or_else(|| parameter.register.strip_prefix('d')).and_then(|value| value.parse::<u8>().ok()) {
-            names.insert(format!("s{index}"), parameter.name.clone());
-            names.insert(format!("d{index}"), parameter.name.clone());
-            names.insert(format!("v{index}"), parameter.name);
+/// Seed source identities from supported ABI locations and source widths.
+/// Aggregates/stack arguments need their own field/object model, not fake registers.
+fn parameter_name_seeds(signature: Option<&Signature>, report: &str, address: u64) -> Vec<super::semantic::ParameterNameSeed> {
+    let parameters = if signature.is_some() { abi_parameters(signature) } else { candidate_abi_parameters(report, address) };
+    parameters.into_iter().filter_map(|parameter| {
+        if let Some(register) = parameter.general_register {
+            let bits = match parameter.source_type.as_deref().and_then(abi_type) {
+                Some(AbiType::Integer(bytes)) if bytes <= 4 => 32,
+                Some(_) => 64,
+                None => 0, // Infer an untyped candidate's view from entry-reaching IR uses.
+            };
+            Some(super::semantic::ParameterNameSeed { register, floating: false, bits, name: parameter.name })
         } else {
-            names.insert(parameter.register, parameter.name);
+            let prefix = parameter.register.get(..1)?;
+            let index = parameter.register.get(1..)?;
+            let bits = match prefix { "s" => 32, "d" => 64, _ => return None };
+            let register = index.parse::<u8>().ok()?;
+            Some(super::semantic::ParameterNameSeed { register, floating: true, bits, name: parameter.name })
         }
-    }
-    names
-}
-
-/// Whether a statement with no detected register assignment may be treated as
-/// name-preserving. Everything else (opaque-instruction barriers, data-in-code
-/// markers, `sync_*` fences) conservatively kills every recovered name because
-/// the decoder could not classify the instruction.
-fn preserves_names(statement: &str) -> bool {
-    let text = statement.trim();
-    text.starts_with("if (")
-        || text.starts_with("goto 0x")
-        || text.starts_with("return")
-        || text.starts_with("*(")
-        || text.starts_with("store(")
-        || is_decoded_comment(text)
-}
-
-/// A comment-only statement preserves names only when it is a decoded
-/// instruction the renderer kept as evidence (uppercase mnemonic: flag
-/// comparisons, hints, `BTI`, `NOP`). Prose markers ("opaque instruction",
-/// "data-in-code barrier", `sync_*` fences) may hide a register write and
-/// therefore kill every name.
-fn is_decoded_comment(statement: &str) -> bool {
-    let text = statement.trim();
-    if text.starts_with("//") { return true; }
-    let Some(body) = text.strip_prefix("/*").and_then(|text| text.strip_suffix("*/")) else { return false };
-    body.trim_start().starts_with(|ch: char| ch.is_ascii_uppercase())
-}
-
-/// Flow-sensitive register naming with join-merge evidence. Returns the
-/// per-address alias map plus, for every join whose incoming names disagree,
-/// a note attached to the join leader explaining why the machine register
-/// stays visible.
-fn parameter_aliases_with_notes(
-    instructions: &[(u64, String)], signature: Option<&Signature>, report: &str, address: u64,
-) -> (BTreeMap<u64, BTreeMap<String, String>>, BTreeMap<u64, String>) {
-    if instructions.is_empty() { return (BTreeMap::new(), BTreeMap::new()); }
-    // An unresolved indirect transfer has an unknown successor set: keep the
-    // whole body register-explicit rather than guessing which names survive.
-    if instructions.iter().any(|(_, statement)| statement.starts_with("goto x")) {
-        return (BTreeMap::new(), BTreeMap::new());
-    }
-
-    fn branch_target(statement: &str) -> Option<u64> {
-        let text = statement.strip_prefix("goto 0x").or_else(|| {
-            statement.strip_prefix("if (")?.split_once(") goto 0x").map(|(_, target)| target)
-        })?;
-        u64::from_str_radix(text.trim_end_matches(';'), 16).ok()
-    }
-    fn transfer(mut names: BTreeMap<String, String>, statement: &str) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-        let copied_name = assigned_register(statement).and_then(|destination| {
-            copied_register(statement).and_then(|source| {
-                (register_bank(&source) == register_bank(&destination))
-                    .then(|| names.get(&source).map(|source_name| {
-                        let physical_destination = destination.strip_prefix('w')
-                            .map(|index| format!("x{index}"))
-                            .unwrap_or_else(|| destination.clone());
-                        format!("{source_name}_copy_{physical_destination}")
-                    })).flatten()
-            }).map(|name| (destination, name))
-        });
-        let mut instruction_names = names.clone();
-        if let Some((destination, copied_name)) = &copied_name {
-            bind_register_name(&mut instruction_names, destination, copied_name.clone());
-        }
-        if statement.starts_with("call(") {
-            names.clear(); // AAPCS64 caller-saved registers may be clobbered.
-        } else if let Some(destination) = assigned_register(statement) {
-            if let Some(index) = destination.strip_prefix('x').or_else(|| destination.strip_prefix('w')) {
-                names.remove(&format!("x{index}")); names.remove(&format!("w{index}"));
-            } else if let Some(index) = destination.strip_prefix('s').or_else(|| destination.strip_prefix('d')).or_else(|| destination.strip_prefix('v')) {
-                names.remove(&format!("s{index}")); names.remove(&format!("d{index}")); names.remove(&format!("v{index}"));
-            } else { names.remove(&destination); }
-            if let Some((_, name)) = copied_name { bind_register_name(&mut names, &destination, name); }
-        } else if !preserves_names(statement) {
-            // An instruction the decoder could not classify may write any
-            // register: drop every name rather than claim a stale identity.
-            names.clear();
-        }
-        (instruction_names, names)
-    }
-    fn intersect_names(left: &BTreeMap<String, String>, right: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-        left.iter().filter_map(|(register, name)| {
-            (right.get(register) == Some(name)).then(|| (register.clone(), name.clone()))
-        }).collect()
-    }
-
-    let address_to_index = instructions.iter().enumerate()
-        .map(|(index, (pc, _))| (*pc, index)).collect::<BTreeMap<_, _>>();
-    let mut successors = vec![Vec::<usize>::new(); instructions.len()];
-    for (index, (_, statement)) in instructions.iter().enumerate() {
-        let target = branch_target(statement).and_then(|target| address_to_index.get(&target).copied());
-        if statement.starts_with("if (") {
-            if let Some(target) = target { successors[index].push(target); }
-            if index + 1 < instructions.len() { successors[index].push(index + 1); }
-        } else if statement.starts_with("goto 0x") {
-            if let Some(target) = target { successors[index].push(target); }
-        } else if !statement.starts_with("return") && index + 1 < instructions.len() {
-            successors[index].push(index + 1);
-        }
-        successors[index].sort_unstable();
-        successors[index].dedup();
-    }
-
-    // A name survives a join only when every observed predecessor carries the
-    // exact same identity. This is deliberately a must-analysis: conflicting
-    // or killed identities leave the machine register visible.
-    let mut incoming = vec![None::<BTreeMap<String, String>>; instructions.len()];
-    incoming[0] = Some(parameter_names(signature, report, address));
-    let mut queue = std::collections::VecDeque::from([0usize]);
-    while let Some(index) = queue.pop_front() {
-        let state = incoming[index].clone().unwrap_or_default();
-        let (_, outgoing) = transfer(state, &instructions[index].1);
-        for &successor in &successors[index] {
-            let merged = incoming[successor].as_ref()
-                .map(|prior| intersect_names(prior, &outgoing))
-                .unwrap_or_else(|| outgoing.clone());
-            if incoming[successor].as_ref() != Some(&merged) {
-                incoming[successor] = Some(merged);
-                if !queue.contains(&successor) { queue.push_back(successor); }
-            }
-        }
-    }
-
-    // Join-merge evidence: when a join leader (a statement with more than one
-    // incoming edge) saw disagreeing names for a register, record which
-    // identities met there. This keeps the source-name recovery auditable
-    // instead of silently reverting to machine registers.
-    let mut notes = BTreeMap::new();
-    let predecessors = {
-        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); instructions.len()];
-        for (index, next) in successors.iter().enumerate() {
-            for &successor in next { predecessors[successor].push(index); }
-        }
-        predecessors
-    };
-    for (index, preds) in predecessors.iter().enumerate() {
-        if preds.len() < 2 { continue; }
-        let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for &pred in preds {
-            let state = incoming[pred].clone().unwrap_or_default();
-            let (_, outgoing) = transfer(state, &instructions[pred].1);
-            for (register, name) in outgoing {
-                let seen = conflicts.entry(register).or_default();
-                if !seen.contains(&name) { seen.push(name); }
-            }
-        }
-        let mut described = Vec::new();
-        for (register, names) in conflicts {
-            if names.len() > 1 {
-                let mut sorted = names;
-                sorted.sort();
-                described.push(format!("{register} reaches with conflicting names ({})", sorted.join(" | ")));
-            }
-        }
-        if !described.is_empty() {
-            let leader = instructions[index].0;
-            notes.insert(leader, format!(
-                "merge at {leader:#x}: {}; machine registers retained after the join", described.join("; ")
-            ));
-        }
-    }
-
-    let mut result = BTreeMap::new();
-    for (index, (pc, statement)) in instructions.iter().enumerate() {
-        if let Some(state) = incoming[index].clone() {
-            let (display, _) = transfer(state, statement);
-            result.insert(*pc, display);
-        }
-    }
-    (result, notes)
-}
-
-/// Test-only convenience over `parameter_aliases_with_notes`.
-#[cfg(test)]
-fn parameter_aliases_by_instruction(
-    instructions: &[(u64, String)], signature: Option<&Signature>, report: &str, address: u64,
-) -> BTreeMap<u64, BTreeMap<String, String>> {
-    parameter_aliases_with_notes(instructions, signature, report, address).0
-}
-
-fn substitute_parameter_names(statement: &str, names: &BTreeMap<String, String>) -> String {
-    replace_register_names(statement, names)
+    }).collect()
 }
 
 fn branch_target_statement(statement:&str)->Option<u64>{
@@ -1236,7 +1149,7 @@ fn render_arm64_body(
     start: u64, end: u64, display_name: &str, signature: Option<&Signature>,
     symbols: &[(u64,String)], signatures: &BTreeMap<u64,(String,Signature)>,
     code: &[u8], base: u64, file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
-    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>,
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, object_layout:Option<&super::objc::ClassLayout>,
 ) -> Option<String> {
     if start < base || start >= end || (start - base) % 4 != 0 { return None; }
     let lo = usize::try_from(start - base).ok()?;
@@ -1254,14 +1167,18 @@ fn render_arm64_body(
         if !statement.is_empty() { instructions.push((address, statement.into())); }
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
-    let (parameter_aliases, parameter_notes) = parameter_aliases_with_notes(&instructions, signature, parameter_evidence, start);
+    let name_seeds = parameter_name_seeds(signature, parameter_evidence, start);
+    let parameter_names: super::semantic::ParameterNameAnalysis = super::semantic::parameter_value_names(code, base, start, end, file_offset, data_ranges, &name_seeds);
+    let object_statements=object_layout.map(|layout|object_member_statements(code,base,start,end,file_offset,data_ranges,layout)).unwrap_or_default();
     let no_aliases = BTreeMap::new();
     // Structured regions render their statements through
     // `render_linear_statement`, which keeps the raw registers; apply the same
     // recovered names (and stack-slot localization) the linear path applies so
     // branches do not silently drop the identities.
     let substitute_at = |address: u64, text: &str| {
-        let substituted = substitute_parameter_names(text, parameter_aliases.get(&address).unwrap_or(&no_aliases));
+        if let Some(statement)=object_statements.get(&address){return statement.clone()}
+        let substituted = replace_instruction_register_names(text, parameter_names.inputs.get(&address).unwrap_or(&no_aliases),
+            Some(parameter_names.outputs.get(&address).unwrap_or(&no_aliases)));
         if stable_stack { localize_stack_slot_accesses(&substituted) } else { substituted }
     };
     let switch_evidence=parse_switch_evidence(jump_tables);
@@ -1276,6 +1193,8 @@ fn render_arm64_body(
 
     let mut out = String::new();
     out.push_str(&format!("// {start:#018x}..{end:#018x}; decoded machine operations translated to C-like statements\n"));
+    if let Some(blocker) = parameter_names.blocker { out.push_str(&format!("// Source parameter identity substitution withheld: {blocker}.\n")); }
+    for note in parameter_names.notes.values() { out.push_str(&format!("// Source identity evidence: {note}\n")); }
     if !stable_stack && instructions.iter().any(|(_, statement)| statement.contains("(sp")) {
         out.push_str("// SP-relative accesses keep machine expressions because this function does not prove an unchanged stack pointer.\n");
     }
@@ -1453,7 +1372,6 @@ fn render_arm64_body(
             }
         }
         let (address, statement) = (*address, statement.as_str());
-        if let Some(note) = parameter_notes.get(&address) { out.push_str(&format!("    {note}\n")); }
         if labels.contains(&address) { out.push_str(&format!("loc_{address:x}:\n")); }
         let statement = if statement.starts_with("call(0x") {
             render_linear_statement(statement,address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors)
@@ -1489,8 +1407,7 @@ fn render_arm64_body(
         } else if statement.starts_with("return /* ABI result register x0") {
             render_signature_return(signature)
         } else { statement.to_string() };
-        let statement = substitute_parameter_names(&statement, parameter_aliases.get(&address).unwrap_or(&BTreeMap::new()));
-        let statement=if stable_stack{localize_stack_slot_accesses(&statement)}else{statement};
+        let statement = substitute_at(address,&statement);
         out.push_str(&format!("    {address:#018x}: {statement}\n"));
         instruction_index += 1;
     }
@@ -1522,7 +1439,11 @@ fn recover_internal(
         let Some(encoding) = line.split(" types=").nth(1).and_then(|s| s.split(" imp=").next()) else { continue };
         if let Some(sig) = objc_method(name.trim(),encoding.trim()) { by_address.insert(imp,(name.trim().into(),sig)); }
     }
+    let object_models=arm64.as_ref().map(|context|context.objc_layouts).unwrap_or(&[]);
+    refine_property_signatures(&mut by_address,object_models);
+    let declarations=object_declarations(object_models);
     let mut signatures = String::from("Signature evidence: exact SDK ABI declarations, validated Objective-C type encodings, hash-bound analyst C prototypes, and supported Itanium mangled parameter types. Unknown source types remain unresolved.\n");
+    signatures.push_str(&declarations);
     for (address,(name,sig)) in by_address.iter().take(700) {
         let abi = if arm64.is_some() {
             format!("    ABI profile=Apple-arm64-LP64 bindings=[{}] result={}{}\n",
@@ -1538,6 +1459,7 @@ fn recover_internal(
     }
     if by_address.is_empty() && name_only.is_empty() { signatures.push_str("No source-level signatures were supported by available metadata or the exact API catalog.\n"); }
     let mut pseudo = String::from("// Bounded C-like reconstruction. Statements come from decoded AArch64 operations; declarations use validated runtime metadata or exact symbol prototypes. Unknown types, values, and effects stay marked.\n");
+    pseudo.push_str(&declarations);
     for (i,&start) in starts.iter().take(200).enumerate() {
         let end = starts.get(i+1).copied().unwrap_or(scan_end);
         if pseudo.len() > 55_000 { break }
@@ -1546,7 +1468,8 @@ fn recover_internal(
         let signature = named.map(|(_,signature)| signature);
         if let Some(context) = &arm64 {
             let end = starts.get(i+1).copied().unwrap_or(scan_end);
-            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors) {
+            let layout=object_layout_for_imp(context.objc_layouts,start,name,signature);
+            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors,layout) {
                 if pseudo.len() + body.len() > 58_000 { break; }
                 pseudo.push_str(&body);
                 pseudo.push('\n');
@@ -1573,6 +1496,57 @@ fn recover_internal(
 
 #[cfg(test)] mod tests {
     use super::*;
+    fn member_fixture() -> super::super::objc::ClassLayout {
+        use super::super::objc::*;
+        ClassLayout { address:0x2000,name:"Widget".into(),instance_start:8,instance_size:16,
+            ivars:vec![IvarLayout{record:0x3000,offset_pointer:0x4000,name:"x0".into(),encoding:"q".into(),offset:8,size:8,alignment:8}],
+            properties:vec![PropertyLayout::parse(0x5000,"label".into(),"T@\"NSString\",R".into()).unwrap()],
+            methods:vec![MethodLayout{implementation:0x1000,class_method:false}],ivars_complete:true,properties_complete:true }
+    }
+
+    #[test] fn property_types_refine_only_unambiguous_generic_id_accessors() {
+        let layout=member_fixture();
+        let getter=objc_method("-[Widget label]","@16@0:8").unwrap();
+        let mut signatures=BTreeMap::from([(0x1000,("-[Widget label]".into(),getter.clone()))]);
+        refine_property_signatures(&mut signatures,std::slice::from_ref(&layout));
+        assert_eq!(signatures[&0x1000].1.declaration,"- (NSString *)label;");
+        let explicit=objc_method("-[Widget label]","@\"NSNumber\"16@0:8").unwrap();
+        signatures.get_mut(&0x1000).unwrap().1=explicit.clone();
+        refine_property_signatures(&mut signatures,std::slice::from_ref(&layout));
+        assert_eq!(signatures[&0x1000].1,explicit);
+        for attributes in ["T@\"NSNumber\",R,Glabel","Ti,R,Glabel"] {
+            let mut conflicting=layout.clone();
+            conflicting.properties.push(super::super::objc::PropertyLayout::parse(0x5008,"alternative".into(),attributes.into()).unwrap());
+            signatures.get_mut(&0x1000).unwrap().1=getter.clone();
+            refine_property_signatures(&mut signatures,&[conflicting]);
+            assert_eq!(signatures[&0x1000].1,getter);
+        }
+        let mut partial=layout.clone();partial.properties_complete=false;
+        signatures.get_mut(&0x1000).unwrap().1=getter.clone();
+        refine_property_signatures(&mut signatures,&[partial]);
+        assert_eq!(signatures[&0x1000].1,getter);
+    }
+
+    #[test] fn shared_imps_and_class_methods_do_not_supply_one_instance_receiver() {
+        let layout=member_fixture();let signature=objc_method("-[Widget label]","@16@0:8").unwrap();
+        assert!(object_layout_for_imp(std::slice::from_ref(&layout),0x1000,"-[Widget label]",Some(&signature)).is_some());
+        assert!(object_layout_for_imp(std::slice::from_ref(&layout),0x1000,"+[Widget label]",Some(&signature)).is_none());
+        let mut other=layout.clone();other.address=0x6000;other.name="OtherWidget".into();
+        assert!(object_layout_for_imp(&[layout.clone(),other.clone()],0x1000,"-[Widget label]",Some(&signature)).is_none());
+        let mut signatures=BTreeMap::from([(0x1000,("-[Widget label]".into(),signature.clone()))]);
+        refine_property_signatures(&mut signatures,&[layout,other]);
+        assert_eq!(signatures[&0x1000].1,signature);
+    }
+
+    #[test] fn field_names_that_look_like_registers_remain_source_identifiers() {
+        let layout=member_fixture();
+        let signature=objc_method("-[Widget value]","q16@0:8").unwrap();
+        let code=[0xf9400400u32,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let body=render_arm64_body(0x1000,0x1008,"-[Widget value]",Some(&signature),&[],&BTreeMap::new(),&code,0x1000,0,&[],"",&[],"",&BTreeMap::new(),Some(&layout)).unwrap();
+        assert!(body.contains("x0 = self->x0;"),"{body}");
+        assert!(!body.contains("self->self"),"{body}");
+    }
+
     #[test] fn terminal_statements_cannot_be_folded_into_structured_regions() {
         assert!(is_linear_statement("x0 = x0 + 1;"));
         assert!(!is_linear_statement("return x0;"));
@@ -1797,7 +1771,7 @@ fn recover_internal(
         let pointer = Signature { language: "C", source: "test", declaration: "void *pointer(void);".into() };
         assert!(!signature_returns_void(Some(&pointer)));
         let code = 0xd65f03c0u32.to_le_bytes();
-        let body = render_arm64_body(0x1000, 0x1004, "_pointer", Some(&pointer), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new()).unwrap();
+        let body = render_arm64_body(0x1000, 0x1004, "_pointer", Some(&pointer), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new(),None).unwrap();
         assert!(body.contains("return x0;"), "{body}");
         assert!(!body.contains("void return supported"), "{body}");
     }
@@ -1821,138 +1795,102 @@ fn recover_internal(
         assert_eq!(render_fp_argument(b's', 0x8000_0000), "-0.0");
         assert_eq!(render_fp_argument(b'd', 0x7ff8_0000_0000_1234), "bitcast<double>(0x7ff8000000001234)");
     }
+    fn names_fixture(words: &[u32], signature: &Signature) -> super::super::semantic::ParameterNameAnalysis {
+        let code = words.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+        super::super::semantic::parameter_value_names(&code,0x1000,0x1000,0x1000+code.len() as u64,0,&[],&parameter_name_seeds(Some(signature),"",0x1000))
+    }
     #[test] fn parameter_names_flow_until_the_register_is_redefined() {
-        assert_eq!(copied_register("x6 = x4;"), Some("x4".into()));
-        assert_eq!(copied_register("x6 = x4 + 1;"), None);
         let signature = objc_method("-[Widget setObject:]", "v24@0:8@16").unwrap();
-        let instructions = vec![
-            (0x0ffc, "x4 = x2;".into()),
-            (0x1000, "x2 = *(x0 + 0x10);".into()),
-            (0x1004, "x5 = x4;".into()),
-            (0x1008, "x3 = x2;".into()),
-            (0x100c, "return x5;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&instructions, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names(&instructions[0].1, &aliases[&0x0ffc]), "arg0_copy_x4 = arg0;");
-        assert_eq!(substitute_parameter_names(&instructions[1].1, &aliases[&0x1000]), "arg0 = *(self + 0x10);");
-        assert_eq!(substitute_parameter_names(&instructions[2].1, &aliases[&0x1004]), "arg0_copy_x4_copy_x5 = arg0_copy_x4;");
-        assert_eq!(substitute_parameter_names(&instructions[3].1, &aliases[&0x1008]), "x3 = x2;");
-        assert_eq!(substitute_parameter_names(&instructions[4].1, &aliases[&0x100c]), "return arg0_copy_x4_copy_x5;");
-        assert_eq!(substitute_parameter_names("w2 = w2;", &parameter_names(Some(&signature), "", 0)), "arg0 = arg0;");
+        // mov x4,x2; ldr x2,[x0,#16]; mov x5,x4; mov x3,x2; ret.
+        let names = names_fixture(&[0xaa0203e4,0xf9400802,0xaa0403e5,0xaa0203e3,0xd65f03c0],&signature);
+        assert_eq!(names.outputs[&0x1000]["x4"],"arg0_copy_x4");
+        assert_eq!(names.inputs[&0x1004]["x2"],"arg0");
+        assert!(!names.outputs[&0x1004].contains_key("x2"));
+        assert_eq!(names.outputs[&0x1008]["x5"],"arg0_copy_x5");
+        assert!(!names.outputs[&0x100c].contains_key("x3"));
+        let text=replace_instruction_register_names("x2 = *(x0 + 0x10);",&names.inputs[&0x1004],Some(&names.outputs[&0x1004]));
+        assert_eq!(text,"x2 = *(self + 0x10);");
+    }
+    #[test] fn modeled_frame_pointer_updates_preserve_incoming_argument_names() {
+        let signature=Signature{language:"C",source:"test",declaration:"int sum(int left, int right);".into()};
+        let names=names_fixture(&[0xd10043ff,0xb9000fe0,0xb9000be1,0xd65f03c0],&signature);
+        assert_eq!(names.inputs[&0x1004]["w0"],"left");
+        assert_eq!(names.inputs[&0x1008]["w1"],"right");
+        assert!(!names.inputs[&0x1008].contains_key("x0")); // Unknown upper ABI bits.
     }
     #[test] fn parameter_aliases_merge_across_control_flow_and_stop_at_calls() {
-        let signature = symbol("_CFRelease").unwrap();
-        let branched = vec![
-            (0x1000, "if (x1 == 0) goto 0x1008;".into()),
-            (0x1004, "goto 0x100c;".into()),
-            (0x1008, "x1 = 1;".into()),
-            (0x100c, "return x0;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&branched, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x100c]), "return cf;");
-
-        let conflicting = vec![
-            (0x1000, "if (x1 == 0) goto 0x100c;".into()),
-            (0x1004, "x2 = x0;".into()),
-            (0x1008, "goto 0x1010;".into()),
-            (0x100c, "x2 = x1;".into()),
-            (0x1010, "return x2;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&conflicting, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1010]), "return x2;");
-        let called = vec![(0x1000, "call(0x2000);".into()), (0x1004, "return x0;".into())];
-        let aliases = parameter_aliases_by_instruction(&called, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1000]), "return cf;");
-        assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1004]), "return x0;");
+        let signature=symbol("_CFRelease").unwrap();
+        let branched=names_fixture(&[0xb4000041,0x14000002,0xd2800021,0xd65f03c0],&signature);
+        assert_eq!(branched.inputs[&0x100c]["x0"],"cf");
+        let conflicting=names_fixture(&[0xb4000061,0xaa0003e2,0x14000002,0xaa0103e2,0xd65f03c0],&signature);
+        assert!(!conflicting.inputs[&0x1010].contains_key("x2"));
+        let called=names_fixture(&[0x94000400,0xd65f03c0],&signature);
+        assert_eq!(called.inputs[&0x1000]["x0"],"cf");
+        assert!(!called.inputs[&0x1004].contains_key("x0"));
     }
     #[test] fn unresolved_indirect_transfers_keep_the_body_register_explicit() {
-        let signature = symbol("_CFRelease").unwrap();
-        let indirect = vec![
-            (0x1000, "x2 = x0;".into()),
-            (0x1004, "goto x16; /* indirect target */".into()),
-            (0x1008, "return x2;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&indirect, Some(&signature), "", 0x1000);
-        assert!(aliases.is_empty(), "{aliases:?}");
+        let signature=symbol("_CFRelease").unwrap();
+        let names=names_fixture(&[0xaa0003e2,0xd61f0200,0xd65f03c0],&signature);
+        assert!(names.inputs.is_empty());
+        assert_eq!(names.blocker,Some("unresolved indirect successors"));
     }
     #[test] fn join_merges_record_conflicting_names_as_evidence() {
-        let signature = objc_method("-[Widget setObject:]", "v24@0:8@16").unwrap();
-        let conflicting = vec![
-            (0x1000, "if (x1 == 0) goto 0x100c;".into()),
-            (0x1004, "x2 = x0;".into()),
-            (0x1008, "goto 0x1010;".into()),
-            (0x100c, "x2 = x1;".into()),
-            (0x1010, "return x2;".into()),
-        ];
-        let (aliases, notes) = parameter_aliases_with_notes(&conflicting, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1010]), "return x2;");
-        let note = notes.get(&0x1010).expect("conflicting join must be documented");
-        assert!(note.contains("merge at 0x1010"), "{note}");
-        assert!(note.contains("x2 reaches with conflicting names"), "{note}");
-        assert!(note.contains("self_copy_x2"), "{note}");
-        assert!(note.contains("_cmd_copy_x2"), "{note}");
-
-        // A join that sees the same identity everywhere stays silent.
-        let agreeing = vec![
-            (0x1000, "if (x1 == 0) goto 0x100c;".into()),
-            (0x1004, "goto 0x1010;".into()),
-            (0x100c, "x2 = x0;".into()),
-            (0x1010, "return x2;".into()),
-        ];
-        let (_, notes) = parameter_aliases_with_notes(&agreeing, Some(&signature), "", 0x1000);
-        assert!(notes.is_empty(), "{notes:?}");
+        let signature=objc_method("-[Widget setObject:]","v24@0:8@16").unwrap();
+        let names=names_fixture(&[0xb4000061,0xaa0003e2,0x14000002,0xaa0103e2,0xd65f03c0],&signature);
+        assert!(!names.inputs[&0x1010].contains_key("x2"));
+        let note=&names.notes[&0x1010];
+        assert!(note.contains("x2 reaches with conflicting names"),"{note}");
+        assert!(note.contains("self_copy_x2")&&note.contains("_cmd_copy_x2"),"{note}");
+        let partly=names_fixture(&[0xb4000061,0x14000003,0xd503201f,0xaa0003e2,0xd65f03c0],&signature);
+        assert!(partly.notes[&0x1010].contains("arg0 | self_copy_x2"));
+        // Distinct copies on different arms are the same parameter identity.
+        let agreeing=names_fixture(&[0xb4000061,0xaa0003e2,0x14000002,0xaa0003e2,0xd65f03c0],&signature);
+        assert_eq!(agreeing.inputs[&0x1010]["x2"],"self_copy_x2");
+        assert!(agreeing.notes.is_empty(),"{:?}",agreeing.notes);
     }
-    #[test] fn unclassified_instruction_barriers_kill_names_but_decoded_comments_keep_them() {
-        let signature = symbol("_CFRelease").unwrap();
-        let barrier = vec![
-            (0x1000, "x2 = x0;".into()),
-            (0x1004, "/* opaque instruction encoding; decoder gave up */".into()),
-            (0x1008, "return x2;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&barrier, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1008]), "return x2;");
-
-        let data_marker = vec![
-            (0x1000, "x2 = x0;".into()),
-            (0x1004, "/* data-in-code barrier */".into()),
-            (0x1008, "return x2;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&data_marker, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1008]), "return x2;");
-
-        // A decoded flag-comparison keeps the evidence comment raw but the
-        // identity survives to the next statement.
-        let compared = vec![
-            (0x1000, "x2 = x0;".into()),
-            (0x1004, "/* CMP x2, x1; NZCV updated */".into()),
-            (0x1008, "return x2;".into()),
-        ];
-        let aliases = parameter_aliases_by_instruction(&compared, Some(&signature), "", 0x1000);
-        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1008]), "return cf_copy_x2;");
+    #[test] fn unclassified_instruction_barriers_kill_names_but_decoded_comparisons_keep_them() {
+        let signature=symbol("_CFRelease").unwrap();
+        let barrier=names_fixture(&[0xaa0003e2,0xffffffff,0xd65f03c0],&signature);
+        assert!(!barrier.inputs[&0x1008].contains_key("x2"));
+        let compared=names_fixture(&[0xaa0003e2,0xeb01005f,0xd65f03c0],&signature);
+        assert_eq!(compared.inputs[&0x1008]["x2"],"cf_copy_x2");
     }
     #[test] fn evidence_comments_keep_raw_registers_during_substitution() {
         let names = BTreeMap::from([("x0".to_string(), "value".to_string())]);
-        let substituted = substitute_parameter_names("x0 = *(x0 + 0x8); /* load through x0 */", &names);
+        let substituted = replace_instruction_register_names("x0 = *(x0 + 0x8); /* load through x0 */", &names, None);
         assert_eq!(substituted, "value = *(value + 0x8); /* load through x0 */");
+    }
+    #[test] fn instruction_destinations_and_writeback_never_reuse_input_names() {
+        let signature=Signature { language:"C",source:"test",declaration:"long load(long *owner, long value);".into() };
+        let names=names_fixture(&[0xf8408c01,0xd65f03c0],&signature); // ldr x1,[x0,#8]!
+        let rendered=replace_instruction_register_names("x0 = x0 + 0x8; x1 = *(x0);",&names.inputs[&0x1000],Some(&names.outputs[&0x1000]));
+        assert_eq!(rendered,"x0 = owner + 0x8; x1 = *(x0);");
+        let body_code=[0xa9400400u32,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>(); // ldp x0,x1,[x0]
+        let body=render_arm64_body(0x1000,0x1008,"_load",Some(&signature),&[],&BTreeMap::new(),&body_code,0x1000,0,&[],"",&[],"",&BTreeMap::new(),None).unwrap();
+        assert!(body.contains("pair_addr_1000 = owner; x0 = *(pair_addr_1000); x1 = *(pair_addr_1000 + 0x8);"),"{body}");
+        let inputs=BTreeMap::from([("x0".into(),"owner".into())]);
+        assert_eq!(replace_instruction_register_names("x0(\"x0 = x0;\", x0); /* x0 */",&inputs,None),"x0(\"x0 = x0;\", owner); /* x0 */");
     }
     #[test] fn structured_loop_bodies_receive_recovered_names() {
         // CBZ X0, exit; ADD X2, X0, #4; B header; RET — a header-tested loop.
         let signature = Signature { language: "C", declaration: "long count(long value);".into(), source: "test prototype" };
         let code = [0xb400_0060u32, 0x9100_1002, 0x17ff_fffe, 0xd65f_03c0]
             .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let body = render_arm64_body(0x1000, 0x1010, "_count", Some(&signature), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new()).unwrap();
+        let body = render_arm64_body(0x1000, 0x1010, "_count", Some(&signature), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new(),None).unwrap();
         assert!(body.contains("while (!(value == 0))"), "{body}");
         assert!(body.contains("0x0000000000001004: x2 = value + 0x4;"), "{body}");
         assert!(!body.contains("x0 + 0x4;"), "{body}");
     }
     #[test] fn scalar_fp_parameter_names_cover_single_and_double_register_views() {
         let signature = symbol("_CFNumberGetValue").unwrap();
-        let names = parameter_names(Some(&signature), "", 0);
+        let analysis = names_fixture(&[0xd65f03c0], &signature);
+        let names = &analysis.inputs[&0x1000];
         assert_eq!(names.get("x1").map(String::as_str), Some("theType"));
         let float_signature = Signature { language: "C", declaration: "double scale(float factor, double value);".into(), source: "test prototype" };
-        let names = parameter_names(Some(&float_signature), "", 0);
+        let analysis = names_fixture(&[0xd65f03c0], &float_signature);
+        let names = &analysis.inputs[&0x1000];
         assert_eq!(names.get("s0").map(String::as_str), Some("factor"));
-        assert_eq!(names.get("d0").map(String::as_str), Some("factor"));
+        assert_eq!(names.get("d0").map(String::as_str), None);
         assert_eq!(names.get("d1").map(String::as_str), Some("value"));
     }
     #[test] fn reciprocal_results_remain_unknown_while_unrelated_call_arguments_survive() {
@@ -2057,5 +1995,19 @@ fn recover_internal(
         assert!(report.contains("- (void)setObject:(id)arg0;"),"{report}");
         assert!(report.contains("void CFRelease(CFTypeRef cf);"));
         assert!(pseudo.contains("call_target(0x0000000000002000);"));
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+    #[test]
+    fn debug_join() {
+        let signature = objc_method("-[Widget setObject:]", "v24@0:8@16").unwrap();
+        let code = [0xb4000061u32,0xaa0003e2,0x14000002,0xaa0103e2,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let analysis = super::super::semantic::parameter_value_names(&code,0x1000,0x1000,0x1014,0,&[],&parameter_name_seeds(Some(&signature),"",0x1000));
+        for (pc, map) in &analysis.inputs { eprintln!("{pc:#x}: {map:?}"); }
+        eprintln!("notes: {:?}", analysis.notes);
+        assert!(analysis.notes.contains_key(&0x1010));
     }
 }

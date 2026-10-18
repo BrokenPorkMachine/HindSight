@@ -4,6 +4,8 @@ The current dependency order is the [Chimera master list of completion](CHIMERA_
 
 Immediate priority: AArch64 pseudocode and reconstruction for Apple binaries, using native Mach-O/dyld and Darwin runtime/SDK evidence for images, function/class/selector/method names, C declarations, properties, ivars, structs and types. Shared macOS/iOS semantics and decoder qualification are reused.
 
+The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md#active-priority-aarch64-pseudocode-and-source-reconstruction) govern execution: dependable pseudocode → canonical SSA/memory effects → ABI/native types → typed expressions/control flow → recompilable source → behavioral/fidelity qualification. Evidence and validation accompany every step; broader product work follows the first working reconstruction milestone unless it unblocks it.
+
 ## 0.1 — Genesis (foundation complete)
 
 - [x] Independent HindSight product identity and macOS workbench.

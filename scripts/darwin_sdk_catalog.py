@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import tempfile
 
@@ -11,6 +13,51 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HEADER = ROOT / "native/reconstruction/sdk_declarations.h"
 MAX_AST_BYTES = 4 * 1024 * 1024
+
+
+def verify_macho_target(path, target):
+    """Keep a compiler's declarations bound to a compatible captured slice."""
+    with Path(path).open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        header = stream.read(32)
+        if len(header) != 32 or header[:4] != bytes.fromhex("cffaedfe"):
+            raise ValueError("prototype binding requires a thin little-endian 64-bit Mach-O slice")
+        cpu, subtype, _, count, size = struct.unpack_from("<IIIII", header, 4)
+        architecture = target.split("-", 1)[0]
+        expected_cpu = 0x01000007 if architecture == "x86_64" else 0x0100000c
+        if cpu != expected_cpu or (architecture == "arm64e" and subtype & 0xffffff != 2) or (architecture == "arm64" and subtype & 0xffffff == 2):
+            raise ValueError("prototype target architecture differs from captured Mach-O")
+        if count > 8192 or size > 16 * 1024 * 1024:
+            raise ValueError("Mach-O load-command budget exceeded")
+        commands = stream.read(size)
+        if len(commands) != size:
+            raise ValueError("truncated Mach-O load commands")
+        stream.seek(0)
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        after = os.fstat(stream.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("source changed during prototype binding")
+    expected_platform = 7 if target.endswith("-simulator") else 2 if "-ios" in target else 1
+    platforms = set()
+    offset = 0
+    for _ in range(count):
+        if offset + 8 > size:
+            raise ValueError("truncated Mach-O load command")
+        command, length = struct.unpack_from("<II", commands, offset)
+        if length < 8 or length % 8 or length > size - offset:
+            raise ValueError("invalid Mach-O load-command framing")
+        if command == 0x32:
+            if length < 24:
+                raise ValueError("truncated Mach-O build version")
+            platforms.add(struct.unpack_from("<I", commands, offset + 8)[0])
+        elif command in {0x24, 0x25}:
+            if length != 16:
+                raise ValueError("invalid Mach-O minimum version")
+            platforms.add(1 if command == 0x24 else 2)
+        offset += length
+    if offset != size or platforms != {expected_platform}:
+        raise ValueError("prototype target platform differs from or is absent in captured Mach-O")
+    return digest
 
 
 def _json_documents(text):

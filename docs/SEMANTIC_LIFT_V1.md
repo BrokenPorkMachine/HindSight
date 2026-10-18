@@ -48,7 +48,7 @@ from an older worker is conservatively incomplete rather than contradictory. The
 literal-load correction below is the one exception: it removes a previously
 emitted statement class, so the identity advances to reject the older,
 contradictory reports. The
-`AArch64 register semantics v52` banner identifies the statement set that
+`AArch64 register semantics v54` banner identifies the statement set that
 produced a preview.
 
 The preview includes bounded GPR SSA evidence in separate `// ssa` lines.
@@ -61,8 +61,17 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v86-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v89-schema122`; the report fields
 and cache-envelope schema are unchanged.
+
+The [source-parameter identity pass](AARCH64_SOURCE_VARIABLES.md) now uses
+shared effects and decoded CFG edges rather than assignment/comment text.
+Width-specific parameter values can survive copies, agreeing joins and intact
+frame spills/restores. Input/output naming maps distinguish overwritten
+destinations and preserve multi-write/writeback order. Scalar pre-indexed
+accesses no longer apply offsets twice; overlapping-base pair loads capture
+their original effective address. General locals, canonical memory/FP/flags
+SSA, expression AST and executable source reconstruction remain open.
 
 Lane-wise vector bitwise `AND`/`BIC`/`ORR`/`ORN`/`EOR`/`BSL`/`BIT`/`BIF`
 and the `MOV` alias now use shared IR. Full-width operations can fold proven
@@ -70,6 +79,29 @@ and the `MOV` alias now use shared IR. Full-width operations can fold proven
 destination because the current V-register model cannot represent a partial
 write without inventing the preserved high half. Replicated `MOVI.2D` constants
 also enter shared IR and can feed these operations.
+
+Integer SIMD lane extracts (`UMOV`/its `MOV` alias and `SMOV`) now have
+shared `VectorExtract` records carrying destination width, source V register,
+lane, element width and sign/zero extension. They write exactly their GPR
+destination (W writes also replace its X identity), preserve NZCV and V
+registers, and fold complete known vector bits with bounded provenance.
+These are bit extractions, not floating conversions or source-variable copies.
+The fixed fields and allowed width/size combinations follow LLVM's
+[AArch64 instruction formats](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AArch64/AArch64InstrFormats.td).
+
+The old major-group `simd` preservation marker is removed: unmodeled SIMD/FP
+and reserved words are opaque barriers, not proof that general-purpose state
+survives. The vector-bitwise decoder also checks fixed bit 24 so neighboring
+encoding groups cannot be mistaken for bitwise operations. This does not
+complete SIMD/FP, system, trap or streaming-mode semantics.
+
+`python3 scripts/test-arm64-vector-extract.py /absolute/path/to/reworker`
+assembles all 82 legal size/lane/width forms with Apple Clang, checks worker
+expressions and known-bit results, and on Apple Silicon executes 42,640
+fixture comparisons against an independent byte-oriented C reference.
+The execution scope is normal EL0, non-streaming lane results; privileged
+access traps and SME configuration are not qualified. An Intel macOS host
+cross-assembles and checks the worker but explicitly reports no native execution.
 
 Non-temporal `LDNP`/`STNP` instructions use the shared pair-load/store IR. Their
 cache-policy hint does not change the represented register or memory effects,

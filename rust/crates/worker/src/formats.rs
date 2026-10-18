@@ -188,6 +188,7 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
     range(phoff, phnum * phsize, length)?;
     let table = read(file, add(o.offset, phoff)?, (phnum * phsize) as usize)?;
     let mut loads = vec![];
+    let mut dynamic_segment: Option<(u64, u64, u64)> = None;
     for p in table.chunks_exact(phsize.max(1) as usize) {
         let kind = u32v(p, be);
         let (offset, va, filesz, memsz, permission, alignment) = if bits == 64 {

@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import struct
 import tempfile
 import unittest
 
@@ -55,6 +56,7 @@ class DarwinCatalogTests(unittest.TestCase):
         self.assertEqual([argument["encoding"] for argument in score["arguments"]], ["@", ":", "d", "Q"])
         self.assertEqual(score["return_type"]["size"], 8)
         self.assertRegex(score["implementation_image"]["uuid"], r"^[0-9a-f-]{36}$")
+        self.assertEqual(score["implementation_image"]["uuid"], cls["image"]["uuid"])
         self.assertEqual(methods["pair"]["return_type"]["size"], 16)
         self.assertEqual(methods["pair"]["return_type"]["alignment"], 8)
         self.assertIn("rangeForCount:", {method["selector"] for method in cls["class_methods"]})
@@ -108,6 +110,21 @@ class DarwinCatalogTests(unittest.TestCase):
             SDK.collect_declarations(["bad;identifier"], self.header)
         with self.assertRaisesRegex(ValueError, "disagree"):
             SDK.collect_declarations(["HSNativeCatalogCount"], self.header, sdk="macosx", target="arm64-apple-ios16.0")
+
+    def test_source_binding_checks_actual_macho_architecture_and_platform(self):
+        host_target = self.catalog["architecture"] + "-apple-macos14.0"
+        SDK.verify_macho_target(self.helper, host_target)
+        with self.assertRaisesRegex(ValueError, "platform differs"):
+            SDK.verify_macho_target(self.helper, self.catalog["architecture"] + "-apple-ios16.0")
+        other = "x86_64" if self.catalog["architecture"] == "arm64" else "arm64"
+        with self.assertRaisesRegex(ValueError, "architecture differs"):
+            SDK.verify_macho_target(self.helper, other + "-apple-macos14.0")
+        malformed = Path(self.directory.name) / "malformed.macho"
+        raw = bytearray(self.helper.read_bytes())
+        struct.pack_into("<I", raw, 20, 0xffffffff)
+        malformed.write_bytes(raw)
+        with self.assertRaisesRegex(ValueError, "budget exceeded"):
+            SDK.verify_macho_target(malformed, host_target)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,18 @@
 
 # Unreleased — Decompiler SSA and scalar FP foundation
 
+- Replace text-derived pseudocode parameter flow with bounded shared-IR entry identities, width-specific register views, CFG must-joins, frame spills/restores and paired-write invalidation. Separate input/output names and record join/limit reasons.
+- Correct scalar pre-indexed access rendering and capture original effective addresses for overlapping-base pair loads. Six Apple-assembled functions qualify pseudocode names/effects with 1,560 original-native result checks; reconstructed-source equivalence remains open.
+- Advance analysis/cache identity to `arm64-analysis-v89-schema122` and statement banner to v54; transport/cache schemas remain unchanged.
+
+- Lift all 82 legal integer SIMD-to-GPR lane forms (`UMOV`/`MOV`, `SMOV`) into shared IR with exact destination/extension effects and bounded vector-bit provenance. Apple-assembled fixtures and 42,640 native lane-result comparisons qualify the non-streaming EL0 result model.
+- Remove the broad SIMD preservation fallback and tighten the vector-bitwise fixed-bit mask. Reserved/unmodeled words invalidate unknown state instead of preserving stale constants, SSA identities or object receivers.
+- Advance analysis/cache identity to `arm64-analysis-v88-schema122` and statement banner to v53; report/cache schemas remain unchanged.
+
+- Join structured target-local Objective-C ivar/property layouts to AArch64 pseudocode. Proven instance-receiver memory accesses render named ivars; typed property declarations and object accessor signatures retain metadata provenance.
+- Correct LP64 class/metaclass RO member offsets and read ivar-offset variables as 32-bit values. Shared IMPs, overlapping/contradictory layouts, unknown receivers, calls, opaque effects and conflicting CFG paths withhold field substitutions.
+- Advance analysis/cache identity to `arm64-analysis-v87-schema122`; the 72-field report and v52 machine-statement banner remain unchanged.
+
 - Admit bounded ELF32/ELF64 relocatable objects, assign deterministic analysis-only addresses to allocatable sections, and rebase section-relative symbols without claiming loader placement or applying relocations.
 - Recover bounded section-backed ELF `SHT_REL`/`SHT_RELA` records with validated symbol-table links, target sections, sites, types, symbol indices, and addends; relocations remain unapplied evidence.
 - Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.

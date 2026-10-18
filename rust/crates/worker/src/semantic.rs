@@ -3,6 +3,9 @@
 
 use std::fmt::Write as _;
 
+mod names;
+pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
+
 const MAX_FUNCTIONS: usize = 8;
 const MAX_WORDS_PER_FUNCTION: usize = 128;
 const MAX_OUTPUT: usize = 48_000;
@@ -522,6 +525,9 @@ enum IrOperation {
     /// `MOVI` of a replicated 8-bit immediate into a V register. The value is
     /// the proven 128-bit bit pattern, so lane-exact folding can consume it.
     VectorImmediate { destination: u8, value: u128, immediate: u8 },
+    /// Extract one integer vector lane into a GPR. This is a bit operation,
+    /// not a same-bank variable copy or floating-point conversion.
+    VectorExtract { destination: IrRegister, source: u8, lane: u8, bits: u8, signed: bool },
     DirectCall { target: u64 },
     IndirectCall { target: IrRegister },
     Branch { target: u64 },
@@ -575,6 +581,7 @@ impl IrOperation {
                 effects.uses = operand_gpr_mask(value);
             }
             Self::Address { destination, .. } => effects.definitions = gpr_mask(destination),
+            Self::VectorExtract { destination, .. } => effects.definitions = gpr_mask(destination),
             Self::Binary { destination, left, right, .. } => {
                 effects.definitions = gpr_mask(destination);
                 effects.uses = operand_gpr_mask(left) | operand_gpr_mask(right);
@@ -713,6 +720,7 @@ impl IrOperation {
             | Self::ScalarFloatMultiplyAdd(..) | Self::ScalarFloatSelect { .. }
             | Self::SimdLoad { .. } | Self::SimdStore { .. }
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
+            | Self::VectorExtract { .. }
         );
         let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
         let consumed_flags = if consumes_flags {
@@ -732,7 +740,6 @@ impl IrOperation {
         match self {
             Self::Nop => Some("/* nop */".into()),
             Self::Marker { mnemonic, domain } => {
-                if mnemonic == "simd" { flow.v_registers.fill(None); }
                 Some(match domain {Some(domain)=>format!("/* {mnemonic} {domain} */"),None=>format!("/* {mnemonic} */")})
             },
             Self::Assign { destination, value } => {
@@ -1155,7 +1162,8 @@ impl IrOperation {
                 let pre_update = writeback.filter(|item| item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
                 let post_update = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc));
                 let size = bytes.trailing_zeros();
-                let access = memory_access_operand(&expression, size, signed, destination.wide);
+                let access_expression = writeback.filter(|item|item.pre_index).map(|item|item.base.target().name()).unwrap_or(expression);
+                let access = memory_access_operand(&access_expression, size, signed, destination.wide);
                 flow.write(destination, None);
                 let mut statement = String::new();
                 if let Some((base, rendered, value)) = pre_update {
@@ -1189,7 +1197,8 @@ impl IrOperation {
                     }
                 };
                 let value = match value { IrOperand::Register(register) => register.target(), _ => return None };
-                let access = memory_access_operand(&expression, bytes.trailing_zeros(), false, value.wide);
+                let access_expression = writeback.filter(|item|item.pre_index).map(|item|item.base.target().name()).unwrap_or(expression);
+                let access = memory_access_operand(&access_expression, bytes.trailing_zeros(), false, value.wide);
                 let mut statement = String::new();
                 if let Some(item) = writeback.filter(|item| item.pre_index) {
                     let (base, rendered, new_value) = apply_ir_writeback(item, flow, pc);
@@ -1214,11 +1223,20 @@ impl IrOperation {
                     flow.write(base, value);
                     pre_text = Some((base, rendered));
                 }
-                let [(expression, known), (second_expression, second_known)] = pair_accesses(flow, pc, address, bytes, pre_index)?;
+                let [(mut expression, known), (mut second_expression, second_known)] = pair_accesses(flow, pc, address, bytes, pre_index)?;
+                // Both addresses are computed before either destination is
+                // written. A valid non-writeback LDP may overwrite its base.
+                let captured_address = if gpr_mask(first) & address_gpr_mask(address) != 0 {
+                    let temporary=format!("pair_addr_{pc:x}");
+                    let capture=format!("{temporary} = {expression}; ");
+                    expression=temporary.clone(); second_expression=signed_memory_operand(&temporary,i64::from(bytes));
+                    Some(capture)
+                } else { None };
                 let first = first.target(); let second = second.target();
                 flow.write(first, None); flow.write(second, None);
                 let mut statement = String::new();
                 if let Some((base, rendered)) = pre_text { statement.push_str(&format!("{} = {}; ", base.name(), rendered)); }
+                if let Some(capture)=captured_address {statement.push_str(&capture);}
                 statement.push_str(&format!("{} = {};{} {} = {};{}", first.name(), memory_access_operand(&expression, bytes.trailing_zeros(), signed, first.wide), address_suffix(known.as_ref()), second.name(), memory_access_operand(&second_expression, bytes.trailing_zeros(), signed, second.wide), address_suffix(second_known.as_ref())));
                 if let Some((base, rendered, value)) = writeback.filter(|item| !item.pre_index).map(|item| apply_ir_writeback(item, flow, pc)) { flow.write(base, value); statement.push_str(&format!(" {} = {};", base.name(), rendered)); }
                 Some(statement)
@@ -1430,6 +1448,18 @@ impl IrOperation {
             Self::VectorImmediate { destination, value, immediate } => {
                 flow.write_v(destination as u32, Some(VKnownValue { value, origins: vec![pc] }));
                 Some(format!("/* movi.2d v{destination}, #0x{immediate:02x} */"))
+            }
+            Self::VectorExtract { destination, source, lane, bits, signed } => {
+                let destination = destination.target();
+                let known = flow.read_v(source as u32).and_then(|input| {
+                    let mask = (1u128 << bits) - 1;
+                    let value = ((input.value >> (u32::from(lane) * u32::from(bits))) & mask) as u64;
+                    let value = if signed { ((value << (64 - bits)) as i64 >> (64 - bits)) as u64 } else { value };
+                    Some(KnownValue { value: destination.mask(value), origins: combine_origins(&input.origins, &[], pc)? })
+                });
+                flow.write(destination, known.clone());
+                let expression = format!("{}(vector_lane(v{source}, {lane}, {bits}), {bits})", if signed { "sext" } else { "zext" });
+                Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known.as_ref())))
             }
             Self::VectorBitwise { destination, left, right, operator } => {
                 let left_value = flow.read_v(left.index as u32);
@@ -2421,6 +2451,7 @@ enum Operation {
     SimdLoad { destination: IrSimdRegister, base: Register, address: AddressForm },
     SimdStore { source: IrSimdRegister, base: Register, address: AddressForm },
     VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
+    VectorExtract { destination: Register, source: u8, lane: u8, bits: u8, signed: bool },
     LoadPair {
         dst1: Register,
         dst2: Register,
@@ -2822,6 +2853,9 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         },
         Operation::VectorBitwise { destination, left, right, operator } => {
             IrOperation::VectorBitwise { destination, left, right, operator }
+        }
+        Operation::VectorExtract { destination, source, lane, bits, signed } => {
+            IrOperation::VectorExtract { destination: reg(destination), source, lane, bits, signed }
         }
         Operation::VMoveImm { vd, value } => IrOperation::VectorImmediate {
             destination: vd,
@@ -4939,7 +4973,7 @@ fn decode(word: u32, pc: u64) -> Operation {
     // two-register misc group. `Q` selects the 128-bit (`Q`) or 64-bit (`D`)
     // destination view. `ORR` with `Rn == Rm` is the architectural `MOV`
     // alias. No arrangement-dependent arithmetic or exception state is claimed.
-    if word & 0x9e20_fc00 == 0x0e20_1c00 {
+    if word & 0x9f20_fc00 == 0x0e20_1c00 {
         let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
         let destination = IrSimdRegister { index: (word & 31) as u8, width };
         let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
@@ -4959,16 +4993,29 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
         return Operation::VectorBitwise { destination, left, right, operator };
     }
-    // Vector (SIMD) data processing (0x0e...): modeled as a marker preserving
-    // general-purpose value flow. These instructions operate on V registers,
-    // which are not tracked precisely yet, but they do not touch the
-    // general-purpose registers.
-    if (word & 0x0e00_0000) == 0x0e00_0000 {
-        return Operation::SystemMarker {
-            mnemonic: "simd",
-            domain: None,
+    // Advanced SIMD UMOV/MOV-to-general and SMOV. Q is the destination
+    // GPR width, not the source-vector width; imm5 encodes size plus lane.
+    // LLVM AArch64InstrFormats.td BaseSIMDMov / UMov / SMov define the
+    // fixed fields and legal size/Q combinations. Never infer preservation
+    // from the broad SIMD major group: it also contains GPR-writing forms.
+    if matches!(word & 0xbfe0_fc00, 0x0e00_2c00 | 0x0e00_3c00) {
+        let imm5 = (word >> 16) & 31;
+        let size = imm5.trailing_zeros();
+        let wide = word & 0x4000_0000 != 0;
+        let signed = word & 0x1000 == 0;
+        let legal = if signed { size <= if wide { 2 } else { 1 } }
+            else { (wide && size == 3) || (!wide && size <= 2) };
+        if !legal { return Operation::Opaque; }
+        return Operation::VectorExtract {
+            destination: Register { index: word & 31, wide, stack_pointer: false },
+            source: ((word >> 5) & 31) as u8,
+            lane: (imm5 >> (size + 1)) as u8,
+            bits: (8u32 << size) as u8,
+            signed,
         };
     }
+    // Unmodeled SIMD/FP and reserved encodings remain opaque. A major opcode
+    // is not proof that GPRs, NZCV, memory or control flow are untouched.
     Operation::Opaque
 }
 
@@ -4981,7 +5028,8 @@ struct KnownValue {
 #[derive(Clone)]
 struct VKnownValue {
     /// 128-bit vector value (both lanes combined; little-endian lane 0 in the
-    /// low 64 bits). Tracked only for the simple `MOVI` immediate forms so far.
+    /// low 64 bits). A known value describes all 128 bits, never an unknown
+    /// upper half; partial writes that cannot establish it invalidate the value.
     value: u128,
     origins: Vec<u64>,
 }
@@ -6399,8 +6447,10 @@ impl Operation {
             Self::VectorBitwise { destination, left, right, operator } => {
                 IrOperation::VectorBitwise { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
             }
+            Self::VectorExtract { destination, source, lane, bits, signed } => {
+                IrOperation::VectorExtract { destination: destination.into(), source, lane, bits, signed }.render(flow, pc).unwrap_or_default()
+            }
             Self::SystemMarker { mnemonic, domain } => {
-                if mnemonic == "simd" { flow.v_registers.fill(None); }
                 match domain {
                     Some(domain) => format!("/* {mnemonic} {domain} */"),
                     None => format!("/* {mnemonic} */"),
@@ -6942,6 +6992,315 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
     stack.into_iter().map(|(offset, (bytes, value, provenance))| (offset, bytes, value, provenance)).collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObjectValue {
+    Unknown,
+    Receiver(i64),
+    Stack(i64),
+    Constant(u64),
+    IvarOffset(u64),
+    IvarAddress(u64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObjectState {
+    registers: [ObjectValue; 32],
+    stack: std::collections::BTreeMap<(i64, u8), ObjectValue>,
+}
+
+impl ObjectState {
+    fn entry() -> Self {
+        let mut state = Self { registers: [ObjectValue::Unknown; 32], stack: std::collections::BTreeMap::new() };
+        state.registers[0] = ObjectValue::Receiver(0);
+        state.registers[31] = ObjectValue::Stack(0);
+        state
+    }
+
+    fn read(&self, register: IrRegister) -> ObjectValue {
+        let value = match register.class {
+            IrRegisterClass::Zero => ObjectValue::Constant(0),
+            IrRegisterClass::General | IrRegisterClass::StackPointer => self.registers[register.index as usize],
+            _ => ObjectValue::Unknown,
+        };
+        if register.bits == 64 { return value; }
+        match value {
+            ObjectValue::Constant(value) => ObjectValue::Constant(value & u32::MAX as u64),
+            ObjectValue::IvarOffset(_) => value,
+            _ => ObjectValue::Unknown,
+        }
+    }
+
+    fn operand(&self, operand: IrOperand) -> ObjectValue {
+        match operand { IrOperand::Register(register) => self.read(register), IrOperand::Constant(value) => ObjectValue::Constant(value) }
+    }
+
+    fn write(&mut self, register: IrRegister, value: ObjectValue) {
+        if !matches!(register.class, IrRegisterClass::General | IrRegisterClass::StackPointer) { return; }
+        self.registers[register.index as usize] = if register.bits == 64 { value } else {
+            match value { ObjectValue::Constant(value) => ObjectValue::Constant(value & u32::MAX as u64), ObjectValue::IvarOffset(_) => value, _ => ObjectValue::Unknown }
+        };
+    }
+
+    fn offset(value: ObjectValue, offset: i64) -> ObjectValue {
+        match value {
+            ObjectValue::Receiver(value) => value.checked_add(offset).map(ObjectValue::Receiver).unwrap_or(ObjectValue::Unknown),
+            ObjectValue::Stack(value) => value.checked_add(offset).filter(|value| value.unsigned_abs() <= 1024 * 1024).map(ObjectValue::Stack).unwrap_or(ObjectValue::Unknown),
+            ObjectValue::Constant(value) => ObjectValue::Constant(value.wrapping_add(offset as u64)),
+            _ if offset == 0 => value,
+            _ => ObjectValue::Unknown,
+        }
+    }
+
+    fn add(left: ObjectValue, right: ObjectValue) -> ObjectValue {
+        match (left, right) {
+            (ObjectValue::Receiver(0), ObjectValue::IvarOffset(slot)) | (ObjectValue::IvarOffset(slot), ObjectValue::Receiver(0)) => ObjectValue::IvarAddress(slot),
+            (_, ObjectValue::Constant(offset)) => Self::offset(left, offset as i64),
+            (ObjectValue::Constant(offset), _) => Self::offset(right, offset as i64),
+            _ => ObjectValue::Unknown,
+        }
+    }
+
+    fn address(&self, address: IrMemoryAddress) -> ObjectValue {
+        match address {
+            IrMemoryAddress::BaseOffset { base, offset } => Self::offset(self.read(base), offset),
+            IrMemoryAddress::PcRelative { target, .. } => ObjectValue::Constant(target),
+            IrMemoryAddress::BaseIndex { base, index, extension, scale } => {
+                let value = self.read(index);
+                let value = match value {
+                    ObjectValue::Constant(value) => {
+                        let value = match extension {
+                            Some(IrExtension::Zero(bits)) if bits < 64 => value & ((1u64 << bits) - 1),
+                            Some(IrExtension::Sign(32)) => sign_extend_32(value),
+                            Some(IrExtension::Sign(_)) => return ObjectValue::Unknown,
+                            _ => value,
+                        };
+                        ObjectValue::Constant(value.wrapping_shl(u32::from(scale)))
+                    }
+                    ObjectValue::IvarOffset(_) if scale == 0 => value,
+                    _ => return ObjectValue::Unknown,
+                };
+                Self::add(self.read(base), value)
+            }
+        }
+    }
+
+    fn load(&self, address: ObjectValue, bytes: u8, slots: &std::collections::BTreeSet<u64>) -> ObjectValue {
+        match address {
+            ObjectValue::Stack(offset) if bytes == 8 => self.stack.get(&(offset, bytes)).copied().unwrap_or(ObjectValue::Unknown),
+            ObjectValue::Constant(slot) if bytes == 4 && slots.contains(&slot) => ObjectValue::IvarOffset(slot),
+            _ => ObjectValue::Unknown,
+        }
+    }
+
+    fn store(&mut self, address: ObjectValue, bytes: u8, value: ObjectValue) {
+        if let ObjectValue::Stack(offset) = address {
+            self.stack.retain(|(other, width), _| other.saturating_add(i64::from(*width)) <= offset || offset.saturating_add(i64::from(bytes)) <= *other);
+            if bytes == 8 && value != ObjectValue::Unknown && self.stack.len() < 64 { self.stack.insert((offset, bytes), value); }
+        } else {
+            // A store through an unknown/object address may alias saved state.
+            self.stack.clear();
+            // An offset variable may itself be changed through an alias. An
+            // earlier cached offset must not become a fresh source field read.
+            for value in &mut self.registers {
+                if matches!(value,ObjectValue::IvarOffset(_)|ObjectValue::IvarAddress(_)){*value=ObjectValue::Unknown;}
+            }
+        }
+    }
+
+    fn merge(&self, other: &Self) -> Self {
+        let mut result = self.clone();
+        for (index, value) in result.registers.iter_mut().enumerate() {
+            if *value != other.registers[index] { *value = ObjectValue::Unknown; }
+        }
+        result.stack.retain(|key, value| other.stack.get(key) == Some(value));
+        result
+    }
+
+    fn transfer(&self, operation: IrOperation, slots: &std::collections::BTreeSet<u64>) -> Self {
+        let effects = operation.gpr_effects();
+        if effects.barrier {
+            return Self { registers: [ObjectValue::Unknown; 32], stack: std::collections::BTreeMap::new() };
+        }
+        let mut result = self.clone();
+        for index in 0..32 {
+            if effects.definitions & (1u32 << index) != 0 { result.registers[index] = ObjectValue::Unknown; }
+        }
+        match operation {
+            IrOperation::Assign { destination, value } => result.write(destination, self.operand(value)),
+            IrOperation::Address { destination, value, .. } => result.write(destination, ObjectValue::Constant(value)),
+            IrOperation::Binary { destination, operator: IrBinaryOp::Add, left, right } => result.write(destination, Self::add(self.operand(left), self.operand(right))),
+            IrOperation::Binary { destination, operator: IrBinaryOp::Subtract, left, right } => {
+                if let ObjectValue::Constant(value) = self.operand(right) { result.write(destination, Self::offset(self.operand(left), (value as i64).wrapping_neg())); }
+            }
+            IrOperation::LogicalRegister { destination, left, right, operator: IrBinaryOp::Or, negate_right: false, shift: None } => {
+                let left = self.read(left); let right = self.read(right);
+                if left == ObjectValue::Constant(0) { result.write(destination, right); }
+                else if right == ObjectValue::Constant(0) || left == right { result.write(destination, left); }
+            }
+            IrOperation::Load { destination, address, bytes, writeback: None, .. } => result.write(destination, self.load(self.address(address), bytes, slots)),
+            IrOperation::Store { address, value, bytes, writeback: None } => result.store(self.address(address), bytes, self.operand(value)),
+            IrOperation::LoadPair { first, second, address, bytes, writeback: None, .. } => {
+                let address = self.address(address);
+                result.write(first, self.load(address, bytes, slots));
+                result.write(second, self.load(Self::offset(address, i64::from(bytes)), bytes, slots));
+            }
+            IrOperation::StorePair { address, first, second, bytes, writeback: None } => {
+                let address = self.address(address);
+                result.store(address, bytes, self.read(first));
+                result.store(Self::offset(address, i64::from(bytes)), bytes, self.read(second));
+            }
+            IrOperation::SimdStore { address, source, writeback: None } => result.store(self.address(address), source.width.bytes(), ObjectValue::Unknown),
+            IrOperation::SimdPairStore { .. } | IrOperation::AtomicStore { .. }
+                | IrOperation::Store { .. } | IrOperation::StorePair { .. } | IrOperation::SimdStore { .. } => result.stack.clear(),
+            _ => {}
+        }
+        // Track frame writeback in architectural order, including the common
+        // STP prologue. Pair contents may remain unknown; the new SP is exact.
+        let writeback = match operation {
+            IrOperation::Load { writeback, .. } | IrOperation::Store { writeback, .. }
+            | IrOperation::LoadPair { writeback, .. } | IrOperation::StorePair { writeback, .. }
+            | IrOperation::SimdLoad { writeback, .. } | IrOperation::SimdStore { writeback, .. }
+            | IrOperation::SimdPairLoad { writeback, .. } | IrOperation::SimdPairStore { writeback, .. } => writeback,
+            _ => None,
+        };
+        if let Some(update) = writeback { result.write(update.base, Self::offset(self.read(update.base), update.offset)); }
+        result
+    }
+}
+
+pub struct ObjectMemberAccess {
+    pub offset: Option<u64>,
+    pub offset_pointer: Option<u64>,
+    pub bytes: u8,
+    pub floating: bool,
+    pub write: bool,
+    pub register: String,
+    pub signed: bool,
+    pub result_bits: u8,
+}
+
+/// Must-analysis over structured instruction effects, rooted in an instance
+/// IMP's incoming x0. Calls/opaque effects kill identities; CFG joins intersect
+/// them. Offset-slot identity is preserved instead of folding a runtime-slid
+/// ivar offset to its on-disk numeric value.
+pub fn object_member_accesses(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
+    use std::collections::{BTreeMap, VecDeque};
+    let mut result = BTreeMap::new();
+    if start<base || end<=start || (start-base)%4!=0 || (end-start)%4!=0 || (end-start)/4>MAX_WORDS_PER_FUNCTION as u64 { return result; }
+    let Some(body)=code.get((start-base) as usize..(end-base) as usize)else{return result};
+    let operations=body.chunks_exact(4).enumerate().map(|(index,word)|{
+        let pc=start+index as u64*4;let position=file_offset.saturating_add(pc-base);
+        if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){IrOperation::TargetSpecific}
+        else{lift_operation(decode(u32::from_le_bytes(word.try_into().unwrap()),pc),pc)}
+    }).collect::<Vec<_>>();
+    if operations.iter().any(|operation|matches!(operation,IrOperation::IndirectBranch{..})){return result}
+    let mut states=vec![None::<ObjectState>;operations.len()];states[0]=Some(ObjectState::entry());
+    let mut work=VecDeque::from([0usize]);let mut iterations=0;
+    while let Some(index)=work.pop_front(){
+        iterations+=1;if iterations>32768{return BTreeMap::new()}
+        let outgoing=states[index].as_ref().unwrap().transfer(operations[index],slots);
+        let mut successors=Vec::new();
+        match operations[index]{
+            IrOperation::Branch{target}|IrOperation::ConditionalBranch{target,..}=>{
+                if target>=start&&target<end&&(target-start)%4==0{successors.push(((target-start)/4) as usize)}
+                if matches!(operations[index],IrOperation::ConditionalBranch{..})&&index+1<operations.len(){successors.push(index+1)}
+            }
+            IrOperation::Return{..}|IrOperation::IndirectBranch{..}=>{}
+            _ if index+1<operations.len()=>successors.push(index+1),
+            _=>{}
+        }
+        for successor in successors{
+            let merged=states[successor].as_ref().map(|prior|prior.merge(&outgoing)).unwrap_or_else(||outgoing.clone());
+            if states[successor].as_ref()!=Some(&merged){states[successor]=Some(merged);if !work.contains(&successor){work.push_back(successor)}}
+        }
+    }
+    for (index,operation) in operations.iter().enumerate(){
+        let Some(state)=&states[index]else{continue};
+        let (address,bytes,floating,write,register,signed,result_bits)=match *operation{
+            IrOperation::Load{destination,address,bytes,signed,writeback:None}=>(address,bytes,false,false,destination.target().name(),signed,destination.bits),
+            IrOperation::Store{value:IrOperand::Register(register),address,bytes,writeback:None}=>(address,bytes,false,true,register.target().name(),false,register.bits),
+            IrOperation::SimdLoad{destination,address,writeback:None} if matches!(destination.width,IrSimdWidth::Single|IrSimdWidth::Double)=>(address,destination.width.bytes(),true,false,simd_register_name(destination),false,destination.width.bytes()*8),
+            IrOperation::SimdStore{source,address,writeback:None} if matches!(source.width,IrSimdWidth::Single|IrSimdWidth::Double)=>(address,source.width.bytes(),true,true,simd_register_name(source),false,source.width.bytes()*8),
+            _=>continue,
+        };
+        let (offset,offset_pointer)=match state.address(address){
+            ObjectValue::Receiver(offset) if offset>=0=>(Some(offset as u64),None),
+            ObjectValue::IvarAddress(slot)=>(None,Some(slot)),
+            _=>continue,
+        };
+        result.insert(start+index as u64*4,ObjectMemberAccess{offset,offset_pointer,bytes,floating,write,register,signed,result_bits});
+    }
+    result
+}
+
+#[cfg(test)]
+mod object_member_tests {
+    use super::*;
+
+    fn accesses(words:&[u32]) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
+        let code=words.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+        object_member_accesses(&code,0x1000,0x1000,0x1000+code.len() as u64,0,&[],&std::collections::BTreeSet::new())
+    }
+
+    #[test]
+    fn member_origins_follow_full_width_copies_but_not_partial_redefinitions() {
+        let proven=accesses(&[0xaa0003e8,0xf9400501,0xd65f03c0]); // mov x8,x0; ldr x1,[x8,#8]
+        assert_eq!(proven[&0x1004].offset,Some(8));
+        assert!(!proven[&0x1004].write);
+        assert_eq!(proven[&0x1004].register,"x1");
+        assert!(accesses(&[0x2a0003e8,0xf9400501,0xd65f03c0]).is_empty()); // mov w8,w0
+        assert!(accesses(&[0xaa0003e8,0xd2800008,0xf9400501,0xd65f03c0]).is_empty());
+        assert!(accesses(&[0x94000004,0xf9400400,0xd65f03c0]).is_empty());
+        assert!(accesses(&[0xffffffff,0xf9400400,0xd65f03c0]).is_empty());
+    }
+
+    #[test]
+    fn frame_spills_require_an_intact_full_width_saved_receiver() {
+        let prefix=[0xd10043ff,0xf90007e0]; // sub sp,sp,#16; str x0,[sp,#8]
+        let mut words=prefix.to_vec();words.extend([0xb90003e1,0xf94007e8,0xf9400500,0xd65f03c0]);
+        assert!(accesses(&words).contains_key(&0x1010)); // str w1,[sp] is disjoint
+        let mut overlap=prefix.to_vec();overlap.extend([0xb9000fe1,0xf94007e8,0xf9400500,0xd65f03c0]);
+        assert!(accesses(&overlap).is_empty()); // str w1,[sp,#12] overlaps saved x0
+    }
+
+    #[test]
+    fn cfg_joins_intersect_receiver_identity_and_ignore_unreachable_clobbers() {
+        let mut diamond=[0xaa0003e8,0xb4000061,0xaa0203e8,0x14000002,0xd503201f,0xf9400500,0xd65f03c0];
+        assert!(accesses(&diamond).is_empty());
+        diamond[2]=0xaa0003e8;
+        assert!(accesses(&diamond).contains_key(&0x1014));
+        assert!(accesses(&[0x14000002,0xaa0103e0,0xf9400400,0xd65f03c0]).contains_key(&0x1008));
+    }
+
+    #[test]
+    fn loop_backedges_invalidate_transient_receiver_proofs() {
+        assert!(accesses(&[0xaa0003e8,0xf9400501,0xaa0203e8,0xb5ffffc3,0xd65f03c0]).is_empty());
+        assert!(accesses(&[0xaa0003e8,0xf9400501,0xb5ffffe3,0xd65f03c0]).contains_key(&0x1004));
+    }
+
+    #[test]
+    fn data_indirect_transfers_and_exhausted_function_bounds_withhold_proofs() {
+        let code=[0xf9400400u32,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        assert!(object_member_accesses(&code,0x1000,0x1000,0x1008,0,&[(0,4,1)],&std::collections::BTreeSet::new()).is_empty());
+        assert!(accesses(&[0xf9400401,0xd61f0200,0xd65f03c0]).is_empty());
+        assert!(accesses(&vec![0xf9400401;129]).is_empty());
+    }
+
+    #[test]
+    fn runtime_ivar_offset_identity_is_not_folded_and_alias_stores_kill_it() {
+        let mut state=ObjectState::entry();
+        let register=|index,bits|IrRegister{class:IrRegisterClass::General,index,bits};
+        let slots=std::collections::BTreeSet::from([0x2000]);
+        state.registers[8]=ObjectValue::Constant(0x2000);
+        state=state.transfer(IrOperation::Load{destination:register(9,32),address:IrMemoryAddress::BaseOffset{base:register(8,64),offset:0},bytes:4,signed:false,writeback:None},&slots);
+        assert_eq!(state.registers[9],ObjectValue::IvarOffset(0x2000));
+        assert_eq!(state.address(IrMemoryAddress::BaseIndex{base:register(0,64),index:register(9,64),extension:None,scale:0}),ObjectValue::IvarAddress(0x2000));
+        assert_eq!(state.address(IrMemoryAddress::BaseIndex{base:register(0,64),index:register(9,64),extension:None,scale:3}),ObjectValue::Unknown);
+        state=state.transfer(IrOperation::Store{address:IrMemoryAddress::BaseOffset{base:register(1,64),offset:0},value:IrOperand::Constant(0),bytes:4,writeback:None},&slots);
+        assert_eq!(state.registers[9],ObjectValue::Unknown);
+    }
+}
+
 /// Stack-relative slot names are safe only when every instruction in the
 /// recovered function is understood well enough to prove that SP is unchanged.
 pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, function_end: u64) -> bool {
@@ -6976,7 +7335,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v52; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v54; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -9672,6 +10031,153 @@ mod vector_bitwise_tests {
         lift_operation(decode(0x0e65_1c83, 0x1000), 0x1000).render(&mut flow, 0x1000);
         assert!(flow.read_v(3).is_none());
         assert!(flow.read_v(4).is_some() && flow.read_v(5).is_some());
+    }
+}
+
+#[cfg(test)]
+mod vector_extract_tests {
+    use super::*;
+
+    fn word(wide: bool, signed: bool, bits: u8, lane: u8, destination: u8, source: u8) -> u32 {
+        let size = bits.trailing_zeros() - 3;
+        let imm5 = (u32::from(lane) << (size + 1)) | (1 << size);
+        0x0e00_0000 | ((wide as u32) << 30) | (imm5 << 16)
+            | if signed { 0x2c00 } else { 0x3c00 }
+            | (u32::from(source) << 5) | u32::from(destination)
+    }
+
+    #[test]
+    fn every_legal_size_lane_and_destination_width_has_shared_effects() {
+        let mut count = 0;
+        for (wide, signed, sizes) in [
+            (false, false, &[8u8, 16, 32][..]), (true, false, &[64u8][..]),
+            (false, true, &[8u8, 16][..]), (true, true, &[8u8, 16, 32][..]),
+        ] {
+            for &bits in sizes {
+                for lane in 0..128 / bits {
+                    let encoding = word(wide, signed, bits, lane, 3, 7);
+                    let operation = decode(encoding, 0x1000);
+                    let shared = lift_operation(operation, 0x1000);
+                    assert_eq!(shared, IrOperation::VectorExtract {
+                        destination: Register { index: 3, wide, stack_pointer: false }.into(),
+                        source: 7, lane, bits, signed,
+                    }, "{encoding:#x}");
+                    let effects = shared.gpr_effects();
+                    assert_eq!(effects.definitions, 1 << 3);
+                    assert_eq!(effects.uses, 0);
+                    assert!(!effects.barrier);
+                    assert_eq!(operation.render(&mut Flow::new(), 0x1000), shared.render(&mut Flow::new(), 0x1000).unwrap());
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, 82);
+    }
+
+    #[test]
+    fn extracts_exact_lane_bits_sign_extends_and_retains_provenance() {
+        let patterns = [0, u128::MAX, 1u128 << 127, 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210];
+        for pattern in patterns {
+            for wide in [false, true] {
+                for signed in [false, true] {
+                    for bits in [8u8, 16, 32, 64] {
+                        let legal = if signed { bits < if wide { 64 } else { 32 } }
+                            else { if wide { bits == 64 } else { bits <= 32 } };
+                        if !legal { continue; }
+                        for lane in 0..128 / bits {
+                            let mut flow = Flow::new();
+                            flow.write_v(7, Some(VKnownValue { value: pattern, origins: vec![0xff0] }));
+                            flow.write_v(8, Some(VKnownValue { value: 0x1234, origins: vec![0xff4] }));
+                            flow.write(Register { index: 4, wide: true, stack_pointer: false }, Some(KnownValue { value: 9, origins: vec![0xff8] }));
+                            flow.flags = Some(0b1010);
+                            flow.flag_origins = Some(vec![0xffc]);
+                            let operation = lift_operation(decode(word(wide, signed, bits, lane, 3, 7), 0x1000), 0x1000);
+                            let statement = operation.render(&mut flow, 0x1000).unwrap();
+                            // Independent byte-oriented reference, not the renderer's shift/sign-extension expression.
+                            let bytes = pattern.to_le_bytes();
+                            let offset = usize::from(lane) * usize::from(bits / 8);
+                            let mut expected = [0u8; 8];
+                            let element = &bytes[offset..offset + usize::from(bits / 8)];
+                            if signed && element.last().unwrap() & 0x80 != 0 { expected.fill(0xff); }
+                            expected[..element.len()].copy_from_slice(element);
+                            let expected = u64::from_le_bytes(expected) & if wide { u64::MAX } else { u32::MAX as u64 };
+                            let value = flow.read(Register { index: 3, wide, stack_pointer: false }).unwrap();
+                            assert_eq!(value.value, expected, "{statement}");
+                            assert_eq!(value.origins, vec![0xff0, 0x1000]);
+                            assert_eq!(flow.read_v(7).unwrap().value, pattern);
+                            assert_eq!(flow.read_v(8).unwrap().value, 0x1234);
+                            assert_eq!(flow.registers[4].as_ref().unwrap().value, 9);
+                            assert_eq!(flow.flags, Some(0b1010));
+                            assert_eq!(flow.flag_origins, Some(vec![0xffc]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_sources_and_exhausted_provenance_kill_only_the_written_gpr() {
+        for source in [None, Some(VKnownValue { value: 3, origins: (0..8).collect() })] {
+            let mut flow = Flow::new();
+            flow.registers[0] = Some(KnownValue { value: 42, origins: vec![0xff0] });
+            flow.registers[1] = flow.registers[0].clone();
+            flow.v_registers[0] = source;
+            let operation = lift_operation(decode(word(false, false, 8, 0, 0, 0), 0x1000), 0x1000);
+            let statement = operation.render(&mut flow, 0x1000).unwrap();
+            assert!(!statement.contains("constant="));
+            assert!(flow.registers[0].is_none());
+            assert_eq!(flow.registers[1].as_ref().unwrap().value, 42);
+        }
+        let operation = lift_operation(decode(word(true, false, 64, 1, 31, 31), 0x1000), 0x1000);
+        assert_eq!(operation.gpr_effects().definitions, 0); // XZR, never SP.
+        assert!(operation.render(&mut Flow::new(), 0x1000).unwrap().starts_with("xzr = zext(vector_lane(v31, 1, 64), 64);"));
+    }
+
+    #[test]
+    fn reserved_sizes_and_unmodeled_neighbors_are_opaque_barriers() {
+        for wide in [false, true] {
+            for signed in [false, true] {
+                for imm5 in 0..32u32 {
+                    let encoding = 0x0e00_0000 | ((wide as u32) << 30) | (imm5 << 16)
+                        | if signed { 0x2c00 } else { 0x3c00 };
+                    let size = imm5.trailing_zeros();
+                    let legal = if signed { size <= if wide { 2 } else { 1 } }
+                        else { (wide && size == 3) || (!wide && size <= 2) };
+                    if !legal {
+                        assert!(matches!(decode(encoding, 0x1000), Operation::Opaque), "{encoding:#x}");
+                    }
+                }
+            }
+        }
+        // Previously the major-group fallback called all of these "simd".
+        // Include an unmodeled INS, vector arithmetic and a reserved word.
+        for encoding in [0xffff_ffff, 0x0e00_0000, 0x4e01_1c00, 0x4e22_8420, 0x8e01_3c00, 0x4f22_1c20] {
+            let operation = decode(encoding, 0x1000);
+            assert!(matches!(operation, Operation::Opaque), "{encoding:#x}");
+            assert!(lift_operation(operation, 0x1000).gpr_effects().barrier);
+            let mut flow = Flow::new();
+            flow.registers[0] = Some(KnownValue { value: 7, origins: vec![0xff0] });
+            flow.v_registers[0] = Some(VKnownValue { value: 7, origins: vec![0xff0] });
+            flow.flags = Some(0b0110);
+            operation.render(&mut flow, 0x1000);
+            assert!(flow.registers.iter().all(Option::is_none));
+            assert!(flow.v_registers.iter().all(Option::is_none));
+            assert!(flow.flags.is_none());
+        }
+    }
+
+    #[test]
+    fn call_arguments_and_receiver_proofs_observe_vector_gpr_writes() {
+        let words = [0xd280_00e0u32, 0x6f00_e400, word(false, false, 8, 0, 0, 0), 0x9400_0001];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let arguments = known_call_argument_values(&code, 0x1000, 0x1000, 0x100c);
+        assert!(arguments.iter().any(|argument| argument.0 == 0 && argument.1 == 0), "{arguments:?}");
+        for encoding in [word(true, false, 64, 0, 0, 0), 0xffff_ffff, 0x4e22_8420] {
+            let words = [encoding, 0xf940_0400, 0xd65f_03c0];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            assert!(object_member_accesses(&code, 0x1000, 0x1000, 0x100c, 0, &[], &std::collections::BTreeSet::new()).is_empty());
+        }
     }
 }
 

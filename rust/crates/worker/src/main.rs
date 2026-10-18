@@ -21,6 +21,7 @@
 mod preview;
 mod binary;
 mod semantic;
+mod objc;
 mod signatures;
 use std::{fs::File,io::{self,Read}};
 use reworkbench_protocol::{read_frame,write_frame,write_frame_with_limit,MAX_ANALYSIS_FRAME};

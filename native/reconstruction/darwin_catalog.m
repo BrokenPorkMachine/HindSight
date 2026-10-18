@@ -190,7 +190,9 @@ int main(int argc, const char **argv) {
         ];
         NSDictionary *document = @{@"schema": @1, @"producer": @"hindsight-darwin-native-v1", @"scope": @"helper-process loaded runtime; no target loaded",
             @"host_os": NSProcessInfo.processInfo.operatingSystemVersionString, @"os_build": text(build),
-#if defined(__arm64__)
+#if defined(__arm64e__)
+            @"architecture": @"arm64e",
+#elif defined(__arm64__)
             @"architecture": @"arm64",
 #elif defined(__x86_64__)
             @"architecture": @"x86_64",
