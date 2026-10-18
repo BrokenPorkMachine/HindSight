@@ -51,7 +51,13 @@ PE32/PE32+ images support i386, x86-64 and AArch64. The parser validates the DOS
 and PE signatures, COFF and optional headers, directory-table framing, alignments,
 section extents, preferred image base and entry point. File alignment padding is
 excluded from code, and virtual zero-fill tails are separate from captured bytes.
-Standalone COFF objects are not admitted.
+PE imports, exports and base relocations are recovered from data directories as
+bounded evidence.
+
+Standalone COFF objects (`.obj`) are admitted for i386, x86-64 and AArch64 with
+bounded section, symbol and relocation tables. Section contents receive
+deterministic analysis-only addresses, symbols supply names, function starts,
+undefined imports and visible exports, and relocations remain unapplied evidence.
 
 Both parsers reject overlapping mappings, overflowing addresses, out-of-file
 tables, architecture mismatches and entries outside file-backed executable

@@ -168,6 +168,21 @@ def elf_object():
     return data
 
 
+def coff_object():
+    """Minimal COFF i386 object with one section, symbol and relocation."""
+    data = bytearray(0x200)
+    struct.pack_into("<HHIIIHH", data, 0, 0x014c, 1, 0, 0x80, 2, 0, 0)
+    struct.pack_into("<8sIIIIIIHHI", data, 20, b".text\x00\x00\x00", 0, 0, 8, 0x60, 0x68, 0, 1, 0, 0x00000020 | 0x20000000)
+    data[0x60:0x68] = b"\x55\x89\xe5\x5d\xc3\x90\x90\x90"
+    struct.pack_into("<IIH", data, 0x68, 1, 0, 0x0014)
+    data[0x80:0x88] = b"_main\x00\x00\x00"
+    struct.pack_into("<IHHBB", data, 0x88, 0, 1, 0x0020, 2, 0)
+    struct.pack_into("<I", data, 0x80 + 18, 4)
+    struct.pack_into("<I", data, 8, 0x80)
+    struct.pack_into("<I", data, 12, 1)
+    return data
+
+
 def elf_sectionless_dynamic(gnu_hash=False):
     """Section-header-free ELF64 AArch64 ET_DYN with PT_DYNAMIC-derived evidence."""
     data = bytearray(0x400)
@@ -431,5 +446,13 @@ with tempfile.TemporaryDirectory() as directory:
     assert "0x0000000140001000 name=ExportedFunc source=PE export" in result["export_trie"], result["export_trie"]
     assert "0x0000000140001010 PE base relocation type=10 source=PE base relocation" in result["relocations"], result["relocations"]
     assert "PE data-directory evidence recovered" in result["metadata"], result["metadata"]
+
+    # COFF objects are admitted with section, symbol and relocation evidence.
+    result, _ = analyze(coff_object(), "coff")
+    assert result["kind"] == "analysis_result", result
+    assert result["analyzed_instructions"] > 0, result
+    assert "0x0000000000010000 name=_main source=COFF symbol" in result["functions"], result["functions"]
+    assert "0x0000000000010001 COFF relocation type=20 symbol-index=0 source=COFF relocation" in result["relocations"], result["relocations"]
+    assert result["symbol_count"] == 1, result["symbol_count"]
 
 print("ELF/PE capture, mappings, decode, evidence, paging, byte order, embedded offsets, malformed-input and sectionless dynamic-link checks passed")

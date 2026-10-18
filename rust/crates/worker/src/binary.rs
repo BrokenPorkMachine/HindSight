@@ -49,7 +49,7 @@ impl Options {
             base: number(&args[2])?,
             offset: number(&args[3])?,
         };
-        if !["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
+        if !["auto", "macho", "elf", "pe", "coff", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
             || !["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
                 .contains(&o.architecture.as_str())
         {
@@ -519,7 +519,15 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     if matches!(o.format.as_str(), "auto" | "pe") && header.starts_with(b"MZ") {
         return formats::pe(file, o);
     }
-    if matches!(o.format.as_str(), "elf" | "pe") {
+    if matches!(o.format.as_str(), "auto" | "coff") {
+        let machine = if header.len() >= 2 { u16::from_le_bytes([header[0], header[1]]) } else { 0 };
+        if matches!(machine, 0x014c | 0x8664 | 0xaa64) {
+            if let Ok(image) = formats::coff(file, o) {
+                return Ok(image);
+            }
+        }
+    }
+    if matches!(o.format.as_str(), "elf" | "pe" | "coff") {
         return Err(bad("Selected format does not match the image header"));
     }
     if o.format != "raw" && magic(&header).is_some() {

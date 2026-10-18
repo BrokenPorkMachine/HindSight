@@ -1182,6 +1182,183 @@ fn pe_data_directories(
     Ok(any)
 }
 
+pub(super) fn coff(file: &mut File, o: &Options) -> io::Result<Image> {
+    let length = file.metadata()?.len() - o.offset;
+    range(0, 20, length)?;
+    let h = read(file, o.offset, 20)?;
+    let machine = half(&h[0..], false);
+    let num_sections = half(&h[2..], false) as u64;
+    let time_date = u32v(&h[4..], false);
+    let ptr_symtab = u32v(&h[8..], false) as u64;
+    let num_symbols = u32v(&h[12..], false) as u64;
+    let opt_size = half(&h[16..], false) as u64;
+    let characteristics = half(&h[18..], false) as u32;
+    let arch = match machine {
+        0x014c => Arch::X86,
+        0x8664 => Arch::X64,
+        0xaa64 => Arch::A64,
+        _ => return Err(bad("Unsupported COFF machine")),
+    };
+    let bits = if machine == 0x014c { 32u32 } else { 64 };
+    if num_sections == 0 || num_sections > 96 {
+        return Err(bad("Invalid COFF section count"));
+    }
+    if opt_size != 0 {
+        return Err(bad("COFF objects must not carry an optional header"));
+    }
+    if num_symbols > 200_000 {
+        return Err(bad("COFF symbol count over budget"));
+    }
+    let mut i = image("COFF", arch, bits, false, o, length)?;
+    i.cpu = machine as u32;
+    i.flags = characteristics;
+    // Section table.
+    let sec_table_offset = 20u64;
+    let sec_table_bytes = num_sections * 40;
+    range(sec_table_offset, sec_table_bytes, length)?;
+    let sec_table = read(file, add(o.offset, sec_table_offset)?, sec_table_bytes as usize)?;
+    // Symbol table + string table.
+    let mut string_table: Vec<u8> = Vec::new();
+    if num_symbols > 0 {
+        range(ptr_symtab, num_symbols * 18, length)?;
+        let st_off = add(ptr_symtab, num_symbols * 18)?;
+        range(st_off, 4, length)?;
+        let sz_bytes = read(file, add(o.offset, st_off)?, 4)?;
+        let st_size = u32v(&sz_bytes, false) as u64;
+        if st_size < 4 || st_size > 16 * 1024 * 1024 {
+            return Err(bad("Invalid COFF string table size"));
+        }
+        range(st_off, st_size, length)?;
+        string_table = read(file, add(o.offset, st_off)?, st_size as usize)?;
+    }
+    // Analysis-only section bases (4KB stride).
+    let mut section_base: Vec<u64> = Vec::with_capacity(num_sections as usize);
+    let mut base = 0x10000u64;
+    for _ in 0..num_sections {
+        section_base.push(base);
+        base = base.saturating_add(0x1000);
+    }
+    // Section names helper.
+    let section_name = |name_bytes: &[u8]| -> String {
+        if name_bytes[0] == b'/' {
+            // /N string-table reference
+            let idx_str = String::from_utf8_lossy(&name_bytes[1..]).trim_end_matches('\0').to_string();
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                if idx > 0 && idx + 1 < string_table.len() {
+                    let tail = &string_table[idx..];
+                    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+                    return String::from_utf8_lossy(&tail[..end]).to_string();
+                }
+            }
+            format!("/{}", idx_str)
+        } else {
+            let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+            String::from_utf8_lossy(&name_bytes[..end]).to_string()
+        }
+    };
+    // Parse sections.
+    let mut section_raw: Vec<(u64, u64, u64, u64, u32)> = Vec::new(); // (rva-ish base, raw_size, file_off, mem, chars)
+    for (idx, s) in sec_table.chunks_exact(40).enumerate() {
+        let name = section_name(&s[..8]);
+        let virtual_size = u32v(&s[8..], false) as u64;
+        let virtual_address = u32v(&s[12..], false) as u64;
+        let raw_size = u32v(&s[16..], false) as u64;
+        let raw_offset = u32v(&s[20..], false) as u64;
+        let ptr_reloc = u32v(&s[24..], false) as u64;
+        let _num_reloc = u32v(&s[32..], false) as u64; // u16 at 32? Actually NumberOfRelocations is u16 at offset 32, NumberOfLinenumbers u16 at 34
+        let num_reloc = u16::from_le_bytes([s[32], s[33]]) as u64;
+        let characteristics = u32v(&s[36..], false);
+        if raw_size > 0 {
+            range(raw_offset, raw_size, length)?;
+        }
+        let sb = section_base[idx];
+        if raw_size > 0 {
+            section(
+                &mut i,
+                Section {
+                    name: name.clone(),
+                    segment: "COFF".into(),
+                    address: sb,
+                    size: raw_size,
+                    offset: add(o.offset, raw_offset)?,
+                    executable: characteristics & 0x20000000 != 0,
+                    ..Section::default()
+                },
+            )?;
+        }
+        section_raw.push((sb, raw_size, raw_offset, virtual_size.max(raw_size), characteristics));
+        // Relocations for this section.
+        if num_reloc > 0 && ptr_reloc > 0 {
+            let reloc_bytes = num_reloc * 10;
+            range(ptr_reloc, reloc_bytes, length)?;
+            let relocs = read(file, add(o.offset, ptr_reloc)?, reloc_bytes as usize)?;
+            for r in relocs.chunks_exact(10) {
+                let va = u32v(&r[0..], false) as u64;
+                let sym_idx = u32v(&r[4..], false) as u64;
+                let rtype = u16::from_le_bytes([r[8], r[9]]) as u64;
+                let site = sb + va;
+                push(&mut i.foreign.relocations, &format!("0x{site:016x} COFF relocation type={rtype} symbol-index={sym_idx} source=COFF relocation\n"));
+            }
+            push(&mut i.inventory, &format!("COFF section {name} relocations={num_reloc}.\n"));
+        }
+        let _ = virtual_address;
+    }
+    // Symbols.
+    if num_symbols > 0 {
+        let symtab = read(file, add(o.offset, ptr_symtab)?, (num_symbols * 18) as usize)?;
+        let mut idx = 0u64;
+        while idx < num_symbols {
+            let rec = &symtab[(idx as usize) * 18..(idx as usize) * 18 + 18];
+            let name_bytes = &rec[0..8];
+            let value = u32v(&rec[8..], false) as u64;
+            let section_number = i16::from_le_bytes([rec[12], rec[13]]);
+            let sym_type = u16::from_le_bytes([rec[14], rec[15]]);
+            let storage_class = rec[16];
+            let num_aux = rec[17] as u64;
+            i.foreign.symbol_count += 1;
+            // Name resolution.
+            let name = if name_bytes[..4] == [0, 0, 0, 0] {
+                let off = u32v(&name_bytes[4..], false) as usize;
+                if off > 0 && off < string_table.len() {
+                    let tail = &string_table[off..];
+                    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+                    String::from_utf8_lossy(&tail[..end]).to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(8);
+                String::from_utf8_lossy(&name_bytes[..end]).to_string()
+            };
+            let section_idx = if section_number > 0 { (section_number - 1) as usize } else { usize::MAX };
+            if !name.is_empty() {
+                if section_number == 0 {
+                    // Undefined external.
+                    push(&mut i.foreign.imports, &format!("name={name} storage-class={storage_class} source=COFF symbol\n"));
+                } else if section_number > 0 && section_idx < section_raw.len() {
+                    let sb = section_base[section_idx];
+                    let va = sb + value;
+                    let row = format!("0x{va:016x} name={name} source=COFF symbol type={sym_type} storage-class={storage_class} section={section_number}\n");
+                    push(&mut i.foreign.symbols, &row);
+                    // Function detection: storage class 2 (external) or 3 (static) with type 0x20 in code section.
+                    let is_code = section_raw[section_idx].4 & 0x00000020 != 0;
+                    if sym_type == 0x20 && is_code {
+                        i.foreign.functions.push((va, name.clone(), "COFF symbol".into()));
+                    }
+                    if storage_class == 2 {
+                        push(&mut i.foreign.exports, &row);
+                    }
+                }
+            }
+            idx += 1 + num_aux;
+        }
+    }
+    // Entry point: none for objects.
+    let _ = time_date;
+    push(&mut i.inventory, &format!("COFF machine={machine:#x}; sections={}; symbols={}; string-table={} bytes.\nCOFF object structural analysis; relocations remain unapplied evidence.\n", num_sections, num_symbols, string_table.len()));
+    Ok(i)
+}
+
 pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
     let length = file.metadata()?.len() - o.offset;
     range(0, 64, length)?;
@@ -1322,7 +1499,7 @@ pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
     if pe_recovered {
         push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis with recovered imports, exports and base relocations; PDB, Authenticode validation, Windows execution and semantic lifting remain unavailable. Standalone COFF objects are unsupported.\n"));
     } else {
-        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis; imports/exports, PDB, relocations, Authenticode validation, Windows execution and semantic lifting remain unavailable. Standalone COFF objects are unsupported.\n"));
+        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis; imports/exports and base relocations recovered; PDB, Authenticode validation, Windows execution and semantic lifting remain unavailable.\n"));
     }
     Ok(i)
 }
