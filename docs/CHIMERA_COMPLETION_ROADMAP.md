@@ -268,7 +268,7 @@ Acceptance: each language/ISA declares and passes its own supported matrix. Stru
 Dependencies: C00/C01 contracts; format work serves reconstruction after the first qualification milestone.
 
 - [x] ELF sectionless dynamic linking and relocations (`PT_DYNAMIC`/`DT_*` evidence for images without section headers): bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied.
-- [ ] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host).
+- [~] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host). *(in progress — claimed)*
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
 - [x] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs).
 - [x] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases).
