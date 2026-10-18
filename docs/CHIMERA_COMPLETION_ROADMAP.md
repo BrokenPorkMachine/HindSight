@@ -224,7 +224,7 @@ Dependencies: C04–C08 and the machine-state emitter from C01.
 - [~] Emit deterministic compilable recovered C17/Objective-C from the typed AST, with declarations, dependencies, globals, runtime adapters, helpers, ABI annotations, and source maps. *(in progress — claimed)*
 - [~] Define/parse the restricted pseudocode grammar with typed diagnostics and explicit arithmetic/memory semantics; generated supported text round-trips to the same AST. *(in progress — claimed)*
 - [~] Offer readable pseudocode, machine-state C, and recovered source with independent completeness/validation labels and exact unresolved dependency manifests. *(in progress — claimed)*
-- [ ] Preserve packing, alignment, volatility, atomic ordering, signed behavior, FP assumptions, and authentication effects; reject export where a reachable dependency is unresolved.
+- [~] Preserve packing, alignment, volatility, atomic ordering, signed behavior, FP assumptions, and authentication effects; reject export where a reachable dependency is unresolved. *(in progress — claimed)*
 
 Acceptance: exported projects compile under recorded flags and their address/AST/evidence maps validate; no silent stub, zero return, or invented framework behavior makes a function appear complete.
 
