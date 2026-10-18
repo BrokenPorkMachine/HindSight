@@ -271,7 +271,7 @@ Dependencies: C00/C01 contracts; format work serves reconstruction after the fir
 - [ ] Qualify Linux native attach with its process/ABI/image identity model (environmental gate; requires a Linux qualification host).
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
 - [x] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs).
-- [ ] PDB validation.
+- [~] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases). *(in progress — claimed; do not start independently)*
 - [ ] Authenticode validation.
 - [ ] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification.
 
