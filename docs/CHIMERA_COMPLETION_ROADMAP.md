@@ -273,7 +273,7 @@ Dependencies: C00/C01 contracts; format work serves reconstruction after the fir
 - [x] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs).
 - [x] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases).
 - [~] Authenticode validation (PE security directory, PKCS#7/CMS signed data and certificate chain verification). *(in progress — claimed; do not start independently)*
-- [ ] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification.
+- [~] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification. *(in progress — claimed)*
 
 Acceptance: malformed/overflow/ambiguous fixtures fail with bounded diagnostics; live and static mappings retain exact identity; round trips preserve supported artifacts and conflicts.
 
