@@ -399,7 +399,7 @@ fn callable_name(name: &str, signature: Option<&Signature>) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct AbiParameter { name: String, register: String, general_register: Option<u8>, source_type: Option<String> }
+struct AbiParameter { name: String, register: String, general_register: Option<u8>, stack_scalar: Option<(usize, u8)>, source_type: Option<String> }
 
 fn split_declarators(arguments: &str) -> Vec<&str> {
     let mut result = Vec::new();
@@ -568,14 +568,14 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let mut blocked = signature.language == "C++ / Objective-C++" && signature.declaration.contains("::");
     let mut result = Vec::new();
     if is_objc {
-        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), source_type: Some("id".into()) });
-        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), source_type: Some("SEL".into()) });
+        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), stack_scalar: None, source_type: Some("id".into()) });
+        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("SEL".into()) });
     }
     for (ty, name) in parameters {
         let scalar = abi_type(&ty);
         if blocked || scalar.is_none() {
             let reason = if blocked { "earlier layout or implicit C++ receiver unresolved" } else { "type layout unresolved" };
-            result.push(AbiParameter { name, register: format!("unresolved_argument /* {reason}: {ty} */"), general_register: None, source_type: Some(ty) });
+            result.push(AbiParameter { name, register: format!("unresolved_argument /* {reason}: {ty} */"), general_register: None, stack_scalar: None, source_type: Some(ty) });
             blocked = true;
             continue;
         }
@@ -584,7 +584,7 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
             let (bank, prefix) = if matches!(scalar, AbiType::FloatAggregate(_)) { (&mut fp, "d") } else { (&mut gp, "x") };
             if *bank + words <= 8 {
                 let registers = (*bank..*bank + words).map(|index| format!("{prefix}{index}")).collect::<Vec<_>>().join(", ");
-                result.push(AbiParameter { name, register: format!("aggregate<{ty}>({registers})"), general_register: None, source_type: Some(ty) });
+                result.push(AbiParameter { name, register: format!("aggregate<{ty}>({registers})"), general_register: None, stack_scalar: None, source_type: Some(ty) });
                 *bank += words;
             } else {
                 // Darwin does not split these SDK aggregates between registers
@@ -592,7 +592,7 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
                 *bank = 8;
                 stack_offset = (stack_offset + 7) & !7;
                 let bytes = words as usize * 8;
-                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None, source_type: Some(ty) });
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None, stack_scalar: None, source_type: Some(ty) });
                 stack_offset += bytes;
                 stack_slot += 1;
             }
@@ -601,18 +601,18 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
         if let AbiType::Float(bytes) = scalar {
             if fp < 8 {
             let register = format!("{}{fp}", if bytes == 4 { "s" } else { "d" });
-            result.push(AbiParameter { name, register, general_register: None, source_type: Some(ty) });
+            result.push(AbiParameter { name, register, general_register: None, stack_scalar: None, source_type: Some(ty) });
             fp += 1;
             continue;
             }
         } else if gp < 8 {
-            result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp), source_type: Some(ty) });
+            result.push(AbiParameter { name, register: format!("x{gp}"), general_register: Some(gp), stack_scalar: None, source_type: Some(ty) });
             gp += 1;
             continue;
         }
         let bytes = match scalar { AbiType::Integer(bytes) | AbiType::Float(bytes) => bytes as usize, _ => continue };
         stack_offset = (stack_offset + bytes - 1) & !(bytes - 1);
-        result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64)"), general_register: None, source_type: Some(ty) });
+        result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64)"), general_register: None, stack_scalar: Some((stack_offset, bytes as u8)), source_type: Some(ty) });
         stack_offset += bytes;
         stack_slot += 1;
     }
@@ -725,7 +725,7 @@ fn candidate_abi_parameters(report: &str, address: u64) -> Vec<AbiParameter> {
     let candidates = incoming_parameter_candidates(report, address);
     let highest = candidates.iter().filter_map(|register| register.strip_prefix('x')?.parse::<u8>().ok()).max();
     highest.map(|highest| (0..=highest.min(7)).map(|index| AbiParameter {
-        name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), source_type: None,
+        name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), stack_scalar: None, source_type: None,
     }).collect()).unwrap_or_default()
 }
 
@@ -792,7 +792,7 @@ fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) ->
     let parameters = signature.map(|signature| abi_parameters(Some(signature))).unwrap_or_else(|| {
         incoming_parameter_candidates(report, address).into_iter().filter_map(|register| {
             let index = register.strip_prefix('x')?.parse::<u8>().ok()?;
-            (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), source_type: None })
+            (index < 8).then(|| AbiParameter { name: format!("arg{index}"), register: format!("x{index}"), general_register: Some(index), stack_scalar: None, source_type: None })
         }).collect()
     });
     let mut names = BTreeMap::new();
@@ -929,6 +929,7 @@ fn render_linear_statement(
                     .or_else(||(!indirect).then(||symbols.iter().find(|(candidate,_)|*candidate==target).map(|(_,name)|name.as_str())).flatten());
                 let known=super::semantic::known_call_argument_values(code,base,start,address);
                 let known_float=super::semantic::known_call_float_argument_values(code,base,start,address);
+                let known_stack=super::semantic::known_call_stack_argument_values(code,base,start,address);
                 if let Some(selector)=objc_selectors.get(&address){
                     let parts=selector.split(':').collect::<Vec<_>>();
                     let argument_count=parts.len().saturating_sub(1);
@@ -949,6 +950,7 @@ fn render_linear_statement(
                     let target_signature=signatures.get(&target).map(|(_,signature)|signature);
                     let values=known.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
                     let float_values=known_float.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
+                    let stack_values=known_stack.iter().map(|(offset,bytes,value,provenance)|(*offset,(*bytes,*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
                     let args=target_signature.map(|signature|abi_parameters(Some(signature))).unwrap_or_else(||candidate_abi_parameters(parameter_evidence,target));
                     let bindings=args.iter().map(|argument|format!("{}={}",argument.name,argument.register)).collect::<Vec<_>>().join(", ");
                     let mut evidence=Vec::new();
@@ -959,6 +961,16 @@ fn render_linear_statement(
                                 evidence.push(format!("{}({})={value:#x} {provenance}{}",argument.name,argument.register,
                                     cast.map(|cast| format!(" [{cast}]")).unwrap_or_default()));
                                 return rendered;
+                            }
+                        }
+                        if let (Some((offset, width)), Some(ty))=(argument.stack_scalar,argument.source_type.as_deref()) {
+                            if matches!(abi_type(ty),Some(AbiType::Integer(_))) {
+                                if let Some((stored_width,value,provenance))=stack_values.get(&offset).filter(|(stored_width,_,_)|*stored_width>=width) {
+                                    let (rendered,cast)=typed_gp_argument(*value,Some(ty));
+                                    evidence.push(format!("{}(sp+0x{offset:x}, {width} bytes)={value:#x} {provenance}; store-width={stored_width}{}",
+                                        argument.name,cast.map(|cast|format!(" [{cast}]")).unwrap_or_default()));
+                                    return rendered;
+                                }
                             }
                         }
                         if let Some((prefix, index)) = argument.register.as_bytes().split_first().and_then(|(prefix, rest)| std::str::from_utf8(rest).ok()?.parse::<u8>().ok().map(|index| (*prefix, index))) {
@@ -1375,6 +1387,32 @@ fn recover_internal(
         assert!(call.starts_with("consume((int)-1, (uint8_t)0xff, (void *)0);"), "{call}");
         assert!(call.contains("source-cast=signed<int>; low-bits=32; raw-register=0xffffffff"), "{call}");
         assert!(call.contains("proven_by=[0x1000]"), "{call}");
+    }
+    #[test] fn direct_calls_use_proven_stack_scalar_values_and_discard_aliased_stores() {
+        let signature=Signature { language: "C", source: "test prototype", declaration:
+            "void consume(long a,long b,long c,long d,long e,long f,long g,long h,int ninth);".into() };
+        let signatures=BTreeMap::from([(0x2000,("_consume".into(),signature))]);
+        let words=[0x5280_1fe9u32,0xb900_03e9]; // movz w9,#0xff; str w9,[sp]
+        let code=words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call=render_linear_statement("call(0x2000);",0x1008,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new());
+        assert!(call.starts_with("consume(x0, x1, x2, x3, x4, x5, x6, x7, (int)0xff);"),"{call}");
+        assert!(call.contains("ninth(sp+0x0, 4 bytes)=0xff"),"{call}");
+        assert!(call.contains("stack_store=0x1004"),"{call}");
+        let packed=Signature { language: "C", source: "test prototype", declaration:
+            "void packed(long a,long b,long c,long d,long e,long f,long g,long h,signed char byte,short half,int word);".into() };
+        let packed_signatures=BTreeMap::from([(0x2000,("_packed".into(),packed))]);
+        let packed_words=[0x5280_1fe9u32,0x3900_03e9,0x529f_ffea,0x7900_07ea,0x5280_1feb,0xb900_07eb];
+        let packed_code=packed_words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let packed_call=render_linear_statement("call(0x2000);",0x1018,0x1000,&[],&packed_signatures,None,"",&packed_code,0x1000,false,&BTreeMap::new());
+        assert!(packed_call.starts_with("packed(x0, x1, x2, x3, x4, x5, x6, x7, (signed char)-1, (short)-1, (int)0xff);"),"{packed_call}");
+        for offset in ["sp+0x0, 1 bytes", "sp+0x2, 2 bytes", "sp+0x4, 4 bytes"] {
+            assert!(packed_call.contains(offset),"{packed_call}");
+        }
+        for (barrier, description) in [(0xf900_0020u32,"possible alias"),(0xd100_43ff,"SP update"),(0x9400_0000,"prior call")] {
+            let code=[words[0],words[1],barrier].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            let call=render_linear_statement("call(0x2000);",0x100c,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new());
+            assert!(call.contains("stack argument (slot 0, sp+0x0"),"{description}: {call}");
+        }
     }
     #[test] fn protocol_prototypes_keep_scope_optionality_and_implementation_uncertainty() {
         let records = "  protocol 0x4000 name=First confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n  optional-class method 0x4200  name=factory  types=@16@0:8  imp=0x9999 confidence=validated\n  protocol 0x5000 name=Second confidence=validated\n  required-instance method 0x5100  name=accept:  types=v24@0:8d16  imp=0x0 confidence=validated\n";

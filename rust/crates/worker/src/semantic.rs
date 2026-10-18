@@ -6567,6 +6567,53 @@ pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: 
     (0..8u8).filter_map(|index| flow.read_v(index as u32).map(|value| (index, value.value, format!("proven_by=[{}]", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(",")) ))).collect()
 }
 
+/// Prove scalar outgoing stack values only from direct SP-relative stores in
+/// the same straight-line call window. Any possible alias, call, opaque
+/// operation, or SP update discards earlier stores. The caller supplies the
+/// formal width; a wider store proves its low bytes at the same offset.
+pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(usize, u8, u64, String)> {
+    if function_start < base || callsite < function_start || (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return Vec::new(); }
+    let Some(call_index) = usize::try_from(callsite - base).ok().map(|offset| offset / 4) else { return Vec::new() };
+    let Some(function_index) = usize::try_from(function_start - base).ok().map(|offset| offset / 4) else { return Vec::new() };
+    if call_index.saturating_mul(4) > code.len() { return Vec::new(); }
+    let mut flow = Flow::new();
+    let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
+    for index in call_index.saturating_sub(64).max(function_index)..call_index {
+        let Some(bytes) = code.get(index * 4..index * 4 + 4) else { return Vec::new() };
+        let pc = base + index as u64 * 4;
+        let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
+        let portable = lift_operation(operation, pc);
+        if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) { return Vec::new(); }
+        if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) { flow.clear(); stack.clear(); continue; }
+        let sp_changed = matches!(operation,
+            Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer)
+            || matches!(portable,
+                IrOperation::Load { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::Store { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::LoadPair { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::StorePair { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::FloatLoad { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::FloatStore { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. });
+        if sp_changed { stack.clear(); }
+        match portable {
+            IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, offset }, value, bytes, writeback: None }
+                if !sp_changed && (1..=8).contains(&bytes) && (0..=256).contains(&offset) => {
+                    let offset = offset as usize;
+                    stack.retain(|other, (width, _, _)| *other + usize::from(*width) <= offset || offset + usize::from(bytes) <= *other);
+                    let known = match value {
+                        IrOperand::Constant(value) => Some((value, format!("proven_by=[{pc:#x}]"))),
+                        IrOperand::Register(register) => flow.read(register.target()).map(|value| (value.value, format!("{}; stack_store={pc:#x}", proven_by(&value)))),
+                    };
+                    if let Some((value, provenance)) = known { stack.insert(offset, (bytes, value, provenance)); }
+                }
+            IrOperation::Store { .. } | IrOperation::StorePair { .. } | IrOperation::FloatStore { .. } | IrOperation::AtomicStore { .. } => stack.clear(),
+            _ => {}
+        }
+        if portable == IrOperation::TargetSpecific || portable.render(&mut flow, pc).is_none() { flow.clear(); stack.clear(); }
+    }
+    stack.into_iter().map(|(offset, (bytes, value, provenance))| (offset, bytes, value, provenance)).collect()
+}
+
 /// Stack-relative slot names are safe only when every instruction in the
 /// recovered function is understood well enough to prove that SP is unchanged.
 pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, function_end: u64) -> bool {
