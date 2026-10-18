@@ -7,6 +7,7 @@ mod names;
 pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
 mod artifact;
 pub use artifact::build as reconstruct_artifact;
+pub use artifact::interpret as interpret_artifact;
 
 const MAX_FUNCTIONS: usize = 8;
 const MAX_WORDS_PER_FUNCTION: usize = 128;

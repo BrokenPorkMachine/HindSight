@@ -950,6 +950,238 @@ fn elf_dynamic(
     Ok(records > 0 || recovered_symbols)
 }
 
+fn resolve_rva(extents: &[(u64, u64, u64, u64)], rva: u64, bytes: u64) -> io::Result<u64> {
+    for &(s_rva, mem_size, file_off, raw_size) in extents {
+        let back = if raw_size > 0 { raw_size.min(mem_size) } else { mem_size };
+        if rva >= s_rva && bytes <= back && rva - s_rva <= back - bytes {
+            return add(file_off, rva - s_rva);
+        }
+    }
+    Err(bad("PE data outside section mappings"))
+}
+
+fn read_cstr(file: &mut File, i: &Image, extents: &[(u64, u64, u64, u64)], rva: u64, max: usize) -> io::Result<String> {
+    let mut avail = 0u64;
+    for &(s_rva, mem_size, _, raw_size) in extents {
+        if rva >= s_rva && rva < s_rva + mem_size {
+            let back = if raw_size > 0 { raw_size.min(mem_size) } else { mem_size };
+            avail = (s_rva + back) - rva;
+            break;
+        }
+    }
+    if avail == 0 {
+        return Err(bad("PE data outside section mappings"));
+    }
+    let n = avail.min(max as u64) as usize;
+    let rel = resolve_rva(extents, rva, n as u64)?;
+    let buf = read(file, add(i.origin, rel)?, n)?;
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Ok(String::from_utf8_lossy(&buf[..end]).to_string())
+}
+
+fn pe_data_directories(
+    file: &mut File,
+    i: &mut Image,
+    base: u64,
+    extents: &[(u64, u64, u64, u64)],
+    p: &[u8],
+    directory_offset: u64,
+    directories: u64,
+    bits: u32,
+) -> io::Result<bool> {
+    let ptr = if bits == 64 { 8u64 } else { 4 };
+    let dir = |index: usize| -> (u64, u64) {
+        if (index as u64) >= directories {
+            return (0, 0);
+        }
+        let off = (directory_offset + (index as u64) * 8) as usize;
+        if off + 8 > p.len() {
+            return (0, 0);
+        }
+        (u32v(&p[off..], false) as u64, u32v(&p[off + 4..], false) as u64)
+    };
+    let mut any = false;
+
+    // Imports (data directory 1).
+    let (imp_rva, _) = dir(1);
+    if imp_rva != 0 {
+        let mut desc_rva = imp_rva;
+        let mut desc_count = 0usize;
+        loop {
+            let rel = resolve_rva(extents, desc_rva, 20)?;
+            let desc = read(file, add(i.origin, rel)?, 20)?;
+            let oft = u32v(&desc[0..], false) as u64;
+            let ts = u32v(&desc[4..], false);
+            let fc = u32v(&desc[8..], false);
+            let name_rva = u32v(&desc[12..], false) as u64;
+            let ft = u32v(&desc[16..], false) as u64;
+            if oft == 0 && name_rva == 0 && ft == 0 && ts == 0 && fc == 0 {
+                break;
+            }
+            desc_count += 1;
+            if desc_count > 4096 {
+                return Err(bad("PE import descriptor budget exceeded"));
+            }
+            if name_rva != 0 {
+                let dll = read_cstr(file, i, extents, name_rva, 260)?;
+                if !dll.is_empty() {
+                    let thunk_rva = if oft != 0 { oft } else { ft };
+                    if thunk_rva != 0 {
+                        let mut t_rva = thunk_rva;
+                        let mut t_count = 0usize;
+                        loop {
+                            let t_rel = resolve_rva(extents, t_rva, ptr)?;
+                            let raw = read(file, add(i.origin, t_rel)?, ptr as usize)?;
+                            let thunk = if bits == 64 { u64v(&raw, false) } else { u32v(&raw, false) as u64 };
+                            if thunk == 0 {
+                                break;
+                            }
+                            t_count += 1;
+                            if t_count > 100_000 {
+                                return Err(bad("PE import thunk budget exceeded"));
+                            }
+                            let high = if bits == 64 { 1u64 << 63 } else { 1u64 << 31 };
+                            if thunk & high != 0 {
+                                let ordinal = (thunk & 0xffff) as u16;
+                                push(&mut i.foreign.imports, &format!("dll={dll} ordinal={ordinal} source=PE import\n"));
+                            } else {
+                                let hn_rva = thunk & !high;
+                                if hn_rva != 0 {
+                                    let hn_rel = resolve_rva(extents, hn_rva, 2)?;
+                                    let hint_buf = read(file, add(i.origin, hn_rel)?, 2)?;
+                                    let hint = u16::from_le_bytes([hint_buf[0], hint_buf[1]]);
+                                    let name = read_cstr(file, i, extents, hn_rva + 2, 258)?;
+                                    if !name.is_empty() {
+                                        push(&mut i.foreign.imports, &format!("dll={dll} name={name} hint={hint} source=PE import\n"));
+                                    }
+                                }
+                            }
+                            t_rva += ptr;
+                        }
+                    }
+                    any = true;
+                }
+            }
+            desc_rva += 20;
+        }
+        push(&mut i.inventory, &format!("PE import descriptors={desc_count}.\n"));
+    }
+
+    // Exports (data directory 0).
+    let (exp_rva, _) = dir(0);
+    if exp_rva != 0 {
+        let rel = resolve_rva(extents, exp_rva, 40)?;
+        let dir_bytes = read(file, add(i.origin, rel)?, 40)?;
+        let name_rva = u32v(&dir_bytes[12..], false) as u64;
+        let num_funcs = u32v(&dir_bytes[20..], false) as u64;
+        let num_names = u32v(&dir_bytes[24..], false) as u64;
+        let aof_rva = u32v(&dir_bytes[28..], false) as u64;
+        let aon_rva = u32v(&dir_bytes[32..], false) as u64;
+        let aono_rva = u32v(&dir_bytes[36..], false) as u64;
+        if num_funcs > 100_000 || num_names > 100_000 {
+            return Err(bad("PE export budget exceeded"));
+        }
+        let mut func_rvas: Vec<u64> = Vec::new();
+        if aof_rva != 0 && num_funcs > 0 {
+            let aof_rel = resolve_rva(extents, aof_rva, num_funcs * 4)?;
+            let aof_bytes = read(file, add(i.origin, aof_rel)?, (num_funcs * 4) as usize)?;
+            for k in 0..num_funcs as usize {
+                func_rvas.push(u32v(&aof_bytes[k * 4..], false) as u64);
+            }
+        }
+        let mut name_rvas: Vec<u64> = Vec::new();
+        if aon_rva != 0 && num_names > 0 {
+            let aon_rel = resolve_rva(extents, aon_rva, num_names * 4)?;
+            let aon_bytes = read(file, add(i.origin, aon_rel)?, (num_names * 4) as usize)?;
+            for k in 0..num_names as usize {
+                name_rvas.push(u32v(&aon_bytes[k * 4..], false) as u64);
+            }
+        }
+        let mut ordinals: Vec<u16> = Vec::new();
+        if aono_rva != 0 && num_names > 0 {
+            let aono_rel = resolve_rva(extents, aono_rva, num_names * 2)?;
+            let aono_bytes = read(file, add(i.origin, aono_rel)?, (num_names * 2) as usize)?;
+            for k in 0..num_names as usize {
+                ordinals.push(u16::from_le_bytes([aono_bytes[k * 2], aono_bytes[k * 2 + 1]]));
+            }
+        }
+        for k in 0..name_rvas.len() {
+            let ename = read_cstr(file, i, extents, name_rvas[k], 260)?;
+            if ename.is_empty() {
+                continue;
+            }
+            let func_index = if k < ordinals.len() { ordinals[k] as usize } else { k };
+            if func_index >= func_rvas.len() {
+                continue;
+            }
+            let func_rva = func_rvas[func_index];
+            if func_rva == 0 {
+                continue;
+            }
+            let va = base + func_rva;
+            push(&mut i.foreign.exports, &format!("0x{va:016x} name={ename} source=PE export\n"));
+            any = true;
+        }
+        if name_rva != 0 {
+            let dll = read_cstr(file, i, extents, name_rva, 260)?;
+            if !dll.is_empty() {
+                push(&mut i.inventory, &format!("PE export module={dll}\n"));
+            }
+        }
+        push(&mut i.inventory, &format!("PE export names={num_names} functions={num_funcs}.\n"));
+    }
+
+    // Base relocations (data directory 5).
+    let (br_rva, br_size) = dir(5);
+    if br_rva != 0 && br_size > 0 {
+        let mut off = 0u64;
+        let mut reloc_count = 0usize;
+        while off + 8 <= br_size {
+            let block_rva = br_rva + off;
+            let rel = resolve_rva(extents, block_rva, 8)?;
+            let header = read(file, add(i.origin, rel)?, 8)?;
+            let page_rva = u32v(&header[0..], false) as u64;
+            let block_size = u32v(&header[4..], false) as u64;
+            if block_size < 8 || block_size % 2 != 0 || off + block_size > br_size {
+                return Err(bad("Invalid PE base relocation block"));
+            }
+            let num_entries = ((block_size - 8) / 2) as usize;
+            if num_entries > 100_000 {
+                return Err(bad("PE base relocation budget exceeded"));
+            }
+            if num_entries > 0 {
+                let entries_rel = resolve_rva(extents, block_rva + 8, (num_entries * 2) as u64)?;
+                let entries_bytes = read(file, add(i.origin, entries_rel)?, num_entries * 2)?;
+                for k in 0..num_entries {
+                    let entry = u16::from_le_bytes([entries_bytes[k * 2], entries_bytes[k * 2 + 1]]);
+                    let rtype = (entry >> 12) as u64;
+                    let offset = (entry & 0xfff) as u64;
+                    if rtype == 0 {
+                        continue;
+                    }
+                    let site_rva = page_rva + offset;
+                    let site_va = base + site_rva;
+                    push(&mut i.foreign.relocations, &format!("0x{site_va:016x} PE base relocation type={rtype} source=PE base relocation\n"));
+                    reloc_count += 1;
+                }
+            }
+            off += block_size;
+            if block_size == 0 {
+                break;
+            }
+        }
+        if reloc_count > 0 {
+            any = true;
+        }
+        push(&mut i.inventory, &format!("PE base relocation records={reloc_count}.\n"));
+    }
+
+    if any {
+        push(&mut i.inventory, "PE data-directory evidence recovered (imports/exports/base relocations).\n");
+    }
+    Ok(any)
+}
+
 pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
     let length = file.metadata()?.len() - o.offset;
     range(0, 64, length)?;
@@ -1086,6 +1318,11 @@ pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
     if rva != 0 {
         entry(&mut i, add(base, rva)?)?;
     }
-    push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis; imports/exports, PDB, relocations, Authenticode validation, Windows execution and semantic lifting remain unavailable. Standalone COFF objects are unsupported.\n"));
+    let pe_recovered = pe_data_directories(file, &mut i, base, &extents, &p, directory_offset, directories, bits)?;
+    if pe_recovered {
+        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis with recovered imports, exports and base relocations; PDB, Authenticode validation, Windows execution and semantic lifting remain unavailable. Standalone COFF objects are unsupported.\n"));
+    } else {
+        push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis; imports/exports, PDB, relocations, Authenticode validation, Windows execution and semantic lifting remain unavailable. Standalone COFF objects are unsupported.\n"));
+    }
     Ok(i)
 }

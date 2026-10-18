@@ -120,7 +120,10 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [x] ELF sectionless dynamic-link/relocation recovery (`PT_DYNAMIC`/`DT_*` relocation and symbol evidence for images without section headers): bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables, `DT_HASH`/`DT_GNU_HASH`-proven symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied. Linux native process attach is split below because it requires a Linux release host.
 - [ ] Linux native process attach (environmental gate; requires a Linux qualification host).
 - [x] Bounded PE32/PE32+ image ingestion for Windows-oriented static projects (i386, x86-64, AArch64): preferred-base mappings, entry points, file-backed/zero-fill separation, disassembly, CFG candidates, strings and verified paging.
-- [ ] Standalone COFF objects, PE imports/exports/relocations, PDB and Authenticode validation.
+- [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
+- [ ] Standalone COFF objects.
+- [ ] PDB validation.
+- [ ] Authenticode validation.
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).
 - [x] Hash-bound function-name exchange JSON and Ghidra/PyGhidra, IDA, and Binary Ninja adapters; worker report export, rebasing, conflict preview and verified structural-backend symbol catalogs. Adapter behavior is contract-tested; live third-party qualification remains open.
 - [ ] Broader reversing artifact interoperability (types, comments, signatures and native tool project formats), GUI import and live adapter qualification.

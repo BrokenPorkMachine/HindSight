@@ -1351,6 +1351,14 @@ fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,cod
 }
 
 pub fn reconstruct(path:&str,digest:&str,size:&str,start:&str,end:&str,id:&str)->io::Result<String>{
+ reconstruction_request(path,digest,size,start,end,id,None)
+}
+pub fn interpret(path:&str,digest:&str,size:&str,start:&str,end:&str,inputs:&str,id:&str)->io::Result<String>{
+ let values=inputs.split(',').map(|value|value.strip_prefix("0x").filter(|s|!s.is_empty()&&s.len()<=16).and_then(|s|u64::from_str_radix(s,16).ok()).ok_or_else(||io::Error::new(io::ErrorKind::InvalidInput,"Interpreter requires eight hexadecimal X0-X7 inputs"))).collect::<io::Result<Vec<_>>>()?;
+ let registers:[u64;8]=values.try_into().map_err(|_|io::Error::new(io::ErrorKind::InvalidInput,"Interpreter requires eight hexadecimal X0-X7 inputs"))?;
+ reconstruction_request(path,digest,size,start,end,id,Some(registers))
+}
+fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id:&str,registers:Option<[u64;8]>)->io::Result<String>{
  let invalid=|message|io::Error::new(io::ErrorKind::InvalidInput,message);
  if path.len()>16384||!std::path::Path::new(path).is_absolute()||digest.len()!=64||!digest.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte))||id.len()!=36||!id.bytes().all(|byte|byte.is_ascii_hexdigit()||byte==b'-'){return Err(invalid("Invalid reconstruction identity"));}
  let size:u64=size.parse().map_err(|_|invalid("Invalid captured source size"))?;
@@ -1381,7 +1389,8 @@ pub fn reconstruct(path:&str,digest:&str,size:&str,start:&str,end:&str,id:&str)-
  if sources.is_empty(){sources.push("section-start fallback candidate".into());}
  let name=if names.len()==1{names.iter().next().copied()}else if names.is_empty(){facts.objc_function_names.get(&start).map(String::as_str)}else{None};
  let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
- let artifact=super::semantic::reconstruct_artifact(super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources})?;
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources};
+ let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)
 }

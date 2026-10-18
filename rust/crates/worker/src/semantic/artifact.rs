@@ -2,6 +2,7 @@
 use super::*;
 use crate::reconstruction::{address, array, object, ranges, Builder, Input, Value as V};
 use std::{collections::BTreeMap, io};
+mod executable;
 
 /// Source-tree vocabulary v1. Attributes carry explicit bit/memory contracts;
 /// these are machine-state expressions, not fabricated recovered source locals.
@@ -241,6 +242,83 @@ fn model(operation: IrOperation) -> Option<Tree> {
         IrOperation::Address {
             destination, value, ..
         } => assign(destination, constant(value, destination.bits)),
+        IrOperation::MoveKeep {
+            destination,
+            value,
+            shift,
+        } => assign(
+            destination,
+            binary(
+                "|",
+                binary(
+                    "&",
+                    reg(destination),
+                    constant(!(0xffffu64 << shift), destination.bits),
+                    destination.bits,
+                ),
+                constant(u64::from(value) << shift, destination.bits),
+                destination.bits,
+            ),
+        ),
+        IrOperation::Compare { kind, left, right } => {
+            let right = match right {
+                IrCompareOperand::Immediate(value) => constant(value, left.bits),
+                IrCompareOperand::Register {
+                    register,
+                    shift: None,
+                } => reg(register),
+                _ => return None,
+            };
+            tree(
+                "flags-compare",
+                None,
+                object([
+                    ("operator", ir_compare_mnemonic(kind).into()),
+                    ("bits", left.bits.into()),
+                ]),
+                vec![reg(left), right],
+            )
+        }
+        IrOperation::ConditionalSelect {
+            destination,
+            if_true,
+            if_false,
+            condition,
+            else_op,
+        } => {
+            let other = match else_op {
+                IrSelectElse::None => reg(if_false),
+                IrSelectElse::Increment => binary(
+                    "+",
+                    reg(if_false),
+                    constant(1, destination.bits),
+                    destination.bits,
+                ),
+                IrSelectElse::Invert => unary("~", reg(if_false), destination.bits),
+                IrSelectElse::Negate => unary("-", reg(if_false), destination.bits),
+            };
+            assign(
+                destination,
+                tree(
+                    "select",
+                    Some(integer_type(destination.bits)),
+                    object([]),
+                    vec![
+                        tree(
+                            "flag-condition",
+                            Some("bool".into()),
+                            object([
+                                ("predicate", flag_predicate_name(condition).into()),
+                                ("state", "nzcv".into()),
+                            ]),
+                            vec![],
+                        ),
+                        reg(if_true),
+                        other,
+                    ],
+                ),
+            )
+        }
         IrOperation::Binary {
             destination,
             operator: op,
@@ -751,6 +829,12 @@ impl Tree {
 }
 
 pub fn build(input: Input<'_>) -> io::Result<String> {
+    build_mode(input, None)
+}
+pub fn interpret(input: Input<'_>, registers: [u64; 8]) -> io::Result<String> {
+    build_mode(input, Some(registers))
+}
+fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<String> {
     let Input {
         code,
         base,
@@ -793,9 +877,10 @@ pub fn build(input: Input<'_>) -> io::Result<String> {
     let settings = object([
         ("instruction_limit", 128u64.into()),
         ("code_scan_limit", (4 * 1024 * 1024u64).into()),
-        ("ast_vocabulary", "machine-state-tree-v1".into()),
+        ("ast_vocabulary", "machine-state-tree-v2".into()),
         ("cfg_policy", "instruction-level-conservative".into()),
         ("source_export", false.into()),
+        ("machine_contract", executable::CONTRACT.into()),
     ]);
     let mut builder = Builder::new(source, start, end, architecture, name, settings.clone())?;
     let scope = builder.record(
@@ -825,6 +910,8 @@ pub fn build(input: Input<'_>) -> io::Result<String> {
     let mut ir_ids = Vec::new();
     let mut statements = Vec::new();
     let mut statement_mirrors = Vec::new();
+    let mut trees = Vec::new();
+    let mut strict_blocked = truncated || exhausted;
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
     for (index, bytes) in body.chunks_exact(4).enumerate() {
         let pc = start + index as u64 * 4;
@@ -922,6 +1009,7 @@ pub fn build(input: Input<'_>) -> io::Result<String> {
         if matches!(portable, IrOperation::Marker { .. }) {
             reasons.push("runtime-marker-contract-unqualified");
         }
+        strict_blocked |= !reasons.is_empty();
         for reason in reasons {
             let unknown = builder.record(
                 "unsupported-effect",
@@ -950,6 +1038,7 @@ pub fn build(input: Input<'_>) -> io::Result<String> {
         statements.push(ast);
         statement_mirrors.push(mirror);
         rendering.push_str(&format!("loc_{pc:x}: {}\n", tree.render()));
+        trees.push(tree);
         ir_ids.push(ir);
         models.push(portable);
         lifted.push(LiftedInstruction {
@@ -1168,6 +1257,61 @@ pub fn build(input: Input<'_>) -> io::Result<String> {
     builder.edge(&bounds, &root_mirror, "supports")?;
     for mirror in statement_mirrors {
         builder.edge(&mirror, &root_mirror, "derives")?;
+    }
+    let program = if strict_blocked {
+        Err("truncated, unsupported or unresolved shared effect".into())
+    } else {
+        executable::Program::new(start, trees)
+    };
+    match program {
+        Ok(program) => {
+            let generated=builder.record("metadata","derived",object([
+                ("artifact_kind","machine-state-c".into()),
+                ("contract",executable::CONTRACT.into()),("source",program.source().into()),
+                ("status","generated-uncompiled".into()),("entry",address(start)),
+                ("guest_memory_base",address(0x100000)),("guest_memory_size",4096u64.into()),
+                ("limits","single-threaded normal EL0 GPR/NZCV; flat nonvolatile memory; no precise hardware fault-state or ABI/source-equivalence claim".into())]),array([]))?;
+            builder.edge(&root_mirror, &generated, "renders-as")?;
+            if let Some(inputs) = registers {
+                let run = builder.record(
+                    "metadata",
+                    "derived",
+                    object([
+                        ("artifact_kind", "machine-state-run".into()),
+                        ("contract", executable::CONTRACT.into()),
+                        ("inputs_x0_x7", array(inputs.into_iter().map(address))),
+                        (
+                            "initial_state",
+                            "other GPRs and NZCV zero; SP=0x101000; 4096 zero bytes at 0x100000"
+                                .into(),
+                        ),
+                        ("step_limit", 4096u64.into()),
+                        ("result", program.run(inputs, 4096)),
+                    ]),
+                    array([]),
+                )?;
+                builder.edge(&generated, &run, "supports")?;
+            }
+        }
+        Err(reason) => {
+            if registers.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Strict interpreter blocked: {reason}"),
+                ));
+            }
+            let rejected = builder.record(
+                "metadata",
+                "derived",
+                object([
+                    ("artifact_kind", "machine-state-c-rejection".into()),
+                    ("reason", reason.into()),
+                    ("contract", executable::CONTRACT.into()),
+                ]),
+                array([]),
+            )?;
+            builder.edge(&root_mirror, &rejected, "supports")?;
+        }
     }
     Ok(builder
         .finish(root, rendering, instructions, truncated, exhausted)

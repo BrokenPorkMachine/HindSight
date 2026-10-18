@@ -67,6 +67,46 @@ def pe(bits=64, arm=False):
     return data
 
 
+def pe_data_directories():
+    """Minimal PE32+ with import, export and base-relocation data directories."""
+    data = bytearray(0xb00)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 60, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    optional = 240
+    struct.pack_into("<HHIIIHH", data, 0x84, 0x8664, 2, 0, 0, 0, optional, 2)
+    start = 0x98
+    struct.pack_into("<H", data, start, 0x20b)
+    struct.pack_into("<I", data, start + 16, 0x1000)
+    struct.pack_into("<Q", data, start + 24, 0x140000000)
+    struct.pack_into("<II", data, start + 32, 0x1000, 0x200)
+    struct.pack_into("<II", data, start + 56, 0x3000, 0x400)
+    struct.pack_into("<I", data, start + 108, 16)
+    table = start + optional
+    struct.pack_into("<8sIIIIIIHHI", data, table, b".text", 8, 0x1000, 0x200, 0x400, 0, 0, 0, 0, 0x60000020)
+    struct.pack_into("<8sIIIIIIHHI", data, table + 40, b".rdata", 0x300, 0x2000, 0x400, 0x600, 0, 0, 0, 0, 0x40000040)
+    data[0x400:0x408] = b"\x55\x48\x89\xe5\x5d\xc3\x90\x90"
+    dd = start + 112
+    struct.pack_into("<II", data, dd + 0, 0x2080, 40)
+    struct.pack_into("<II", data, dd + 8, 0x2000, 40)
+    struct.pack_into("<II", data, dd + 5 * 8, 0x20e0, 10)
+    struct.pack_into("<IIIII", data, 0x600, 0x2050, 0, 0, 0x2040, 0x2060)
+    data[0x640:0x640 + len(b"testdll.dll\0")] = b"testdll.dll\0"
+    struct.pack_into("<Q", data, 0x650, 0x2070)
+    struct.pack_into("<Q", data, 0x660, 0x2070)
+    struct.pack_into("<H", data, 0x670, 7)
+    data[0x672:0x672 + len(b"ImportedFunc\0")] = b"ImportedFunc\0"
+    struct.pack_into("<IIIIIIIIII", data, 0x680, 0, 0, 0, 0, 0x20c0, 1, 1, 0x20b0, 0x20b4, 0x20b8)
+    struct.pack_into("<I", data, 0x6b0, 0x1000)
+    struct.pack_into("<I", data, 0x6b4, 0x20d0)
+    struct.pack_into("<H", data, 0x6b8, 0)
+    data[0x6c0:0x6c0 + len(b"host.dll\0")] = b"host.dll\0"
+    data[0x6d0:0x6d0 + len(b"ExportedFunc\0")] = b"ExportedFunc\0"
+    struct.pack_into("<II", data, 0x6e0, 0x1000, 10)
+    struct.pack_into("<H", data, 0x6e8, (10 << 12) | 0x10)
+    return data
+
+
 def elf_symbols(bits=64, be=False):
     data = elf(bits, be)
     data.extend(bytes(0x900 - len(data)))
@@ -382,5 +422,14 @@ with tempfile.TemporaryDirectory() as directory:
     result = run("--analyze-image", *args, "elf", "auto", "0", "0", env=env)
     assert "name=named_entry source=ELF static-symbol" in result["functions"]
     assert "lower_priority_name" not in result["functions"]
+
+    # PE data directories recover imports, exports and base relocations.
+    result, _ = analyze(pe_data_directories(), "pe")
+    assert result["kind"] == "analysis_result", result
+    assert result["analyzed_instructions"] > 0, result
+    assert "dll=testdll.dll name=ImportedFunc hint=7 source=PE import" in result["dyld_imports"], result["dyld_imports"]
+    assert "0x0000000140001000 name=ExportedFunc source=PE export" in result["export_trie"], result["export_trie"]
+    assert "0x0000000140001010 PE base relocation type=10 source=PE base relocation" in result["relocations"], result["relocations"]
+    assert "PE data-directory evidence recovered" in result["metadata"], result["metadata"]
 
 print("ELF/PE capture, mappings, decode, evidence, paging, byte order, embedded offsets, malformed-input and sectionless dynamic-link checks passed")
