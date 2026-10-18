@@ -160,7 +160,7 @@ Acceptance: dominance, phi inputs, interference, def-use, memory versions, read-
 
 Dependencies: C00N names/prototypes/layouts, C02 and C03; basic library types seed the solver before general C05 propagation.
 
-- [ ] Complete Apple AAPCS64 parameter/return recovery: GP/FP banks, stack values, homogeneous/arbitrary aggregates, varargs, hidden result/context values, returns, tails, and nonreturning calls.
+- [~] Complete Apple AAPCS64 parameter/return recovery: GP/FP banks, stack values, homogeneous/arbitrary aggregates, varargs, hidden result/context values, returns, tails, and nonreturning calls. *(in progress — claimed)*
 - [ ] Build typed direct/import/tail/thunk/indirect/dispatch call edges, confidence, candidate sets, and caller/callee navigation.
 - [ ] Compute effects, clobbers, memory, ownership/allocation, throws/nonreturn, arguments/returns, and target summaries; iterate caller/callee constraints with bounded convergence.
 - [ ] Preserve prototype conflicts and per-parameter evidence; treat names, signatures, targets, and implementations as separate claims.
