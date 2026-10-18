@@ -131,7 +131,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["language", "root", "nodes", "rendering", "compilable"],
       "properties": {
-        "language": { "enum": ["c11", "objective-c", "c++", "swift-subset", "unknown"] },
+        "language": { "enum": ["c17", "objective-c", "c++", "swift-subset", "unknown"] },
         "root": { "anyOf": [{ "$ref": "#/$defs/contentId" }, { "type": "null" }] },
         "nodes": {
           "type": "array", "maxItems": 100000,

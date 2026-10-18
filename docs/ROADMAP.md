@@ -2,6 +2,8 @@
 
 The current dependency order is the [Chimera master list of completion](CHIMERA_COMPLETION_ROADMAP.md). Evidence-backed source recreation is the first completion milestone; all remaining requirements below remain in scope.
 
+Immediate priority: AArch64 pseudocode and reconstruction for Apple binaries, using native Mach-O/dyld and Darwin runtime/SDK evidence for images, function/class/selector/method names, C declarations, properties, ivars, structs and types. Shared macOS/iOS semantics and decoder qualification are reused.
+
 ## 0.1 — Genesis (foundation complete)
 
 - [x] Independent HindSight product identity and macOS workbench.

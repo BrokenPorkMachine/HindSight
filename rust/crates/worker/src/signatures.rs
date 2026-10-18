@@ -902,10 +902,45 @@ fn parameter_names(signature: Option<&Signature>, report: &str, address: u64) ->
     names
 }
 
-fn parameter_aliases_by_instruction(
+/// Whether a statement with no detected register assignment may be treated as
+/// name-preserving. Everything else (opaque-instruction barriers, data-in-code
+/// markers, `sync_*` fences) conservatively kills every recovered name because
+/// the decoder could not classify the instruction.
+fn preserves_names(statement: &str) -> bool {
+    let text = statement.trim();
+    text.starts_with("if (")
+        || text.starts_with("goto 0x")
+        || text.starts_with("return")
+        || text.starts_with("*(")
+        || text.starts_with("store(")
+        || is_decoded_comment(text)
+}
+
+/// A comment-only statement preserves names only when it is a decoded
+/// instruction the renderer kept as evidence (uppercase mnemonic: flag
+/// comparisons, hints, `BTI`, `NOP`). Prose markers ("opaque instruction",
+/// "data-in-code barrier", `sync_*` fences) may hide a register write and
+/// therefore kill every name.
+fn is_decoded_comment(statement: &str) -> bool {
+    let text = statement.trim();
+    if text.starts_with("//") { return true; }
+    let Some(body) = text.strip_prefix("/*").and_then(|text| text.strip_suffix("*/")) else { return false };
+    body.trim_start().starts_with(|ch: char| ch.is_ascii_uppercase())
+}
+
+/// Flow-sensitive register naming with join-merge evidence. Returns the
+/// per-address alias map plus, for every join whose incoming names disagree,
+/// a note attached to the join leader explaining why the machine register
+/// stays visible.
+fn parameter_aliases_with_notes(
     instructions: &[(u64, String)], signature: Option<&Signature>, report: &str, address: u64,
-) -> BTreeMap<u64, BTreeMap<String, String>> {
-    if instructions.is_empty() { return BTreeMap::new(); }
+) -> (BTreeMap<u64, BTreeMap<String, String>>, BTreeMap<u64, String>) {
+    if instructions.is_empty() { return (BTreeMap::new(), BTreeMap::new()); }
+    // An unresolved indirect transfer has an unknown successor set: keep the
+    // whole body register-explicit rather than guessing which names survive.
+    if instructions.iter().any(|(_, statement)| statement.starts_with("goto x")) {
+        return (BTreeMap::new(), BTreeMap::new());
+    }
 
     fn branch_target(statement: &str) -> Option<u64> {
         let text = statement.strip_prefix("goto 0x").or_else(|| {
@@ -938,6 +973,10 @@ fn parameter_aliases_by_instruction(
                 names.remove(&format!("s{index}")); names.remove(&format!("d{index}")); names.remove(&format!("v{index}"));
             } else { names.remove(&destination); }
             if let Some((_, name)) = copied_name { bind_register_name(&mut names, &destination, name); }
+        } else if !preserves_names(statement) {
+            // An instruction the decoder could not classify may write any
+            // register: drop every name rather than claim a stale identity.
+            names.clear();
         }
         (instruction_names, names)
     }
@@ -984,6 +1023,45 @@ fn parameter_aliases_by_instruction(
         }
     }
 
+    // Join-merge evidence: when a conditional's in-function successors saw
+    // disagreeing names for a register, record which identities met at the
+    // join leader. This keeps the source-name recovery auditable instead of
+    // silently reverting to machine registers.
+    let mut notes = BTreeMap::new();
+    let predecessors = {
+        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); instructions.len()];
+        for (index, next) in successors.iter().enumerate() {
+            for &successor in next { predecessors[successor].push(index); }
+        }
+        predecessors
+    };
+    for (_index, (_, statement)) in instructions.iter().enumerate() {
+        if !statement.starts_with("if (") { continue; }
+        let Some(target) = branch_target(statement).filter(|target| address_to_index.contains_key(target)) else { continue };
+        let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for &pred in &predecessors[address_to_index[&target]] {
+            let state = incoming[pred].clone().unwrap_or_default();
+            let (_, outgoing) = transfer(state, &instructions[pred].1);
+            for (register, name) in outgoing {
+                let seen = conflicts.entry(register).or_default();
+                if !seen.contains(&name) { seen.push(name); }
+            }
+        }
+        let mut described = Vec::new();
+        for (register, names) in conflicts {
+            if names.len() > 1 {
+                let mut sorted = names;
+                sorted.sort();
+                described.push(format!("{register} reaches with conflicting names ({})", sorted.join(" | ")));
+            }
+        }
+        if !described.is_empty() {
+            notes.insert(target, format!(
+                "merge at {target:#x}: {}; machine registers retained after the join", described.join("; ")
+            ));
+        }
+    }
+
     let mut result = BTreeMap::new();
     for (index, (pc, statement)) in instructions.iter().enumerate() {
         if let Some(state) = incoming[index].clone() {
@@ -991,7 +1069,15 @@ fn parameter_aliases_by_instruction(
             result.insert(*pc, display);
         }
     }
-    result
+    (result, notes)
+}
+
+/// Test-only convenience over `parameter_aliases_with_notes`.
+#[cfg(test)]
+fn parameter_aliases_by_instruction(
+    instructions: &[(u64, String)], signature: Option<&Signature>, report: &str, address: u64,
+) -> BTreeMap<u64, BTreeMap<String, String>> {
+    parameter_aliases_with_notes(instructions, signature, report, address).0
 }
 
 fn substitute_parameter_names(statement: &str, names: &BTreeMap<String, String>) -> String {
@@ -1168,7 +1254,16 @@ fn render_arm64_body(
         if !statement.is_empty() { instructions.push((address, statement.into())); }
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
-    let parameter_aliases = parameter_aliases_by_instruction(&instructions, signature, parameter_evidence, start);
+    let (parameter_aliases, parameter_notes) = parameter_aliases_with_notes(&instructions, signature, parameter_evidence, start);
+    let no_aliases = BTreeMap::new();
+    // Structured regions render their statements through
+    // `render_linear_statement`, which keeps the raw registers; apply the same
+    // recovered names (and stack-slot localization) the linear path applies so
+    // branches do not silently drop the identities.
+    let substitute_at = |address: u64, text: &str| {
+        let substituted = substitute_parameter_names(text, parameter_aliases.get(&address).unwrap_or(&no_aliases));
+        if stable_stack { localize_stack_slot_accesses(&substituted) } else { substituted }
+    };
     let switch_evidence=parse_switch_evidence(jump_tables);
     let mut labels = instructions.iter().filter_map(|(_,statement)| {
         let target = statement.strip_prefix("goto 0x")
@@ -1244,9 +1339,10 @@ fn render_arm64_body(
                         let single_backedge=incoming_to_header.len()==1&&incoming_to_header[0].1==tail_address;
                         if exit_follows_backedge&&no_body_entries&&single_backedge
                             &&(instruction_index+1..backedge).all(|index|is_linear_statement(&instructions[index].1)){
-                            out.push_str(&format!("    {header:#018x}: while (!({condition})) {{ /* natural loop */\n"));
+                            out.push_str(&format!("    {header:#018x}: while (!({})) {{ /* natural loop */\n",substitute_at(header,condition)));
                             for (body_address,body_statement) in &instructions[instruction_index+1..backedge]{
                                 let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                let rendered=substitute_at(*body_address,&rendered);
                                 out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
                             }
                             out.push_str(&format!("    }} /* backedge at {tail_address:#x}; exit at {exit:#x} */\n"));
@@ -1276,9 +1372,10 @@ fn render_arm64_body(
                     out.push_str(&format!("    {loop_header:#018x}: do {{ /* natural loop */\n"));
                     for (body_address,body_statement) in &instructions[instruction_index..loop_tail]{
                                 let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                let rendered=substitute_at(*body_address,&rendered);
                         out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
                     }
-                    out.push_str(&format!("    }} while ({condition}); /* backedge at {:#x} */\n",instructions[loop_tail].0));
+                    out.push_str(&format!("    }} while ({}); /* backedge at {:#x} */\n",substitute_at(instructions[loop_tail].0,condition),instructions[loop_tail].0));
                     instruction_index=loop_tail+1;
                     continue;
                 }
@@ -1308,14 +1405,16 @@ fn render_arm64_body(
                                     if branch_enters_else_once&&branch_skips_then&&no_mid_arm_entries
                                         &&arm_is_linear(instruction_index+1..then_branch)
                                         &&arm_is_linear(else_index..join_index){
-                                        out.push_str(&format!("    {address:#018x}: if (!({condition})) {{ /* structured diamond; else={else_start:#x}, join={join:#x} */\n"));
+                                        out.push_str(&format!("    {address:#018x}: if (!({})) {{ /* structured diamond; else={else_start:#x}, join={join:#x} */\n",substitute_at(*address,condition)));
                                         for (arm_address,arm_statement) in &instructions[instruction_index+1..then_branch]{
                                             let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                            let rendered=substitute_at(*arm_address,&rendered);
                                             out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
                                         }
                                         out.push_str("    } else {\n");
                                         for (arm_address,arm_statement) in &instructions[else_index..join_index]{
                                             let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                            let rendered=substitute_at(*arm_address,&rendered);
                                             out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
                                         }
                                         out.push_str("    }\n");
@@ -1345,7 +1444,8 @@ fn render_arm64_body(
                         let return_statement = if return_statement.starts_with("return /* ABI result register x0") {
                             render_signature_return(signature)
                         } else { return_statement.to_string() };
-                        out.push_str(&format!("    if (!({condition})) {return_statement} /* structured from {address:#x} and {return_address:#x} */\n"));
+                        let return_statement = substitute_at(*return_address,&return_statement);
+                        out.push_str(&format!("    if (!({})) {return_statement} /* structured from {address:#x} and {return_address:#x} */\n",substitute_at(*address,condition)));
                         instruction_index += 2;
                         continue;
                     }
@@ -1353,6 +1453,7 @@ fn render_arm64_body(
             }
         }
         let (address, statement) = (*address, statement.as_str());
+        if let Some(note) = parameter_notes.get(&address) { out.push_str(&format!("    {note}\n")); }
         if labels.contains(&address) { out.push_str(&format!("loc_{address:x}:\n")); }
         let statement = if statement.starts_with("call(0x") {
             render_linear_statement(statement,address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors)
@@ -1763,6 +1864,86 @@ fn recover_internal(
         let aliases = parameter_aliases_by_instruction(&called, Some(&signature), "", 0x1000);
         assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1000]), "return cf;");
         assert_eq!(substitute_parameter_names("return x0;", &aliases[&0x1004]), "return x0;");
+    }
+    #[test] fn unresolved_indirect_transfers_keep_the_body_register_explicit() {
+        let signature = symbol("_CFRelease").unwrap();
+        let indirect = vec![
+            (0x1000, "x2 = x0;".into()),
+            (0x1004, "goto x16; /* indirect target */".into()),
+            (0x1008, "return x2;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&indirect, Some(&signature), "", 0x1000);
+        assert!(aliases.is_empty(), "{aliases:?}");
+    }
+    #[test] fn join_merges_record_conflicting_names_as_evidence() {
+        let signature = symbol("_CFRelease").unwrap();
+        let conflicting = vec![
+            (0x1000, "if (x1 == 0) goto 0x100c;".into()),
+            (0x1004, "x2 = x0;".into()),
+            (0x1008, "goto 0x1010;".into()),
+            (0x100c, "x2 = x1;".into()),
+            (0x1010, "return x2;".into()),
+        ];
+        let (aliases, notes) = parameter_aliases_with_notes(&conflicting, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1010]), "return x2;");
+        let note = notes.get(&0x1010).expect("conflicting join must be documented");
+        assert!(note.contains("merge at 0x1010"), "{note}");
+        assert!(note.contains("x2 reaches with conflicting names"), "{note}");
+        assert!(note.contains("cf"), "{note}");
+        assert!(note.contains("_cmd"), "{note}");
+
+        // A join that sees the same identity everywhere stays silent.
+        let agreeing = vec![
+            (0x1000, "if (x1 == 0) goto 0x100c;".into()),
+            (0x1004, "goto 0x1010;".into()),
+            (0x100c, "x2 = x0;".into()),
+            (0x1010, "return x2;".into()),
+        ];
+        let (_, notes) = parameter_aliases_with_notes(&agreeing, Some(&signature), "", 0x1000);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+    #[test] fn unclassified_instruction_barriers_kill_names_but_decoded_comments_keep_them() {
+        let signature = symbol("_CFRelease").unwrap();
+        let barrier = vec![
+            (0x1000, "x2 = x0;".into()),
+            (0x1004, "/* opaque instruction encoding; decoder gave up */".into()),
+            (0x1008, "return x2;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&barrier, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1008]), "return x2;");
+
+        let data_marker = vec![
+            (0x1000, "x2 = x0;".into()),
+            (0x1004, "/* data-in-code barrier */".into()),
+            (0x1008, "return x2;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&data_marker, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1008]), "return x2;");
+
+        // A decoded flag-comparison keeps the evidence comment raw but the
+        // identity survives to the next statement.
+        let compared = vec![
+            (0x1000, "x2 = x0;".into()),
+            (0x1004, "/* CMP x2, x1; NZCV updated */".into()),
+            (0x1008, "return x2;".into()),
+        ];
+        let aliases = parameter_aliases_by_instruction(&compared, Some(&signature), "", 0x1000);
+        assert_eq!(substitute_parameter_names("return x2;", &aliases[&0x1008]), "return cf_copy_x2;");
+    }
+    #[test] fn evidence_comments_keep_raw_registers_during_substitution() {
+        let names = BTreeMap::from([("x0".to_string(), "value".to_string())]);
+        let substituted = substitute_parameter_names("x0 = *(x0 + 0x8); /* load through x0 */", &names);
+        assert_eq!(substituted, "value = *(value + 0x8); /* load through x0 */");
+    }
+    #[test] fn structured_loop_bodies_receive_recovered_names() {
+        // CBZ X0, exit; ADD X2, X0, #4; B header; RET — a header-tested loop.
+        let signature = Signature { language: "C", declaration: "long count(long value);".into(), source: "test prototype" };
+        let code = [0xb400_0060u32, 0x9100_1002, 0x17ff_fffe, 0xd65f_03c0]
+            .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let body = render_arm64_body(0x1000, 0x1010, "_count", Some(&signature), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new()).unwrap();
+        assert!(body.contains("while (!(value == 0))"), "{body}");
+        assert!(body.contains("value_copy_x2 = value + 4;"), "{body}");
+        assert!(!body.contains("0x1004: x2 = x0 + 4;"), "{body}");
     }
     #[test] fn scalar_fp_parameter_names_cover_single_and_double_register_views() {
         let signature = symbol("_CFNumberGetValue").unwrap();
