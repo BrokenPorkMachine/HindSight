@@ -203,7 +203,7 @@ Source progress: [named scalar recovery](WORKER_RECONSTRUCTION_ARTIFACTS.md#name
 - [~] Recover parameters, locals, aggregates, fields, globals, captures, lifetimes, and coalesced SSA variables; name from factual evidence or deterministic role descriptions. *(in progress — claimed)*
 - [~] Form expression trees with use counts, dominance, effect ordering, widths, casts, lvalues, array/field access, and defined overflow/shift semantics. *(in progress — claimed)*
 - [~] Recognize induction variables, accumulators, state variables, and compiler temporaries with retained supporting facts. *(in progress — claimed)*
-- [ ] Persist analyst variable/type edits, split/merge, switch marking, and cross-function undo/redo; invalidate and recompute dependent hypotheses by analysis revision.
+- [~] Persist analyst variable/type edits, split/merge, switch marking, and cross-function undo/redo; invalidate and recompute dependent hypotheses by analysis revision. *(in progress — claimed)*
 
 Acceptance: regenerated expressions retain def-use and memory/call ordering; branch joins, alias conflicts, partial writes, and register reuse cannot leak an old source identity.
 
