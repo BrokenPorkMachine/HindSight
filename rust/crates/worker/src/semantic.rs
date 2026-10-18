@@ -5318,16 +5318,28 @@ fn decode(word: u32, pc: u64) -> Operation {
         // fall through for invalid sizes or unrecognized opcodes or unrecognized opcodes
     }
     // Advanced SIMD two-register reciprocal estimate (FRECPE/FRSQRTE).
-    // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q selects Quad (1) or Double (0).
-    // Only single/double precision (size=10/11) are modeled; half/reserved sizes stay opaque.
+    // `0 Q U 0 1110 size 1 Rm 1 10110 Rn Rd`. Q (bit 30) selects Quad (1) or Double (0).
+    // size (bits 23:22): 00=reserved, 01=half (.4h/.8h), 10=single (.4s), 11=double (.2d).
+    // Q=1 & size=01 -> .4h (Quad); Q=0 & size=11 -> .2h (Double).
+    // Single/double/half precision are modeled; reserved sizes stay opaque.
     if word & 0x9f00_fc00 == 0x0e00_d800 {
-        if (word >> 22) & 3 < 2 { return Operation::Opaque; }
+        let size = (word >> 22) & 3;
+        let q = (word >> 30) & 1;
+        // Only valid size/Q combinations are modeled.
+        let width = match ((word >> 30) & 1, (word >> 22) & 3) {
+            (1, 1) => IrSimdWidth::Quad,    // Q=1, size=1 (.4h)
+            (0, 3) => IrSimdWidth::Double,  // Q=0, size=3 (.2h)
+            (1, 2) => IrSimdWidth::Quad,    // Q=1, size=2 (.4s)
+            (0, 2) => IrSimdWidth::Double,  // Q=0, size=2 (.2d)
+            (1, 3) => IrSimdWidth::Quad,    // Q=1, size=3 (.8h)
+            (0, 3) => IrSimdWidth::Double,  // Q=0, size=3 (.2h) - duplicate but explicit
+            _ => return Operation::Opaque,
+        };
         let operator = if word & 0x2000_0000 != 0 {
             IrVectorFloatUnaryOperator::ReciprocalSqrtEstimate
         } else {
             IrVectorFloatUnaryOperator::ReciprocalEstimate
         };
-        let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
         let destination = IrSimdRegister { index: (word & 31) as u8, width };
         let source = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
         return Operation::VectorFloatUnary { destination, source, operator };
@@ -8189,16 +8201,22 @@ mod tests {
     }
 
     #[test]
-    fn vector_reciprocal_estimate_rejects_half_and_reserved_size_encodings() {
+    fn vector_reciprocal_estimate_rejects_reserved_size_encodings() {
         // The instruction family uses size=10/11 for the modeled S/D forms.
-        // Neighboring size=00/01 encodings are not silently assigned those
+        // Neighboring size=00 (reserved) encodings are not silently assigned those
         // semantics, even though the broad opcode bits otherwise match.
-        for size in 0..2 {
-            for base in [0x4ea1_d820u32, 0x6ea1_d820] {
-                let word = (base & !(3 << 22)) | (size << 22);
-                assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
-            }
+        // Size=01 (half-precision) is now modeled for vector FRECPE/FRSQRTE.
+        for base in [0x4ea1_d820u32, 0x6ea1_d820] {
+            // size=0 (reserved) should still be opaque
+            let word = base & !(3 << 22); // size=0
+            assert!(matches!(decode(word, 0x1000), Operation::Opaque), "{word:#x}");
         }
+        // Valid half-precision encodings (size=1, Q=1 for .4h; Q=0, size=3 for .2h)
+        // are now modeled and should decode successfully.
+        for word in [0x0ef9_d820u32, 0x4ef9_d820, 0x2ef9_d820, 0x6ef9_d820] {
+            assert!(matches!(decode(word, 0x1000), Operation::VectorFloatUnary { .. }), "{word:#x}");
+        }
+        // Valid single/double precision encodings still work
         for word in [0x4ea1_d820u32, 0x4ee1_d820, 0x6ea1_d820, 0x6ee1_d820] {
             assert!(matches!(decode(word, 0x1000), Operation::VectorFloatUnary { .. }), "{word:#x}");
         }
