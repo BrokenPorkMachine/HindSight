@@ -272,7 +272,7 @@ Dependencies: C00/C01 contracts; format work serves reconstruction after the fir
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
 - [x] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs).
 - [x] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases).
-- [~] Authenticode validation (PE security directory, PKCS#7/CMS signed data and certificate chain verification). *(in progress — claimed; do not start independently)*
+- [x] Authenticode validation (PE security directory, PKCS#7/CMS signed data structural validation and certificate metadata).
 - [~] Complete broader native project/type/comment/signature interoperability, GUI import, and live Ghidra/IDA/Binary Ninja adapter qualification. *(in progress — claimed)*
 
 Acceptance: malformed/overflow/ambiguous fixtures fail with bounded diagnostics; live and static mappings retain exact identity; round trips preserve supported artifacts and conflicts.
@@ -282,7 +282,7 @@ Acceptance: malformed/overflow/ambiguous fixtures fail with bounded diagnostics;
 Dependencies: C00 identities, C11 artifacts, C15 persistence/protocols.
 
 - [~] Shareable investigation bundles with content hashing and replayable experiment recipes. *(in progress — claimed)*
-- [ ] Findings, review/comment state, evidence links, and reproducible experiment records.
+- [~] Findings, review/comment state, evidence links, and reproducible experiment records. *(in progress — claimed)*
 - [ ] Extension signatures, capability policy, allowlists, trust and organization settings.
 - [ ] Optional on-premises execution node with versioned authenticated headless jobs and returned evidence identities.
 
