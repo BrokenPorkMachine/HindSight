@@ -357,7 +357,7 @@ enum IrExtension { Zero(u8), Sign(u8) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrAtomicOrdering { Relaxed, Acquire, Release }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round, ReciprocalEstimate, ReciprocalSqrtEstimate }
+enum IrFloatUnaryOperator { Abs, Neg, Sqrt, Round, ReciprocalEstimate, ReciprocalSqrtEstimate, ReciprocalExponent }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrFloatPrecision { Single, Double }
 /// Width of a SIMD load/store operand. `Quad` names the whole 128-bit V
@@ -1286,9 +1286,12 @@ impl IrOperation {
                 let function = match operator {
                     IrFloatUnaryOperator::Abs => "fabs", IrFloatUnaryOperator::Neg => "fneg", IrFloatUnaryOperator::Sqrt => "fsqrt", IrFloatUnaryOperator::Round => "frint",
                     IrFloatUnaryOperator::ReciprocalEstimate => "frecpe", IrFloatUnaryOperator::ReciprocalSqrtEstimate => "frsqrte",
+                    IrFloatUnaryOperator::ReciprocalExponent => "frecpx",
                 };
                 let note = if matches!(operator, IrFloatUnaryOperator::ReciprocalEstimate | IrFloatUnaryOperator::ReciprocalSqrtEstimate) {
                     " /* estimate accuracy and FPCR/FPSR behavior unresolved */"
+                } else if matches!(operator, IrFloatUnaryOperator::ReciprocalExponent) {
+                    " /* reciprocal exponent; FPCR/FPSR behavior unresolved */"
                 } else { "" };
                 Some(format!("{} = {function}({});{note}", register(destination), register(source)))
             }
@@ -4709,7 +4712,8 @@ fn decode(word: u32, pc: u64) -> Operation {
     }
     // Scalar Advanced SIMD reciprocal estimates and refinement steps. Exact
     // masks admit only S/D forms; FP16, vector lanes, integer estimates, and
-    // reciprocal-exponent operations retain their existing fallback. These
+    // reciprocal-exponent operations are now modeled for scalar S/D forms; FP16,
+    // vector, and integer forms retain their existing fallback. These
     // operations are named, never evaluated as host division/sqrt expressions.
     let scalar_estimate = match word & 0xffff_fc00 {
         0x5ea1_d800 => Some((IrFloatPrecision::Single, IrFloatUnaryOperator::ReciprocalEstimate)),
@@ -4720,6 +4724,21 @@ fn decode(word: u32, pc: u64) -> Operation {
     };
     if let Some((precision, operator)) = scalar_estimate {
         return Operation::ScalarFloatUnary { destination: (word & 31) as u8, source: ((word >> 5) & 31) as u8, precision, operator };
+    }
+    // Scalar Advanced SIMD reciprocal exponent (`FRECPX`). Exact masks admit
+    // only S/D forms; FP16, vector, and integer forms retain their fallback.
+    let scalar_reciprocal_exponent = match word & 0xffff_fc00 {
+        0x5ea1_f800 => Some(IrFloatPrecision::Single),
+        0x5ee1_f800 => Some(IrFloatPrecision::Double),
+        _ => None,
+    };
+    if let Some(precision) = scalar_reciprocal_exponent {
+        return Operation::ScalarFloatUnary {
+            destination: (word & 31) as u8,
+            source: ((word >> 5) & 31) as u8,
+            precision,
+            operator: IrFloatUnaryOperator::ReciprocalExponent,
+        };
     }
     let scalar_refinement = match word & 0xffe0_fc00 {
         0x5e20_fc00 => Some((IrFloatPrecision::Single, IrFloatBinaryOperator::ReciprocalStep)),
@@ -6839,7 +6858,7 @@ pub fn render(
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v49; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = String::from("AArch64 register semantics v50; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -9409,13 +9428,27 @@ mod reciprocal_tests {
     }
 
     #[test]
+    fn scalar_reciprocal_exponent_lifts_without_claiming_exact_behavior() {
+        for (word, expected) in [(0x5ea1_f820u32, "s0 = frecpx(s1);"), (0x5ee1_f820u32, "d0 = frecpx(d1);")] {
+            let operation = decode(word, 0x1000);
+            let portable = lift_operation(operation, 0x1000);
+            let statement = portable.render(&mut Flow::new(), 0x1000).unwrap();
+            assert!(statement.starts_with(expected), "{statement}");
+            assert!(statement.contains("unresolved"), "{statement}");
+            assert_eq!(statement, operation.render(&mut Flow::new(), 0x1000));
+            let report = render(&word.to_le_bytes(), 0x1000, 0, &[0x1000], &[]);
+            assert!(report.contains(expected), "{report}");
+            assert!(!report.contains("barrier=all_gprs"), "{report}");
+        }
+    }
+
+    #[test]
     fn half_vector_integer_and_exponent_neighbors_retain_fallbacks() {
         // Assembled with -march=armv8.2-a+fp16. These include valid FP16,
         // vector, integer estimate, and scalar reciprocal-exponent encodings.
         for word in [0x5ef9_d820, 0x7ef9_d862, 0x5e46_3ca4, 0x5ec9_3d07,
             0x0ea1_d820, 0x4ea1_d862, 0x4ee1_d8a4, 0x6ea1_d8e6,
             0x4e6a_fd28, 0x4ead_fd8b, 0x4ea1_c9ee, 0x6ea1_ca30,
-            0x5ea1_fa72, 0x5ee1_fab4,
             // Reserved neighboring size/opcode bits must not broaden the lift.
             0x5e21_d820, 0x5e61_d820, 0x5ea1_dc20, 0x5e22_f820] {
             assert!(!is_reciprocal(lift_operation(decode(word, 0x1000), 0x1000)), "{word:#x}");
