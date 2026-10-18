@@ -151,21 +151,25 @@ pub fn objc_method(name: &str, encoding: &str) -> Option<Signature> {
 /// Protocol declarations carry selector/type evidence but never prove an IMP,
 /// a receiver class, or that an optional method is implemented.
 pub fn protocol_signatures(records: &str) -> String {
-    let mut owner = None::<String>;
+    let mut owner = None::<(String, Vec<String>)>;
     let mut output = String::new();
     let mut seen = std::collections::BTreeSet::new();
     for line in records.lines().take(8192) {
         let line = line.trim();
         if line.len() > 4096 { owner = None; continue; }
         if line.starts_with("protocol ") {
-            owner = line.split(" name=").nth(1).and_then(|tail| tail.split_once(" confidence=")).and_then(|(name, confidence)| {
-                (confidence == "validated" && !name.is_empty() && name.len() <= 256 &&
-                    name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.'))).then(||name.to_string())
+            owner = line.split(" name=").nth(1).and_then(|tail| {
+                let (fields, confidence)=tail.rsplit_once(" confidence=")?;
+                let mut tokens=fields.split_whitespace();let name=tokens.next()?;
+                let valid=|value:&str|!value.is_empty()&&value.len()<=256&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'));
+                if confidence!="validated"||!valid(name){return None}
+                let adopted=tokens.find_map(|field|field.strip_prefix("adopts=")).map(|parents|parents.split(',').filter(|parent|valid(parent)&&*parent!=name).take(32).map(str::to_owned).collect()).unwrap_or_default();
+                Some((name.to_string(),adopted))
             });
             continue;
         }
         if line.starts_with("category ") || line.starts_with("reference ") { owner = None; }
-        let Some(owner) = owner.as_deref() else { continue; };
+        let Some((owner,adopted)) = owner.as_ref() else { continue; };
         let Some((kind, _)) = line.split_once(" method ") else { continue; };
         if !matches!(kind, "required-instance" | "required-class" | "optional-instance" | "optional-class") || !line.ends_with("confidence=validated") { continue; }
         let Some((selector, tail)) = line.split(" name=").nth(1).and_then(|tail| tail.split_once("  types=")) else { continue; };
@@ -177,7 +181,9 @@ pub fn protocol_signatures(records: &str) -> String {
         let Some(signature) = objc_method(&synthetic, encoding) else { continue; };
         let key = (owner.to_owned(), kind.to_owned(), selector.to_owned(), encoding.to_owned());
         if !seen.insert(key) { continue; }
-        let row = format!("protocol={owner} membership={kind} selector={selector} source=validated-protocol-method-encoding implementation=unproven\n@protocol {owner}\n@{}\n{}\n@end\n    ABI profile=Apple-arm64-LP64 bindings=[{}] result={}\n",
+        let inheritance=if adopted.is_empty(){String::new()}else{format!(" <{}>",adopted.join(", "))};
+        let adoption_evidence=if adopted.is_empty(){String::new()}else{format!(" adopts={} inheritance=validated",adopted.join(","))};
+        let row = format!("protocol={owner}{adoption_evidence} membership={kind} selector={selector} source=validated-protocol-method-encoding implementation=unproven\n@protocol {owner}{inheritance}\n@{}\n{}\n@end\n    ABI profile=Apple-arm64-LP64 bindings=[{}] result={}\n",
             if kind.starts_with("optional-") { "optional" } else { "required" }, signature.declaration,
             abi_parameter_bindings(Some(&signature), &[]).join(", "), render_signature_return(Some(&signature)));
         if output.len() + row.len() > 20_000 || seen.len() > 128 {
@@ -1415,16 +1421,18 @@ fn recover_internal(
         }
     }
     #[test] fn protocol_prototypes_keep_scope_optionality_and_implementation_uncertainty() {
-        let records = "  protocol 0x4000 name=First confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n  optional-class method 0x4200  name=factory  types=@16@0:8  imp=0x9999 confidence=validated\n  protocol 0x5000 name=Second confidence=validated\n  required-instance method 0x5100  name=accept:  types=v24@0:8d16  imp=0x0 confidence=validated\n";
+        let records = "  protocol 0x4000 name=First adopts=Parent,Tracing confidence=validated\n  required-instance method 0x4100  name=accept:  types=v24@0:8i16  imp=0x0 confidence=validated\n  optional-class method 0x4200  name=factory  types=@16@0:8  imp=0x9999 confidence=validated\n  protocol 0x5000 name=Second confidence=validated\n  required-instance method 0x5100  name=accept:  types=v24@0:8d16  imp=0x0 confidence=validated\n";
         let output = protocol_signatures(records);
-        assert!(output.contains("protocol=First membership=required-instance selector=accept:"), "{output}");
+        assert!(output.contains("protocol=First adopts=Parent,Tracing inheritance=validated membership=required-instance selector=accept:"), "{output}");
         assert!(output.contains("- (void)accept:(int)arg0;"), "{output}");
         assert!(output.contains("@optional\n+ (id)factory;"), "{output}");
         assert!(output.contains("protocol=Second") && output.contains("- (void)accept:(double)arg0;"));
+        assert!(output.contains("protocol=First adopts=Parent,Tracing inheritance=validated"), "{output}");
+        assert!(output.contains("@protocol First <Parent, Tracing>"), "{output}");
         assert!(output.contains("arg0=d0"));
         assert!(output.contains("implementation=unproven"));
         assert!(!output.contains("0x9999"));
-        assert_eq!(protocol_signatures(&(records.to_string()+records)).matches("protocol=First membership=required-instance").count(), 1);
+        assert_eq!(protocol_signatures(&(records.to_string()+records)).matches("protocol=First adopts=Parent,Tracing inheritance=validated membership=required-instance").count(), 1);
     }
     #[test] fn protocol_prototypes_reject_unvalidated_unsupported_and_unscoped_records() {
         for records in [

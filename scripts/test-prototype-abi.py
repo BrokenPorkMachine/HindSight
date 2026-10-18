@@ -79,12 +79,14 @@ def run(worker):
             for index, offset, size in [(6, 0, 1), (7, 2, 2), (8, 4, 4), (9, 8, 8)]:
                 assert re.search(rf"arg{index}=stack argument \(slot \d+, sp\+0x{offset:x}, {size} bytes", packed), packed
             assert "protocol=ABIParent membership=required-instance selector=parentValue" in evidence, evidence[-12000:]
-            assert "protocol=ABIRecovered membership=required-instance selector=castValue:" in evidence, evidence[-12000:]
+            assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=required-instance selector=castValue:" in evidence, evidence[-12000:]
+            assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated" in evidence, evidence[-12000:]
+            assert "@protocol ABIRecovered <ABIParent>" in evidence
             # Runtime `c` encodes char/signed-char without a source typedef name.
             assert "- (int)castValue:(char)arg0;" in evidence
-            assert "protocol=ABIRecovered membership=optional-class selector=makeOptional" in evidence
+            assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=optional-class selector=makeOptional" in evidence
             assert "@optional\n+ (id)makeOptional;" in evidence
-            assert "protocol=ABIRecovered membership=optional-instance selector=optionalRatio:" in evidence
+            assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=optional-instance selector=optionalRatio:" in evidence
             assert "- (double)optionalRatio:(float)arg0;" in evidence
             assert "implementation=unproven" in evidence
             assert "source-cast=signed<int>; low-bits=32; raw-register=0xffffffff" in pseudocode, pseudocode[-8000:]
@@ -94,7 +96,7 @@ def run(worker):
                 assert returned in body, body
             print(f"Mach-O prototype/ABI metadata and pseudocode checks passed ({optimization})")
             if optimization == "-O2":
-                match = re.search(r"protocol (0x[0-9a-f]+) name=ABIRecovered confidence=validated", report["objc_protocols"])
+                match = re.search(r"protocol (0x[0-9a-f]+) name=ABIRecovered(?: adopts=[^ ]+)? confidence=validated", report["objc_protocols"])
                 assert match, report["objc_protocols"]
                 data = binary.read_bytes()
                 offset = file_offset(data, int(match[1], 16))
