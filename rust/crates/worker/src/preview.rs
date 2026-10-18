@@ -1180,8 +1180,10 @@ fn stack_slot_value_shape(mnemonic:&str,assembly:&str)->&'static str{
  else{"u64-or-pointer-width"}
 }
 fn stack_slot_candidates(ir:&str)->String{
- let mut out=String::from("Bounded stack-slot candidates grouped by signed SP-relative offset (SP movement, source names, lifetimes, aggregate layouts, and source types remain unresolved)\n");
- let mut slots=std::collections::BTreeMap::<i64,(std::collections::BTreeSet<&'static str>,std::collections::BTreeSet<&'static str>,usize,Vec<String>)>::new();
+ let mut out=String::from("Bounded stack-slot candidates grouped by signed pointer-relative offset (SP movement, source names, lifetimes, aggregate layouts, and source types remain unresolved)\n");
+ // Group by (base register, signed offset) so SP-relative and frame-pointer-relative
+ // accesses are kept distinct instead of being collapsed onto one shared slot.
+ let mut slots=std::collections::BTreeMap::<(String,i64),(std::collections::BTreeSet<&'static str>,std::collections::BTreeSet<&'static str>,usize,Vec<String>)>::new();
  for line in ir.lines().take(20_000){
   let mut fields=line.split_whitespace();
   let Some(address)=fields.next() else{continue};
@@ -1189,13 +1191,21 @@ fn stack_slot_candidates(ir:&str)->String{
   if kind!="op"{continue}
   let assembly=fields.collect::<Vec<_>>().join(" ");
   let mnemonic=assembly.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-  if !matches!(mnemonic.as_str(),"ldr"|"ldrb"|"ldrh"|"ldrsw"|"ldp"|"str"|"strb"|"strh"|"stp")||!assembly.contains("[sp,")||!assembly.contains('#'){continue}
-  let Some(offset_text)=assembly.split("[sp,").nth(1).and_then(|tail|tail.split('#').nth(1)).map(|tail|tail.split(|ch:char|ch==']'||ch==','||ch.is_whitespace()).next().unwrap_or("")) else{continue};
+  if !matches!(mnemonic.as_str(),"ldr"|"ldrb"|"ldrh"|"ldrsw"|"ldp"|"str"|"strb"|"strh"|"stp")||!assembly.contains('[')||!assembly.contains('#'){continue}
+  // Extract the base register and offset from `[base, #imm]` (or `[base,#imm]`).
+  let Some(bracket)=assembly.split('[').nth(1) else{continue};
+  let Some(close)=bracket.find(']') else{continue};
+  let inner=&bracket[..close];
+  let mut parts=inner.split(',');let Some(base_raw)=parts.next() else{continue};
+  let base=base_raw.trim().to_ascii_lowercase();
+  if !matches!(base.as_str(),"sp"|"x29"|"fp"|"x20"|"x19"){continue}
+  let offset_part=parts.collect::<Vec<_>>().join(",");
+  let Some(offset_text)=offset_part.split('#').nth(1).map(|tail|tail.split(|ch:char|ch==']'||ch==','||ch.is_whitespace()).next().unwrap_or("")) else{continue};
   let offset=if let Some(hex)=offset_text.strip_prefix("-0x"){i64::from_str_radix(hex,16).ok().and_then(i64::checked_neg)}else if let Some(hex)=offset_text.strip_prefix("0x"){i64::from_str_radix(hex,16).ok()}else{offset_text.parse::<i64>().ok()};let Some(offset)=offset else{continue};
-  let role=if mnemonic.starts_with("ldr"){"read"}else{"write"};let shape=stack_slot_value_shape(&mnemonic,&assembly);let slot=slots.entry(offset).or_default();slot.0.insert(shape);slot.1.insert(role);slot.2+=1;if slot.3.len()<8{slot.3.push(format!("{address}:{role}:{shape}"));}
+  let role=if mnemonic.starts_with("ldr"){"read"}else{"write"};let shape=stack_slot_value_shape(&mnemonic,&assembly);let slot=slots.entry((base.clone(),offset)).or_default();slot.0.insert(shape);slot.1.insert(role);slot.2+=1;if slot.3.len()<8{slot.3.push(format!("{address}:{role}:{shape}"));}
  }
- if slots.is_empty(){out.push_str("No decoded stack-relative load/store candidates were recovered.\n");}
- else{for (offset,(shapes,roles,count,sites)) in slots{let name=if offset<0{format!("stack_slot_sp_m{:x}",offset.unsigned_abs())}else{format!("stack_slot_sp_p{offset:x}")};out.push_str(&format!("  {name} offset={offset:+#x} accesses={count} roles={} value-shape={} examples={} classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown\n",roles.into_iter().collect::<Vec<_>>().join(","),shapes.into_iter().collect::<Vec<_>>().join(","),sites.join(",")));if out.len()>58_000{break}}out.push_str("Names are stable labels for observed SP-relative offsets only; a stack adjustment may change the absolute slot represented by a label.\n");}
+ if slots.is_empty(){out.push_str("No decoded pointer-relative load/store candidates were recovered.\n");}
+ else{for ((base,offset),(shapes,roles,count,sites)) in slots{let base_tag=match base.as_str(){"sp"=>"sp","x29"|"fp"=>"fp",other=>other};let name=if offset<0{format!("stack_slot_{base_tag}_m{:x}",offset.unsigned_abs())}else{format!("stack_slot_{base_tag}_p{offset:x}")};out.push_str(&format!("  {name} base={base} offset={offset:+#x} accesses={count} roles={} value-shape={} examples={} classification=stack-slot-candidate provenance=decoded-stack-relative-address type=unknown\n",roles.into_iter().collect::<Vec<_>>().join(","),shapes.into_iter().collect::<Vec<_>>().join(","),sites.join(",")));if out.len()>58_000{break}}out.push_str("Names are stable labels for observed pointer-relative offsets only; a base adjustment may change the absolute slot represented by a label.\n");}
  out
 }
 fn analysis_quality_report(map_bytes:u64,scan_bytes:u64,encrypted:bool,truncated:bool,instructions:usize,decoded:usize,data_words:usize,functions:usize,blocks:usize,calls:usize,tails:usize,relocations:usize,data_refs:&str,dominators:&str)->String{

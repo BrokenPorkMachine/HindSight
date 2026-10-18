@@ -1,5 +1,7 @@
 # HindSight Roadmap
 
+The current dependency order is the [Chimera master list of completion](CHIMERA_COMPLETION_ROADMAP.md). Evidence-backed source recreation is the first completion milestone; all remaining requirements below remain in scope.
+
 ## 0.1 — Genesis (foundation complete)
 
 - [x] Independent HindSight product identity and macOS workbench.
@@ -111,7 +113,8 @@
 - [x] Bounded ELF32/ELF64 executable/shared-image static ingestion (i386, x86-64, AArch64): validated load/section mappings, sectionless images, entry points, disassembly, CFG candidates, strings, verified paging and project capture. Big-endian images remain metadata-only.
 - [x] ELF section-backed static/dynamic symbols, metadata-backed function names/starts, undefined imports, visible dynamic exports, binding/visibility provenance, and explicit TLS-offset handling. Symbols are bounded and validated against their declared sections.
 - [x] Bounded ELF32/ELF64 relocatable-object ingestion with deterministic analysis-only section addresses and section-relative symbol rebasing.
-- [ ] ELF sectionless dynamic-link/relocation recovery and Linux native process attach.
+- [~] ELF sectionless dynamic-link/relocation recovery (`PT_DYNAMIC`/`DT_*` relocation and symbol evidence for images without section headers). **In progress — claimed; do not start independently.** Linux native process attach is split below because it requires a Linux release host.
+- [ ] Linux native process attach (environmental gate; requires a Linux qualification host).
 - [x] Bounded PE32/PE32+ image ingestion for Windows-oriented static projects (i386, x86-64, AArch64): preferred-base mappings, entry points, file-backed/zero-fill separation, disassembly, CFG candidates, strings and verified paging.
 - [ ] Standalone COFF objects, PE imports/exports/relocations, PDB and Authenticode validation.
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).

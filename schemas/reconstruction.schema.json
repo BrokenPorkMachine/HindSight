@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hindsight.local/schemas/reconstruction-v1.json",
+  "title": "HindSight Reconstruction Artifact",
+  "description": "Versioned, bounded source reconstruction and evidence-graph contract. Facts, derivations, assumptions, analyst assertions, alternatives, and validation results remain distinct.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "producer", "source_sha256", "analysis_engine", "function",
+    "eligibility", "nodes", "edges", "ast", "alternatives", "budgets",
+    "validation", "truncated"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "producer": { "type": "string", "const": "hindsight-reconstruction-v1" },
+    "source_sha256": { "$ref": "#/$defs/sha256" },
+    "analysis_engine": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "function": { "$ref": "#/$defs/functionIdentity" },
+    "eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reasons"],
+      "properties": {
+        "state": { "enum": ["equivalent", "recompilable-with-intrinsics", "review-only", "blocked"] },
+        "reasons": {
+          "type": "array", "maxItems": 128,
+          "items": { "$ref": "#/$defs/reason" }
+        }
+      }
+    },
+    "nodes": {
+      "type": "array", "maxItems": 200000,
+      "items": { "$ref": "#/$defs/evidenceNode" }
+    },
+    "edges": {
+      "type": "array", "maxItems": 500000,
+      "items": { "$ref": "#/$defs/evidenceEdge" }
+    },
+    "ast": { "$ref": "#/$defs/ast" },
+    "alternatives": {
+      "type": "array", "maxItems": 10000,
+      "items": { "$ref": "#/$defs/alternative" }
+    },
+    "budgets": { "$ref": "#/$defs/budgets" },
+    "validation": {
+      "type": "array", "maxItems": 10000,
+      "items": { "$ref": "#/$defs/validationRun" }
+    },
+    "truncated": { "type": "boolean" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "contentId": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "address": { "type": "string", "pattern": "^0x[0-9a-f]{1,16}$" },
+    "addressRange": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": { "$ref": "#/$defs/address" },
+        "end": { "$ref": "#/$defs/address" }
+      }
+    },
+    "functionIdentity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "start", "end", "architecture", "abi"],
+      "properties": {
+        "id": { "$ref": "#/$defs/contentId" },
+        "start": { "$ref": "#/$defs/address" },
+        "end": { "$ref": "#/$defs/address" },
+        "architecture": { "enum": ["arm64", "arm64e", "x86_64"] },
+        "abi": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": ["string", "null"], "maxLength": 4096 }
+      }
+    },
+    "reason": {
+      "type": "object", "additionalProperties": false,
+      "required": ["code", "message", "blocking", "evidence"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "blocking": { "type": "boolean" },
+        "evidence": {
+          "type": "array", "maxItems": 256, "uniqueItems": true,
+          "items": { "$ref": "#/$defs/contentId" }
+        }
+      }
+    },
+    "evidenceNode": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "epistemic", "producer", "confidence", "payload", "ranges"],
+      "properties": {
+        "id": { "$ref": "#/$defs/contentId" },
+        "kind": {
+          "enum": [
+            "bytes", "decode", "ir-operation", "definition", "use", "phi",
+            "memory-object", "memory-effect", "cfg-block", "cfg-edge", "call",
+            "symbol", "metadata", "type", "variable", "hypothesis", "ast-node",
+            "validation-run", "analyst-override", "unsupported-effect", "budget-event"
+          ]
+        },
+        "epistemic": { "enum": ["fact", "derived", "assumption", "analyst-assertion", "rejected"] },
+        "producer": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "payload": { "type": "object", "maxProperties": 128 },
+        "ranges": {
+          "type": "array", "maxItems": 256,
+          "items": { "$ref": "#/$defs/addressRange" }
+        }
+      }
+    },
+    "evidenceEdge": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "source", "target", "relation", "producer"],
+      "properties": {
+        "id": { "$ref": "#/$defs/contentId" },
+        "source": { "$ref": "#/$defs/contentId" },
+        "target": { "$ref": "#/$defs/contentId" },
+        "relation": {
+          "enum": [
+            "contains", "decodes-to", "lifts-to", "defines", "uses", "flows-to",
+            "controls", "calls", "reads", "writes", "aliases", "types",
+            "supports", "contradicts", "assumes", "invalidates", "derives",
+            "renders-as", "validates", "alternative-to", "overrides"
+          ]
+        },
+        "producer": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "explanation": { "type": "string", "maxLength": 4096 }
+      }
+    },
+    "ast": {
+      "type": "object", "additionalProperties": false,
+      "required": ["language", "root", "nodes", "rendering", "compilable"],
+      "properties": {
+        "language": { "enum": ["c11", "objective-c", "c++", "swift-subset", "unknown"] },
+        "root": { "anyOf": [{ "$ref": "#/$defs/contentId" }, { "type": "null" }] },
+        "nodes": {
+          "type": "array", "maxItems": 100000,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["id", "kind", "type", "children", "evidence", "ranges", "confidence"],
+            "properties": {
+              "id": { "$ref": "#/$defs/contentId" },
+              "kind": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
+              "type": { "type": ["string", "null"], "maxLength": 4096 },
+              "children": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/contentId" } },
+              "evidence": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/contentId" } },
+              "ranges": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/addressRange" } },
+              "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+              "attributes": { "type": "object", "maxProperties": 128 }
+            }
+          }
+        },
+        "rendering": { "type": "string", "maxLength": 1048576 },
+        "compilable": { "type": "boolean" }
+      }
+    },
+    "alternative": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "subject", "candidates", "selected", "reason"],
+      "properties": {
+        "id": { "$ref": "#/$defs/contentId" },
+        "subject": { "$ref": "#/$defs/contentId" },
+        "candidates": { "type": "array", "minItems": 2, "maxItems": 128, "items": { "$ref": "#/$defs/contentId" } },
+        "selected": { "anyOf": [{ "$ref": "#/$defs/contentId" }, { "type": "null" }] },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      }
+    },
+    "budgets": {
+      "type": "object", "additionalProperties": false,
+      "required": ["limits", "consumed", "exhausted"],
+      "properties": {
+        "limits": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "consumed": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } },
+        "exhausted": { "type": "array", "uniqueItems": true, "items": { "type": "string", "maxLength": 64 } }
+      }
+    },
+    "validationRun": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "kind", "status", "artifact_sha256", "assumptions", "mismatches"],
+      "properties": {
+        "id": { "$ref": "#/$defs/contentId" },
+        "kind": { "enum": ["schema", "recompile", "cfg", "def-use", "memory-effects", "differential", "smt", "ast-similarity"] },
+        "status": { "enum": ["passed", "failed", "blocked", "timed-out", "not-run"] },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "assumptions": { "type": "array", "maxItems": 1024, "items": { "type": "string", "maxLength": 4096 } },
+        "mismatches": { "type": "array", "maxItems": 10000, "items": { "type": "string", "maxLength": 4096 } }
+      }
+    }
+  }
+}

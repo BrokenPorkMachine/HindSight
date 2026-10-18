@@ -806,7 +806,25 @@ fn replace_register_names(statement: &str, names: &BTreeMap<String, String>) -> 
     let bytes = statement.as_bytes();
     let mut output = String::with_capacity(statement.len());
     let mut cursor = 0;
+    let mut in_block_comment = false;
     while cursor < bytes.len() {
+        // Evidence comments keep the raw machine registers: they document the
+        // decoded instruction, not a source-level expression.
+        if in_block_comment {
+            let end = statement[cursor..].find("*/").map(|offset| cursor + offset + 2).unwrap_or(bytes.len());
+            output.push_str(&statement[cursor..end]);
+            cursor = end;
+            in_block_comment = false;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"/*") {
+            in_block_comment = true;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"//") {
+            output.push_str(&statement[cursor..]);
+            break;
+        }
         if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
             let start = cursor;
             cursor += 1;
