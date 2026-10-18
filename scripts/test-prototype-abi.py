@@ -92,6 +92,8 @@ def run(worker):
             assert "@interface ABIChild : ABISample /* inherited protocols: ABICategory, ABIRecovered */" in evidence
             # Runtime `c` encodes char/signed-char without a source typedef name.
             assert "- (int)castValue:(char)arg0;" in evidence
+            assert "- (id<ABIParent>)echoParent:(id<ABIParent>)arg0;" in evidence, evidence[-14000:]
+            assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=required-instance selector=echoParent:" in evidence
             assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=optional-class selector=makeOptional" in evidence
             assert "@optional\n+ (id)makeOptional;" in evidence
             assert "protocol=ABIRecovered adopts=ABIParent inheritance=validated membership=optional-instance selector=optionalRatio:" in evidence

@@ -4,7 +4,7 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v8` in analysis/cache/continuity identities.
+`prototype-abi-v9` in analysis/cache/continuity identities.
 
 Supported Apple ARM64 LP64 rules include:
 
@@ -83,6 +83,13 @@ is no longer present in the linked image.
 Locally resolvable superclass pointers propagate protocol sets through bounded,
 cycle-checked superclass chains. These rows identify inherited conformance and
 do not rewrite it as a direct declaration on the subclass.
+Quoted Objective-C object encodings preserve validated class and protocol
+qualifiers, including `id<Protocol>` and `Class<Protocol> *`, as pointer-width
+arguments and results. Malformed or unbounded qualifier lists remain unresolved.
+For protocol methods, bounded `extendedMethodTypes` entries override the lossy
+base method encoding by the runtime-defined required/optional and instance/class
+list order. The enclosing protocol record, table, strings, and list counts must
+all remain inside validated Mach-O sections.
 
 Unknown typedefs and aggregate layouts can change both register banks and stack
 offsets. The unsupported parameter and subsequent bindings remain unresolved.
@@ -92,8 +99,7 @@ receiver; those argument bindings remain unresolved without membership evidence.
 This is progress toward complete resolution. It does not recover arbitrary C/C++
 layouts, Swift ABI, DWARF types, user header libraries, most stack-passed values,
 anonymous variadic values, hidden ABI attributes, or caller/callee constraints.
-Extended method-type tables and conflict resolution across receiver hypotheses
-remain open.
+Conflict resolution across receiver hypotheses remains open.
 Unresolved GP return candidates and register-use arity evidence remain explicitly
 weaker than source declarations. Objective-C selector evidence alone does not
 establish a receiver class or uniquely select a method prototype.

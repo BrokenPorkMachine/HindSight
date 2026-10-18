@@ -40,6 +40,14 @@ fn clean(text: &str) -> bool {
     !text.is_empty() && text.len() <= 1024 && !text.chars().any(|c| c.is_control() || matches!(c, '\\' | ';' | '{' | '}'))
 }
 
+fn objc_object_type(annotation: &str) -> Option<String> {
+    let valid=|value:&str|!value.is_empty()&&value.len()<=256&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'));
+    let class=annotation.split('<').next().unwrap_or("");let mut rest=&annotation[class.len()..];let mut protocols=Vec::new();
+    while !rest.is_empty(){let body=rest.strip_prefix('<')?;let end=body.find('>')?;for protocol in body[..end].split(','){if !valid(protocol)||protocols.len()>=32{return None}protocols.push(protocol);}rest=&body[end+1..];}
+    if !class.is_empty()&&!valid(class){return None};if protocols.is_empty(){return (!class.is_empty()).then(||format!("{class} *"));}
+    let qualified=protocols.join(", ");Some(if class.is_empty(){format!("id<{qualified}>")}else{format!("{class}<{qualified}> *")})
+}
+
 fn objc_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
     if depth > 8 { return None }
     while *at < bytes.len() && b"rnNoORV".contains(&bytes[*at]) { *at += 1; }
@@ -58,7 +66,7 @@ fn objc_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
                 while bytes.get(*at).is_some_and(|b| *b != b'"') { *at += 1; }
                 if bytes.get(*at) != Some(&b'"') { return None }
                 let name = std::str::from_utf8(&bytes[start..*at]).ok()?; *at += 1;
-                if !clean(name) { return None } format!("{name} *")
+                objc_object_type(name)?
             } else { "id".into() }
         }
         b'#' => "Class".into(), b':' => "SEL".into(), b'*' => "char *".into(),
@@ -561,7 +569,7 @@ fn abi_type(ty: &str) -> Option<AbiType> {
     let normalized = uncomment_type(ty)?;
     let ty = normalized.trim();
     if ty.contains('{') || ty.contains('}') || ty.contains('[') { return None; }
-    if ty.contains('*') || ty.contains('&') || ty.contains("(^") { return Some(AbiType::Integer(8)); }
+    if ty.contains('*') || ty.contains('&') || ty.contains("(^") || ty.starts_with("id<")&&ty.ends_with('>') { return Some(AbiType::Integer(8)); }
     let ty = ty.split_whitespace().filter(|word| !matches!(*word,
         "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable" | "__kindof"
     )).collect::<Vec<_>>().join(" ");
@@ -591,7 +599,7 @@ fn abi_integer_kind(ty: &str) -> Option<AbiIntegerKind> {
     let simple = normalized.split_whitespace().filter(|word| !matches!(*word,
         "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable" | "__kindof"
     )).collect::<Vec<_>>().join(" ");
-    let pointer = normalized.contains('*') || normalized.contains('&') || normalized.contains("(^") || matches!(simple.as_str(),
+    let pointer = normalized.contains('*') || normalized.contains('&') || normalized.contains("(^") || simple.starts_with("id<")&&simple.ends_with('>') || matches!(simple.as_str(),
         "id" | "Class" | "SEL" | "instancetype" | "dispatch_queue_t" | "dispatch_block_t" |
         "CFTypeRef" | "CFAllocatorRef" | "CFStringRef" | "CFArrayRef" | "CFDictionaryRef" | "CFBooleanRef" | "CFNumberRef" | "CFDataRef" |
         "CFBundleRef" | "CFURLRef" | "CFPropertyListRef" | "CFErrorRef" | "CFRunLoopRef");
@@ -1403,6 +1411,10 @@ fn recover_internal(
         assert!(objc_method("-[A x:]", "v24@0:8").is_none());
         assert_eq!(objc_method("-[A rect:]", "v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16").unwrap().declaration, "- (void)rect:(CGRect)arg0;");
         assert!(objc_method("-[A rect:]", "v48@0:8{CGRect=qqqq}16").is_none());
+        assert_eq!(objc_method("-[A constrained:]", "@\"Widget<Primary><Tracing>\"24@0:8@\"<Primary><Tracing>\"16").unwrap().declaration,
+            "- (Widget<Primary, Tracing> *)constrained:(id<Primary, Tracing>)arg0;");
+        assert_eq!(abi_parameters(objc_method("-[A constrained:]", "@\"<Primary>\"24@0:8@\"<Tracing>\"16").as_ref()).iter().map(|value|value.register.as_str()).collect::<Vec<_>>(),vec!["x0","x1","x2"]);
+        for encoding in ["@\"<Bad->\"16@0:8", "@\"<Primary\"16@0:8", "@\"<>\"16@0:8"] { assert!(objc_method("-[A bad]",encoding).is_none(),"{encoding}"); }
     }
     #[test] fn sdk_method_names_cannot_override_conflicting_runtime_types() {
         let pointer_conflict = objc_method("-[NSString length]", "@16@0:8").unwrap();

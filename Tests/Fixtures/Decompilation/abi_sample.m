@@ -12,6 +12,7 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 
 @protocol ABIRecovered <ABIParent>
 - (int)castValue:(signed char)value;
+- (id<ABIParent>)echoParent:(id<ABIParent>)value;
 @optional
 + (id)makeOptional;
 - (double)optionalRatio:(float)ratio;
@@ -36,6 +37,7 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 @implementation ABISample
 - (NSInteger)parentValue { return 3; }
 - (int)castValue:(signed char)value { return value; }
+- (id<ABIParent>)echoParent:(id<ABIParent>)value { return value; }
 - (void *)pointer { return (void *)0x1234; }
 - (double)scalar { return 1.5; }
 - (float)single { return 2.5f; }

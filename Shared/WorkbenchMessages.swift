@@ -6,7 +6,7 @@ struct BinaryImportOptions: Codable, Equatable {
     var load_address: String = "0"
     var file_offset: String = "0"
     static let automatic = BinaryImportOptions()
-    static let analysisRevision = "prototype-abi-v8"
+    static let analysisRevision = "prototype-abi-v9"
     private static func number(_ text: String) -> UInt64? {
         if text.hasPrefix("0x") { return UInt64(text.dropFirst(2), radix: 16) }
         return UInt64(text)
