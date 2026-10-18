@@ -234,7 +234,7 @@ Dependencies: C00/C01; expand continuously with C02–C09.
 
 - [~] Execute original and generated code with matched ISA, ABI, inputs, mapped memory, deterministic imports, and bounds; compare returns/registers, memory writes, traps, and call events. *(in progress — claimed)*
 - [~] Exercise integer/FP boundary cases, invalid memory, random seeds, aliasing, and supported concurrency/atomic models. *(in progress — claimed)*
-- [ ] Add bounded SMT equivalence for supported pure/region models, including assumptions, timeouts, and counterexamples.
+- [~] Add bounded SMT equivalence for supported pure/region models, including assumptions, timeouts, and counterexamples. *(in progress — claimed)*
 - [ ] Score recovered AST structure, variables/types/names, CFG/def-use/effects, recompilation, and tested behavior separately by language/optimization/feature/compiler.
 - [ ] Store input/toolchain/backend/test identities and results as graph evidence; enforce per-category regression thresholds in CI.
 - [ ] Reuse macOS qualification for shared AArch64, Mach-O/dyld, native type/layout and Darwin runtime semantics on iOS; report the tested common foundation and the remaining platform/version/ABI deltas separately.
