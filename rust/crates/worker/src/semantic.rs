@@ -10294,7 +10294,7 @@ mod vector_extract_tests {
         }
         // Previously the major-group fallback called all of these "simd".
         // Include an unmodeled INS, vector arithmetic and a reserved word.
-        for encoding in [0xffff_ffff, 0x0e00_0000, 0x4e01_1c00, 0x4e22_8420, 0x8e01_3c00, 0x4f22_1c20] {
+        for encoding in [0xffff_ffff, 0x0e00_0000, 0x4e01_1c00, 0x4ea2_8c20, 0x8e01_3c00, 0x4f22_1c20] {
             let operation = decode(encoding, 0x1000);
             assert!(matches!(operation, Operation::Opaque), "{encoding:#x}");
             assert!(lift_operation(operation, 0x1000).gpr_effects().barrier);
@@ -10315,7 +10315,7 @@ mod vector_extract_tests {
         let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let arguments = known_call_argument_values(&code, 0x1000, 0x1000, 0x100c);
         assert!(arguments.iter().any(|argument| argument.0 == 0 && argument.1 == 0), "{arguments:?}");
-        for encoding in [word(true, false, 64, 0, 0, 0), 0xffff_ffff, 0x4e22_8420] {
+        for encoding in [word(true, false, 64, 0, 0, 0), 0xffff_ffff, 0x4ea2_8c20] {
             let words = [encoding, 0xf940_0400, 0xd65f_03c0];
             let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
             assert!(object_member_accesses(&code, 0x1000, 0x1000, 0x100c, 0, &[], &std::collections::BTreeSet::new()).is_empty());
