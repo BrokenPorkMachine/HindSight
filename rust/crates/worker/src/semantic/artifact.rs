@@ -750,10 +750,10 @@ fn instruction_model(operation: Operation, portable: IrOperation, word: u32) -> 
         {
             let expression = value.children.get(1)?;
             tree(
-                "flags-compare",
+                "flags-arithmetic",
                 None,
                 object([
-                    ("operator", if subtract { "cmp" } else { "cmn" }.into()),
+                    ("operator", if subtract { "sub" } else { "add" }.into()),
                     ("bits", num_bits(expression).into()),
                 ]),
                 expression.children.clone(),

@@ -223,6 +223,25 @@ fn stmt(t: &Tree) -> Result<String, String> {
             num(t, "bits"),
             compare(t)?
         ),
+        "flags-arithmetic" => {
+            let op = text(t, "operator");
+            let bits = num(t, "bits");
+            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+            let n_bit = if bits == 32 { 31 } else { 63 };
+            let left = child(0)?;
+            let right = child(1)?;
+            let result = if op == "add" {
+                format!("({left} + {right}) & {mask}")
+            } else {
+                format!("({left} - {right}) & {mask}")
+            };
+            let nzcv = if op == "add" {
+                format!("((( ({result}) >> {n_bit} ) & 1) << 3) | ((( ({result}) == 0 ) as u64) << 2) | ((( ({left}) > ({mask} - ({right})) ) as u64) << 1) | ((( (({left}) ^ ({right})) & (({left}) ^ ({result})) >> ({bits} - 1) ) & 1)")
+            } else {
+                format!("((( ({result}) >> {n_bit} ) & 1) << 3) | ((( ({result}) == 0 ) as u64) << 2) | ((( ({left}) < ({right}) ) as u64) << 1) | ((( (({left}) ^ ({result})) & (({left}) ^ ({right})) >> ({bits} - 1) ) & 1)")
+            };
+            format!("s->nzcv={nzcv};")
+        },
         "memory-store" => {
             let n = num(t, "bytes");
             if !matches!(n, 1 | 2 | 4 | 8) {
@@ -525,6 +544,28 @@ impl State {
                     self.eval(&t.children[1])?,
                     num(t, "bits") == 64,
                 )
+            }
+            "flags-arithmetic" => {
+                let op = text(t, "operator");
+                let bits = num(t, "bits");
+                let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let n_bit = if bits == 32 { 31 } else { 63 };
+                let left = self.eval(&t.children[0])?;
+                let right = self.eval(&t.children[1])?;
+                let result = if op == "add" {
+                    left.wrapping_add(right) & mask
+                } else {
+                    left.wrapping_sub(right) & mask
+                };
+                let n = ((result >> n_bit) & 1) as u8;
+                let z = if result == 0 { 1 } else { 0 };
+                let c = if op == "add" {
+                    (left > mask - right) as u8
+                } else {
+                    (left < right) as u8
+                };
+                let v = (((!(left ^ right) & (left ^ result)) >> (bits - 1)) & 1) as u8;
+                self.nzcv = (n << 3) | (z << 2) | (c << 1) | v;
             }
             "memory-store" => self.store(
                 self.eval(&t.children[0])?,

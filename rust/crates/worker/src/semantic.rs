@@ -467,6 +467,26 @@ enum IrVectorArithmeticOperator {
     /// `Vd = Vn * Vm` (`MUL`).
     Multiply,
 }
+/// Lane-wise vector floating-point three-same binary operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrVectorFloatBinaryOperator {
+    /// `Vd = Vn + Vm` (`FADD`).
+    Add,
+    /// `Vd = Vn - Vm` (`FSUB`).
+    Subtract,
+    /// `Vd = Vn * Vm` (`FMUL`).
+    Multiply,
+    /// `Vd = Vn / Vm` (`FDIV`).
+    Divide,
+    /// `Vd = fmax(Vn, Vm)` (`FMAX`).
+    Max,
+    /// `Vd = fmin(Vn, Vm)` (`FMIN`).
+    Min,
+    /// `Vd = fmaxnm(Vn, Vm)` (`FMAXNM`).
+    MaxNum,
+    /// `Vd = fminnm(Vn, Vm)` (`FMINNM`).
+    MinNum,
+}
 /// Scalar fused multiply-add: optionally subtract the product from the addend,
 /// then optionally negate the result. Rendering retains the instruction name
 /// because FPCR rounding, NaNs, signed zero, and exceptions are not folded.
@@ -561,6 +581,11 @@ enum IrOperation {
     /// width: `Quad` for the 128-bit `Q` form and `Double` for the 64-bit `D`
     /// form, because a `Q=0` encoding writes only the low 64 bits.
     VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
+    /// Lane-wise vector floating-point three-same binary operation. Registers
+    /// carry the architectural width (`Quad`/`Double`); element size (single or
+    /// double) is not tracked because the lane count is implied by the width
+    /// and the instruction's arrangement.
+    VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
     /// Lane-wise vector integer arithmetic. Registers carry the architectural
     /// width (`Quad`/`Double`); element size is not tracked because the lane
     /// count is implied by the width and the instruction's arrangement.
@@ -618,7 +643,7 @@ impl IrOperation {
             // Lane-wise vector bitwise operations write only their V-register
             // destination and read no general-purpose register.
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
-            | Self::VectorArithmetic { .. }
+            | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
             | Self::Return { target: None } => {}
             Self::Assign { destination, value } => {
                 effects.definitions = gpr_mask(destination);
@@ -764,7 +789,7 @@ impl IrOperation {
             | Self::ScalarFloatMultiplyAdd(..) | Self::ScalarFloatSelect { .. }
             | Self::SimdLoad { .. } | Self::SimdStore { .. }
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
-            | Self::VectorArithmetic { .. }
+            | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
             | Self::VectorExtract { .. }
         );
         let consumed_flag_origins = if consumes_flags { flow.flag_origins.take() } else { None };
@@ -1589,6 +1614,61 @@ impl IrOperation {
                 let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
                 Some(format!("{destination_name} = {expression};{evidence}"))
             }
+            Self::VectorFloatBinary { destination, left, right, operator } => {
+                let left_value = flow.read_v(left.index as u32);
+                let right_value = flow.read_v(right.index as u32);
+                let full_register = destination.width == IrSimdWidth::Quad;
+                let is_single = left.width == IrSimdWidth::Single;
+                let fold = |value: u128, operands: &[&VKnownValue]| {
+                    let rest: Vec<u64> = operands[1..].iter().flat_map(|operand| operand.origins.iter().copied()).collect();
+                    combine_origins(&operands[0].origins, &rest, pc).map(|origins| VKnownValue { value, origins })
+                };
+                let known = if !full_register {
+                    None
+                } else {
+                    let lanes = if is_single { 4u32 } else { 2u32 };
+                    left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| {
+                        let mut result = 0u128;
+                        for lane in 0..lanes {
+                            let shift = lane * if is_single { 32 } else { 64 };
+                            let mask = if is_single { 0xffff_ffffu128 } else { u128::MAX };
+                            let l_bits = ((left.value >> shift) & mask) as u64;
+                            let r_bits = ((right.value >> shift) & mask) as u64;
+                            let l_val = if is_single { f32::from_bits(l_bits as u32) as f64 } else { f64::from_bits(l_bits) };
+                            let r_val = if is_single { f32::from_bits(r_bits as u32) as f64 } else { f64::from_bits(r_bits) };
+                            let out = match operator {
+                                IrVectorFloatBinaryOperator::Add => l_val + r_val,
+                                IrVectorFloatBinaryOperator::Subtract => l_val - r_val,
+                                IrVectorFloatBinaryOperator::Multiply => l_val * r_val,
+                                IrVectorFloatBinaryOperator::Divide => l_val / r_val,
+                                IrVectorFloatBinaryOperator::Max => f64::max(l_val, r_val),
+                                IrVectorFloatBinaryOperator::Min => f64::min(l_val, r_val),
+                                IrVectorFloatBinaryOperator::MaxNum => l_val.max(r_val),
+                                IrVectorFloatBinaryOperator::MinNum => l_val.min(r_val),
+                            };
+                            let out_bits = if is_single { (out as f32).to_bits() as u64 } else { out.to_bits() };
+                            result |= (out_bits as u128) << shift;
+                        }
+                        fold(result, &[left, right])
+                    })
+                };
+                flow.write_v(destination.index as u32, known.clone());
+                let destination_name = simd_register_name(destination);
+                let left_name = simd_register_name(left);
+                let right_name = simd_register_name(right);
+                let expression = match operator {
+                    IrVectorFloatBinaryOperator::Add => format!("fadd({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::Subtract => format!("fsub({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::Multiply => format!("fmul({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::Divide => format!("fdiv({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::Max => format!("fmax({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::Min => format!("fmin({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::MaxNum => format!("fmaxnm({left_name}, {right_name})"),
+                    IrVectorFloatBinaryOperator::MinNum => format!("fminnm({left_name}, {right_name})"),
+                };
+                let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
+                Some(format!("{destination_name} = {expression};{evidence}"))
+            }
             Self::DirectCall { target } => {
                 flow.clear();
                 Some(format!("call({target:#x}); /* signature, arguments, result and side effects unresolved */"))
@@ -1644,7 +1724,24 @@ impl IrOperation {
                 flow.clear();
                 Some(statement)
             }
+            Self::VectorFloatBinary { destination, left, right, operator } => {
+                let dest_name = simd_register_name(destination);
+                let left_name = simd_register_name(left);
+                let right_name = simd_register_name(right);
+                let op_str = match operator {
+                    IrVectorFloatBinaryOperator::Add => "fadd",
+                    IrVectorFloatBinaryOperator::Subtract => "fsub",
+                    IrVectorFloatBinaryOperator::Multiply => "fmul",
+                    IrVectorFloatBinaryOperator::Divide => "fdiv",
+                    IrVectorFloatBinaryOperator::Max => "fmax",
+                    IrVectorFloatBinaryOperator::Min => "fmin",
+                    IrVectorFloatBinaryOperator::MaxNum => "fmaxnm",
+                    IrVectorFloatBinaryOperator::MinNum => "fminnm",
+                };
+                Some(format!("{} = {}({}, {});", dest_name, op_str, left_name, right_name))
+            }
             Self::TargetSpecific => None,
+            _ => unreachable!(),
         }
     }
 }
@@ -2525,6 +2622,7 @@ enum Operation {
     SimdLoad { destination: IrSimdRegister, base: Register, address: AddressForm },
     SimdStore { source: IrSimdRegister, base: Register, address: AddressForm },
     VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
+    VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
     VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorArithmeticOperator },
     VectorExtract { destination: Register, source: u8, lane: u8, bits: u8, signed: bool },
     LoadPair {
@@ -2931,6 +3029,9 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         }
         Operation::VectorArithmetic { destination, left, right, operator } => {
             IrOperation::VectorArithmetic { destination, left, right, operator }
+        }
+        Operation::VectorFloatBinary { destination, left, right, operator } => {
+            IrOperation::VectorFloatBinary { destination, left, right, operator }
         }
         Operation::VectorExtract { destination, source, lane, bits, signed } => {
             IrOperation::VectorExtract { destination: reg(destination), source, lane, bits, signed }
@@ -5077,6 +5178,33 @@ fn decode(word: u32, pc: u64) -> Operation {
             return Operation::VectorArithmetic { destination, left, right, operator };
         }
     }
+    // Lane-wise vector floating-point three-same: `0 Q U 0 1110 size 1 Rm
+    // opcode Rn Rd` with bit 21 set (FP, vs 0 for integer). size bit 0
+    // (bit 22) selects single (0) or double (1) lanes; size bit 1 (bit 23)
+    // selects the paired flavor for ADD/SUB, MAX/MIN, MAXNM/MINNM. FMUL and
+    // FDIV use U=1 (bit 29) and ignore bit 23. Q selects the 128-bit (Q) or
+    // 64-bit (D) destination view.
+    if word & 0x9f00_0000 == 0x0e00_0000 && word & 0x0020_0000 != 0 {
+        let opcode = (word >> 11) & 0x1f;
+        let size = (word >> 22) & 3;
+        let vb = (size >> 1) & 1;
+        let operator = match (opcode, vb) {
+            (0b11010, 0) => IrVectorFloatBinaryOperator::Add,
+            (0b11010, 1) => IrVectorFloatBinaryOperator::Subtract,
+            (0b11011, _) => IrVectorFloatBinaryOperator::Multiply,
+            (0b11111, _) => IrVectorFloatBinaryOperator::Divide,
+            (0b11110, 0) => IrVectorFloatBinaryOperator::Max,
+            (0b11110, 1) => IrVectorFloatBinaryOperator::Min,
+            (0b11000, 0) => IrVectorFloatBinaryOperator::MaxNum,
+            (0b11000, 1) => IrVectorFloatBinaryOperator::MinNum,
+            _ => return Operation::Opaque,
+        };
+        let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
+        let destination = IrSimdRegister { index: (word & 31) as u8, width };
+        let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
+        let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
+        return Operation::VectorFloatBinary { destination, left, right, operator };
+    }
     // Lane-wise vector bitwise data processing: `0 Q U 01110 opc 1 Rm 00011 1
     // Rn Rd`. Bit 29 (`U`) and bits 23-22 (`opc`) select the operation —
     // U=0 AND/BIC/ORR/ORN, U=1 EOR/BSL/BIT/BIF — and bits 15-10 are fixed at
@@ -6561,6 +6689,9 @@ impl Operation {
             }
             Self::VectorArithmetic { destination, left, right, operator } => {
                 IrOperation::VectorArithmetic { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
+            }
+            Self::VectorFloatBinary { destination, left, right, operator } => {
+                IrOperation::VectorFloatBinary { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
             }
             Self::VectorExtract { destination, source, lane, bits, signed } => {
                 IrOperation::VectorExtract { destination: destination.into(), source, lane, bits, signed }.render(flow, pc).unwrap_or_default()

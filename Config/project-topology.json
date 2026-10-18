@@ -18,6 +18,7 @@
     "App/HindSightApp.swift",
     "App/InvestigationLedgerModel.swift",
     "App/InvestigationLedgerWorkspace.swift",
+    "App/RemoteAnalysisTransactions.swift",
     "App/RemoteGateway.swift",
     "App/RuntimeCorrelationModel.swift",
     "App/RuntimeCorrelationWorkspace.swift",
@@ -102,7 +103,8 @@
       "Shared/TargetModel.swift",
       "Shared/HostPlatform.swift",
       "Shared/ReconstructionArtifact.swift",
-      "App/RemoteGateway.swift"
+      "App/RemoteGateway.swift",
+      "App/RemoteAnalysisTransactions.swift"
     ],
     "CoordinatorService": [
       "PlatformServices/CoordinatorService/VerifiedPageCache.swift",
@@ -132,5 +134,5 @@
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "99fa36ac2b00131124f4d268ed040f986418144e58d4c00d08b2130b72858771"
+  "project_sha256": "2534ccf0c10a37ba6c35565feed0c815a891d0d5a232f01ed5b003ab27f0ada6"
 }

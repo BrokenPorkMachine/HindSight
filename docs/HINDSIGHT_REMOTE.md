@@ -10,12 +10,29 @@ Whether the client lives in this repository, another branch, or a separate repos
 
 ## Client communication readiness gate
 
-Current checkpoint: local NSXPC coordinator, bounded worker requests and an
-in-progress per-function reconstruction view exist. There is no app-hosted
-HTTPS listener, authenticated browser API, remote event stream or verified
-client connection in this tree yet. None of the boxes below is closed by Docker
-packaging, native XPC, or a static client preview. The dependency-ordered next
-actions are in the [Chimera current queue](CHIMERA_COMPLETION_ROADMAP.md#current-actionable-queue-2026-10-18).
+Current checkpoint: the app has an opt-in, loopback-only TLS listener with a
+per-start bearer token. Protocol v1 exposes `GET /v1/capabilities`,
+`GET /v1/project`, and an asynchronous captured-source analysis job:
+`POST /v1/jobs/analysis`, `GET /v1/jobs/{request_id}`,
+`GET /v1/jobs/{request_id}/result`, `DELETE /v1/jobs/{request_id}`.
+The POST body requires a client-generated UUID `request_id`, exact
+`project_path`, `record_id`, and `source_sha256`; retries with the same ID and
+source return the existing job for up to ten minutes. Results are returned
+only when the project and source still match. No browser cross-origin access,
+LAN exposure, uploads, event streaming, debugger or VM control is enabled.
+The gateway itself passed a loopback TLS client smoke test with certificate
+verification, bearer authentication (200), unauthenticated rejection (401),
+host rejection (400), and a bounded JSON POST (202). Run the full automated
+transactional gate with `bash scripts/test-server-transactions.sh` on macOS;
+`--quick` substitutes arm64/x86_64 app-target type-checking for the full build
+when another workstream is editing the native worker.
+It exercises the production job state machine against a controlled coordinator
+(admission, retry idempotency, stale-source/result rejection, polling, limits,
+cancellation and stop cleanup), the real TLS gateway, project-store security
+contracts, and the full app/coordinator/worker build. The full app → coordinator → worker analysis
+job path has not yet passed a real client interoperability test, and the
+server is not ready for release. The dependency-ordered next actions are in the
+[Chimera current queue](CHIMERA_COMPLETION_ROADMAP.md#current-actionable-queue-2026-10-18).
 
 All items below are open until demonstrated against the app-hosted implementation:
 

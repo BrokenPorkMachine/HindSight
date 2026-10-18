@@ -393,6 +393,36 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var remotePort = "8443"
     @Published private(set) var remoteToken = ""
     @Published private(set) var remoteStatus = "Off"
+    private lazy var remoteTransactions = RemoteAnalysisTransactions(backend: .init(
+        analyze: { [weak self] recordID, requestID, done in
+            guard let self else { return }
+            self.client.request(timeout: 260, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+                                invalidateConnectionOnTimeout: false,
+                                operation: { $0.analyzeRecord(recordID, requestID: requestID, withReply: $1) },
+                                completion: done)
+        },
+        status: { [weak self] requestID, done in
+            guard let self else { return }
+            self.client.request(timeout: 3, maxReplyBytes: 64 * 1024,
+                                invalidateConnectionOnTimeout: false,
+                                operation: { $0.inspectionStatus(requestID, withReply: $1) },
+                                completion: done)
+        },
+        cancel: { [weak self] requestID, done in
+            guard let self else { return }
+            self.client.request(timeout: 3, invalidateConnectionOnTimeout: false,
+                                operation: { service, finish in
+                service.cancelInspection(requestID) { finish($0 ? "true" : "false") }
+            }) { result in
+                done(result.flatMap { value in
+                    if value == "true" { return .success(true) }
+                    if value == "false" { return .success(false) }
+                    return .failure(NSError(domain: "HindSight", code: 5,
+                                            userInfo: [NSLocalizedDescriptionKey: "Invalid cancellation reply."]))
+                })
+            }
+        }
+    ))
     private lazy var remoteGateway = RemoteGateway(handle: { [weak self] request, reply in
         Task { @MainActor in self?.handleRemoteRequest(request, reply: reply) }
     }, status: { [weak self] value in
@@ -417,16 +447,81 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     func stopRemoteGateway() {
         remoteGateway.stop()
         remoteToken = ""
+        remoteTransactions.stop()
     }
-    private func handleRemoteRequest(_ request: String, reply: @escaping (String) -> Void) {
-        if request == "GET /v1/capabilities HTTP/1.1" {
-            reply("{\"protocol\":1,\"server\":\"HindSight\",\"features\":[\"project_read\"],\"execution\":false}")
-        } else if let project, let data = try? JSONEncoder().encode(project) {
-            reply(String(decoding: data, as: UTF8.self))
-        } else {
-            reply("{\"error\":\"no open project\"}")
+    private func handleRemoteRequest(_ request: RemoteRequest, reply: @escaping (RemoteResponse) -> Void) {
+        remoteTransactions.handle(request, project: project, ready: projectSessionReady, reply: reply)
+    }
+#if HINDSIGHT_SERVER_TEST
+    private var remoteIntegrationSmokeStarted = false
+    private func runRemoteIntegrationSmokeIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard !remoteIntegrationSmokeStarted,
+              environment["HINDSIGHT_REMOTE_INTEGRATION_SMOKE"] == "1" else { return }
+        remoteIntegrationSmokeStarted = true
+        Task { await performRemoteIntegrationSmoke(environment) }
+    }
+    private func remoteSmokeRequest(timeout: UInt64 = 20,
+                                    _ operation: @escaping (CoordinatorProtocol, @escaping (String) -> Void) -> Void) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            client.request(timeout: timeout, operation: operation) { continuation.resume(with: $0) }
         }
     }
+    private func performRemoteIntegrationSmoke(_ environment: [String: String]) async {
+        do {
+            guard let projectPath = environment["HINDSIGHT_REMOTE_SMOKE_PROJECT"],
+                  let binaryPath = environment["HINDSIGHT_REMOTE_SMOKE_BINARY"],
+                  let identityPath = environment["HINDSIGHT_REMOTE_SMOKE_IDENTITY"],
+                  let password = environment["HINDSIGHT_REMOTE_SMOKE_PASSWORD"],
+                  let token = environment["HINDSIGHT_REMOTE_SMOKE_TOKEN"], token.utf8.count >= 32,
+                  let portText = environment["HINDSIGHT_REMOTE_SMOKE_PORT"],
+                  let port = UInt16(portText), port > 0 else {
+                throw NSError(domain: "HindSightSmoke", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "Incomplete smoke configuration."])
+            }
+            let opened = try await remoteSmokeRequest { service, done in
+                service.openProject(projectPath, create: true, withReply: done)
+            }
+            guard let openedReply = try? JSONDecoder().decode(ServiceReply.self, from: Data(opened.utf8)),
+                  openedReply.ok, let openedProject = openedReply.project else {
+                throw NSError(domain: "HindSightSmoke", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "Project creation failed: \(opened)"])
+            }
+            project = openedProject
+            let options = String(decoding: try JSONEncoder().encode(BinaryImportOptions.automatic), as: UTF8.self)
+            let imported = try await remoteSmokeRequest(timeout: 150) { service, done in
+                service.importBinary(binaryPath, optionsJSON: options, requestID: UUID().uuidString, withReply: done)
+            }
+            guard let importedReply = try? JSONDecoder().decode(ServiceReply.self, from: Data(imported.utf8)),
+                  importedReply.ok, let importedProject = importedReply.project,
+                  importedProject.records.first?.result.captured == true else {
+                throw NSError(domain: "HindSightSmoke", code: 3,
+                              userInfo: [NSLocalizedDescriptionKey: "Binary import failed: \(imported)"])
+            }
+            project = importedProject
+            connected = true
+            projectSessionReady = true
+            let identityData = try Data(contentsOf: URL(fileURLWithPath: identityPath))
+            var items: CFArray?
+            let identityStatus = SecPKCS12Import(identityData as CFData,
+                [kSecImportExportPassphrase as String: password] as CFDictionary, &items)
+            guard identityStatus == errSecSuccess,
+                  let entries = items as? [[String: Any]],
+                  let item = entries.first?[kSecImportItemIdentity as String],
+                  CFGetTypeID(item as CFTypeRef) == SecIdentityGetTypeID() else {
+                throw NSError(domain: "HindSightSmoke", code: 4,
+                              userInfo: [NSLocalizedDescriptionKey: "TLS identity import failed: \(identityStatus)"])
+            }
+            let identity = unsafeBitCast(item as CFTypeRef, to: SecIdentity.self)
+            try remoteGateway.start(identity: identity, port: port, token: token)
+            print("HINDSIGHT_REMOTE_SMOKE_READY")
+            fflush(stdout)
+        } catch {
+            print("HINDSIGHT_REMOTE_SMOKE_FAILED: \(error.localizedDescription)")
+            fflush(stdout)
+        }
+    }
+#endif
     init() {
         if let saved = UserDefaults.standard.string(forKey: "HindSight.preferred-layout.v1"), VGWorkspaceCatalog.layouts.contains(saved) {
             preferredLayoutPreset = saved
@@ -670,6 +765,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         Date() < startupPressureUntil
     }
     func scheduleColdStart() {
+#if HINDSIGHT_SERVER_TEST
+        if ProcessInfo.processInfo.environment["HINDSIGHT_REMOTE_INTEGRATION_SMOKE"] == "1" {
+            runRemoteIntegrationSmokeIfRequested()
+            return
+        }
+#endif
         guard startupTask == nil, !connected, !connectingToCoordinator else { return }
         beginPressureObservation()
         startupPhase = "UI ready; coordinator pending"
