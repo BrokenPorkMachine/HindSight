@@ -283,7 +283,7 @@ Dependencies: C00 identities, C11 artifacts, C15 persistence/protocols.
 
 - [~] Shareable investigation bundles with content hashing and replayable experiment recipes. *(in progress — claimed)*
 - [~] Findings, review/comment state, evidence links, and reproducible experiment records. *(in progress — claimed)*
-- [ ] Extension signatures, capability policy, allowlists, trust and organization settings.
+- [~] Extension signatures, capability policy, allowlists, trust and organization settings. *(in progress — claimed)*
 - [ ] Optional on-premises execution node with versioned authenticated headless jobs and returned evidence identities.
 
 Acceptance: bundle tampering and dependency changes are detected; team assertions retain authorship; extension and remote execution permissions enforce their declared capabilities.
