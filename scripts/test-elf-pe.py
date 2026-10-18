@@ -183,6 +183,25 @@ def coff_object():
     return data
 
 
+def pdb_file():
+    """Minimal MSF 7.0 PDB with a PDB info stream."""
+    BLOCK = 512
+    data = bytearray(5 * BLOCK)
+    sig = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00"
+    data[0:len(sig)] = sig
+    struct.pack_into("<IIIIII", data, 32, BLOCK, 1, 5, 48, 0, 2)
+    data[BLOCK + 0] = 0x01
+    struct.pack_into("<I", data, 2 * BLOCK, 3)
+    off = 3 * BLOCK
+    struct.pack_into("<I", data, off, 2); off += 4
+    struct.pack_into("<I", data, off, 0); off += 4
+    struct.pack_into("<I", data, off, 24); off += 4
+    struct.pack_into("<I", data, off, 4); off += 4
+    info_off = 4 * BLOCK
+    struct.pack_into("<III", data, info_off, 19990903, 12345, 1)
+    return data
+
+
 def elf_sectionless_dynamic(gnu_hash=False):
     """Section-header-free ELF64 AArch64 ET_DYN with PT_DYNAMIC-derived evidence."""
     data = bytearray(0x400)
@@ -454,5 +473,12 @@ with tempfile.TemporaryDirectory() as directory:
     assert "0x0000000000010000 name=_main source=COFF symbol" in result["functions"], result["functions"]
     assert "0x0000000000010001 COFF relocation type=20 symbol-index=0 source=COFF relocation" in result["relocations"], result["relocations"]
     assert result["symbol_count"] == 1, result["symbol_count"]
+
+    # PDB (MSF 7.0) containers are admitted with stream directory evidence.
+    result, _ = analyze(pdb_file(), "pdb")
+    assert result["kind"] == "analysis_result", result
+    assert "PDB MSF 7.0 block_size=512" in result["metadata"], result["metadata"]
+    assert "PDB info stream version=19990903" in result["metadata"], result["metadata"]
+    assert "PDB MSF container validated with stream directory and known streams." in result["metadata"], result["metadata"]
 
 print("ELF/PE capture, mappings, decode, evidence, paging, byte order, embedded offsets, malformed-input and sectionless dynamic-link checks passed")

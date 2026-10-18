@@ -1359,6 +1359,185 @@ pub(super) fn coff(file: &mut File, o: &Options) -> io::Result<Image> {
     Ok(i)
 }
 
+pub(super) fn pdb(file: &mut File, o: &Options) -> io::Result<Image> {
+    const MSF_SIG: &[u8] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0";
+    let length = file.metadata()?.len() - o.offset;
+    if length < 56 {
+        return Err(bad("PDB file too small for MSF superblock"));
+    }
+    let sig = read(file, o.offset, 32)?;
+    if sig != MSF_SIG {
+        return Err(bad("Invalid PDB MSF 7.0 signature"));
+    }
+    let sb = read(file, add(o.offset, 32)?, 24)?;
+    let block_size = u32v(&sb[0..4], false) as u64;
+    let free_block_map = u32v(&sb[4..8], false) as u64;
+    let num_blocks = u32v(&sb[8..12], false) as u64;
+    let num_directory_bytes = u32v(&sb[12..16], false) as u64;
+    let _unknown = u32v(&sb[16..20], false);
+    let block_map_addr = u32v(&sb[20..24], false) as u64;
+    // Validate block size.
+    if !matches!(block_size, 512 | 1024 | 4096) {
+        return Err(bad("Invalid PDB block size"));
+    }
+    if num_blocks == 0 || num_blocks > 1 << 24 {
+        return Err(bad("Invalid PDB block count"));
+    }
+    if num_blocks * block_size > length {
+        return Err(bad("PDB block count exceeds file size"));
+    }
+    if num_blocks * block_size != length {
+        return Err(bad("PDB file size is not a multiple of block size"));
+    }
+    if free_block_map > 2 {
+        return Err(bad("Invalid PDB free block map index"));
+    }
+    if block_map_addr >= num_blocks {
+        return Err(bad("PDB block map address out of range"));
+    }
+    if num_directory_bytes == 0 || num_directory_bytes > 256 * 1024 * 1024 {
+        return Err(bad("Invalid PDB directory size"));
+    }
+    // Read block map: array of u32 block indices, enough to cover num_directory_bytes.
+    let dir_blocks_needed = (num_directory_bytes + block_size - 1) / block_size;
+    if dir_blocks_needed > num_blocks {
+        return Err(bad("PDB directory block count exceeds total blocks"));
+    }
+    let block_map_offset = add(o.offset, block_map_addr * block_size)?;
+    let block_map_size = dir_blocks_needed * 4;
+    if block_map_size > block_size {
+        // Block map may span multiple blocks, but typically fits in one.
+        // Read from the block map address for dir_blocks_needed entries.
+    }
+    range(block_map_addr * block_size, dir_blocks_needed * 4, length)?;
+    // Read directory block indices.
+    let mut dir_block_indices: Vec<u64> = Vec::with_capacity(dir_blocks_needed as usize);
+    // The block map is at block_map_addr, containing dir_blocks_needed u32 entries.
+    // But the block map itself may be larger. Read dir_blocks_needed * 4 bytes.
+    let bm_data = read(file, block_map_offset, (dir_blocks_needed * 4) as usize)?;
+    for chunk in bm_data.chunks_exact(4) {
+        let idx = u32v(chunk, false) as u64;
+        if idx >= num_blocks {
+            return Err(bad("PDB directory block index out of range"));
+        }
+        dir_block_indices.push(idx);
+    }
+    // Assemble directory bytes.
+    let mut directory: Vec<u8> = Vec::with_capacity(num_directory_bytes as usize);
+    for &blk in &dir_block_indices {
+        let blk_off = add(o.offset, blk * block_size)?;
+        let to_read = block_size.min(num_directory_bytes as u64 - directory.len() as u64) as usize;
+        let data = read(file, blk_off, to_read)?;
+        directory.extend_from_slice(&data);
+        if directory.len() as u64 >= num_directory_bytes {
+            break;
+        }
+    }
+    if (directory.len() as u64) < num_directory_bytes {
+        return Err(bad("PDB directory truncated"));
+    }
+    directory.truncate(num_directory_bytes as usize);
+    // Parse directory header.
+    if directory.len() < 4 {
+        return Err(bad("PDB directory too small"));
+    }
+    let num_streams = u32v(&directory[0..4], false) as u64;
+    if num_streams > 100_000 {
+        return Err(bad("PDB stream count over budget"));
+    }
+    let mut off = 4usize;
+    // Read stream sizes.
+    let mut stream_sizes: Vec<u64> = Vec::with_capacity(num_streams as usize);
+    for _ in 0..num_streams {
+        if off + 4 > directory.len() {
+            return Err(bad("PDB directory truncated reading stream sizes"));
+        }
+        let sz = u32v(&directory[off..off + 4], false) as u64;
+        stream_sizes.push(sz);
+        off += 4;
+    }
+    // Read block indices for each stream.
+    let mut stream_blocks: Vec<Vec<u64>> = Vec::with_capacity(num_streams as usize);
+    for &sz in &stream_sizes {
+        let n = if sz == 0 { 0 } else { (sz + block_size - 1) / block_size };
+        if n > num_blocks {
+            return Err(bad("PDB stream block count exceeds total blocks"));
+        }
+        let mut blocks = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            if off + 4 > directory.len() {
+                return Err(bad("PDB directory truncated reading stream blocks"));
+            }
+            let idx = u32v(&directory[off..off + 4], false) as u64;
+            if idx >= num_blocks && sz > 0 {
+                return Err(bad("PDB stream block index out of range"));
+            }
+            blocks.push(idx);
+            off += 4;
+        }
+        stream_blocks.push(blocks);
+    }
+    // Build Image.
+    let mut i = image("PDB", Arch::X86, 32, false, o, length)?;
+    i.cpu = 0;
+    // Inventory.
+    push(&mut i.inventory, &format!("PDB MSF 7.0 block_size={} num_blocks={} directory_bytes={} streams={}\n", block_size, num_blocks, num_directory_bytes, num_streams));
+    for (idx, (sz, blocks)) in stream_sizes.iter().zip(stream_blocks.iter()).enumerate() {
+        push(&mut i.inventory, &format!("PDB stream {} size={} blocks={}\n", idx, sz, blocks.len()));
+    }
+    // Identify well-known streams.
+    let mut foreign_recovered = false;
+    // Stream 1 = PDB Info (if present).
+    if num_streams > 1 && stream_sizes[1] >= 4 {
+        let (sz, blocks) = (&stream_sizes[1], &stream_blocks[1]);
+        let mut stream_data: Vec<u8> = Vec::with_capacity(*sz as usize);
+        for &blk in blocks {
+            let blk_off = add(o.offset, blk * block_size)?;
+            let to_read = block_size.min(*sz - stream_data.len() as u64) as usize;
+            let data = read(file, blk_off, to_read)?;
+            stream_data.extend_from_slice(&data);
+            if stream_data.len() as u64 >= *sz {
+                break;
+            }
+        }
+        stream_data.truncate(*sz as usize);
+        if stream_data.len() >= 4 {
+            let version = u32v(&stream_data[0..4], false);
+            let version_name = match version {
+                19990903 => "VC70 (2003)",
+                20000404 => "VC80 (2005)",
+                20091201 => "VC110 (2012)",
+                20140508 => "VC140 (2015)",
+                _ => "unknown",
+            };
+            push(&mut i.inventory, &format!("PDB info stream version={} ({})\n", version, version_name));
+            if stream_data.len() >= 24 {
+                let signature = u32v(&stream_data[4..8], false);
+                let age = u32v(&stream_data[16..20], false);
+                push(&mut i.inventory, &format!("PDB info signature={} age={}\n", signature, age));
+            }
+            foreign_recovered = true;
+        }
+    }
+    // Stream 2 = TPI.
+    if num_streams > 2 && stream_sizes[2] > 0 {
+        push(&mut i.inventory, &format!("PDB TPI stream size={}\n", stream_sizes[2]));
+        foreign_recovered = true;
+    }
+    // Stream 3 = DBI.
+    if num_streams > 3 && stream_sizes[3] > 0 {
+        push(&mut i.inventory, &format!("PDB DBI stream size={}\n", stream_sizes[3]));
+        foreign_recovered = true;
+    }
+    if foreign_recovered {
+        push(&mut i.inventory, "PDB MSF container validated with stream directory and known streams.\n");
+    } else {
+        push(&mut i.inventory, "PDB MSF container validated; no recognized streams found.\n");
+    }
+    let _ = (free_block_map, _unknown);
+    Ok(i)
+}
+
 pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
     let length = file.metadata()?.len() - o.offset;
     range(0, 64, length)?;

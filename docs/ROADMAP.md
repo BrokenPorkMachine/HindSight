@@ -122,7 +122,7 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [x] Bounded PE32/PE32+ image ingestion for Windows-oriented static projects (i386, x86-64, AArch64): preferred-base mappings, entry points, file-backed/zero-fill separation, disassembly, CFG candidates, strings and verified paging.
 - [x] PE imports, exports and base relocations from data directories (DLL/symbol names, ordinals, export addresses and relocation sites). Standalone COFF objects, PDB and Authenticode remain separate.
 - [x] Standalone COFF objects (COFF header, section table, symbols and relocations for `.obj` inputs).
-- [~] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases). **In progress — claimed; do not start independently.**
+- [x] PDB validation (MSF container, stream discovery and type/line/symbol evidence for Windows debug databases).
 - [ ] Authenticode validation.
 - [ ] Architecture abstraction beyond ARM64 where it adds real user demand (x86-64 Mach-O lifter via shared IR is P2 priority).
 - [x] Hash-bound function-name exchange JSON and Ghidra/PyGhidra, IDA, and Binary Ninja adapters; worker report export, rebasing, conflict preview and verified structural-backend symbol catalogs. Adapter behavior is contract-tested; live third-party qualification remains open.

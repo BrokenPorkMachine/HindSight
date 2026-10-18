@@ -59,6 +59,10 @@ bounded section, symbol and relocation tables. Section contents receive
 deterministic analysis-only addresses, symbols supply names, function starts,
 undefined imports and visible exports, and relocations remain unapplied evidence.
 
+PDB files (MSF 7.0) are admitted with validated superblock, block map and stream
+directory. Stream count, sizes and well-known streams (PDB info, TPI, DBI) are
+reported as evidence; contents remain uninterpreted.
+
 Both parsers reject overlapping mappings, overflowing addresses, out-of-file
 tables, architecture mismatches and entries outside file-backed executable
 mappings. ELF tables have a 256-entry limit; PE has a 96-section limit. Existing

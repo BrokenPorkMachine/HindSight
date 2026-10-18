@@ -26,6 +26,7 @@
 - Recover dynamic-link evidence from `PT_DYNAMIC` for section-header-free ELF images: bounded `DT_RELA`/`DT_REL`/`DT_JMPREL` relocation tables with load-mapping/site/index validation, `DT_HASH`/`DT_GNU_HASH`-proven dynamic symbol counts, and `DT_SYMTAB` names/imports/exports/function starts; `DT_RELR` remains unapplied and unrecovered.
 - Recover PE imports, exports and base relocations from data directories: DLL and symbol names, ordinals, hint/name tables, export addresses and base-relocation sites, with section-mapping and budget validation. PDB and Authenticode remain unavailable.
 - Admit standalone COFF objects (`.obj`) for i386, x86-64 and AArch64 with bounded section, symbol and relocation tables; sections receive deterministic analysis-only addresses, symbols supply names/function starts/imports/exports, and relocations remain unapplied evidence.
+- Admit PDB files (MSF 7.0) with validated superblock, block map and stream directory; stream count, sizes and well-known streams (PDB info, TPI, DBI) are reported as evidence.
 - Expose bounded GPR SSA definitions/uses and live phi inputs in the ARM64 IR preview, including W/X aliases, SP writeback, loop headers, and explicit unknown barriers.
 - Lift scalar single/double fused multiply-add instructions into shared IR while retaining FPCR/exception behavior as unresolved.
 - Lift scalar single/double `FCSEL` into shared IR, preserve NZCV and GP values, and recover selected FP constants with bounded comparison provenance.

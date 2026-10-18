@@ -49,7 +49,7 @@ impl Options {
             base: number(&args[2])?,
             offset: number(&args[3])?,
         };
-        if !["auto", "macho", "elf", "pe", "coff", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
+        if !["auto", "macho", "elf", "pe", "coff", "pdb", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
             || !["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
                 .contains(&o.architecture.as_str())
         {
@@ -527,7 +527,15 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
             }
         }
     }
-    if matches!(o.format.as_str(), "elf" | "pe" | "coff") {
+    if matches!(o.format.as_str(), "auto" | "pdb") {
+        const MSF_SIG: &[u8] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0";
+        if header.len() >= MSF_SIG.len() && &header[..MSF_SIG.len()] == MSF_SIG {
+            if let Ok(image) = formats::pdb(file, o) {
+                return Ok(image);
+            }
+        }
+    }
+    if matches!(o.format.as_str(), "elf" | "pe" | "coff" | "pdb") {
         return Err(bad("Selected format does not match the image header"));
     }
     if o.format != "raw" && magic(&header).is_some() {
