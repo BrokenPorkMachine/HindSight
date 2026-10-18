@@ -236,7 +236,7 @@ Dependencies: C00/C01; expand continuously with C02–C09.
 - [~] Exercise integer/FP boundary cases, invalid memory, random seeds, aliasing, and supported concurrency/atomic models. *(in progress — claimed)*
 - [~] Add bounded SMT equivalence for supported pure/region models, including assumptions, timeouts, and counterexamples. *(in progress — claimed)*
 - [~] Score recovered AST structure, variables/types/names, CFG/def-use/effects, recompilation, and tested behavior separately by language/optimization/feature/compiler. *(in progress — claimed)*
-- [ ] Store input/toolchain/backend/test identities and results as graph evidence; enforce per-category regression thresholds in CI.
+- [~] Store input/toolchain/backend/test identities and results as graph evidence; enforce per-category regression thresholds in CI. *(in progress — claimed)*
 - [ ] Reuse macOS qualification for shared AArch64, Mach-O/dyld, native type/layout and Darwin runtime semantics on iOS; report the tested common foundation and the remaining platform/version/ABI deltas separately.
 
 Acceptance: zero unexplained behavioral mismatches in the qualification matrix. A differential pass reports its tested domain; a formal result states its proof model and assumptions. Compilation alone never grants equivalence.
