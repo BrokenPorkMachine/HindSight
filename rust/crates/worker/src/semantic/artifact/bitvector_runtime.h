@@ -45,3 +45,18 @@ static inline uint8_t hs_compare(uint64_t a, uint64_t b, unsigned bits, unsigned
     else {r=(a+b)&mask;c=bits==64 ? r<a : a+b>mask;v=(~(a^b)&(a^r)&top)!=0;}
     return (uint8_t)(((r&top)!=0)*8+(r==0)*4+c*2+v);
 }
+
+static inline uint64_t hs_flags_arith(uint64_t left, uint64_t right, uint64_t result, unsigned bits, int is_sub) {
+    uint64_t mask = hs_mask(bits);
+    unsigned n = (unsigned)((result >> (bits - 1)) & 1);
+    unsigned z = (result == 0) ? 1 : 0;
+    unsigned c, v;
+    if (!is_sub) {
+        c = (left > mask - right) ? 1 : 0;
+        v = (unsigned)((((~(left ^ right)) & (left ^ result)) >> (bits - 1)) & 1);
+    } else {
+        c = (left >= right) ? 1 : 0;
+        v = (unsigned)((((left ^ right) & (left ^ result)) >> (bits - 1)) & 1);
+    }
+    return ((uint64_t)n << 3) | ((uint64_t)z << 2) | ((uint64_t)c << 1) | v;
+}

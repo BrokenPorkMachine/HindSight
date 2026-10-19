@@ -7,7 +7,7 @@ struct AnalysisProtocolContract {
         precondition(WorkbenchProtocolLimits.analysisWorkerFrameBytes == 8 * 1024 * 1024)
         precondition(WorkbenchProtocolLimits.defaultXPCReplyBytes == 2 * 1024 * 1024)
         precondition(WorkbenchProtocolLimits.analysisXPCReplyBytes == 12 * 1024 * 1024)
-        precondition(AnalysisReport.jsonFields.count == 72)
+        precondition(AnalysisReport.jsonFields.count == 75)
 
         let requestID = "00000000-0000-0000-0000-000000000000"
         let digest = String(repeating: "a", count: 64)

@@ -73,6 +73,17 @@ Ljoin:
 _hs_ast_flags:
     adds x0, x0, #1
     ret
+.globl _hs_ast_call
+_hs_ast_call:
+    bl _hs_ast_callee
+    ret
+.globl _hs_ast_indirect
+_hs_ast_indirect:
+    blr x8
+    ret
+.globl _hs_ast_callee
+_hs_ast_callee:
+    ret
 .globl _hs_ast_opaque
 _hs_ast_opaque:
     .long 0xffffffff
@@ -92,7 +103,7 @@ _hs_ast_large:
         ranges = {match[3]: (match[1], match[2]) for line in report["functions"].splitlines()
                   if (match := re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+(\S+)", line))}
         artifacts = {}
-        for name in ["identity", "sum", "join", "flags", "opaque", "large"]:
+        for name in ["identity", "sum", "join", "flags", "call", "indirect", "opaque", "large"]:
             start, end = ranges["_hs_ast_"+name]
             document = request(worker, binary, "--reconstruct", start, end)
             assert document.get("producer") == "hindsight-reconstruction-v1", document
@@ -112,7 +123,41 @@ _hs_ast_large:
         assert artifacts["sum"]["eligibility"]["state"] == "review-only"
         assert any(node["kind"] == "phi" for node in artifacts["join"]["nodes"])
         assert artifacts["flags"]["eligibility"]["state"] == "review-only"
-        assert any(node["kind"]=="flags-compare" for node in artifacts["flags"]["ast"]["nodes"])
+        assert any(node["kind"]=="flags-arithmetic" for node in artifacts["flags"]["ast"]["nodes"])
+        # C04: a direct call publishes the caller-visible AAPCS64 contract and
+        # keeps its prototype-derived argument and result locations explicitly
+        # unresolved until a callee prototype is proven.
+        call_effects = [node["attributes"]["call_effects"] for node in artifacts["call"]["ast"]["nodes"]
+                        if node["kind"] == "call" and "call_effects" in node["attributes"]]
+        assert call_effects, artifacts["call"]["ast"]["nodes"]
+        effect = call_effects[0]
+        assert effect["abi"]["name"] == "apple-aapcs64", effect
+        assert effect["abi"]["caller_saved_gpr"] == "x0-x18", effect
+        assert effect["abi"]["callee_saved_gpr"] == "x19-x30", effect
+        assert effect["abi"]["flags_clobbered"] is True, effect
+        assert effect["call_kind"] == "direct", effect
+        assert isinstance(effect["target"], int), effect
+        assert effect["arguments"] == "unresolved: no proven prototype", effect
+        assert effect["result"] == "unresolved: no proven prototype", effect
+        # A call may write memory; the summary never suppresses that.
+        assert effect["memory_effect"]["writes"].startswith("unknown"), effect
+        # A direct call into the captured image admits a bounded observation of
+        # the callee. It is explicitly scoped and never claims the callee
+        # provably performs no memory write.
+        callee = effect["callee_summary"]
+        assert callee["kind"] == "bounded-callee-observation", callee
+        assert callee["instructions"] >= 1, callee
+        assert callee["observed_return"] is True, callee
+        assert "bounded instruction window" in callee["scope"], callee
+        assert effect["memory_effect"]["writes"].startswith("unknown"), effect
+        # An indirect call never claims a target.
+        indirect_effects = [node["attributes"]["call_effects"] for node in artifacts["indirect"]["ast"]["nodes"]
+                            if node["kind"] == "indirect-call" and "call_effects" in node["attributes"]]
+        assert indirect_effects, artifacts["indirect"]["ast"]["nodes"]
+        indirect = indirect_effects[0]
+        assert indirect["call_kind"] == "indirect", indirect
+        assert indirect["target"] is None, indirect
+        assert indirect["dispatch_register"], indirect
         for name in ["opaque"]:
             assert artifacts[name]["eligibility"]["state"] == "blocked"
             assert any(node["kind"] == "unsupported-effect" for node in artifacts[name]["nodes"])

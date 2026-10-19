@@ -1561,6 +1561,33 @@ struct ContentView: View {
                         monospaced(model.currentAnalysis?.call_graph ?? "Run Analyze binary to build the direct call graph.")
                     }.padding(8)
                 }
+            case "Typed Call Graph":
+                GroupBox("Typed call graph") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        analysisToolbar(record)
+                        Text("Call edges are typed by the evidence that proves them: direct (BL to a discovered function start), import (BL to a proven import stub), dispatch (a proven objc_msgSend entry point whose receiver and target method stay unresolved), thunk (BL to a trampoline), unresolved (BL to an address that is none of the above), and tail (a cross-function B candidate). Each edge carries its own confidence. A register-indirect transfer is not claimed here; it stays in the separate indirect-call evidence.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        monospaced(model.currentAnalysis?.typed_call_graph ?? "Run Analyze binary to build the typed call graph.")
+                    }.padding(8)
+                }
+            case "Call Effects":
+                GroupBox("Call effect summaries") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        analysisToolbar(record)
+                        Text("The caller-visible AAPCS64 contract for each call site: the general-purpose and vector registers the callee may destroy, the registers it must preserve, the preserved sp/lr pair, NZCV clobbering, the call kind, and the resolved target. Argument and result locations stay unresolved until a callee prototype is proven, and a call is never reported as performing no memory write.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        monospaced(model.currentAnalysis?.call_effect_summaries ?? "Run Analyze binary to build the call effect summaries.")
+                    }.padding(8)
+                }
+            case "Prototype Conflicts":
+                GroupBox("Prototype conflicts") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        analysisToolbar(record)
+                        Text("Prototype conflicts are unresolved: the report does not publish caller/callee constraint iteration, so it makes no claim that no conflict exists. Treat this as an open item rather than a clean result.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        monospaced(model.currentAnalysis?.prototype_conflicts ?? "Run Analyze binary to check prototype conflicts.")
+                    }.padding(8)
+                }
             case "Data Flow":
                 GroupBox("Data-flow / SSA foundation") {
                     VStack(alignment: .leading, spacing: 10) {

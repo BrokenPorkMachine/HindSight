@@ -2,8 +2,22 @@
 use super::*;
 use crate::reconstruction::{address, array, object, ranges, Builder, Input, Value as V};
 use std::{collections::BTreeMap, io};
+mod calls;
+mod constraints;
 mod executable;
 mod source;
+
+pub(crate) use constraints::{Constraint, ConstraintKind, Solution as ConstraintSolution};
+
+pub(crate) use constraints::{report as constraint_report, solve as solve_constraints};
+
+/// The AAPCS64 register classes published by the call-effect summary. The
+/// report and the reconstruction artifact share one definition so a text
+/// summary never claims a different clobber set than the structured payload.
+pub(crate) use calls::{
+    CALLEE_SAVED_GPR, CALLEE_SAVED_VECTOR, CALLER_SAVED_GPR, CALLER_SAVED_VECTOR,
+    PRESERVED_SPECIAL,
+};
 
 /// Source-tree vocabulary v1. Attributes carry explicit bit/memory contracts;
 /// these are machine-state expressions, not fabricated recovered source locals.
@@ -216,6 +230,10 @@ fn effective_address(address: IrMemoryAddress, update: Option<IrWriteback>) -> T
         .map(|update| reg(update.base))
         .unwrap_or_else(|| address_tree(address))
 }
+
+/// Instruction budget for the bounded callee observation at a direct call
+/// site. The window is an observation, not a whole-function proof.
+const CALLEE_WINDOW: usize = 128;
 
 fn model(operation: IrOperation) -> Option<Tree> {
     let overlaps = |base: IrRegister, value: IrRegister| {
@@ -725,14 +743,17 @@ fn model(operation: IrOperation) -> Option<Tree> {
             None,
             object([
                 ("target", address(target)),
-                ("abi_effects", "unresolved".into()),
+                ("call_effects", calls::CallSummary::direct(target).payload()),
             ]),
             vec![],
         ),
         IrOperation::IndirectCall { target } => tree(
             "indirect-call",
             None,
-            object([("abi_effects", "unresolved".into())]),
+            object([(
+                "call_effects",
+                calls::CallSummary::indirect(target.target().name()).payload(),
+            )]),
             vec![reg(target)],
         ),
         _ => return None,
@@ -1009,6 +1030,14 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     let mut statement_mirrors = Vec::new();
     let mut trees = Vec::new();
     let mut strict_blocked = truncated || exhausted;
+    // A single exact source declaration proves this function's own prototype,
+    // which also proves the prototype of a self-recursive call target.
+    let self_prototype = if signatures.len() == 1 {
+        let (name, signature) = &signatures[0];
+        crate::signatures::source_signature(name, signature)
+    } else {
+        None
+    };
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
     for (index, bytes) in body.chunks_exact(4).enumerate() {
         let pc = start + index as u64 * 4;
@@ -1121,6 +1150,31 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 vec![],
             )
         });
+        // A direct call back into this function's own entry proves the callee
+        // prototype from the function's single exact source declaration. Any
+        // other target keeps its argument and result locations unresolved.
+        let tree = match (&self_prototype, portable) {
+            (Some(prototype), IrOperation::DirectCall { target }) if target == start => {
+                let mut tree = tree;
+                tree.attributes = calls::with_prototype_payload(tree.attributes, prototype);
+                tree
+            }
+            _ => tree,
+        };
+        // A direct call into the captured image admits a bounded observation
+        // of what the callee does. The observation is capped and explicitly
+        // scoped; it never replaces the caller-visible ABI contract.
+        let tree = match portable {
+            IrOperation::DirectCall { target } => match calls::analyze_callee(code, base, target, CALLEE_WINDOW) {
+                Some(summary) => {
+                    let mut tree = tree;
+                    tree.attributes = calls::with_callee_payload(tree.attributes, &summary);
+                    tree
+                }
+                None => tree,
+            },
+            _ => tree,
+        };
         let (ast, mirror) = tree.emit(&mut builder, &ir, pc)?;
         statements.push(ast);
         statement_mirrors.push(mirror);

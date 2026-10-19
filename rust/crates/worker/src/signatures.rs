@@ -25,6 +25,18 @@ fn c_identifier(name:&str)->bool {
     !name.is_empty()&&name.len()<=256&&!reserved.contains(&name)&&name.bytes().next().is_some_and(|b|b.is_ascii_alphabetic()||b==b'_')&&name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')
 }
 
+/// The proven parameter types of a function, in declaration order, together
+/// with the general-purpose register each one travels in. A parameter with
+/// no general register travels on the stack and is reported as `None`.
+///
+/// This is the structured form the caller/callee constraint solver consumes.
+/// It never re-parses a rendered signature report.
+pub fn abi_parameter_types(signature:&Signature)->Vec<(Option<String>,Option<u8>)>{
+    abi_parameters(Some(signature)).into_iter().map(|parameter|{
+        (parameter.source_type, parameter.general_register)
+    }).collect()
+}
+
 pub fn source_signature(name:&str,signature:&Signature)->Option<SourceSignature>{
     if signature.declaration.contains("...")||signature.language=="C++ / Objective-C++"{return None}
     let objc=signature.language=="Objective-C / Objective-C++";
@@ -801,18 +813,66 @@ fn abi_types_agree(expected: &str, actual: &str) -> bool {
 
 fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let Some(signature) = signature else { return Vec::new() };
+
+    // Check for hidden result pointer (sret) for large struct returns
+    // AAPCS64: aggregates > 16 bytes are returned via hidden pointer in x0
+    let mut has_sret = false;
+    let mut sret_ty = None;
+    if let Some(ty) = signature_return_type(signature) {
+        if let Some(AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words)) = abi_type(&ty) {
+            if words > 2 { // > 16 bytes
+                has_sret = true;
+                sret_ty = Some(ty.clone());
+            }
+        }
+    }
+    
     let is_objc = signature.language == "Objective-C / Objective-C++";
     let parameters = if is_objc { objc_parameters(signature) } else { c_parameters(signature) };
-    let mut gp = if is_objc { 2u8 } else { 0u8 };
+    
+    let mut result = Vec::new();
+    
+    // Add hidden sret parameter if needed
+    if has_sret {
+        let sret_name = sret_ty.as_ref().map(|t| format!("sret_{}", t.replace(' ', "_"))).unwrap_or_else(|| "sret".to_string());
+        result.push(AbiParameter { 
+            name: sret_name, 
+            register: "x0".into(), 
+            general_register: Some(0), 
+            stack_scalar: None, 
+            source_type: Some(format!("sret_{}", sret_ty.unwrap_or_default()))
+        });
+    }
+    
+    // Add Objective-C implicit parameters
+    if is_objc {
+        if has_sret {
+            // With sret: self=x1, _cmd=x2
+            result.push(AbiParameter { name: "self".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("id".into()) });
+            result.push(AbiParameter { name: "_cmd".into(), register: "x2".into(), general_register: Some(2), stack_scalar: None, source_type: Some("SEL".into()) });
+        } else {
+            result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), stack_scalar: None, source_type: Some("id".into()) });
+            result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("SEL".into()) });
+        }
+    }
+    
+    // For AAPCS64 with sret:
+    // - has_sret + ObjC: x0=sret, x1=self, x2=_cmd -> next is x3 (gp=3)
+    // - sret only: x0=sret, next is x1 (gp=1)
+    // - ObjC only: x0=self, x1=_cmd, next is x2 (gp=2)
+    // - neither: start at x0 (gp=0)
+    let mut gp = if has_sret {
+        if is_objc { 3u8 } else { 1u8 }
+    } else if is_objc {
+        2u8
+    } else {
+        0u8
+    };
     let mut fp = 0u8;
     let mut stack_slot = 0usize;
     let mut stack_offset = 0usize;
     let mut blocked = signature.language == "C++ / Objective-C++" && signature.declaration.contains("::");
-    let mut result = Vec::new();
-    if is_objc {
-        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), stack_scalar: None, source_type: Some("id".into()) });
-        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("SEL".into()) });
-    }
+    
     for (ty, name) in parameters {
         let scalar = abi_type(&ty);
         if blocked || scalar.is_none() {
@@ -1783,6 +1843,34 @@ fn recover_internal(
             assert!(args[index].register.contains(&format!("sp+0x{offset:x}, {size} bytes")), "{:?}", args[index]);
             assert_eq!(args[index].general_register, None);
         }
+    }
+    #[test] fn sret_hidden_result_pointer_for_large_structs() {
+        // Large struct return via hidden pointer in x0 (sret)
+        let signature = Signature { language: "C", source: "test",
+            declaration: "CGRect large_rect(void);".into() }; // CGRect is 32 bytes (> 16 bytes)
+        let args = abi_parameters(Some(&signature));
+        // First parameter should be sret pointer in x0
+        assert_eq!(args[0].register, "x0");
+        assert!(args[0].source_type.as_ref().unwrap().starts_with("sret_"));
+        // Next parameter would be at x1 (shifted by sret)
+        // No additional parameters in this case
+        
+        // Test with additional parameters
+        let signature = Signature { language: "C", source: "test",
+            declaration: "CGRect large_rect(int a, long b);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert_eq!(args[0].register, "x0"); // sret pointer
+        assert_eq!(args[1].register, "x1"); // a
+        assert_eq!(args[2].register, "x2"); // b
+    }
+    #[test] fn sret_shifts_objc_parameters() {
+        let objc = objc_method("-[View largeRect:]", "{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8Q").unwrap();
+        let args = abi_parameters(Some(&objc));
+        // With sret: self=x1, _cmd=x2, sret=x0
+        assert_eq!(args[0].register, "x0"); // sret
+        assert_eq!(args[1].register, "x1"); // self
+        assert_eq!(args[2].register, "x2"); // _cmd
+        assert_eq!(args[3].register, "x3"); // first explicit arg
     }
     #[test] fn callbacks_blocks_and_array_parameters_decay_to_gp_pointers() {
         let signature = Signature { language: "C", source: "test",

@@ -1,6 +1,6 @@
 # Validation — HindSight 0.5.12
 
-Portable validation covers source topology, release identity, local dependency closure, Python/native contracts, plist/JSON/TOML parsing, shell syntax, deterministic Xcode project topology, Swift syntax parsing where available, Cargo lockfile structure, Rust 1.90 source admission, and compile checks of both the Apple-Silicon Hypervisor implementation and Intel fallback path. 0.5.12 validates Objective-C/C parameter and argument recovery, shared semantic lifting, scalar floating-point argument tracking, cache invalidation, and the 72-field analysis contract alongside existing scalability and continuity checks. Full Xcode/Rust linking still requires the native macOS release host.
+Portable validation covers source topology, release identity, local dependency closure, Python/native contracts, plist/JSON/TOML parsing, shell syntax, deterministic Xcode project topology, Swift syntax parsing where available, Cargo lockfile structure, Rust 1.90 source admission, and compile checks of both the Apple-Silicon Hypervisor implementation and Intel fallback path. 0.5.12 validates Objective-C/C parameter and argument recovery, shared semantic lifting, scalar floating-point argument tracking, cache invalidation, and the 75-field analysis contract alongside existing scalability and continuity checks. Full Xcode/Rust linking still requires the native macOS release host.
 
 
 ## Universal macOS / Intel compatibility
@@ -37,7 +37,7 @@ These checks complement the project-root/database symlink rejection and the nati
 ## Analysis/runtime invariants retained
 
 - Product/service/worker identity is `0.5.12`, release channel `stable`, bundle build `5912`, protocol ABI 1.
-- Swift/Rust agree on the exact 72-field `AnalysisReport`.
+- Swift/Rust agree on the exact 75-field `AnalysisReport`.
 - Cache envelopes bind source SHA-256 and `arm64-analysis-v83-schema122`; only explicitly validated legacy cache paths are admitted.
 - Staged worker progress remains bounded, monotonic pipeline telemetry and is filtered from ordinary diagnostics.
 - Large-CFG dominators remain per-function/budgeted; Function Intelligence distinguishes internal/external calls; tail-call candidates remain exact-entry candidates.

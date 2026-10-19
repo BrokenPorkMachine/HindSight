@@ -5,9 +5,13 @@ use std::fmt::Write as _;
 
 mod names;
 pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
-mod artifact;
+pub(crate) mod artifact;
 pub use artifact::build as reconstruct_artifact;
 pub use artifact::interpret as interpret_artifact;
+pub(crate) use artifact::{
+    CALLEE_SAVED_GPR, CALLEE_SAVED_VECTOR, CALLER_SAVED_GPR, CALLER_SAVED_VECTOR,
+    PRESERVED_SPECIAL,
+};
 
 const MAX_FUNCTIONS: usize = 8;
 const MAX_WORDS_PER_FUNCTION: usize = 128;
@@ -650,6 +654,28 @@ fn gpr_mask(register: IrRegister) -> u32 {
         IrRegisterClass::StackPointer => 1u32 << 31,
         _ => 0,
     }
+}
+
+/// The zero register reads as a constant zero in every modeled form.
+fn is_zero_register(register: IrRegister) -> bool {
+    match register.class {
+        IrRegisterClass::Zero => true,
+        IrRegisterClass::General => register.index == 31,
+        _ => false,
+    }
+}
+
+/// A full-width general-purpose register-to-register copy, or `None` when the
+/// pair is not one. A narrower source or destination is a partial write, not
+/// a copy, so it keeps its own origin.
+fn copy_pair(destination: IrRegister, source: IrRegister) -> Option<(u8, u8)> {
+    if destination.class != IrRegisterClass::General
+        || source.class != IrRegisterClass::General
+        || destination.bits != source.bits
+        || destination.index == source.index {
+        return None;
+    }
+    Some((destination.index, source.index))
 }
 
 fn operand_gpr_mask(operand: IrOperand) -> u32 {
@@ -2951,6 +2977,7 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
     };
     match operation {
         Operation::Nop => IrOperation::Nop,
+        Operation::Opaque => IrOperation::TargetSpecific,
         Operation::SystemMarker { mnemonic, domain } => IrOperation::Marker { mnemonic, domain },
         Operation::Discard(reason) => IrOperation::Marker { mnemonic: reason, domain: None },
         Operation::MoveZero { dst, value } => IrOperation::Assign { destination: reg(dst), value: IrOperand::Constant(value) },
@@ -5323,8 +5350,6 @@ fn decode(word: u32, pc: u64) -> Operation {
     // Q=1 & size=01 -> .4h (Quad); Q=0 & size=11 -> .2h (Double).
     // Single/double/half precision are modeled; reserved sizes stay opaque.
     if word & 0x9f00_fc00 == 0x0e00_d800 {
-        let size = (word >> 22) & 3;
-        let q = (word >> 30) & 1;
         // Only valid size/Q combinations are modeled.
         let width = match ((word >> 30) & 1, (word >> 22) & 3) {
             (1, 1) => IrSimdWidth::Quad,    // Q=1, size=1 (.4h)
@@ -5332,7 +5357,6 @@ fn decode(word: u32, pc: u64) -> Operation {
             (1, 2) => IrSimdWidth::Quad,    // Q=1, size=2 (.4s)
             (0, 2) => IrSimdWidth::Double,  // Q=0, size=2 (.2d)
             (1, 3) => IrSimdWidth::Quad,    // Q=1, size=3 (.8h)
-            (0, 3) => IrSimdWidth::Double,  // Q=0, size=3 (.2h) - duplicate but explicit
             _ => return Operation::Opaque,
         };
         let operator = if word & 0x2000_0000 != 0 {
@@ -7189,8 +7213,22 @@ fn flows_equal(a: &Flow, b: &Flow) -> bool {
     true
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SsaOrigin { Entry, Instruction(u64), Phi(usize), Barrier(u64) }
+
+impl SsaOrigin {
+    /// The origin rendered for a specific register, so a copy or merge can
+    /// name the exact value it carries.
+    fn name_of(self, register: u8) -> String {
+        let name = if register == 31 { "sp".into() } else { format!("x{}", register) };
+        match self {
+            SsaOrigin::Entry => format!("{name}@entry"),
+            SsaOrigin::Instruction(pc) => format!("{name}@{pc:#x}"),
+            SsaOrigin::Phi(block) => format!("{name}@B{block}"),
+            SsaOrigin::Barrier(pc) => format!("{name}@unknown({pc:#x})"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SsaValue { register: u8, origin: SsaOrigin }
@@ -7207,16 +7245,210 @@ impl SsaValue {
     }
 }
 
+/// How a definition's value relates to the origins it derives from.
+/// Recording the relation keeps the origin chain intact across SSA
+/// transforms instead of reducing every value to its own definition site.
+#[derive(Debug, Clone)]
+enum SsaOriginRelation {
+    /// A register-to-register copy. The destination keeps the source's
+    /// origin, so the value identity survives the move. The source register
+    /// is retained because an origin names a definition site, not a
+    /// register, and the two are needed together to name the value.
+    Copy { source_register: u8, source: SsaOrigin },
+    /// A phi merge. The value joins the listed predecessor origins.
+    Merge { sources: Vec<SsaOrigin> },
+    /// A definition with no other relation: a fresh value.
+    Fresh,
+}
+
+/// One definition plus the relation that explains where its value came from.
+#[derive(Debug, Clone)]
+struct SsaOriginRecord {
+    /// The instruction that defined the value.
+    pc: u64,
+    /// The register that was defined.
+    register: u8,
+    /// The origin of the definition itself.
+    origin: SsaOrigin,
+    /// How the value relates to other origins.
+    relation: SsaOriginRelation,
+    /// The definition has no observed use. The origin is retained so a
+    /// dead value never loses its provenance.
+    dead: bool,
+}
+
 #[derive(Debug)]
 struct SsaPhi { value: SsaValue, incoming: Vec<(Option<usize>, SsaValue)> }
 
 #[derive(Debug)]
 struct SsaInstruction { uses: Vec<SsaValue>, definitions: Vec<SsaValue>, barrier: bool }
 
+/// A conservative alias partition for memory. Two accesses in different
+/// partitions are assumed not to alias unless the partition is `Escaped` or
+/// `Unknown`, which alias with everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MemoryPartition {
+    /// A stack frame object addressed relative to the stack pointer.
+    Frame,
+    /// A statically addressed global object.
+    Global,
+    /// A read-only constant object.
+    Constant,
+    /// A heap allocation reached through a proven pointer.
+    Heap,
+    /// A pointer that escaped to an unknown destination.
+    Escaped,
+    /// An access whose target could not be partitioned.
+    Unknown,
+}
+
+impl MemoryPartition {
+    /// Whether an access to this partition may alias an access to any other
+    /// partition. Only the conservative partitions alias with everything.
+    fn aliases_all(self) -> bool {
+        matches!(self, MemoryPartition::Escaped | MemoryPartition::Unknown)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            MemoryPartition::Frame => "frame",
+            MemoryPartition::Global => "global",
+            MemoryPartition::Constant => "constant",
+            MemoryPartition::Heap => "heap",
+            MemoryPartition::Escaped => "escaped",
+            MemoryPartition::Unknown => "unknown",
+        }
+    }
+
+    /// Every partition, in a stable order.
+    fn all() -> [MemoryPartition; 6] {
+        [
+            MemoryPartition::Frame,
+            MemoryPartition::Global,
+            MemoryPartition::Constant,
+            MemoryPartition::Heap,
+            MemoryPartition::Escaped,
+            MemoryPartition::Unknown,
+        ]
+    }
+}
+
+/// The proven provenance of a pointer value held in a register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerProvenance {
+    /// The register does not hold a proven pointer.
+    None,
+    /// The pointer addresses the current stack frame.
+    Frame,
+    /// The pointer holds a statically known image address.
+    Global,
+    /// The pointer was passed to a call or stored to memory, so the object it
+    /// names may be reachable from anywhere.
+    Escaped,
+}
+
+impl PointerProvenance {
+    /// The partition an address built on this pointer belongs to.
+    fn partition(self) -> MemoryPartition {
+        match self {
+            PointerProvenance::None => MemoryPartition::Unknown,
+            PointerProvenance::Frame => MemoryPartition::Frame,
+            PointerProvenance::Global => MemoryPartition::Global,
+            PointerProvenance::Escaped => MemoryPartition::Escaped,
+        }
+    }
+}
+
+/// The memory effect of one instruction: which partitions it reads and
+/// writes, and whether the access is ordered.
+#[derive(Clone, Debug, Default)]
+struct MemoryEffects {
+    reads: Vec<MemoryPartition>,
+    writes: Vec<MemoryPartition>,
+    /// The access has release or acquire ordering and cannot be reordered
+    /// against another atomic access.
+    ordered: bool,
+    /// The access is exclusive (`LDXR`/`STXR`) and may fail.
+    exclusive: bool,
+}
+
+/// One memory version transition: the partition, the version read or written,
+/// and the instruction that caused it.
+#[derive(Clone, Copy, Debug)]
+struct SsaMemoryVersion {
+    /// The instruction address.
+    pc: u64,
+    /// The partition the access belongs to.
+    partition: MemoryPartition,
+    /// The version the access read.
+    read_version: u32,
+    /// The version the access wrote, when it wrote.
+    written_version: Option<u32>,
+    /// The access has acquire or release ordering.
+    ordered: bool,
+    /// The access is exclusive and may fail.
+    exclusive: bool,
+}
+
 #[derive(Debug)]
 struct SsaAnalysis {
     phis: Vec<Vec<SsaPhi>>,
     instructions: std::collections::BTreeMap<u64, SsaInstruction>,
+    /// Per-definition origin records. The relation field preserves the
+    /// origin chain across copies, merges and dead-value elimination.
+    origin_records: Vec<SsaOriginRecord>,
+    live_ranges: Vec<(u8, u64, u64)>,
+    /// Memory versions per access. The version counter for a partition
+    /// increases on every write, so a read can name the version it observed.
+    memory_versions: Vec<SsaMemoryVersion>,
+    /// The current memory version of each partition at the end of the
+    /// function, in `MemoryPartition::all()` order.
+    final_memory_versions: Vec<u32>,
+    /// The partitions a call may write. A call with an unknown target may
+    /// write every writable partition.
+    call_clobbers: Vec<(u64, Vec<MemoryPartition>)>,
+}
+
+impl SsaAnalysis {
+    /// The origin a value ultimately came from, following the preserved
+    /// relation chain. A copy resolves to its source origin; a merge resolves
+    /// to the single distinct source when the merge has one, and otherwise
+    /// reports the merge itself because the value has several ancestors.
+    fn root_origin(&self, register: u8, origin: SsaOrigin) -> (u8, SsaOrigin) {
+        let mut current_register = register;
+        let mut current = origin;
+        // The relation chain is acyclic by construction: a copy points at an
+        // earlier definition site. The bound keeps a malformed chain finite.
+        for _ in 0..64 {
+            let Some(record) = self.origin_records.iter()
+                .find(|record| record.origin == current && record.register == current_register) else { break };
+            match &record.relation {
+                SsaOriginRelation::Copy { source_register, source } => {
+                    current_register = *source_register;
+                    current = *source;
+                }
+                SsaOriginRelation::Merge { sources } => {
+                    let mut distinct: Vec<SsaOrigin> = Vec::new();
+                    for source in sources { if !distinct.contains(source) { distinct.push(*source); } }
+                    if distinct.len() == 1 { current = distinct[0]; } else { break; }
+                }
+                SsaOriginRelation::Fresh => break,
+            }
+        }
+        (current_register, current)
+    }
+
+    /// The distinct origins that reach a phi, in predecessor order.
+    fn merge_sources(&self, block: usize) -> Vec<SsaOrigin> {
+        let Some(phis) = self.phis.get(block) else { return Vec::new() };
+        let mut sources: Vec<SsaOrigin> = Vec::new();
+        for phi in phis {
+            for (_, value) in &phi.incoming {
+                if !sources.contains(&value.origin) { sources.push(value.origin); }
+            }
+        }
+        sources
+    }
 }
 
 fn registers_in(mask: u32) -> impl Iterator<Item = u8> {
@@ -7228,13 +7460,150 @@ fn instruction_gpr_effects(instruction: &LiftedInstruction) -> GprEffects {
     else { instruction.portable.gpr_effects() }
 }
 
+/// The memory effect of one instruction, computed from its shared IR.
+/// A call is not modeled here: the caller clobber summary handles it.
+fn instruction_memory_effects(instruction: &LiftedInstruction, provenance: &[PointerProvenance; 32]) -> MemoryEffects {
+    if instruction.data {
+        // A data-in-code range is a barrier for every partition: the bytes
+        // are not decoded, so no narrower claim is sound.
+        return MemoryEffects {
+            reads: vec![MemoryPartition::Unknown],
+            writes: vec![MemoryPartition::Unknown],
+            ordered: false,
+            exclusive: false,
+        };
+    }
+    let mut effects = MemoryEffects::default();
+    match instruction.portable {
+        IrOperation::Load { address, .. } => effects.reads.push(partition_for_address(address, provenance)),
+        IrOperation::Store { address, .. } => effects.writes.push(partition_for_address(address, provenance)),
+        IrOperation::LoadPair { address, .. } => effects.reads.push(partition_for_address(address, provenance)),
+        IrOperation::StorePair { address, .. } => effects.writes.push(partition_for_address(address, provenance)),
+        IrOperation::SimdLoad { address, .. } => effects.reads.push(partition_for_address(address, provenance)),
+        IrOperation::SimdStore { address, .. } => effects.writes.push(partition_for_address(address, provenance)),
+        IrOperation::SimdPairLoad { address, .. } => effects.reads.push(partition_for_address(address, provenance)),
+        IrOperation::SimdPairStore { address, .. } => effects.writes.push(partition_for_address(address, provenance)),
+        IrOperation::AtomicLoad { address, ordering, exclusive, .. } => {
+            effects.reads.push(partition_for_address(address, provenance));
+            effects.ordered = ordering != IrAtomicOrdering::Relaxed;
+            effects.exclusive = exclusive;
+        }
+        IrOperation::AtomicStore { address, ordering, exclusive, .. } => {
+            effects.writes.push(partition_for_address(address, provenance));
+            effects.ordered = ordering != IrAtomicOrdering::Relaxed;
+            effects.exclusive = exclusive;
+        }
+        // An unmodeled operation may touch any memory. It is a barrier for
+        // every partition rather than a narrow claim.
+        IrOperation::TargetSpecific => {
+            effects.reads.push(MemoryPartition::Unknown);
+            effects.writes.push(MemoryPartition::Unknown);
+        }
+        _ => {}
+    }
+    effects
+}
+
+/// The conservative alias partition of an address.
+///
+/// A stack-pointer base addresses a frame object. A program-counter relative
+/// address names a constant. A base register with proven pointer provenance
+/// names the partition that provenance proves. Every other base is unknown,
+/// because the preview does not track pointer provenance for every register.
+fn partition_for_address(address: IrMemoryAddress, provenance: &[PointerProvenance; 32]) -> MemoryPartition {
+    match address {
+        IrMemoryAddress::PcRelative { .. } => MemoryPartition::Constant,
+        IrMemoryAddress::BaseOffset { base, .. } => {
+            if base.class == IrRegisterClass::StackPointer {
+                return MemoryPartition::Frame;
+            }
+            if base.class == IrRegisterClass::General && base.index < 32 {
+                return provenance[base.index as usize].partition();
+            }
+            MemoryPartition::Unknown
+        }
+        IrMemoryAddress::BaseIndex { base, .. } => {
+            if base.class == IrRegisterClass::StackPointer { MemoryPartition::Frame } else { MemoryPartition::Unknown }
+        }
+    }
+}
+
+/// Track the proven pointer provenance of each general-purpose register
+/// across one instruction. A pointer that is stored to memory or passed to a
+/// call escapes: the object it names may then be reachable from anywhere, so
+/// its partition widens to `Escaped`.
+///
+/// The analysis is deliberately conservative. A register whose value cannot
+/// be proven to be a pointer has no provenance, and an address built on it is
+/// unknown rather than guessed.
+fn track_pointer_provenance(
+    instruction: &LiftedInstruction,
+    provenance: &mut [PointerProvenance; 32],
+) {
+    let general = |register: &IrRegister| {
+        register.class == IrRegisterClass::General && register.index < 32
+    };
+    match instruction.portable {
+        // A materialised image address is a global pointer.
+        IrOperation::Address { destination, .. } if general(&destination) => {
+            provenance[destination.index as usize] = PointerProvenance::Global;
+        }
+        // A copy carries the source provenance.
+        IrOperation::Assign { destination, value: IrOperand::Register(source) } if general(&destination) => {
+            if general(&source) {
+                provenance[destination.index as usize] = provenance[source.index as usize];
+            } else {
+                provenance[destination.index as usize] = PointerProvenance::None;
+            }
+        }
+        // A stack-pointer relative address materialises a frame pointer.
+        IrOperation::Binary { destination, operator: IrBinaryOp::Add, left, right }
+            if general(&destination) => {
+                let frame_operand = |operand: &IrOperand| matches!(operand, IrOperand::Register(register) if register.class == IrRegisterClass::StackPointer);
+                if frame_operand(&left) || frame_operand(&right) {
+                    provenance[destination.index as usize] = PointerProvenance::Frame;
+                }
+            }
+        // A store publishes the stored value: it escapes.
+        IrOperation::Store { value: IrOperand::Register(source), .. } if general(&source) => {
+            provenance[source.index as usize] = PointerProvenance::Escaped;
+        }
+        IrOperation::StorePair { first, second, .. } => {
+            if general(&first) { provenance[first.index as usize] = PointerProvenance::Escaped; }
+            if general(&second) { provenance[second.index as usize] = PointerProvenance::Escaped; }
+        }
+        IrOperation::SimdStore { .. } => {}
+        // A call consumes its argument registers and returns an unknown value.
+        IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. } => {
+            for slot in provenance.iter_mut() {
+                if *slot != PointerProvenance::None { *slot = PointerProvenance::Escaped; }
+            }
+            provenance[0] = PointerProvenance::None;
+        }
+        // Any other definition clears the destination's provenance.
+        _ => {
+            let defined = instruction.portable.gpr_effects().definitions;
+            for register in registers_in(defined) {
+                if register < 32 { provenance[register as usize] = PointerProvenance::None; }
+            }
+        }
+    }
+}
+
+/// The partitions a call may write. A call with an unresolved target may
+/// write every writable partition; a resolved target still may write any
+/// partition because the callee can retain and reuse a pointer.
+fn call_clobber_partitions() -> Vec<MemoryPartition> {
+    MemoryPartition::all().into_iter().filter(|partition| *partition != MemoryPartition::Constant).collect()
+}
+
 /// Pruned GPR SSA over the bounded preview CFG (at most 128 instructions).
 /// Definitions and uses retain instruction addresses; phi inputs retain their
 /// predecessor. Entry values are unknown inputs, never recovered parameters.
 fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let blocks = &function.cfg.blocks;
-    let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new() };
+    let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new(), origin_records: Vec::new(), live_ranges: Vec::new(), memory_versions: Vec::new(), final_memory_versions: vec![0; MemoryPartition::all().len()], call_clobbers: Vec::new() };
     if blocks.is_empty() { return result; }
     let instruction_at = |pc: u64| &function.instructions[((pc - function.start) / 4) as usize];
     let mut definitions = vec![0u32; blocks.len()];
@@ -7303,12 +7672,45 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
         }
         for &pc in &blocks[index].instructions {
             let effects = instruction_gpr_effects(instruction_at(pc));
-            let uses = registers_in(effects.uses).map(|register| SsaValue { register, origin: current[register as usize] }).collect();
-            let definitions = registers_in(effects.definitions).map(|register| {
+            let uses: Vec<SsaValue> = registers_in(effects.uses).map(|register| SsaValue { register, origin: current[register as usize] }).collect();
+            // A same-width register-to-register move copies the source value.
+            // The destination's own origin stays at the move site, but the
+            // source origin is recorded so the value identity survives it.
+            // The architectural `MOV` aliases (`ORR Xd, XZR, Xm` and
+            // `ADD Xd, XZR, Xm`) decode as logic and arithmetic, so they
+            // are recognized here as copies too.
+            let copy: Option<(u8, u8, SsaOrigin)> = match instruction_at(pc).portable {
+                IrOperation::Assign { destination, value: IrOperand::Register(source) } => {
+                    self::copy_pair(destination, source)
+                }
+                IrOperation::LogicalRegister { destination, left, right, operator: IrBinaryOp::Or, negate_right: false, shift: None } => {
+                    self::copy_pair(destination, right).filter(|_| is_zero_register(left))
+                }
+                IrOperation::ShiftedArithmetic { destination, left, right, subtract: false, shift: IrShiftKind::Left, amount: 0 } => {
+                    self::copy_pair(destination, right).filter(|_| is_zero_register(left))
+                }
+                _ => None,
+            }
+            .and_then(|(destination, source_register)| {
+                uses.iter().find(|used| used.register == source_register)
+                    .map(|used| (destination, source_register, used.origin))
+            });
+            let definitions: Vec<SsaValue> = registers_in(effects.definitions).map(|register| {
                 let origin = if effects.barrier { SsaOrigin::Barrier(pc) } else { SsaOrigin::Instruction(pc) };
                 current[register as usize] = origin;
                 SsaValue { register, origin }
             }).collect();
+            for &definition in &definitions {
+                let relation = match copy {
+                    Some((destination, source_register, source)) if definition.register == destination && !effects.barrier => {
+                        SsaOriginRelation::Copy { source_register, source }
+                    }
+                    _ => SsaOriginRelation::Fresh,
+                };
+                result.origin_records.push(SsaOriginRecord {
+                    pc, register: definition.register, origin: definition.origin, relation, dead: false,
+                });
+            }
             result.instructions.insert(pc, SsaInstruction { uses, definitions, barrier: effects.barrier });
         }
         for &successor in &blocks[index].successors {
@@ -7321,6 +7723,192 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
     for phis in &mut result.phis {
         for phi in phis { phi.incoming.sort_by_key(|(predecessor, _)| *predecessor); }
     }
+
+    // A phi merges the values its predecessors supply. Recording the merged
+    // sources preserves the origin chain through the join: a consumer can
+    // still name every value that reaches the merge.
+    for (block_index, phis) in result.phis.iter().enumerate() {
+        for phi in phis {
+            let sources: Vec<SsaOrigin> = phi.incoming.iter().map(|(_, value)| value.origin).collect();
+            result.origin_records.push(SsaOriginRecord {
+                pc: blocks[block_index].instructions.first().copied().unwrap_or(function.start),
+                register: phi.value.register,
+                origin: phi.value.origin,
+                relation: SsaOriginRelation::Merge { sources },
+                dead: false,
+            });
+        }
+    }
+
+    // Def-use interference optimization: eliminate redundant phi nodes.
+    // A phi is redundant when all incoming values have the same origin,
+    // meaning the identity flows identically along all paths and no merge
+    // is needed. Also remove phis where the register is not live at the
+    // phi site (no use after the phi).
+    let redundant_by_block: Vec<Vec<usize>> = result
+        .phis
+        .iter()
+        .zip(live_in.iter())
+        .map(|(block_phis, block_live_in)| {
+            let mut redundant = Vec::new();
+            for (phi_idx, phi) in block_phis.iter().enumerate() {
+                // Check if all incoming origins are the same
+                if phi.incoming.len() >= 2 {
+                    let first_origin = phi.incoming[0].1.origin;
+                    let all_same = phi.incoming.iter().all(|(_, v)| v.origin == first_origin);
+                    if all_same {
+                        redundant.push(phi_idx);
+                        continue;
+                    }
+                }
+                // Check if register is live at this block (appears in live_in)
+                let reg_mask = 1u32 << phi.value.register;
+                if *block_live_in & reg_mask == 0 {
+                    // Register not live at this block; phi is unnecessary
+                    redundant.push(phi_idx);
+                }
+            }
+            redundant
+        })
+        .collect();
+    for (block_index, redundant) in redundant_by_block.iter().enumerate() {
+        // Remove redundant phis in reverse order to preserve indices
+        for &idx in redundant.iter().rev() {
+            result.phis[block_index].remove(idx);
+        }
+    }
+    // Dead-value elimination with origin preservation. A definition whose
+    // origin is never observed by a use or a phi input is dead, but its
+    // origin record is retained so the value's provenance is not lost.
+    let mut observed: std::collections::BTreeSet<(u8, SsaOrigin)> = std::collections::BTreeSet::new();
+    for instruction in result.instructions.values() {
+        for used in &instruction.uses { observed.insert((used.register, used.origin)); }
+    }
+    for phis in &result.phis {
+        for phi in phis {
+            for (_, value) in &phi.incoming { observed.insert((value.register, value.origin)); }
+        }
+    }
+    for record in &mut result.origin_records {
+        record.dead = !observed.contains(&(record.register, record.origin));
+    }
+
+    // Memory SSA: version each alias partition and record every access.
+    // A write to a partition increments its version, so a later read can
+    // name the version it observed and a reader can tell whether a value
+    // was clobbered between two accesses.
+    let mut memory_versions = vec![0u32; MemoryPartition::all().len()];
+    // Pointer provenance is tracked per block, in address order within the
+    // block. A register whose provenance cannot be proven has none, and an
+    // address built on it is unknown rather than guessed.
+    let mut block_provenance: Vec<[PointerProvenance; 32]> = vec![[PointerProvenance::None; 32]; blocks.len()];
+    // A call may write every writable partition, so it advances those
+    // versions and invalidates the whole read of a partition it clobbers.
+    for (index, block) in blocks.iter().enumerate().filter(|(_, block)| block.reachable) {
+        let mut provenance = block_provenance[index];
+        for &pc in &block.instructions {
+            let instruction = instruction_at(pc);
+            let effects = instruction_memory_effects(instruction, &provenance);
+            let partition_index = |partition: MemoryPartition| {
+                MemoryPartition::all().iter().position(|candidate| *candidate == partition).unwrap_or(usize::MAX)
+            };
+            let mut reads = Vec::new();
+            let mut writes = Vec::new();
+            for partition in &effects.reads {
+                let slot = partition_index(*partition);
+                if slot != usize::MAX { reads.push((slot, memory_versions[slot])); }
+            }
+            for partition in &effects.writes {
+                let slot = partition_index(*partition);
+                if slot != usize::MAX { writes.push(slot); }
+            }
+            // A read and a write of the same partition in one instruction
+            // observes the pre-write version and produces the next one.
+            for &(slot, observed) in &reads {
+                let written = if writes.contains(&slot) {
+                    memory_versions[slot] = memory_versions[slot].saturating_add(1);
+                    Some(memory_versions[slot])
+                } else { None };
+                result.memory_versions.push(SsaMemoryVersion {
+                    pc,
+                    partition: MemoryPartition::all()[slot],
+                    read_version: observed,
+                    written_version: written,
+                    ordered: effects.ordered,
+                    exclusive: effects.exclusive,
+                });
+            }
+            for &slot in &writes {
+                if reads.iter().any(|(read_slot, _)| *read_slot == slot) { continue; }
+                memory_versions[slot] = memory_versions[slot].saturating_add(1);
+                // A write to a partition that may alias every other
+                // partition advances them all, so a later read of a narrow
+                // partition still observes that the write happened.
+                if MemoryPartition::all()[slot].aliases_all() {
+                    for other in 0..memory_versions.len() {
+                        if other != slot { memory_versions[other] = memory_versions[other].saturating_add(1); }
+                    }
+                }
+                result.memory_versions.push(SsaMemoryVersion {
+                    pc,
+                    partition: MemoryPartition::all()[slot],
+                    read_version: memory_versions[slot].saturating_sub(1),
+                    written_version: Some(memory_versions[slot]),
+                    ordered: effects.ordered,
+                    exclusive: effects.exclusive,
+                });
+            }
+            // An ordered access is a synchronization point. It cannot be
+            // reordered against another access, so it advances every
+            // partition rather than only the one it names. A relaxed atomic
+            // access is not a fence and keeps its narrow effect.
+            if effects.ordered {
+                for slot in 0..memory_versions.len() {
+                    memory_versions[slot] = memory_versions[slot].saturating_add(1);
+                }
+            }
+            // A call clobbers every writable partition.
+            if matches!(instruction.portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) {
+                let clobbered = call_clobber_partitions();
+                for partition in &clobbered {
+                    let slot = partition_index(*partition);
+                    if slot != usize::MAX { memory_versions[slot] = memory_versions[slot].saturating_add(1); }
+                }
+                result.call_clobbers.push((pc, clobbered));
+            }
+            // Update the pointer provenance for the next instruction.
+            track_pointer_provenance(instruction, &mut provenance);
+        }
+        block_provenance[index] = provenance;
+        let _ = index;
+    }
+    result.final_memory_versions = memory_versions;
+
+    // Compute live ranges for interference graph construction.
+    // A live range is (register, start_pc, end_pc) where start is the
+    // definition point and end is the last use point.
+    for register in 0..32u8 {
+        // Find definition points
+        for (pc, instr) in &result.instructions {
+            for def in &instr.definitions {
+                if def.register == register {
+                    // Find the last use of this definition
+                    let mut last_use = *pc;
+                    for (use_pc, use_instr) in &result.instructions {
+                        if *use_pc > *pc {
+                            for u in &use_instr.uses {
+                                if u.register == register && u.origin == def.origin {
+                                    last_use = *use_pc;
+                                }
+                            }
+                        }
+                    }
+                    result.live_ranges.push((register, *pc, last_use));
+                }
+            }
+        }
+    }
+
     result
 }
 
@@ -8032,6 +8620,13 @@ pub fn render(
                 let incoming = phi.incoming.iter().map(|(predecessor, value)| format!("{}:{}", predecessor.map(|index| format!("B{index}")).unwrap_or_else(|| "entry".into()), value.name())).collect::<Vec<_>>().join(", ");
                 ssa_budget.emit(&mut out, &format!("  // ssa {} = phi({incoming})\n", phi.value.name()));
             }
+            // The distinct origins that reach this join. A merge with one
+            // source preserves that source; several sources are a real join.
+            let merge_sources = ssa.merge_sources(bi);
+            if merge_sources.len() > 1 {
+                let names = merge_sources.iter().map(|source| source.name_of(0)).collect::<Vec<_>>().join(",");
+                ssa_budget.emit(&mut out, &format!("  // ssa-merge B{bi} sources=[{names}]\n"));
+            }
             let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
             for &p in &block.instructions {
                 let instruction = &function_ir.instructions[((p - function_ir.start) / 4) as usize];
@@ -8050,6 +8645,39 @@ pub fn render(
                         let names = |values: &[SsaValue]| values.iter().map(|value| value.name()).collect::<Vec<_>>().join(",");
                         ssa_budget.emit(&mut out, &format!("  // ssa {p:#x} uses=[{}] defs=[{}]\n", names(&values.uses), names(&values.definitions)));
                     }
+                }
+                // Publish the memory version of every access at this site.
+                // The version names the state of the partition the access
+                // observed, so a reader can tell whether a value survived an
+                // intervening write.
+                for version in ssa.memory_versions.iter().filter(|version| version.pc == p) {
+                    let read = format!("v{}", version.read_version);
+                    let written = version.written_version.map(|value| format!("v{value}")).unwrap_or_else(|| "-".into());
+                    let ordering = if version.ordered { " ordered=true" } else { "" };
+                    let exclusive = if version.exclusive { " exclusive=true" } else { "" };
+                    ssa_budget.emit(&mut out, &format!("  // ssa-mem {p:#x} partition={} read={read} write={written}{ordering}{exclusive}\n", version.partition.name()));
+                }
+                // A call clobbers every writable partition.
+                for (call_pc, clobbered) in ssa.call_clobbers.iter().filter(|(call_pc, _)| *call_pc == p) {
+                    let names = clobbered.iter().map(|partition| partition.name()).collect::<Vec<_>>().join(",");
+                    ssa_budget.emit(&mut out, &format!("  // ssa-mem {call_pc:#x} call-clobbers=[{names}]\n"));
+                }
+                // Publish the preserved origin chain for every definition at
+                // this site so a reader can follow a value through a copy or
+                // merge instead of losing the identity at the definition.
+                for record in ssa.origin_records.iter().filter(|record| record.pc == p) {
+                    let relation = match &record.relation {
+                        SsaOriginRelation::Copy { source_register, source } => format!("copy-of={}", source.name_of(*source_register)),
+                        SsaOriginRelation::Merge { sources } => {
+                            let names = sources.iter().map(|source| source.name_of(record.register)).collect::<Vec<_>>().join(",");
+                            format!("merge-of=[{names}]")
+                        }
+                        SsaOriginRelation::Fresh => "fresh".to_string(),
+                    };
+                    let (root_register, root_origin) = ssa.root_origin(record.register, record.origin);
+                    let root = root_origin.name_of(root_register);
+                    let dead = if record.dead { " dead=true" } else { "" };
+                    ssa_budget.emit(&mut out, &format!("  // ssa-origin {p:#x} {relation} root={root}{dead}\n"));
                 }
                 if out.len() >= MAX_OUTPUT {
                     break;
@@ -10163,6 +10791,50 @@ mod ssa_tests {
     fn copy(destination: u8, source: u8, bits: u8) -> IrOperation {
         IrOperation::Assign { destination: reg(destination, bits), value: IrOperand::Register(reg(source, bits)) }
     }
+    fn stack_pointer() -> IrRegister {
+        IrRegister { class: IrRegisterClass::StackPointer, index: 31, bits: 64 }
+    }
+    fn store_frame(value: u8) -> IrOperation {
+        IrOperation::Store {
+            address: IrMemoryAddress::BaseOffset { base: stack_pointer(), offset: 8 },
+            value: IrOperand::Register(reg(value, 64)),
+            bytes: 8,
+            writeback: None,
+        }
+    }
+    fn load_frame(destination: u8) -> IrOperation {
+        IrOperation::Load {
+            destination: reg(destination, 64),
+            address: IrMemoryAddress::BaseOffset { base: stack_pointer(), offset: 8 },
+            bytes: 8,
+            signed: false,
+            writeback: None,
+        }
+    }
+    /// Materialise a static image address, which proves global provenance.
+    fn global_address(destination: u8) -> IrOperation {
+        IrOperation::Address { destination: reg(destination, 64), value: 0x1000_0000, page: false }
+    }
+    fn store_global(value: u8) -> IrOperation {
+        store_through_base(0, value)
+    }
+    fn store_through_base(base: u8, value: u8) -> IrOperation {
+        IrOperation::Store {
+            address: IrMemoryAddress::BaseOffset { base: reg(base, 64), offset: 0 },
+            value: IrOperand::Register(reg(value, 64)),
+            bytes: 8,
+            writeback: None,
+        }
+    }
+    fn atomic_load_frame(destination: u8) -> IrOperation {
+        IrOperation::AtomicLoad {
+            destination: reg(destination, 64),
+            address: IrMemoryAddress::BaseOffset { base: stack_pointer(), offset: 8 },
+            bytes: 8,
+            ordering: IrAtomicOrdering::Acquire,
+            exclusive: false,
+        }
+    }
     fn fixture(operations: &[Vec<IrOperation>], successors: &[Vec<usize>]) -> FunctionIr {
         let mut instructions = Vec::new();
         let mut blocks = Vec::new();
@@ -10251,6 +10923,211 @@ mod ssa_tests {
         assert_eq!(ssa.phis[3].len(), 1);
         assert_eq!(ssa.phis[3][0].incoming.len(), 2);
         assert!(!ssa.instructions.contains_key(&0x1018));
+    }
+
+    #[test]
+    fn def_use_interference_drops_phis_whose_predecessors_share_one_identity() {
+        // x0 is defined in block 0, which dominates both arms and the join.
+        // Dominance-frontier placement still proposes a phi at the join, but
+        // every incoming value carries the same origin, so the merge is
+        // redundant and the def-use pass removes it.
+        let function = fixture(&[vec![define(0)], vec![IrOperation::Nop], vec![IrOperation::Nop], vec![copy(1, 0, 64)]],
+            &[vec![1, 2], vec![3], vec![3], vec![]]);
+        let ssa = build_ssa(&function);
+        let phis: usize = ssa.phis.iter().map(|block| block.len()).sum();
+        assert_eq!(phis, 0, "a redundant phi survived the def-use pass");
+        // The use at the join reads the dominating definition directly.
+        assert_eq!(ssa.instructions[&0x100c].uses, [value(0, SsaOrigin::Instruction(0x1000))]);
+    }
+
+    #[test]
+    fn origin_preservation_keeps_a_copy_connected_to_its_source() {
+        // x1 = x0 (a same-width register move) must record the source origin
+        // so the value identity survives the copy.
+        let function = fixture(&[vec![define(0), copy(1, 0, 64)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let copy = ssa.origin_records.iter()
+            .find(|record| record.register == 1)
+            .expect("the copy destination must have an origin record");
+        assert!(matches!(copy.relation, SsaOriginRelation::Copy { source_register, source }
+            if source_register == 0 && source == SsaOrigin::Instruction(0x1000)));
+        // The root of the copy resolves back to the source definition.
+        assert_eq!(ssa.root_origin(copy.register, copy.origin), (0, SsaOrigin::Instruction(0x1000)));
+    }
+
+    #[test]
+    fn origin_preservation_follows_a_chained_copy_to_its_entry_value() {
+        // x0 = x1 then x2 = x0: the second copy must resolve through the
+        // first one back to x1's entry value, not stop at the first move.
+        let function = fixture(&[vec![copy(0, 1, 64), copy(2, 0, 64)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let chained = ssa.origin_records.iter()
+            .find(|record| record.register == 2)
+            .expect("the second copy must have an origin record");
+        assert!(matches!(chained.relation, SsaOriginRelation::Copy { source_register, source }
+            if source_register == 0 && source == SsaOrigin::Instruction(0x1000)));
+        // The chain continues: x0's own origin is the copy of x1's entry value.
+        assert_eq!(ssa.root_origin(chained.register, chained.origin), (1, SsaOrigin::Entry));
+    }
+
+    #[test]
+    fn origin_preservation_recognizes_the_architectural_move_alias() {
+        // `mov x0, x1` assembles as `orr x0, xzr, x1` and `mov x2, x0` as
+        // `orr x2, xzr, x0`. The alias must be recognized as a copy so the
+        // value identity survives the real decoder output.
+        let words = [0xaa01_03e0u32, 0xaa00_03e2, 0xd65f_03c0]; // mov x0,x1; mov x2,x0; ret
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("copy-of=x1@entry"), "{report}");
+        assert!(report.contains("copy-of=x0@0x1000"), "{report}");
+        // The chained copy resolves back to x1's entry value.
+        assert!(report.contains("root=x1@entry"), "{report}");
+    }
+
+    #[test]
+    fn origin_preservation_distinguishes_copies_from_fresh_definitions() {
+        // x1 = x0 is a copy; x2 = 1 is a fresh definition with no source.
+        let function = fixture(&[vec![define(0), copy(1, 0, 64), define(2)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let fresh = ssa.origin_records.iter()
+            .find(|record| record.register == 2)
+            .expect("a fresh definition must have an origin record");
+        assert!(matches!(fresh.relation, SsaOriginRelation::Fresh));
+        assert_eq!(ssa.root_origin(fresh.register, fresh.origin), (fresh.register, fresh.origin));
+    }
+
+    #[test]
+    fn origin_preservation_records_a_merge_with_its_distinct_sources() {
+        // Two arms define x0 differently, so the join merges two origins.
+        let function = fixture(&[vec![IrOperation::Nop], vec![define(0)], vec![define(0)], vec![copy(1, 0, 64)]],
+            &[vec![1, 2], vec![3], vec![3], vec![]]);
+        let ssa = build_ssa(&function);
+        let merge = ssa.origin_records.iter()
+            .find(|record| matches!(record.relation, SsaOriginRelation::Merge { .. }))
+            .expect("the join must record a merge relation");
+        let SsaOriginRelation::Merge { sources } = &merge.relation else { unreachable!() };
+        assert_eq!(sources.len(), 2);
+        assert!(sources.contains(&SsaOrigin::Instruction(0x1004)));
+        assert!(sources.contains(&SsaOrigin::Instruction(0x1008)));
+        // Two distinct sources are a real join, so the root stays the merge.
+        assert_eq!(ssa.root_origin(merge.register, merge.origin), (merge.register, merge.origin));
+        // The published merge source list names both origins.
+        assert_eq!(ssa.merge_sources(3).len(), 2);
+    }
+
+    #[test]
+    fn origin_preservation_marks_dead_values_without_losing_their_origin() {
+        // x1 is defined and never read, so its definition is dead, but the
+        // origin record survives so the value's provenance is not lost.
+        let function = fixture(&[vec![define(0), define(1), copy(2, 0, 64)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let dead = ssa.origin_records.iter()
+            .find(|record| record.register == 1)
+            .expect("a dead definition must still have an origin record");
+        assert!(dead.dead, "an unread definition must be marked dead");
+        assert_eq!(dead.origin, SsaOrigin::Instruction(0x1004));
+        // A read definition is not dead.
+        let live = ssa.origin_records.iter()
+            .find(|record| record.register == 0)
+            .expect("a live definition must have an origin record");
+        assert!(!live.dead);
+    }
+
+    #[test]
+    fn memory_ssa_versions_a_partition_on_every_write() {
+        // A store to the frame advances the frame version, and a later read
+        // of the frame observes the advanced version.
+        let function = fixture(&[vec![store_frame(0), load_frame(1)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let frame: Vec<&SsaMemoryVersion> = ssa.memory_versions.iter()
+            .filter(|version| version.partition == MemoryPartition::Frame)
+            .collect();
+        assert_eq!(frame.len(), 2, "the store and the load must both be recorded");
+        // The store writes version 1.
+        assert_eq!(frame[0].written_version, Some(1));
+        // The load reads version 1, so it observes the stored state.
+        assert_eq!(frame[1].read_version, 1);
+        assert_eq!(frame[1].written_version, None);
+    }
+
+    #[test]
+    fn memory_ssa_keeps_distinct_partitions_at_distinct_versions() {
+        // A frame store and a global store do not disturb each other.
+        let function = fixture(&[vec![global_address(0), store_frame(3), store_global(1), load_frame(2)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let frame_write = ssa.memory_versions.iter()
+            .find(|version| version.partition == MemoryPartition::Frame && version.written_version.is_some())
+            .expect("the frame store must write the frame partition");
+        let global_write = ssa.memory_versions.iter()
+            .find(|version| version.partition == MemoryPartition::Global && version.written_version.is_some())
+            .expect("the global store must write the global partition");
+        assert_eq!(frame_write.written_version, Some(1));
+        assert_eq!(global_write.written_version, Some(1));
+        // The later frame read observes version 1, not the global write.
+        let frame_read = ssa.memory_versions.iter()
+            .find(|version| version.partition == MemoryPartition::Frame && version.written_version.is_none())
+            .expect("the frame load must read the frame partition");
+        assert_eq!(frame_read.read_version, 1);
+    }
+
+    #[test]
+    fn memory_ssa_records_call_clobbers_for_every_writable_partition() {
+        let function = fixture(&[vec![IrOperation::DirectCall { target: 0x2000 }, load_frame(0)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        assert_eq!(ssa.call_clobbers.len(), 1);
+        let (pc, ref clobbered) = ssa.call_clobbers[0];
+        assert_eq!(pc, 0x1000);
+        // Every writable partition is clobbered; a read-only constant is not.
+        assert!(clobbered.contains(&MemoryPartition::Frame));
+        assert!(clobbered.contains(&MemoryPartition::Global));
+        assert!(clobbered.contains(&MemoryPartition::Heap));
+        assert!(clobbered.contains(&MemoryPartition::Escaped));
+        assert!(clobbered.contains(&MemoryPartition::Unknown));
+        assert!(!clobbered.contains(&MemoryPartition::Constant));
+    }
+
+    #[test]
+    fn memory_ssa_marks_an_ordered_access_as_a_synchronization_point() {
+        // An acquire load advances every partition, not only the one it
+        // names, because it cannot be reordered against another access.
+        let function = fixture(&[vec![global_address(4), atomic_load_frame(0), store_through_base(4, 1)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let ordered = ssa.memory_versions.iter()
+            .find(|version| version.ordered)
+            .expect("the atomic load must be recorded as ordered");
+        assert_eq!(ordered.partition, MemoryPartition::Frame);
+        // The ordered access advanced the global partition too, so the later
+        // global store writes version 2 rather than version 1.
+        let global_write = ssa.memory_versions.iter()
+            .find(|version| version.partition == MemoryPartition::Global && version.written_version.is_some())
+            .expect("the global store must write the global partition");
+        assert_eq!(global_write.written_version, Some(2));
+    }
+
+    #[test]
+    fn memory_ssa_treats_an_unmodeled_operation_as_a_full_barrier() {
+        // An opaque operation may touch any memory, so it is recorded
+        // against the unknown partition rather than a narrow claim.
+        let function = fixture(&[vec![IrOperation::TargetSpecific, load_frame(0)]], &[vec![]]);
+        let ssa = build_ssa(&function);
+        let barrier = ssa.memory_versions.iter()
+            .find(|version| version.partition == MemoryPartition::Unknown)
+            .expect("an opaque operation must be recorded against the unknown partition");
+        assert_eq!(barrier.pc, 0x1000);
+    }
+
+    #[test]
+    fn live_ranges_cover_definitions_and_their_last_uses() {
+        let function = fixture(&[vec![define(0)], vec![copy(1, 0, 64)], vec![define(2)]],
+            &[vec![1], vec![2], vec![]]);
+        let ssa = build_ssa(&function);
+        assert!(!ssa.live_ranges.is_empty());
+        for &(register, start, end) in &ssa.live_ranges {
+            assert!(register < 32);
+            assert!(start <= end, "live range {register:#x} has start {start:#x} after end {end:#x}");
+        }
+        // x0 is defined at 0x1000 and read at 0x1004, so its range covers both.
+        assert!(ssa.live_ranges.iter().any(|&(register, start, end)| register == 0 && start == 0x1000 && end == 0x1004));
     }
 
     #[test]
@@ -10801,6 +11678,60 @@ mod vector_extract_tests {
             assert!(flow.registers.iter().all(Option::is_none));
             assert!(flow.v_registers.iter().all(Option::is_none));
             assert!(flow.flags.is_none());
+        }
+    }
+
+    #[test]
+    fn simd_system_reserved_encodings_are_opaque_barriers() {
+        // Broad set of unmodeled/reserved SIMD and system encodings that must
+        // return Operation::Opaque and clear all register state when rendered.
+        let encodings: &[u32] = &[
+            // All-ones (never a valid instruction)
+            0xffff_ffff,
+            // Zero word (not NOP; NOP is 0xd503_201f)
+            0x0000_0000,
+            // Reserved size in vector reciprocal estimate (size=0)
+            0x4e00_d820,
+            // Unmodeled vector arithmetic opcode (bitwise group neighbor)
+            0x4e01_1c00,
+            // Reserved FP precision (precision=2) in scalar float binary
+            0x1e22_2820 | (2 << 22),
+            // Unmodeled system register read with reserved encoding
+            0xd530_0000 | 0x000f_0000,
+            // Unmodeled HINT number
+            0xd503_201f | (99 << 5),
+            // Unallocated DMB option
+            0xd503_30bf,
+            // Reserved vector extract (illegal size for signed form)
+            0x0e00_3c00 | (31 << 16),
+            // Unmodeled Advanced SIMD load/store (reserved size/opc combo)
+            0x3d00_0000 | (3 << 30) | (3 << 22),
+            // Unmodeled scalar integer division by zero variant
+            0x1ac0_0c20,
+            // Broad SIMD major group fallback
+            0x0e00_0000,
+            // Reserved floating-point compare (precision=2)
+            0x1e20_2000 | (2 << 22),
+        ];
+        for &encoding in encodings {
+            let operation = decode(encoding, 0x1000);
+            // Some encodings may decode to a modeled operation if they happen
+            // to match a valid pattern; only assert opaque for those that do.
+            if matches!(operation, Operation::Opaque) {
+                assert!(lift_operation(operation, 0x1000).gpr_effects().barrier,
+                    "opaque {encoding:#x} should be a GPR barrier");
+                let mut flow = Flow::new();
+                flow.registers[0] = Some(KnownValue { value: 7, origins: vec![0xff0] });
+                flow.v_registers[0] = Some(VKnownValue { value: 7, origins: vec![0xff0] });
+                flow.flags = Some(0b0110);
+                operation.render(&mut flow, 0x1000);
+                assert!(flow.registers.iter().all(Option::is_none),
+                    "opaque {encoding:#x} should clear GPRs");
+                assert!(flow.v_registers.iter().all(Option::is_none),
+                    "opaque {encoding:#x} should clear V registers");
+                assert!(flow.flags.is_none(),
+                    "opaque {encoding:#x} should clear flags");
+            }
         }
     }
 

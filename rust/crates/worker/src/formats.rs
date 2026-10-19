@@ -145,7 +145,7 @@ pub(super) fn elf(file: &mut File, o: &Options) -> io::Result<Image> {
     let mut i = image("ELF", arch, bits, be, o, length)?;
     i.cpu = machine as u32;
     i.filetype = half(&h[16..], be) as u32;
-    if !matches!(i.filetype, 1 | 2 | 3) {
+    if !matches!(i.filetype, 1..=3) {
         return Err(bad("ELF admission requires a relocatable object, executable, or shared image; core files are unsupported"));
     }
     let relocatable = i.filetype == 1;
@@ -979,6 +979,7 @@ fn read_cstr(file: &mut File, i: &Image, extents: &[(u64, u64, u64, u64)], rva: 
     Ok(String::from_utf8_lossy(&buf[..end]).to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pe_data_directories(
     file: &mut File,
     i: &mut Image,
@@ -1225,7 +1226,7 @@ pub(super) fn coff(file: &mut File, o: &Options) -> io::Result<Image> {
         range(st_off, 4, length)?;
         let sz_bytes = read(file, add(o.offset, st_off)?, 4)?;
         let st_size = u32v(&sz_bytes, false) as u64;
-        if st_size < 4 || st_size > 16 * 1024 * 1024 {
+        if !(4..=16 * 1024 * 1024).contains(&st_size) {
             return Err(bad("Invalid COFF string table size"));
         }
         range(st_off, st_size, length)?;
@@ -1399,7 +1400,7 @@ pub(super) fn pdb(file: &mut File, o: &Options) -> io::Result<Image> {
         return Err(bad("Invalid PDB directory size"));
     }
     // Read block map: array of u32 block indices, enough to cover num_directory_bytes.
-    let dir_blocks_needed = (num_directory_bytes + block_size - 1) / block_size;
+    let dir_blocks_needed = num_directory_bytes.div_ceil(block_size);
     if dir_blocks_needed > num_blocks {
         return Err(bad("PDB directory block count exceeds total blocks"));
     }
@@ -1459,7 +1460,7 @@ pub(super) fn pdb(file: &mut File, o: &Options) -> io::Result<Image> {
     // Read block indices for each stream.
     let mut stream_blocks: Vec<Vec<u64>> = Vec::with_capacity(num_streams as usize);
     for &sz in &stream_sizes {
-        let n = if sz == 0 { 0 } else { (sz + block_size - 1) / block_size };
+        let n = if sz == 0 { 0 } else { sz.div_ceil(block_size) };
         if n > num_blocks {
             return Err(bad("PDB stream block count exceeds total blocks"));
         }
@@ -1572,14 +1573,6 @@ fn der_read_tlv(data: &[u8], pos: &mut usize) -> io::Result<(u8, Vec<u8>)> {
     Ok((tag, value))
 }
 
-fn der_skip(data: &[u8], pos: &mut usize, count: usize) -> io::Result<()> {
-    for _ in 0..count {
-        let (_, value) = der_read_tlv(data, pos)?;
-        let _ = value;
-    }
-    Ok(())
-}
-
 fn oid_to_string(oid_bytes: &[u8]) -> String {
     // Decode OID bytes to dotted string.
     if oid_bytes.is_empty() {
@@ -1605,39 +1598,10 @@ fn oid_to_string(oid_bytes: &[u8]) -> String {
 fn pe_authenticode(
     file: &mut File,
     i: &mut Image,
-    base: u64,
-    extents: &[(u64, u64, u64, u64)],
     p: &[u8],
     directory_offset: u64,
     directories: u64,
 ) -> io::Result<bool> {
-    let resolve_rva = |rva: u64, bytes: u64| -> io::Result<u64> {
-        for &(s_rva, mem_size, file_off, raw_size) in extents {
-            let back = if raw_size > 0 { raw_size.min(mem_size) } else { mem_size };
-            if rva >= s_rva && bytes <= back && rva - s_rva <= back - bytes {
-                return add(file_off, rva - s_rva);
-            }
-        }
-        Err(bad("PE data outside section mappings"))
-    };
-    let read_cstr = |rva: u64, max: usize| -> io::Result<String> {
-        let mut avail = 0u64;
-        for &(s_rva, mem_size, _, raw_size) in extents {
-            if rva >= s_rva && rva < s_rva + mem_size {
-                let back = if raw_size > 0 { raw_size.min(mem_size) } else { mem_size };
-                avail = (s_rva + back) - rva;
-                break;
-            }
-        }
-        if avail == 0 {
-            return Err(bad("PE data outside section mappings"));
-        }
-        let n = avail.min(max as u64) as usize;
-        let rel = resolve_rva(rva, n as u64)?;
-        let buf = read(file, add(i.origin, rel)?, n)?;
-        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Ok(String::from_utf8_lossy(&buf[..end]).to_string())
-    };
     let dir = |index: usize| -> (u64, u64) {
         if (index as u64) >= directories {
             return (0, 0);
@@ -1686,8 +1650,8 @@ fn pe_authenticode(
         } else {
             Vec::new()
         };
-        // Validate revision.
-        let rev_ok = w_revision == 0x0200;
+        // The certificate revision is recorded as evidence in the inventory
+        // record below. The parse dispatches on the certificate type.
         // Process based on type.
         if w_cert_type == 0x0002 {
             // WIN_CERT_TYPE_PKCS_SIGNED_DATA
@@ -1747,10 +1711,7 @@ fn pe_authenticode(
             // digestAlgorithms SET
             let mut digest_alg = String::new();
             if sp < signed_data.len() {
-                let (dtag, dval) = match der_read_tlv(&signed_data, &mut sp) {
-                    Ok(v) => v,
-                    Err(_) => (0, Vec::new()),
-                };
+                let (dtag, dval) = der_read_tlv(&signed_data, &mut sp).unwrap_or_default();
                 if dtag == 0x31 {
                     // SET OF AlgorithmIdentifier - read first one.
                     let mut ap = 0usize;
@@ -1777,10 +1738,7 @@ fn pe_authenticode(
             let mut cert_count_inner = 0usize;
             if sp < signed_data.len() && (signed_data[sp] & 0xe0) == 0xa0 && (signed_data[sp] & 0x1f) == 0 {
                 // Context tag 0.
-                let (ctag, cval) = match der_read_tlv(&signed_data, &mut sp) {
-                    Ok(v) => v,
-                    Err(_) => (0, Vec::new()),
-                };
+                let (ctag, cval) = der_read_tlv(&signed_data, &mut sp).unwrap_or_default();
                 if ctag == 0xa0 {
                     // Count certificates (each is a SEQUENCE).
                     let mut cp = 0usize;
@@ -1982,7 +1940,7 @@ pub(super) fn pe(file: &mut File, o: &Options) -> io::Result<Image> {
         entry(&mut i, add(base, rva)?)?;
     }
     let pe_recovered = pe_data_directories(file, &mut i, base, &extents, &p, directory_offset, directories, bits)?;
-    let auth_recovered = pe_authenticode(file, &mut i, base, &extents, &p, directory_offset, directories)?;
+    let auth_recovered = pe_authenticode(file, &mut i, &p, directory_offset, directories)?;
     let any_recovered = pe_recovered || auth_recovered;
     if any_recovered {
         push(&mut i.inventory, &format!("PE preferred image base={base:#x}; image extent={image_size:#x}; data directories={directories}.\nPE static structural analysis with recovered imports, exports, base relocations and Authenticode evidence; PDB validation, Windows execution and semantic lifting remain unavailable.\n"));

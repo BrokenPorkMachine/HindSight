@@ -191,7 +191,8 @@ struct AnalysisReport: Codable, Sendable {
     static let jsonFields: Set<String> = [
         "protocol", "kind", "request_id", "source_sha256", "function_count", "symbol_count",
         "basic_block_count", "analyzed_instructions", "truncated", "functions", "cfg", "ir",
-        "strings", "xrefs", "call_graph", "dataflow", "ssa", "dominators", "phi_nodes",
+        "strings", "xrefs", "call_graph", "typed_call_graph", "call_effect_summaries",
+        "prototype_conflicts", "dataflow", "ssa", "dominators", "phi_nodes",
         "dominance_frontiers", "relocations", "jump_tables", "metadata", "runtime_records",
         "annotated_disassembly", "ssa_renamed", "runtime_graph", "swift_types", "selector_xrefs",
         "phi_operands", "objc_classes", "swift_contexts", "call_values", "chained_fixups",
@@ -219,6 +220,9 @@ struct AnalysisReport: Codable, Sendable {
     let strings: String
     let xrefs: String
     let call_graph: String
+    let typed_call_graph: String
+    let call_effect_summaries: String
+    let prototype_conflicts: String
     let dataflow: String
     let ssa: String
     let dominators: String
@@ -293,7 +297,7 @@ struct AnalysisReport: Codable, Sendable {
         `protocol` == 1 && kind == "analysis_result" && request_id == id && source_sha256 == digest &&
         function_count >= 0 && symbol_count >= 0 && basic_block_count >= 0 && analyzed_instructions >= 0 &&
         functions.utf8.count < 65536 && cfg.utf8.count < 65536 && ir.utf8.count < 65536 && (semantic_preview?.utf8.count ?? 0) < 65536 &&
-        strings.utf8.count < 65536 && xrefs.utf8.count < 65536 && call_graph.utf8.count < 65536 &&
+        strings.utf8.count < 65536 && xrefs.utf8.count < 65536 && call_graph.utf8.count < 65536 && typed_call_graph.utf8.count < 65536 && call_effect_summaries.utf8.count < 65536 && prototype_conflicts.utf8.count < 65536 &&
         dataflow.utf8.count < 65536 && ssa.utf8.count < 65536 && dominators.utf8.count < 65536 &&
         phi_nodes.utf8.count < 65536 && dominance_frontiers.utf8.count < 65536 && relocations.utf8.count < 65536 && jump_tables.utf8.count < 65536 &&
         metadata.utf8.count < 65536 && runtime_records.utf8.count < 65536 && annotated_disassembly.utf8.count < 65536 && ssa_renamed.utf8.count < 65536 && runtime_graph.utf8.count < 65536 && swift_types.utf8.count < 65536 && selector_xrefs.utf8.count < 65536 && phi_operands.utf8.count < 65536 && objc_classes.utf8.count < 65536 && swift_contexts.utf8.count < 65536 && call_values.utf8.count < 65536 && chained_fixups.utf8.count < 65536 && chained_starts.utf8.count < 65536 && objc_protocols.utf8.count < 65536 && swift_fields.utf8.count < 65536 && swift_field_records.utf8.count < 65536 && interblock_values.utf8.count < 65536 && predecessor_values.utf8.count < 65536 && chained_pointers.utf8.count < 65536 && chained_multistarts.utf8.count < 65536 && arm64e_pointers.utf8.count < 65536 && swift_field_ownership.utf8.count < 65536 && propagated_values.utf8.count < 65536 && indirect_calls.utf8.count < 65536 && dyld_imports.utf8.count < 65536 && dyld_linking.utf8.count < 65536 && softlinking.utf8.count < 65536 && symbolication.utf8.count < 65536 && symbol_resolver.utf8.count < 65536 && apple_symbolication.utf8.count < 65536 && arm64e_bind_symbols.utf8.count < 65536 && dylib_ordinals.utf8.count < 65536 && resolved_imports.utf8.count < 65536 && authenticated_bind_targets.utf8.count < 65536 && indirect_symbols.utf8.count < 65536 && pointer_slots.utf8.count < 65536 && export_trie.utf8.count < 65536 && symbol_provenance.utf8.count < 65536 && linkage_records.utf8.count < 65536 && symbol_callers.utf8.count < 65536 && got_auth_slots.utf8.count < 65536 && import_export_collisions.utf8.count < 65536 && function_intelligence.utf8.count < 65536 && data_references.utf8.count < 65536 && tail_call_candidates.utf8.count < 65536 && function_neighborhoods.utf8.count < 65536 && analysis_quality.utf8.count < 65536 && analysis_insights.utf8.count < 65536 && summary.utf8.count < 32768

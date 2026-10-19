@@ -55,7 +55,48 @@ def run(worker):
                 # Parameters come from the existing structured ABI adapter.
                 source_root=next(n for n in document["ast"]["nodes"] if n["id"]==generated["payload"]["ast_root"])
                 parameters=source_root["attributes"]["parameters"]
+                # C05: the machine representation and the proven source type
+                # are separate. Every AST node states its machine type, and a
+                # node with a proven declaration states its semantic type too.
+                typed=[n for n in document["ast"]["nodes"] if n["attributes"].get("source_type") not in (None,"unresolved")]
+                assert typed,(name,optimization)
+                for node in typed:
+                    assert node["attributes"]["machine_type"]=="uint64_t",(name,optimization,node)
+                    source_type=node["attributes"]["source_type"]
+                    assert source_type["spelling"] and source_type["bits"] in (8,16,32,64),(name,optimization,node)
+                # The parameter bindings carry the declared parameter type.
+                bindings={n["attributes"]["source_type"]["spelling"] for n in typed if n["kind"]=="source-parameter"}
+                declared={p["source_spelling"] for p in parameters}
+                assert bindings<=declared,(name,optimization,bindings,declared)
+                # C03: a recovered function publishes its proven frame
+                # objects. The partition is exact, so two objects are the same
+                # memory location only when their extents are equal.
+                frame_objects=[n["payload"] for n in document["nodes"]
+                               if n["payload"].get("artifact_kind")=="frame-object"]
+                extents=[(o["offset"],o["bytes"]) for o in frame_objects]
+                assert len(extents)==len(set(extents)),(name,optimization,extents)
+                for frame_object in frame_objects:
+                    assert frame_object["partition"]=="private-frame",(name,optimization,frame_object)
+                    assert frame_object["bytes"] in (1,2,4,8,16),(name,optimization,frame_object)
+                    assert int(frame_object["version_pc"],16)>=int(start,16),(name,optimization,frame_object)
+                # A type never contradicts its declared width: a proven source
+                # type states the same width the declaration proves.
+                for parameter in parameters:
+                    for node in typed:
+                        source_type=node["attributes"]["source_type"]
+                        if source_type["spelling"]==parameter["source_spelling"]:
+                            assert source_type["bits"]==parameter["bits"],(name,optimization,node,parameter)
+                            assert source_type["signed"]==parameter["signed"],(name,optimization,node,parameter)
+                            assert source_type["pointer"]==parameter["pointer"],(name,optimization,node,parameter)
                 assert not re.search(r"\bx(?:[0-9]|[12][0-9]|30)\b|s->|switch\(s->pc",source)
+                # C07: a recovered local carries a deterministic role name
+                # derived from the decoded operation, not an opaque counter.
+                assert not re.search(r"\bhs_value_\d+\b",source),(name,optimization,source)
+                roles=re.findall(r"\bhs_([a-z_]+)_\d+\b",source)
+                known={"sum","difference","product","bit_and","bit_or","bit_xor","shifted",
+                       "quotient","extended","extracted","negated","compared","selected",
+                       "slot","condition","nzcv","narrowed","copy","path","result","value"}
+                assert set(roles)<=known,(name,optimization,set(roles)-known)
                 assert all(p["name"] in source for p in parameters)
                 arguments=",".join(f"({p['source_spelling']})(uintptr_t)x[{p['abi_gpr']}]" for p in parameters)
                 wrapper=f"""

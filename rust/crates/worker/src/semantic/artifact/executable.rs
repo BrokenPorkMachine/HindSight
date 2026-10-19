@@ -226,21 +226,16 @@ fn stmt(t: &Tree) -> Result<String, String> {
         "flags-arithmetic" => {
             let op = text(t, "operator");
             let bits = num(t, "bits");
-            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            let n_bit = if bits == 32 { 31 } else { 63 };
+            let mask = format!("hs_mask({})", bits);
             let left = child(0)?;
             let right = child(1)?;
             let result = if op == "add" {
-                format!("({left} + {right}) & {mask}")
+                format!("(({left} + {right}) & {mask})")
             } else {
-                format!("({left} - {right}) & {mask}")
+                format!("(({left} - {right}) & {mask})")
             };
-            let nzcv = if op == "add" {
-                format!("((( ({result}) >> {n_bit} ) & 1) << 3) | ((( ({result}) == 0 ) as u64) << 2) | ((( ({left}) > ({mask} - ({right})) ) as u64) << 1) | ((( (({left}) ^ ({right})) & (({left}) ^ ({result})) >> ({bits} - 1) ) & 1)")
-            } else {
-                format!("((( ({result}) >> {n_bit} ) & 1) << 3) | ((( ({result}) == 0 ) as u64) << 2) | ((( ({left}) < ({right}) ) as u64) << 1) | ((( (({left}) ^ ({result})) & (({left}) ^ ({right})) >> ({bits} - 1) ) & 1)")
-            };
-            format!("s->nzcv={nzcv};")
+            let is_sub = if op == "add" { 0 } else { 1 };
+            format!("s->nzcv=hs_flags_arith({left},{right},{result},{bits},{is_sub});")
         },
         "memory-store" => {
             let n = num(t, "bytes");
@@ -336,7 +331,7 @@ impl Program {
     pub(super) fn source(&self) -> String {
         let mut s = include_str!("bitvector_runtime.h").to_string();
         s.push_str(include_str!("machine_runtime.h"));
-        writeln!(s,"\nint hs_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(self.start)).unwrap();
+        writeln!(s,"\nint hs_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(self.start)).unwrap();
         for (i, t) in self.body.iter().enumerate() {
             let pc = self.start + i as u64 * 4;
             writeln!(
@@ -549,22 +544,25 @@ impl State {
                 let op = text(t, "operator");
                 let bits = num(t, "bits");
                 let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-                let n_bit = if bits == 32 { 31 } else { 63 };
-                let left = self.eval(&t.children[0])?;
+                    let left = self.eval(&t.children[0])?;
                 let right = self.eval(&t.children[1])?;
                 let result = if op == "add" {
                     left.wrapping_add(right) & mask
                 } else {
                     left.wrapping_sub(right) & mask
                 };
-                let n = ((result >> n_bit) & 1) as u8;
+                let n = ((result >> (bits - 1)) & 1) as u8;
                 let z = if result == 0 { 1 } else { 0 };
                 let c = if op == "add" {
                     (left > mask - right) as u8
                 } else {
-                    (left < right) as u8
+                    (left >= right) as u8
                 };
-                let v = (((!(left ^ right) & (left ^ result)) >> (bits - 1)) & 1) as u8;
+                let v = if op == "add" {
+                    ((((!(left ^ right)) & (left ^ result)) >> (bits - 1)) & 1) as u8
+                } else {
+                    ((((left ^ right) & (left ^ result)) >> (bits - 1)) & 1) as u8
+                };
                 self.nzcv = (n << 3) | (z << 2) | (c << 1) | v;
             }
             "memory-store" => self.store(

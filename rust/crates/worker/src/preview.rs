@@ -1,4 +1,8 @@
 use std::{ffi::{CStr,CString},fs::{File,Metadata},io::{self,Read,Seek,SeekFrom},os::{raw::c_char,fd::{AsRawFd,FromRawFd},unix::fs::MetadataExt}};
+use super::semantic::{
+    CALLEE_SAVED_GPR, CALLEE_SAVED_VECTOR, CALLER_SAVED_GPR, CALLER_SAVED_VECTOR,
+    PRESERVED_SPECIAL,
+};
 extern "C" {
  fn re_macho_window_size(header:*const u8,length:usize,file_size:u64)->usize;
  fn re_macho_code_range(data:*const u8,length:usize,file_size:u64,offset:*mut u64,address:*mut u64,size:*mut u64,reason:*mut c_char,capacity:usize)->i32;
@@ -713,6 +717,112 @@ fn explicit_cast_evidence(code:&[u8],base:u64)->String{
  out
 }
 
+/// Build the caller and callee claims for every direct call and iterate them
+/// to a fixed point.
+///
+/// The caller side states the machine representation the call site observed
+/// for an argument register. The callee side states the type a proven
+/// prototype declares. The two are separate claims: a disagreement is
+/// reported as a conflict with both sides kept, and neither side is
+/// preferred over the other.
+fn caller_callee_constraints(
+ calls:&[(u64,u64,u64)],
+ signature_symbols:&[(u64,String)],
+ external_prototypes:&std::collections::BTreeMap<String,super::signatures::Signature>,
+ observed:&std::collections::BTreeMap<u64,std::collections::BTreeMap<u8,u8>>,
+)->super::semantic::artifact::ConstraintSolution{
+ use super::semantic::artifact::{Constraint,ConstraintKind};
+ // The proven prototype of each function, by address.
+ let mut prototypes:std::collections::BTreeMap<u64,super::signatures::Signature>=std::collections::BTreeMap::new();
+ for (address,name) in signature_symbols{
+  if let Some(signature)=super::signatures::symbol(name).or_else(||external_prototypes.get(name).cloned()){
+   prototypes.insert(*address,signature);
+  }
+ }
+ let mut caller_claims:Vec<Constraint>=Vec::new();
+ let mut callee_claims:Vec<Constraint>=Vec::new();
+ for &(func,site,target) in calls.iter().take(2000){
+  // The callee side: a proven prototype for the target declares the type
+  // of each argument, keyed by the register the argument travels in. The
+  // register is the identity both sides share across the call.
+  if let Some(signature)=prototypes.get(&target){
+   for (spelling,register) in super::signatures::abi_parameter_types(signature){
+    let (Some(spelling),Some(register))=(spelling,register) else{continue};
+    if register>=8{continue}
+    callee_claims.push(Constraint{site,callee:target,kind:ConstraintKind::ArgumentType,index:Some(register),spelling,origin:"callee-prototype",strength:0.95});
+   }
+  }
+  // The caller side: the caller's own proven parameter types, also keyed by
+  // the register the value travels in.
+  if let Some(signature)=prototypes.get(&func){
+   for (spelling,register) in super::signatures::abi_parameter_types(signature){
+    let (Some(spelling),Some(register))=(spelling,register) else{continue};
+    if register>=8{continue}
+    caller_claims.push(Constraint{site,callee:target,kind:ConstraintKind::ArgumentType,index:Some(register),spelling,origin:"caller-prototype",strength:0.9});
+   }
+  }
+  // The observed machine representation of an argument register. It is a
+  // width, not a source type, so it is a separate claim kind and is never
+  // compared against a prototype spelling.
+  if let Some(registers)=observed.get(&site){
+   for (register,width) in registers{
+    if *width==0{continue}
+    caller_claims.push(Constraint{site,callee:target,kind:ConstraintKind::ArgumentWidth,index:Some(*register),spelling:format!("machine-width-{width}"),origin:"caller-observation",strength:0.6});
+   }
+  }
+ }
+ super::semantic::artifact::solve_constraints(caller_claims,callee_claims)
+}
+
+/// The machine representation of each argument register observed at a call
+/// site, from the reaching definition in the same block. The shape names the
+/// width the definition proves, not a source type: a caller observes the
+/// machine representation, the callee side states the declared type, and the
+/// constraint solver keeps the two as separate claims.
+fn observed_argument_widths(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64)->std::collections::BTreeMap<u64,std::collections::BTreeMap<u8,u8>>{
+ let mut out=std::collections::BTreeMap::new();
+ for &(_,site,_) in calls.iter().take(2000){
+  let lo=site.saturating_sub(base) as usize;
+  let function_start=starts.iter().copied().filter(|start|*start<=site).next_back().unwrap_or(base);
+  let start=lo.saturating_sub(16*4).max(function_start.saturating_sub(base) as usize);
+  let mut defs:[Option<u64>;8]=[None;8];
+  if lo<=code.len(){
+   for (i,ch) in code[start..lo.min(code.len())].chunks_exact(4).enumerate(){
+    let w=le32(ch);
+    if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];continue}
+    if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some(base+start as u64+i as u64*4);}}
+   }
+  }
+  let mut observed=std::collections::BTreeMap::new();
+  for register in 0..8u8{
+   if let Some(pc)=defs[register as usize]{
+    let offset=pc.saturating_sub(base) as usize;
+    if offset+4<=code.len(){
+     let width=definition_value_width(le32(&code[offset..offset+4]));
+     observed.insert(register,width);
+    }
+   }
+  }
+  if !observed.is_empty(){out.insert(site,observed);}
+ }
+ out
+}
+
+/// The width in bits a definition proves, or zero when it proves none.
+fn definition_value_width(w:u32)->u8{
+ match definition_value_shape(w){
+  "loaded-8-bit-value"=>8,
+  "loaded-16-bit-value"=>16,
+  "loaded-32-bit-value"=>32,
+  "integer-u32-zero-extended"=>32,
+  "loaded-64-bit-or-pointer-width"=>64,
+  "integer-u64"=>64,
+  "u64-or-pointer-width"=>64,
+  "pointer-width-address-candidate"=>64,
+  _=>0,
+ }
+}
+
 fn call_argument_provenance(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
  let mut arguments=String::new();
  for &(func,site,target) in calls.iter().take(2000){let lo=site.saturating_sub(base) as usize;let function_start=func.saturating_sub(base) as usize;let start=lo.saturating_sub(16*4).max(function_start.min(lo));let mut defs:[Option<(u64,u32)>;8]=[None;8];if lo<=code.len(){for (i,ch) in code[start..lo.min(code.len())].chunks_exact(4).enumerate(){let w=le32(ch);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];continue}if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some((base+start as u64+i as u64*4,w));}}}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|(pc,w)|format!("x{r}<-{pc:#x} shape={}",definition_value_shape(w)))).collect::<Vec<_>>();arguments.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee} observed-argument-register-definitions={} args=[{}] return-register=x0\n",args.len(),args.join(", ")));if arguments.len()>18_000{break}}
@@ -793,11 +903,6 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
     if (w & 0xfc00_0000) == 0xf800_0000 {
       let imm = ((w & 0x03ff_0000) >> 10) as i64;
       if rn == index_register { origin = format!("LDRw-indexed@{imm:#x}"); break; }
-    }
-    // LDR (literal) pattern: 0xF950xxxx
-    if (w & 0xf000_0000) == 0xf900_0000 && (w & 0x00f0_0000) == 0x0050_0000 {
-      let imm = (w & 0x000fffff) as i32;
-      if rn == index_register { origin = format!("LDRw-literal@{imm:#x}"); break; }
     }
   }
   if origin.is_empty() { "unknown".into() } else { origin }
@@ -1267,6 +1372,71 @@ fn function_neighborhood_report(starts:&[u64],calls:&[(u64,u64,u64)],tails:&[(u6
  for f in selected{if out.len()>58_000{break}let ins=incoming.get(&f).map_or(&[][..],|v|v.as_slice());let outs=outgoing.get(&f).map_or(&[][..],|v|v.as_slice());let name=names.get(&f).copied().map(str::to_string).or_else(||objc_names.get(&f).cloned()).unwrap_or_else(||"<discovered>".into());let total_in=incoming_count.get(&f).copied().unwrap_or(0);let total_out=outgoing_count.get(&f).copied().unwrap_or(0);out.push_str(&format!("function {f:#018x} {name}  incoming={total_in} outgoing={total_out}\n"));for &(site,peer,kind) in ins{let pn=names.get(&peer).copied().unwrap_or("<discovered>");out.push_str(&format!("  <- {kind:<16} site={site:#018x} from={peer:#018x} {pn}\n"));}if total_in>ins.len(){out.push_str(&format!("  <- … {} additional incoming edges omitted\n",total_in-ins.len()));}for &(site,peer,kind) in outs{let pn=names.get(&peer).copied().or_else(||objc_names.get(&peer).map(String::as_str)).unwrap_or("<external-or-discovered>");out.push_str(&format!("  -> {kind:<16} site={site:#018x} to={peer:#018x} {pn}\n"));}if total_out>outs.len(){out.push_str(&format!("  -> … {} additional outgoing edges omitted\n",total_out-outs.len()));}out.push('\n');}
  if out.lines().count()<=2{out.push_str("No direct function neighborhood edges were recovered in the bounded code scan.\n");}out
 }
+
+fn typed_call_graph_report(calls:&[(u64,u64,u64)],tails:&[(u64,u64,u64)],symbols:&[(u64,String)],objc_names:&std::collections::BTreeMap<u64,String>,export_names:&std::collections::BTreeMap<u64,String>,stub_names:&std::collections::BTreeMap<u64,String>,starts:&[u64],scan_end:u64,indirect_facts:&[(String,String,u64)],thunks:&std::collections::BTreeSet<u64>)->String{
+ let mut out=String::from("Typed call graph\n=================\nEdge types: direct (BL to a discovered function start), import (BL to a proven import stub), dispatch (BL to a proven objc_msgSend entry point; receiver and target method unresolved), thunk (BL to a trampoline/stub; target is a stub address), indirect (BLR through register; candidate set from relocation/relocation+heuristic), unresolved (BL to an address that is neither a discovered function start nor a proven import stub nor a thunk), tail (cross-function B candidate). Confidence: high/medium/low. Indirect call sites are also reported by the separate indirect-call evidence.\n\n");
+ let stubs:std::collections::BTreeSet<u64>=stub_names.keys().copied().collect();
+ let admitted:std::collections::BTreeSet<u64>=starts.iter().copied().collect();
+ let mut direct_count=0usize;let mut import_count=0usize;let mut tail_count=0usize;let mut dispatch_count=0usize;let mut unresolved_count=0usize;let mut thunk_count=0usize;
+ let mut callers_of:std::collections::BTreeMap<u64,Vec<(u64,u64,&str,f64)>>=std::collections::BTreeMap::new();
+ let mut callees_of:std::collections::BTreeMap<u64,Vec<(u64,u64,&str,f64)>>=std::collections::BTreeMap::new();
+ for &(func,site,target) in calls.iter().take(5000){
+  let caller_name=resolved_function_name(func,symbols,objc_names,export_names,stub_names).unwrap_or("<discovered>");
+  let callee_name=resolved_function_name(target,symbols,objc_names,export_names,stub_names).unwrap_or("<target>");
+  // A message send is proven by the callee symbol, not by the callee address.
+  let is_dispatch=symbol_name_at(symbols,target).is_some_and(|name|name.contains("objc_msgSend"));
+  // A target outside the captured image is named by a relocation rather than
+  // resolved to an address, so the edge is external.
+  let outside_image=target<scan_end.saturating_sub(1)&&target>=scan_end;
+  let edge_type=if is_dispatch{"dispatch"}else if thunks.contains(&target){"thunk"}else if stubs.contains(&target){"import"}else if admitted.contains(&target){"direct"}else if outside_image{"unresolved"}else{"unresolved"};
+  let confidence=match edge_type{"direct"=>0.9,"import"=>0.95,"dispatch"=>0.6,"thunk"=>0.7,"unresolved"=>0.3,_=>0.5};
+  match edge_type{"direct"=>direct_count+=1,"import"=>import_count+=1,"dispatch"=>dispatch_count+=1,"thunk"=>thunk_count+=1,"unresolved"=>unresolved_count+=1,_=>{}}
+  if out.len()<58000{out.push_str(&format!("edge={edge_type:<8} confidence={confidence:.2} caller={func:#018x} {caller_name}  site={site:#018x}  callee={target:#018x} {callee_name}\n"));}
+  callers_of.entry(target).or_default().push((func,site,edge_type,confidence));
+  callees_of.entry(func).or_default().push((target,site,edge_type,confidence));
+ }
+ for &(caller,site,target) in tails.iter().take(5000){
+  tail_count+=1;
+  let caller_name=resolved_function_name(caller,symbols,objc_names,export_names,stub_names).unwrap_or("<discovered>");
+  let callee_name=resolved_function_name(target,symbols,objc_names,export_names,stub_names).unwrap_or("<target>");
+  if out.len()<58000{out.push_str(&format!("edge=tail      confidence=0.60 caller={caller:#018x} {caller_name}  site={site:#018x}  callee={target:#018x} {callee_name}  candidate=true\n"));}
+  callers_of.entry(target).or_default().push((caller,site,"tail",0.6));
+  callees_of.entry(caller).or_default().push((target,site,"tail",0.6));
+ }
+ // The candidate set for an indirect edge: the symbols the indirect-symbol
+ // table proves a pointer slot may hold. A candidate is never promoted to a
+ // target; the set only bounds what the edge may reach.
+ let candidates:Vec<(u64,String)>=indirect_facts.iter().take(2000).map(|(name,kind,address)|(*address,format!("{name} ({kind})"))).collect();
+ if !candidates.is_empty()&&out.len()<58000{
+  out.push_str("\nIndirect candidate set (from the indirect-symbol table; a candidate is never a proven target):\n");
+  for (address,label) in candidates.iter().take(200){
+   if out.len()>=58400{break}
+   out.push_str(&format!("  candidate={address:#018x} {label}\n"));
+  }
+ }
+ if out.len()<58000{
+  out.push_str(&format!("\nSummary: direct={direct_count} import={import_count} dispatch={dispatch_count} thunk={thunk_count} unresolved={unresolved_count} tail={tail_count}\n"));
+   out.push_str(&format!("Total edges: {}\n",direct_count+import_count+dispatch_count+thunk_count+unresolved_count+tail_count));
+ }
+ if out.len()<58000{
+  out.push_str("\nCaller/callee navigation (top 50 by outgoing edge count):\n");
+  let mut nav:Vec<(usize,u64)>=callees_of.iter().map(|(k,v)|(v.len(),*k)).collect();
+  nav.sort_by_key(|a| std::cmp::Reverse(a.0));
+  for (count,addr) in nav.into_iter().take(50){
+   let name=resolved_function_name(addr,symbols,objc_names,export_names,stub_names).unwrap_or("<discovered>");
+   if out.len()<59500{out.push_str(&format!("  {addr:#018x} {name}: {count} outgoing edges\n"));}
+  }
+  out.push_str("\nTop 50 by incoming edge count:\n");
+  let mut nav2:Vec<(usize,u64)>=callers_of.iter().map(|(k,v)|(v.len(),*k)).collect();
+  nav2.sort_by_key(|a| std::cmp::Reverse(a.0));
+  for (count,addr) in nav2.into_iter().take(50){
+   let name=resolved_function_name(addr,symbols,objc_names,export_names,stub_names).unwrap_or("<target>");
+   if out.len()<59900{out.push_str(&format!("  {addr:#018x} {name}: {count} incoming edges\n"));}
+  }
+ }
+ if out.len()>=58000{out.push_str("\n... (output truncated)\n");}
+ out
+}
 /// Recover only decoded instructions whose textual operands explicitly use
 /// the stack pointer and an immediate offset. These are variable-location
 /// candidates, not source variables: names, lifetimes, layouts, and source
@@ -1465,7 +1635,35 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(86,"synthesis","Structural, language-runtime, linkage, value-flow, and evidence synthesis completed.");
  let mut xrefs=String::new();for &(from,to,k) in edges.iter().filter(|(_,_,k)|*k!="fallthrough").take(5000){if xrefs.len()>60_000{break}xrefs.push_str(&format!("{from:#018x}  --{k:<6}-->  {to:#018x}\n"));}
  let mut call_graph=String::new();for &(func,site,target) in calls.iter().take(5000){if call_graph.len()>60_000{break}let caller=resolved_function_name(func,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<discovered>");let callee=resolved_function_name(target,&symbols,&objc_function_names,&export_names,&stub_names).unwrap_or("<target>");call_graph.push_str(&format!("{func:#018x} {caller}  --BL@{site:#018x}-->  {target:#018x} {callee}\n"));}
- let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
+ // A thunk is a stub that trampolines onward rather than resolving a proven
+ // import. A stub whose symbol is a proven dyld import is an import edge; a
+ // stub with no proven import behind it is a local trampoline, so the call
+ // graph reports it as a thunk edge and never claims the eventual target.
+ let import_symbols:std::collections::BTreeSet<String>=dyld_import_entries(&mut file,&window,size)?.into_iter().map(|(_,name,_,_,_)|name).collect();
+ let thunks:std::collections::BTreeSet<u64>=stub_names.iter().filter(|(_,name)|!import_symbols.contains(*name)).map(|(address,_)|*address).collect();
+ let typed_call_graph=typed_call_graph_report(&calls,&tail_call_facts,&symbols,&objc_function_names,&export_names,&stub_names,&starts,scan_end,&indirect_facts,&thunks);
+
+ // Build call effect summaries from calls
+ let mut call_effect_summaries = String::new();
+ for &(func, site, target) in calls.iter().take(5000) {
+     let caller_name = resolved_function_name(func, &symbols, &objc_function_names, &export_names, &stub_names).unwrap_or("<discovered>");
+     let callee_name = resolved_function_name(target, &symbols, &objc_function_names, &export_names, &stub_names).unwrap_or("<target>");
+      // A stub is a proven import; any other target is a direct call to an
+      // address that is not an import stub.
+      let edge_type = if stub_names.contains_key(&target) { "import" } else { "direct" };
+     call_effect_summaries.push_str(&format!(
+         "effect: caller={func:#018x} ({caller_name}) site={site:#018x} callee={target:#018x} ({callee_name}) type={edge_type} clobbers=gpr:{CALLER_SAVED_GPR},vector:{CALLER_SAVED_VECTOR},nzcv preserved=gpr:{CALLEE_SAVED_GPR},vector:{CALLEE_SAVED_VECTOR},{PRESERVED_SPECIAL} memory=unresolved
+",
+     ));
+ }
+
+ // Generate prototype conflicts report (placeholder for constraint solver integration)
+ // Caller/callee constraint iteration. The caller side states what a call
+ // site observed about an argument; the callee side states what a proven
+ // prototype declares. The two sides are compared and any disagreement is
+ // reported as a conflict with both claims kept. Neither side is preferred,
+ // and the iteration is bounded.
+ let prototype_conflicts;let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
  let selector_xrefs=selector_call_xrefs(&relocations,&calls,&symbols);
  analysis_progress(92,"evidence","Formatting xrefs, call evidence, relocations, selectors, and bounded strings.");
  let cfstring_ranges=sections(&window).into_iter().filter(|section|section.sect=="__cfstring"&&section.offset<=size&&section.size<=size-section.offset).map(|section|(section.offset,section.size)).collect::<Vec<_>>();let strings=printable_strings(&mut file,size,&cfstring_ranges)?;let object_detections=object_detections(&mut file,&window,size,&strings,&dyld_imports)?;let mut runtime_records=runtime_records;runtime_records.push_str("\n\nC / Apple object detections\n===========================\n");runtime_records.push_str(&object_detections);
@@ -1474,6 +1672,9 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
  let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols)?;
  let external_prototypes=super::signatures::external_prototype_database(digest)?;
+ let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address);
+ let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
+ prototype_conflicts=super::semantic::artifact::constraint_report(&solved);
  let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes,&objc_layouts);
  let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_records=format!("{objc_classes}\n{objc_protocols}");let conformance_signatures=super::signatures::objc_conformance_declarations(&conformance_records);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
  if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
@@ -1529,7 +1730,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let summary=format!("ARM64 analysis v16\nCode range: {:#018x}..{:#018x}\nScanned: {} / {} code bytes\n{}Functions: {}\nSymbols in __text: {}\nBasic blocks: {}\nDirect code xrefs: {}\nDirect BL call edges: {}\nCross-function B tail-call candidates: {}\n__text relocations: {}\nIndirect branch candidates: {}\nInstructions scanned: {}\nData-in-code words skipped: {}\nDecoder coverage: {:.1}% ({}/{})\nString scan: first {} bytes of captured object\nDominators, immediate dominators, and dominance frontiers are solved per function under an explicit block budget; structural phi sites remain derived from the bounded CFG when code bytes are available; register SSA remains conservative across unsupported semantics. LC_FUNCTION_STARTS and LC_DATA_IN_CODE metadata do not veto analysis. Relocation xrefs are sourced from Mach-O relocation records. Indirect branch candidates are promoted only to stronger evidence when a nearby modeled load defines the branch register. Objective-C/Swift metadata reporting is section-grounded; string records, runtime reference edges, selector/message-send xrefs, and Swift nominal descriptor targets are emitted only when their ranges/targets validate. SSA renaming remains conservative across opaque semantics. Phi operand provenance is emitted only when modeled definitions are found on at least two predecessor paths. The unified symbol resolver ranks exact nlist names over exact indirect-symbol names and function-start-only ranges while retaining provenance; name-only imports/exports are never assigned invented addresses. Objective-C class/method and Swift context reconstruction require validated mapped records; arguments, incoming parameter candidates, and explicit integer casts report bounded instruction provenance rather than guessed source declarations.",map.address,map.address+map.bytes,scan_bytes,map.bytes,code_state,starts.len(),symbols.len(),block_count,edges.iter().filter(|(_,_,k)|*k!="fallthrough").count(),calls.len(),tail_call_facts.len(),relocations.len(),jump_tables.lines().count(),instruction_words,data_words,coverage,decoded,instruction_words,size.min(4*1024*1024));
  analysis_progress(97,"finalize","Rechecking captured-object identity and serializing the bounded analysis report.");
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured object changed during analysis"));}
- Ok(format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{},\"functions\":{},\"cfg\":{},\"ir\":{},\"strings\":{},\"xrefs\":{},\"call_graph\":{},\"dataflow\":{},\"ssa\":{},\"dominators\":{},\"phi_nodes\":{},\"dominance_frontiers\":{},\"relocations\":{},\"jump_tables\":{},\"metadata\":{},\"runtime_records\":{},\"annotated_disassembly\":{},\"ssa_renamed\":{},\"runtime_graph\":{},\"swift_types\":{},\"selector_xrefs\":{},\"phi_operands\":{},\"objc_classes\":{},\"swift_contexts\":{},\"call_values\":{},\"chained_fixups\":{},\"chained_starts\":{},\"objc_protocols\":{},\"swift_fields\":{},\"swift_field_records\":{},\"interblock_values\":{},\"predecessor_values\":{},\"chained_pointers\":{},\"chained_multistarts\":{},\"arm64e_pointers\":{},\"swift_field_ownership\":{},\"propagated_values\":{},\"indirect_calls\":{},\"dyld_imports\":{},\"dyld_linking\":{},\"softlinking\":{},\"symbolication\":{},\"symbol_resolver\":{},\"apple_symbolication\":{},\"arm64e_bind_symbols\":{},\"dylib_ordinals\":{},\"resolved_imports\":{},\"authenticated_bind_targets\":{},\"indirect_symbols\":{},\"pointer_slots\":{},\"export_trie\":{},\"symbol_provenance\":{},\"linkage_records\":{},\"symbol_callers\":{},\"got_auth_slots\":{},\"import_export_collisions\":{},\"function_intelligence\":{},\"data_references\":{},\"tail_call_candidates\":{},\"function_neighborhoods\":{},\"analysis_quality\":{},\"analysis_insights\":{},\"semantic_preview\":{},\"summary\":{}}}",super::quote(id),super::quote(digest),starts.len(),symbols.len(),block_count,instruction_words,if truncated{"true"}else{"false"},super::quote(&functions),super::quote(&cfg),super::quote(&ir),super::quote(&strings),super::quote(&xrefs),super::quote(&call_graph),super::quote(&dataflow),super::quote(&ssa),super::quote(&dominators),super::quote(&phi_nodes),super::quote(&dominance_frontiers),super::quote(&relocation_xrefs),super::quote(&jump_tables),super::quote(&metadata),super::quote(&runtime_records),super::quote(&annotated_disassembly),super::quote(&ssa_renamed),super::quote(&runtime_graph),super::quote(&swift_types),super::quote(&selector_xrefs),super::quote(&phi_operands),super::quote(&objc_classes),super::quote(&swift_contexts),super::quote(&call_values),super::quote(&chained_fixups),super::quote(&chained_starts),super::quote(&objc_protocols),super::quote(&swift_fields),super::quote(&swift_field_records),super::quote(&interblock_values),super::quote(&predecessor_values),super::quote(&chained_pointers),super::quote(&chained_multistarts),super::quote(&arm64e_pointers),super::quote(&swift_field_ownership),super::quote(&propagated_values),super::quote(&indirect_calls),super::quote(&dyld_imports),super::quote(&dyld_linking),super::quote(&softlinking),super::quote(&symbolication),super::quote(&symbol_resolver),super::quote(&apple_symbolication),super::quote(&arm64e_bind_symbols),super::quote(&dylib_ordinals),super::quote(&resolved_imports),super::quote(&authenticated_bind_targets),super::quote(&indirect_symbols),super::quote(&pointer_slots),super::quote(&export_trie),super::quote(&symbol_provenance),super::quote(&linkage_records),super::quote(&symbol_callers),super::quote(&got_auth_slots),super::quote(&import_export_collisions),super::quote(&function_intelligence),super::quote(&data_references),super::quote(&tail_call_candidates),super::quote(&function_neighborhoods),super::quote(&analysis_quality),super::quote(&analysis_insights),super::quote(&semantic_preview),super::quote(&summary)))
+ Ok(format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{},\"functions\":{},\"cfg\":{},\"ir\":{},\"strings\":{},\"xrefs\":{},\"call_graph\":{},\"typed_call_graph\":{},\"call_effect_summaries\":{},\"prototype_conflicts\":{},\"dataflow\":{},\"ssa\":{},\"dominators\":{},\"phi_nodes\":{},\"dominance_frontiers\":{},\"relocations\":{},\"jump_tables\":{},\"metadata\":{},\"runtime_records\":{},\"annotated_disassembly\":{},\"ssa_renamed\":{},\"runtime_graph\":{},\"swift_types\":{},\"selector_xrefs\":{},\"phi_operands\":{},\"objc_classes\":{},\"swift_contexts\":{},\"call_values\":{},\"chained_fixups\":{},\"chained_starts\":{},\"objc_protocols\":{},\"swift_fields\":{},\"swift_field_records\":{},\"interblock_values\":{},\"predecessor_values\":{},\"chained_pointers\":{},\"chained_multistarts\":{},\"arm64e_pointers\":{},\"swift_field_ownership\":{},\"propagated_values\":{},\"indirect_calls\":{},\"dyld_imports\":{},\"dyld_linking\":{},\"softlinking\":{},\"symbolication\":{},\"symbol_resolver\":{},\"apple_symbolication\":{},\"arm64e_bind_symbols\":{},\"dylib_ordinals\":{},\"resolved_imports\":{},\"authenticated_bind_targets\":{},\"indirect_symbols\":{},\"pointer_slots\":{},\"export_trie\":{},\"symbol_provenance\":{},\"linkage_records\":{},\"symbol_callers\":{},\"got_auth_slots\":{},\"import_export_collisions\":{},\"function_intelligence\":{},\"data_references\":{},\"tail_call_candidates\":{},\"function_neighborhoods\":{},\"analysis_quality\":{},\"analysis_insights\":{},\"semantic_preview\":{},\"summary\":{}}}",super::quote(id),super::quote(digest),starts.len(),symbols.len(),block_count,instruction_words,if truncated{"true"}else{"false"},super::quote(&functions),super::quote(&cfg),super::quote(&ir),super::quote(&strings),super::quote(&xrefs),super::quote(&call_graph),super::quote(&typed_call_graph),super::quote(&call_effect_summaries),super::quote(&prototype_conflicts),super::quote(&dataflow),super::quote(&ssa),super::quote(&dominators),super::quote(&phi_nodes),super::quote(&dominance_frontiers),super::quote(&relocation_xrefs),super::quote(&jump_tables),super::quote(&metadata),super::quote(&runtime_records),super::quote(&annotated_disassembly),super::quote(&ssa_renamed),super::quote(&runtime_graph),super::quote(&swift_types),super::quote(&selector_xrefs),super::quote(&phi_operands),super::quote(&objc_classes),super::quote(&swift_contexts),super::quote(&call_values),super::quote(&chained_fixups),super::quote(&chained_starts),super::quote(&objc_protocols),super::quote(&swift_fields),super::quote(&swift_field_records),super::quote(&interblock_values),super::quote(&predecessor_values),super::quote(&chained_pointers),super::quote(&chained_multistarts),super::quote(&arm64e_pointers),super::quote(&swift_field_ownership),super::quote(&propagated_values),super::quote(&indirect_calls),super::quote(&dyld_imports),super::quote(&dyld_linking),super::quote(&softlinking),super::quote(&symbolication),super::quote(&symbol_resolver),super::quote(&apple_symbolication),super::quote(&arm64e_bind_symbols),super::quote(&dylib_ordinals),super::quote(&resolved_imports),super::quote(&authenticated_bind_targets),super::quote(&indirect_symbols),super::quote(&pointer_slots),super::quote(&export_trie),super::quote(&symbol_provenance),super::quote(&linkage_records),super::quote(&symbol_callers),super::quote(&got_auth_slots),super::quote(&import_export_collisions),super::quote(&function_intelligence),super::quote(&data_references),super::quote(&tail_call_candidates),super::quote(&function_neighborhoods),super::quote(&analysis_quality),super::quote(&analysis_insights),super::quote(&semantic_preview),super::quote(&summary)))
 }
 
 #[cfg(test)]

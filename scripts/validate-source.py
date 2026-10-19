@@ -433,7 +433,7 @@ assert 'ScrollView {' in settings_app and 'Form {' not in settings_app and '.for
 # the extract/rotate-immediate family (EXTR and its ROR alias), and the
 # flag-neutral add/subtract with carry (ADC/SBC, whose carry input stays a
 # symbolic barrier)
-# as provenance-carrying constants and barriers without changing the 72-field
+# as provenance-carrying constants and barriers without changing the 75-field
 # report or the cache engine identity.
 assert (R/'docs/SEMANTIC_LIFT_V1.md').is_file()
 semantic_source=(R/'rust/crates/worker/src/semantic.rs').read_text()
@@ -760,7 +760,22 @@ start=analysis_source.rfind('Ok(format!(',0,pos)
 end=analysis_source.index('super::quote(&summary)))',pos)+len('super::quote(&summary)))')
 rust_analysis_fields=set(re.findall(r'\\"([A-Za-z0-9_]+)\\":',analysis_source[start:end]))
 assert swift_analysis_fields == rust_analysis_fields, (swift_analysis_fields-rust_analysis_fields, rust_analysis_fields-swift_analysis_fields)
-assert len(swift_analysis_fields) == 72
+assert len(swift_analysis_fields) == 75
+# The three call-evidence fields must be surfaced in the workbench, not merely
+# decoded by the contract. Each is reachable as a workspace, is indexed as a
+# navigable evidence source, and states its own completeness honestly.
+for token in ['"Typed Call Graph"', '"Call Effects"', '"Prototype Conflicts"']:
+    assert token in workspace_catalog, token
+for token in ['case "Typed Call Graph":', 'case "Call Effects":', 'case "Prototype Conflicts":']:
+    assert token in content_ui, token
+for token in ['report.typed_call_graph', 'report.call_effect_summaries', 'report.prototype_conflicts']:
+    assert token in analysis_navigation, token
+for token in ['model.currentAnalysis?.typed_call_graph', 'model.currentAnalysis?.call_effect_summaries',
+              'model.currentAnalysis?.prototype_conflicts']:
+    assert token in content_ui, token
+# A workspace a navigable hit can route to must exist in the catalog.
+for source in re.findall(r'workspace: "([^"]+)"', analysis_navigation):
+    assert f'"{source}"' in workspace_catalog, source
 for token in ['fn unified_symbol_records(', 'symbol_resolver', 'Precedence: exact nlist code symbol']:
     assert token in analysis_worker, token
 assert r'\"unified_symbol_resolver\":true' in bridge_caps

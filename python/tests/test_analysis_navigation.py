@@ -1,5 +1,6 @@
 import pathlib
 import re
+import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 NAV = (ROOT / "App/AnalysisNavigation.swift").read_text()
@@ -50,6 +51,54 @@ def test_navigator_and_inspector_use_structured_evidence_views():
     assert 'monospaced(model.filteredAnalysisLines())' not in CONTENT[nav_start:nav_end]
     assert '"Analysis Triage"' in CATALOG
     assert 'App/AnalysisNavigation.swift' in TOPOLOGY
+
+
+class CallEvidenceSurfaces(unittest.TestCase):
+    """The report's three call-evidence fields must reach the workbench.
+
+    Decoding a field in the transport contract is not the same as surfacing
+    it, so each field needs a workspace, a navigable evidence source and a
+    pane that states its own completeness honestly.
+    """
+
+    surfaces = {
+        'typed_call_graph': 'Typed Call Graph',
+        'call_effect_summaries': 'Call Effects',
+        'prototype_conflicts': 'Prototype Conflicts',
+    }
+
+    def test_call_evidence_report_fields_are_surfaced_in_the_workbench(self):
+        for field, workspace in self.surfaces.items():
+            self.assertIn(f'"{workspace}"', CATALOG, workspace)
+            self.assertIn(f'case "{workspace}":', CONTENT, workspace)
+            self.assertIn(f'model.currentAnalysis?.{field}', CONTENT, field)
+            self.assertIn(f'report.{field}', NAV, field)
+            # A navigable hit routes by workspace name, so the catalog must name it.
+            self.assertIn(f'workspace: "{workspace}"', NAV, workspace)
+
+    def test_call_evidence_surfaces_stay_bounded_below_the_raw_call_graph(self):
+        # The typed and effect views restate call edges the raw call graph
+        # already carries. They must rank below it in the focus queue so the
+        # bounded queue does not fill with near-duplicate call rows.
+        def priority(field):
+            match = re.search(r'text: report\.%s, focusPriority: (\d+)' % field, NAV)
+            self.assertIsNotNone(match, field)
+            return int(match.group(1))
+
+        self.assertGreater(priority('call_graph'), priority('typed_call_graph'))
+        self.assertGreater(priority('typed_call_graph'), priority('call_effect_summaries'))
+        self.assertGreater(priority('call_effect_summaries'), priority('prototype_conflicts'))
+
+    def test_prototype_conflict_surface_makes_no_conflict_claim(self):
+        # The report does not publish caller/callee constraint iteration, so the
+        # surface must say the question is open rather than reading as a clean
+        # result.
+        start = CONTENT.index('case "Prototype Conflicts":')
+        end = CONTENT.index('case "', start + 10)
+        pane = CONTENT[start:end]
+        self.assertIn('Prototype conflicts are unresolved', pane)
+        self.assertIn('no claim that no conflict exists', pane)
+        self.assertIn('open item rather than a clean result', pane)
 
 
 def test_generic_clickable_evidence_keeps_context_navigation():
