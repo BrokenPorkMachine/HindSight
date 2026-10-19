@@ -16,8 +16,11 @@
 //! step per distinct claim. The bound is a safety net for a malformed input,
 //! and hitting it is reported rather than hidden.
 
-use crate::reconstruction::{array, object, Value as V};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// The identity of a claim: the call site, the callee, the kind of claim, the
+/// register index, the spelling, and the origin that made the claim.
+type ClaimKey = (u64, u64, ConstraintKind, Option<u8>, String, &'static str);
 
 /// The kind of claim a constraint makes about a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,8 +33,6 @@ pub(crate) enum ConstraintKind {
     /// a different claim from a source type, so the two are never compared
     /// against each other.
     ArgumentWidth,
-    /// The call does not return to its caller.
-    NonReturning,
 }
 
 impl ConstraintKind {
@@ -40,7 +41,6 @@ impl ConstraintKind {
             ConstraintKind::ArgumentType => "argument-type",
             ConstraintKind::ResultType => "result-type",
             ConstraintKind::ArgumentWidth => "argument-width",
-            ConstraintKind::NonReturning => "non-returning",
         }
     }
 }
@@ -119,7 +119,7 @@ pub(crate) fn solve(caller_claims: Vec<Constraint>, callee_claims: Vec<Constrain
     let mut solution = Solution::default();
     // The key includes the origin, so the same claim from the two sides is
     // kept twice: they are separate claims even when they agree.
-    let mut seen: BTreeSet<(u64, u64, ConstraintKind, Option<u8>, String, &'static str)> = BTreeSet::new();
+    let mut seen: BTreeSet<ClaimKey> = BTreeSet::new();
     let mut pending = caller_claims;
     pending.extend(callee_claims);
     // The solver is monotone: each round may only add claims. A round that
@@ -146,7 +146,7 @@ pub(crate) fn solve(caller_claims: Vec<Constraint>, callee_claims: Vec<Constrain
     // Compare the two sides for every call the solver knows about. The
     // comparison borrows the claims, so the conflicts are collected first and
     // appended afterwards.
-    let mut sites: BTreeSet<(u64, u64)> = solution.constraints.iter().map(|constraint| (constraint.site, constraint.callee)).collect();
+    let sites: BTreeSet<(u64, u64)> = solution.constraints.iter().map(|constraint| (constraint.site, constraint.callee)).collect();
     let mut conflicts: Vec<Conflict> = Vec::new();
     for (site, callee) in sites {
         let claims = solution.claims_for(callee);
@@ -240,43 +240,6 @@ pub(crate) fn report(solution: &Solution) -> String {
     out
 }
 
-/// The solution as a reconstruction payload. The conflict list is published
-/// so a consumer can see a disagreement rather than a silently resolved one.
-pub(crate) fn payload(solution: &Solution) -> V {
-    let claims = solution.constraints.iter().take(512).map(|constraint| {
-        object([
-            ("site", V::from(constraint.site)),
-            ("callee", V::from(constraint.callee)),
-            ("kind", V::from(constraint.kind.name())),
-            ("index", constraint.index.map(V::from).unwrap_or(V::Null)),
-            ("type", V::from(constraint.spelling.clone())),
-            ("origin", V::from(constraint.origin)),
-            ("strength_per_mille", V::from((constraint.strength * 1000.0).round() as u64)),
-        ])
-    });
-    let conflicts = solution.conflicts.iter().take(512).map(|conflict| {
-        object([
-            ("site", V::from(conflict.site)),
-            ("callee", V::from(conflict.callee)),
-            ("kind", V::from(conflict.kind.name())),
-            ("index", conflict.index.map(V::from).unwrap_or(V::Null)),
-            ("caller_type", V::from(conflict.caller.spelling.clone())),
-            ("caller_origin", V::from(conflict.caller.origin)),
-            ("callee_type", V::from(conflict.callee_side.spelling.clone())),
-            ("callee_origin", V::from(conflict.callee_side.origin)),
-        ])
-    });
-    object([
-        ("iterations", V::from(solution.iterations as u64)),
-        ("exhausted", V::from(solution.exhausted)),
-        ("exhaustion_reason", solution.exhaustion_reason.clone().map(V::from).unwrap_or(V::Null)),
-        ("claim_count", V::from(solution.constraints.len() as u64)),
-        ("conflict_count", V::from(solution.conflicts.len() as u64)),
-        ("claims", array(claims)),
-        ("conflicts", array(conflicts)),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,17 +301,6 @@ mod tests {
         assert!(!solution.exhausted);
         assert!(solution.iterations <= MAX_ITERATIONS);
         assert!(solution.conflicts.is_empty());
-    }
-
-    #[test]
-    fn a_non_returning_claim_is_kept_and_published() {
-        let mut constraint = claim(0x1000, 0x2000, ConstraintKind::NonReturning, 0, "void", "callee-prototype");
-        constraint.index = None;
-        let solution = solve(vec![constraint], Vec::new());
-        assert_eq!(solution.constraints.len(), 1);
-        assert!(solution.exhaustion_reason.is_none());
-        let report = report(&solution);
-        assert!(report.contains("non-returning"), "{report}");
     }
 
     #[test]

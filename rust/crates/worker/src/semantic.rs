@@ -7845,8 +7845,8 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
                 // partition advances them all, so a later read of a narrow
                 // partition still observes that the write happened.
                 if MemoryPartition::all()[slot].aliases_all() {
-                    for other in 0..memory_versions.len() {
-                        if other != slot { memory_versions[other] = memory_versions[other].saturating_add(1); }
+                    for (other, version) in memory_versions.iter_mut().enumerate() {
+                        if other != slot { *version = (*version).saturating_add(1); }
                     }
                 }
                 result.memory_versions.push(SsaMemoryVersion {
@@ -7863,8 +7863,8 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
             // partition rather than only the one it names. A relaxed atomic
             // access is not a fence and keeps its narrow effect.
             if effects.ordered {
-                for slot in 0..memory_versions.len() {
-                    memory_versions[slot] = memory_versions[slot].saturating_add(1);
+                for version in memory_versions.iter_mut() {
+                    *version = (*version).saturating_add(1);
                 }
             }
             // A call clobbers every writable partition.

@@ -1565,7 +1565,7 @@ struct ContentView: View {
                 GroupBox("Typed call graph") {
                     VStack(alignment: .leading, spacing: 10) {
                         analysisToolbar(record)
-                        Text("Call edges are typed by the evidence that proves them: direct (BL to a discovered function start), import (BL to a proven import stub), dispatch (a proven objc_msgSend entry point whose receiver and target method stay unresolved), thunk (BL to a trampoline), unresolved (BL to an address that is none of the above), and tail (a cross-function B candidate). Each edge carries its own confidence. A register-indirect transfer is not claimed here; it stays in the separate indirect-call evidence.")
+                        Text("Call edges are typed by the evidence that proves them: direct (BL to a discovered function start), import (BL to a proven import stub), dispatch (a proven objc_msgSend entry point whose receiver and target method stay unresolved), thunk (BL to a trampoline), indirect (BLR through a register, with a candidate set), unresolved (BL to an address that is none of the above), and tail (a cross-function B candidate). Each edge carries its own confidence. A candidate set is a possibility, not a resolved target.")
                             .font(.caption).foregroundStyle(.secondary)
                         monospaced(model.currentAnalysis?.typed_call_graph ?? "Run Analyze binary to build the typed call graph.")
                     }.padding(8)
@@ -1583,9 +1583,9 @@ struct ContentView: View {
                 GroupBox("Prototype conflicts") {
                     VStack(alignment: .leading, spacing: 10) {
                         analysisToolbar(record)
-                        Text("Prototype conflicts are unresolved: the report does not publish caller/callee constraint iteration, so it makes no claim that no conflict exists. Treat this as an open item rather than a clean result.")
+                        Text("Caller/callee constraint iteration compares what the caller side observed about an argument with what the callee's proven prototype declares. A disagreement is published as a conflict with both claims kept, so neither side wins silently, and the iteration is bounded with its exhaustion reason reported. No proven prototype on either side means no agreement is claimed either.")
                             .font(.caption).foregroundStyle(.secondary)
-                        monospaced(model.currentAnalysis?.prototype_conflicts ?? "Run Analyze binary to check prototype conflicts.")
+                        monospaced(model.currentAnalysis?.prototype_conflicts ?? "Run Analyze binary to compare the caller and callee prototype claims.")
                     }.padding(8)
                 }
             case "Data Flow":

@@ -89,16 +89,16 @@ class CallEvidenceSurfaces(unittest.TestCase):
         self.assertGreater(priority('typed_call_graph'), priority('call_effect_summaries'))
         self.assertGreater(priority('call_effect_summaries'), priority('prototype_conflicts'))
 
-    def test_prototype_conflict_surface_makes_no_conflict_claim(self):
-        # The report does not publish caller/callee constraint iteration, so the
-        # surface must say the question is open rather than reading as a clean
-        # result.
+    def test_prototype_conflict_surface_states_the_iteration_and_its_limit(self):
+        # The report publishes the bounded caller/callee constraint iteration,
+        # so the surface must state that a disagreement keeps both claims and
+        # must not read as a clean result.
         start = CONTENT.index('case "Prototype Conflicts":')
         end = CONTENT.index('case "', start + 10)
         pane = CONTENT[start:end]
-        self.assertIn('Prototype conflicts are unresolved', pane)
-        self.assertIn('no claim that no conflict exists', pane)
-        self.assertIn('open item rather than a clean result', pane)
+        self.assertIn('Caller/callee constraint iteration compares', pane)
+        self.assertIn('both claims kept', pane)
+        self.assertIn('no agreement is claimed', pane)
 
 
 def test_generic_clickable_evidence_keeps_context_navigation():

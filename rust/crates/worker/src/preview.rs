@@ -783,7 +783,7 @@ fn observed_argument_widths(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base
  let mut out=std::collections::BTreeMap::new();
  for &(_,site,_) in calls.iter().take(2000){
   let lo=site.saturating_sub(base) as usize;
-  let function_start=starts.iter().copied().filter(|start|*start<=site).next_back().unwrap_or(base);
+  let function_start=starts.iter().copied().rfind(|start|*start<=site).unwrap_or(base);
   let start=lo.saturating_sub(16*4).max(function_start.saturating_sub(base) as usize);
   let mut defs:[Option<u64>;8]=[None;8];
   if lo<=code.len(){
@@ -1657,13 +1657,12 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
      ));
  }
 
- // Generate prototype conflicts report (placeholder for constraint solver integration)
  // Caller/callee constraint iteration. The caller side states what a call
  // site observed about an argument; the callee side states what a proven
  // prototype declares. The two sides are compared and any disagreement is
  // reported as a conflict with both claims kept. Neither side is preferred,
  // and the iteration is bounded.
- let prototype_conflicts;let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
+ let mut relocation_xrefs=String::new();for &(site,ref name,rtype,pcrel,length,target) in relocations.iter().take(5000){if relocation_xrefs.len()>60_000{break}let applied=match target{Some(t) if pcrel=>format!(" resolved={t:#018x} delta={}",(t as i128)-(site as i128)),Some(t)=>format!(" resolved={t:#018x}"),None=>" unresolved-target".into()};relocation_xrefs.push_str(&format!("{site:#018x}  relocation type={rtype} pcrel={} width={} -> {name}{applied}\n",pcrel,1u32<<length));}
  let selector_xrefs=selector_call_xrefs(&relocations,&calls,&symbols);
  analysis_progress(92,"evidence","Formatting xrefs, call evidence, relocations, selectors, and bounded strings.");
  let cfstring_ranges=sections(&window).into_iter().filter(|section|section.sect=="__cfstring"&&section.offset<=size&&section.size<=size-section.offset).map(|section|(section.offset,section.size)).collect::<Vec<_>>();let strings=printable_strings(&mut file,size,&cfstring_ranges)?;let object_detections=object_detections(&mut file,&window,size,&strings,&dyld_imports)?;let mut runtime_records=runtime_records;runtime_records.push_str("\n\nC / Apple object detections\n===========================\n");runtime_records.push_str(&object_detections);
@@ -1674,7 +1673,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let external_prototypes=super::signatures::external_prototype_database(digest)?;
  let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address);
  let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
- prototype_conflicts=super::semantic::artifact::constraint_report(&solved);
+ let prototype_conflicts=super::semantic::artifact::constraint_report(&solved);
  let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes,&objc_layouts);
  let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_records=format!("{objc_classes}\n{objc_protocols}");let conformance_signatures=super::signatures::objc_conformance_declarations(&conformance_records);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
  if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
