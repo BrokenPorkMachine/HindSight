@@ -11,6 +11,7 @@
 //! preserve, never invents an indirect target, and never suppresses a memory
 //! write that an unproven callee may perform.
 use crate::reconstruction::{array, object, Value as V};
+use std::collections::BTreeSet;
 
 /// AAPCS64 caller-saved general-purpose registers: x0-x18 are temporary or
 /// argument registers, and x18 is the platform register. The ABI lets a callee
@@ -51,7 +52,11 @@ pub(super) struct CallSummary {
     /// ABI result location, when a prototype is proven.
     pub result: Option<ResultLocation>,
     /// Whether the target is proven not to return.
-    pub non_returning: bool,
+    ///
+    /// `None` means the question is unresolved. A plain `false` would be an
+    /// unsound claim, because a callee that cannot be shown to return is not
+    /// the same as a callee proven to return.
+    pub non_returning: Option<bool>,
 }
 
 /// One proven argument location.
@@ -83,7 +88,7 @@ impl CallSummary {
             dispatch_register: None,
             arguments: Vec::new(),
             result: None,
-            non_returning: false,
+            non_returning: None,
         }
     }
     /// An indirect call through `register` with no proven target.
@@ -94,7 +99,7 @@ impl CallSummary {
             dispatch_register: Some(register),
             arguments: Vec::new(),
             result: None,
-            non_returning: false,
+            non_returning: None,
         }
     }
 
@@ -193,7 +198,14 @@ impl CallSummary {
             "callee_summary".into(),
             V::String("unresolved: no proven callee effect summary".into()),
         );
-        fields.insert("non_returning".into(), self.non_returning.into());
+        fields.insert(
+            "non_returning".into(),
+            match self.non_returning {
+                Some(true) => "proven: the callee has no reachable return".into(),
+                Some(false) => "proven: the callee returns".into(),
+                None => "unresolved: no non-returning proof established".into(),
+            },
+        );
         V::Object(fields)
     }
 }
@@ -308,6 +320,8 @@ pub(super) struct CalleeSummary {
     pub returns: bool,
     /// Whether the callee performs a call of its own.
     pub calls: bool,
+    /// Whether the callee's control flow loops instead of reaching a return.
+    pub loops: bool,
     /// Whether an unmapped or data instruction appeared in the window.
     pub opaque: bool,
     /// Whether the window ended before the callee terminated.
@@ -351,6 +365,7 @@ impl CalleeSummary {
         fields.insert("observed_memory_read".into(), self.reads_memory.into());
         fields.insert("observed_return".into(), self.returns.into());
         fields.insert("calls".into(), self.calls.into());
+        fields.insert("loops".into(), self.loops.into());
         fields.insert("opaque".into(), self.opaque.into());
         fields.insert("truncated".into(), self.truncated.into());
         fields.insert(
@@ -388,9 +403,155 @@ impl CalleeSummary {
     }
 }
 
-/// Analyze the bounded instruction window of a callee inside the captured image.
+/// Prove that a callee does not return to its caller.
 ///
-/// The window stops at the first return and is capped, so a large or
+/// A callee that never returns is a real machine fact with consequences for
+/// the caller: the instructions after the call are unreachable, so a
+/// reconstruction must not model them as live. This is proved from the
+/// callee's own control flow, not from a name or a catalog entry.
+///
+/// The proof is a bounded reachability analysis over the callee's decoded
+/// instructions. It succeeds only when every path through the callee ends in
+/// a construct that cannot return:
+///
+/// * an infinite loop — a backward branch whose target is at or before the
+///   branch itself, so control never reaches a return;
+/// * a call to a callee that is itself proven not to return;
+/// * a trap — an undefined instruction or a system call that never returns.
+///
+/// Anything else leaves the question unresolved: a reachable return, a
+/// conditional branch, an indirect branch, or an undecodable word all make
+/// the proof fail rather than guess.
+pub(crate) fn prove_non_returning(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+) -> bool {
+    let Some(offset) = target.checked_sub(base).map(|value| value as usize) else {
+        return false;
+    };
+    if offset % 4 != 0 {
+        return false;
+    }
+    // Decode the bounded window once, keeping each instruction's control
+    // flow. A word that does not decode stops the proof: the callee's
+    // behaviour past that point is unknown.
+    let mut window: Vec<(u64, Flow)> = Vec::new();
+    let mut cursor = offset;
+    while window.len() < budget {
+        let Some(bytes) = code.get(cursor..cursor + 4) else {
+            break;
+        };
+        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        let pc = base + cursor as u64;
+        let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
+        let flow = match portable {
+            super::super::IrOperation::Branch { target } => Flow::Direct(target),
+            super::super::IrOperation::ConditionalBranch { .. } => Flow::Conditional,
+            super::super::IrOperation::IndirectBranch { .. } => Flow::Unknown,
+            super::super::IrOperation::Return { .. } => Flow::Returns,
+            super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
+            super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
+            super::super::IrOperation::TargetSpecific => Flow::Unknown,
+            _ => Flow::FallsThrough,
+        };
+        window.push((pc, flow));
+        cursor += 4;
+    }
+    if window.is_empty() {
+        return false;
+    }
+    // Walk the reachable instructions. Reaching a return, a conditional
+    // branch, or an indirect transfer means the callee may come back, so the
+    // proof fails.
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+    let mut pending: Vec<u64> = vec![window[0].0];
+    while let Some(pc) = pending.pop() {
+        if !visited.insert(pc) {
+            continue;
+        }
+        let Some((_, flow)) = window.iter().find(|(address, _)| *address == pc) else {
+            // A branch outside the decoded window leaves the callee's fate
+            // unknown.
+            return false;
+        };
+        match flow {
+            Flow::Returns | Flow::Conditional | Flow::Unknown => return false,
+            Flow::Calls(target) => {
+                // The callee calls onward. It still returns to this frame
+                // unless that callee never returns.
+                if !prove_non_returning(code, base, *target, budget.min(64)) {
+                    return false;
+                }
+            }
+            Flow::Direct(target) => {
+                // A backward branch is an infinite loop: control never
+                // reaches a return from that point.
+                if *target <= pc {
+                    return true;
+                }
+                pending.push(*target);
+            }
+            Flow::FallsThrough => {
+                let next = pc + 4;
+                match window.iter().find(|(address, _)| *address == next) {
+                    Some(_) => pending.push(next),
+                    None => return false,
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The control-flow shape of one decoded callee instruction.
+#[derive(Clone, Copy, Debug)]
+enum Flow {
+    /// The instruction continues at the next address.
+    FallsThrough,
+    /// An unconditional branch to a resolved address.
+    Direct(u64),
+    /// A conditional branch; either arm may be taken.
+    Conditional,
+    /// A branch or call whose target is not resolved.
+    Unknown,
+    /// The callee returns to its caller.
+    Returns,
+    /// A call to a resolved callee.
+    Calls(u64),
+}
+
+/// Record the non-returning proof for a direct call.
+///
+/// The proof is stated as evidence, not as a bare boolean. A callee that
+/// could not be proven either way keeps the unresolved marker, so a
+/// consumer never reads "returns" into a claim the analysis did not make.
+pub(super) fn with_non_returning_payload(payload: V, proven: bool) -> V {
+    let V::Object(mut fields) = payload else {
+        return payload;
+    };
+    let Some(V::Object(mut effects)) = fields.get("call_effects").cloned() else {
+        return V::Object(fields);
+    };
+    effects.insert(
+        "non_returning".into(),
+        if proven {
+            "proven: the callee has no reachable return".into()
+        } else {
+            "unresolved: no non-returning proof established".into()
+        },
+    );
+    fields.insert("call_effects".into(), V::Object(effects));
+    V::Object(fields)
+}
+
+/// Analyze the bounded control flow of a callee inside the captured image.
+///
+/// The walk follows the callee's own control flow rather than reading
+/// straight through the image, so it never decodes an instruction that
+/// belongs to a neighbouring function. It stops at a return, records a
+/// backward branch as an infinite loop, and is capped, so a large or
 /// non-returning callee yields a truncated observation rather than a
 /// complete one. `code` is the captured image text and `base` its address.
 pub(super) fn analyze_callee(
@@ -403,14 +564,28 @@ pub(super) fn analyze_callee(
     if offset % 4 != 0 {
         return None;
     }
+    // A target outside the captured image has no window at all, so there is
+    // nothing to observe.
+    code.get(offset..offset + 4)?;
     let mut summary = CalleeSummary::default();
-    let mut cursor = offset;
-    while summary.instructions < budget {
-        let bytes = code.get(cursor..cursor + 4)?;
-        let word = u32::from_le_bytes(bytes.try_into().ok()?);
-        let pc = base + cursor as u64;
-        let operation = super::super::decode(word, pc);
-        let portable = super::super::lift_operation(operation, pc);
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+    let mut pending: Vec<u64> = vec![base + offset as u64];
+    while let Some(pc) = pending.pop() {
+        if summary.instructions >= budget {
+            summary.truncated = true;
+            break;
+        }
+        if !visited.insert(pc) {
+            // The callee's control flow came back to an instruction already
+            // walked: an infinite loop, so it never reaches a return.
+            summary.loops = true;
+            continue;
+        }
+        let Some(word) = read_word(code, base, pc) else {
+            summary.truncated = true;
+            break;
+        };
+        let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
         summary.instructions += 1;
         let effects = portable.gpr_effects();
         summary.defined_gprs |= effects.definitions;
@@ -434,24 +609,44 @@ pub(super) fn analyze_callee(
             }
             super::super::IrOperation::Return { .. } => {
                 summary.returns = true;
-                break;
             }
             super::super::IrOperation::DirectCall { .. }
             | super::super::IrOperation::IndirectCall { .. } => {
                 summary.calls = true;
+                pending.push(pc + 4);
             }
-            _ => {}
+            super::super::IrOperation::Branch { target } => {
+                if target <= pc {
+                    // A backward branch is an infinite loop.
+                    summary.loops = true;
+                } else {
+                    pending.push(target);
+                }
+            }
+            super::super::IrOperation::ConditionalBranch { target, .. } => {
+                pending.push(target);
+                pending.push(pc + 4);
+            }
+            super::super::IrOperation::IndirectBranch { .. } => {
+                summary.opaque = true;
+            }
+            super::super::IrOperation::TargetSpecific => {
+                summary.opaque = true;
+            }
+            _ => pending.push(pc + 4),
         }
-        cursor += 4;
-        if cursor >= code.len() {
-            summary.truncated = true;
-            break;
-        }
-    }
-    if summary.instructions >= budget {
-        summary.truncated = true;
     }
     Some(summary)
+}
+
+/// Read the instruction word at `pc` from the captured image text.
+fn read_word(code: &[u8], base: u64, pc: u64) -> Option<u32> {
+    let offset = pc.checked_sub(base)? as usize;
+    if offset % 4 != 0 {
+        return None;
+    }
+    let bytes = code.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// Attach a bounded callee observation to a rendered call summary payload.
@@ -622,5 +817,36 @@ mod tests {
             _ => panic!("memory effect records a string write claim"),
         };
         assert!(writes.starts_with("unknown"), "{writes}");
+    }
+
+    #[test]
+    fn a_proven_non_returning_callee_is_proved_from_its_own_control_flow() {
+        // `b .` is an infinite loop: control never reaches a return, so the
+        // callee provably does not return to its caller.
+        let code: Vec<u8> = 0x14000000_u32.to_le_bytes().to_vec();
+        assert!(prove_non_returning(&code, 0x1000, 0x1000, 16));
+        // A callee that returns is not proven non-returning.
+        let code: Vec<u8> = 0xd65f03c0_u32.to_le_bytes().to_vec();
+        assert!(!prove_non_returning(&code, 0x1000, 0x1000, 16));
+        // A conditional branch leaves the question unresolved, because one
+        // arm may still return.
+        let code: Vec<u8> = [0x54000060_u32, 0xd65f03c0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        assert!(!prove_non_returning(&code, 0x1000, 0x1000, 16));
+    }
+
+    #[test]
+    fn a_call_without_a_proof_keeps_its_non_returning_claim_unresolved() {
+        let summary = CallSummary::direct(0x2000);
+        let V::Object(fields) = summary.payload() else {
+            panic!("call summary renders as an object")
+        };
+        let claim = match fields.get("non_returning") {
+            Some(V::String(claim)) => claim.clone(),
+            _ => panic!("the non-returning claim is a stated reason"),
+        };
+        assert!(claim.starts_with("unresolved"), "{claim}");
     }
 }

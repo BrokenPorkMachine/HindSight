@@ -18,7 +18,13 @@ COPY python/reworkbench_sdk/ ./python/reworkbench_sdk/
 COPY python/tests/test_decoder.py python/tests/test_native.py ./python/tests/
 COPY Tests/Fixtures/arm64-integer-sample.macho ./Tests/Fixtures/
 COPY Shared/WorkbenchMessages.swift ./Shared/
-RUN cargo test --manifest-path rust/Cargo.toml --locked -p reworkbench-worker -p reworkbench-protocol \
+# The pinned image installs the minimal profile, which has no clippy
+# component. The strict lint gate is part of the release gate, so the
+# component is added before it runs.
+RUN rustup component add clippy \
+    && cargo test --manifest-path rust/Cargo.toml --locked -p reworkbench-worker -p reworkbench-protocol \
+    && cargo clippy --manifest-path rust/Cargo.toml --locked --all-targets \
+       -p reworkbench-worker -p reworkbench-protocol -- -D warnings \
     && python3 scripts/test-worker.py rust/target/release/reworker \
     && python3 scripts/test-binary-formats.py rust/target/release/reworker \
     && python3 scripts/test-elf-pe.py rust/target/release/reworker

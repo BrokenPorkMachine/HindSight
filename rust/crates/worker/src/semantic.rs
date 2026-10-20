@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 
 mod names;
 pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
+mod files;
 pub(crate) mod artifact;
 pub use artifact::build as reconstruct_artifact;
 pub use artifact::interpret as interpret_artifact;
@@ -8612,7 +8613,8 @@ pub fn render(
         // SSA construction: place phi nodes and rename registers.
         let ssa = build_ssa(&function_ir);
         let mut ssa_budget = SsaOutputBudget { remaining: 4_000, exhausted: false };
-        out.push_str("  // GPR SSA: W/X share an identity; entry/unknown values carry no source type; FP, flags, memory SSA, and implicit call arguments unresolved\n");
+        out.push_str("  // GPR SSA: W/X share an identity; entry/unknown values carry no source type; FP, memory SSA, and implicit call arguments unresolved\n");
+        out.push_str("  // Flag and vector effects are exact per instruction; the NZCV and vector values themselves are not yet SSA values across joins\n");
 
         // Render phase: render each block in address order using final entry flows.
         for (bi, block) in blocks.iter().enumerate() {
@@ -8678,6 +8680,26 @@ pub fn render(
                     let root = root_origin.name_of(root_register);
                     let dead = if record.dead { " dead=true" } else { "" };
                     ssa_budget.emit(&mut out, &format!("  // ssa-origin {p:#x} {relation} root={root}{dead}\n"));
+                }
+                // Publish the exact flag effects. A flag write is partial:
+                // `ANDS` leaves the carry and overflow alone, so a consumer
+                // can tell which flags the instruction really replaced.
+                let flag_effects = files::instruction_flag_effects(instruction);
+                if flag_effects.touches() {
+                    let defines = files::flag_names(flag_effects.defines).join(",");
+                    let uses = files::flag_names(flag_effects.uses).join(",");
+                    ssa_budget.emit(&mut out, &format!("  // ssa-flags {p:#x} defines=[{defines}] uses=[{uses}]\n"));
+                }
+                // Publish the exact vector effects. A narrow write preserves
+                // the rest of its register, so the published width tells a
+                // consumer whether the whole value was replaced.
+                let vector_effects = files::instruction_vector_effects(instruction);
+                if vector_effects.touches() {
+                    let writes = vector_effects.writes.iter()
+                        .map(|(index, width)| format!("v{index}:{}", files::vector_width_name(*width)))
+                        .collect::<Vec<_>>().join(",");
+                    let reads = vector_effects.reads.iter().map(|index| format!("v{index}")).collect::<Vec<_>>().join(",");
+                    ssa_budget.emit(&mut out, &format!("  // ssa-vector {p:#x} writes=[{writes}] reads=[{reads}]\n"));
                 }
                 if out.len() >= MAX_OUTPUT {
                     break;

@@ -1175,6 +1175,20 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             },
             _ => tree,
         };
+        // A callee proven never to return makes the instructions after the
+        // call unreachable. The proof comes from the callee's own control
+        // flow; without it the question stays unresolved.
+        let tree = match portable {
+            IrOperation::DirectCall { target } => {
+                let mut tree = tree;
+                tree.attributes = calls::with_non_returning_payload(
+                    tree.attributes,
+                    calls::prove_non_returning(code, base, target, CALLEE_WINDOW),
+                );
+                tree
+            }
+            _ => tree,
+        };
         let (ast, mirror) = tree.emit(&mut builder, &ir, pc)?;
         statements.push(ast);
         statement_mirrors.push(mirror);

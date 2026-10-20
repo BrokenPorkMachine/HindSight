@@ -15,7 +15,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build analysis worker
-        run: cargo build -p reworkbench-worker --manifest-path rust/Cargo.toml
+        run: cargo build -p reworkbench-worker --locked --manifest-path rust/Cargo.toml
+      - name: Enforce the strict lint gate
+        run: cargo clippy -p reworkbench-worker --all-targets --locked --manifest-path rust/Cargo.toml -- -D warnings
+      - name: Run the worker unit tests
+        run: cargo test -p reworkbench-worker --locked --manifest-path rust/Cargo.toml
+      - name: Audit the source and contract topology
+        run: python3 scripts/validate-source.py
       - name: Qualify Darwin runtime and SDK evidence
         run: |
           python3 -m unittest discover -s python/tests -p test_darwin_catalog.py -v

@@ -154,6 +154,9 @@ _hs_ast_large:
         indirect_effects = [node["attributes"]["call_effects"] for node in artifacts["indirect"]["ast"]["nodes"]
                             if node["kind"] == "indirect-call" and "call_effects" in node["attributes"]]
         assert indirect_effects, artifacts["indirect"]["ast"]["nodes"]
+        # The non-returning claim is stated as evidence, never as a bare
+        # boolean that a consumer could read as "the callee returns".
+        assert effect["non_returning"].startswith(("proven", "unresolved")), effect
         indirect = indirect_effects[0]
         assert indirect["call_kind"] == "indirect", indirect
         assert indirect["target"] is None, indirect
