@@ -146,18 +146,22 @@ impl Value {
 }
 
 extern "C" {
-    fn re_sha256_bytes(data: *const u8, size: usize, digest: *mut std::os::raw::c_char) -> i32;
+    fn re_sha256_bytes(data: *const u8, size: usize, digest: *mut u8) -> i32;
 }
 pub fn digest(value: &Value) -> io::Result<String> {
     let bytes = value.canonical();
-    let mut hash = [0 as std::os::raw::c_char; 65];
+    // The provider writes 64 hexadecimal ASCII bytes. The buffer is a byte
+    // buffer rather than a `c_char` buffer because `c_char` is signed on some
+    // targets and unsigned on others, which would make the byte-to-character
+    // conversion a no-op on one platform and a real conversion on another.
+    let mut hash = [0u8; 65];
     if unsafe { re_sha256_bytes(bytes.as_ptr(), bytes.len(), hash.as_mut_ptr()) } != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Artifact SHA-256 provider failed or byte budget exceeded",
         ));
     }
-    Ok(hash[..64].iter().map(|byte| *byte as u8 as char).collect())
+    Ok(hash[..64].iter().map(|byte| *byte as char).collect())
 }
 
 pub struct Builder {
