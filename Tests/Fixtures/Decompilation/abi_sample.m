@@ -28,6 +28,7 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 - (float)single;
 - (NSRange)range:(NSRange)value;
 - (CGRect)rectangle:(CGRect)value;
+- (CGAffineTransform)affine:(CGAffineTransform)value;
 - (double)manyFP:(double)a b:(double)b c:(double)c d:(double)d e:(double)e
                f:(double)f g:(double)g h:(double)h i:(double)i tail:(int)tail;
 - (void)packed:(long)a b:(long)b c:(long)c d:(long)d e:(long)e f:(long)f
@@ -43,6 +44,7 @@ extern void *known_memset(void *, int, unsigned long) __asm__("_memset");
 - (float)single { return 2.5f; }
 - (NSRange)range:(NSRange)value { return value; }
 - (CGRect)rectangle:(CGRect)value { return value; }
+- (CGAffineTransform)affine:(CGAffineTransform)value { return value; }
 - (double)manyFP:(double)a b:(double)b c:(double)c d:(double)d e:(double)e
                f:(double)f g:(double)g h:(double)h i:(double)i tail:(int)tail {
     return i + tail;

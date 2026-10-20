@@ -162,6 +162,7 @@ fn objc_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
                 ("{CGPoint=dd}", "CGPoint"), ("{CGSize=dd}", "CGSize"),
                 ("{CGRect={CGPoint=dd}{CGSize=dd}}", "CGRect"),
                 ("{_NSRange=QQ}", "NSRange"), ("{CFRange=qq}", "CFRange"),
+                ("{CGAffineTransform=dddddd}", "CGAffineTransform"),
             ].into_iter().find(|(encoding, _)| bytes[start..].starts_with(encoding.as_bytes()))?;
             *at = start + known.0.len();
             known.1.into()
@@ -735,7 +736,7 @@ fn objc_parameters(signature: &Signature) -> Vec<(String, String)> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AbiType { Integer(u8), Float(u8), IntegerAggregate(u8), FloatAggregate(u8) }
+enum AbiType { Integer(u8), Float(u8), IntegerAggregate(u8), FloatAggregate(u8), HiddenResultPointer(u8) }
 
 /// Apple arm64 LP64 scalar ABI. Unknown typedefs/aggregates do not receive
 /// guessed locations: their layout can change both banks and the stack cursor.
@@ -761,6 +762,9 @@ fn abi_type(ty: &str) -> Option<AbiType> {
     Some(match ty.as_str() {
         "CFRange" | "NSRange" => AbiType::IntegerAggregate(2),
         "CGPoint" | "CGSize" => AbiType::FloatAggregate(2), "CGRect" => AbiType::FloatAggregate(4),
+        // Six doubles: 48 bytes, and not a homogeneous aggregate of at most
+        // four members, so it is passed and returned indirectly.
+        "CGAffineTransform" => AbiType::FloatAggregate(6),
         "float" => AbiType::Float(4), "double" | "long double" | "CGFloat" => AbiType::Float(8),
         "bool" | "_Bool" | "BOOL" | "Boolean" | "char" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" | "Int8" | "UInt8" => AbiType::Integer(1),
         "short" | "short int" | "signed short" | "unsigned short" | "unsigned short int" | "int16_t" | "uint16_t" | "Int16" | "UInt16" | "unichar" => AbiType::Integer(2),
@@ -814,60 +818,22 @@ fn abi_types_agree(expected: &str, actual: &str) -> bool {
 fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
     let Some(signature) = signature else { return Vec::new() };
 
-    // Check for hidden result pointer (sret) for large struct returns
-    // AAPCS64: aggregates > 16 bytes are returned via hidden pointer in x0
-    let mut has_sret = false;
-    let mut sret_ty = None;
-    if let Some(ty) = signature_return_type(signature) {
-        if let Some(AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words)) = abi_type(&ty) {
-            if words > 2 { // > 16 bytes
-                has_sret = true;
-                sret_ty = Some(ty.clone());
-            }
-        }
-    }
-    
     let is_objc = signature.language == "Objective-C / Objective-C++";
     let parameters = if is_objc { objc_parameters(signature) } else { c_parameters(signature) };
     
     let mut result = Vec::new();
     
-    // Add hidden sret parameter if needed
-    if has_sret {
-        let sret_name = sret_ty.as_ref().map(|t| format!("sret_{}", t.replace(' ', "_"))).unwrap_or_else(|| "sret".to_string());
-        result.push(AbiParameter { 
-            name: sret_name, 
-            register: "x0".into(), 
-            general_register: Some(0), 
-            stack_scalar: None, 
-            source_type: Some(format!("sret_{}", sret_ty.unwrap_or_default()))
-        });
-    }
-    
-    // Add Objective-C implicit parameters
+    // Add Objective-C implicit parameters. A result that comes back indirectly
+    // does not change this: the indirect result location is the dedicated x8
+    // register, so it never shifts the argument registers.
     if is_objc {
-        if has_sret {
-            // With sret: self=x1, _cmd=x2
-            result.push(AbiParameter { name: "self".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("id".into()) });
-            result.push(AbiParameter { name: "_cmd".into(), register: "x2".into(), general_register: Some(2), stack_scalar: None, source_type: Some("SEL".into()) });
-        } else {
-            result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), stack_scalar: None, source_type: Some("id".into()) });
-            result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("SEL".into()) });
-        }
+        result.push(AbiParameter { name: "self".into(), register: "x0".into(), general_register: Some(0), stack_scalar: None, source_type: Some("id".into()) });
+        result.push(AbiParameter { name: "_cmd".into(), register: "x1".into(), general_register: Some(1), stack_scalar: None, source_type: Some("SEL".into()) });
     }
     
-    // For AAPCS64 with sret:
-    // - has_sret + ObjC: x0=sret, x1=self, x2=_cmd -> next is x3 (gp=3)
-    // - sret only: x0=sret, next is x1 (gp=1)
-    // - ObjC only: x0=self, x1=_cmd, next is x2 (gp=2)
-    // - neither: start at x0 (gp=0)
-    let mut gp = if has_sret {
-        if is_objc { 3u8 } else { 1u8 }
-    } else if is_objc {
-        2u8
-    } else {
-        0u8
-    };
+    // The first general-purpose argument register: x2 after the implicit
+    // Objective-C self and _cmd, x0 otherwise.
+    let mut gp = if is_objc { 2u8 } else { 0u8 };
     let mut fp = 0u8;
     let mut stack_slot = 0usize;
     let mut stack_offset = 0usize;
@@ -883,7 +849,26 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
         }
         let scalar = scalar.unwrap_or(AbiType::Integer(8));
         if let AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words) = scalar {
-            let (bank, prefix) = if matches!(scalar, AbiType::FloatAggregate(_)) { (&mut fp, "d") } else { (&mut gp, "x") };
+            // A homogeneous floating-point aggregate of at most four members
+            // travels in the floating-point registers, whatever its size. Every
+            // other composite larger than 16 bytes is passed by pointer: the
+            // caller copies it and passes its address in the next
+            // general-purpose register.
+            let hfa = matches!(scalar, AbiType::FloatAggregate(words) if words <= 4);
+            let bytes = words as usize * 8;
+            if !hfa && bytes > 16 {
+                if gp < 8 {
+                    result.push(AbiParameter { name, register: format!("by-pointer aggregate<{ty}>({bytes} bytes) in x{gp}; the caller copies the composite and passes its address"), general_register: Some(gp), stack_scalar: None, source_type: Some(ty) });
+                    gp += 1;
+                    continue;
+                }
+                stack_offset = (stack_offset + 7) & !7;
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 composite {ty} passed by pointer)"), general_register: None, stack_scalar: None, source_type: Some(ty) });
+                stack_offset += bytes;
+                stack_slot += 1;
+                continue;
+            }
+            let (bank, prefix) = if hfa { (&mut fp, "d") } else { (&mut gp, "x") };
             if *bank + words <= 8 {
                 let registers = (*bank..*bank + words).map(|index| format!("{prefix}{index}")).collect::<Vec<_>>().join(", ");
                 result.push(AbiParameter { name, register: format!("aggregate<{ty}>({registers})"), general_register: None, stack_scalar: None, source_type: Some(ty) });
@@ -966,12 +951,28 @@ fn signature_returns_void(signature: Option<&Signature>) -> bool {
     signature.and_then(signature_return_type).as_deref() == Some("void")
 }
 
+/// The Apple arm64 result ABI of a declared return type.
+///
+/// A homogeneous floating-point aggregate of at most four members is returned
+/// in the floating-point registers, whatever its size: `CGRect` is 32 bytes
+/// and comes back in d0-d3. Every other composite larger than 16 bytes is
+/// returned indirectly: the caller passes the result location in x8 and the
+/// callee returns that pointer in x0. The result location is a dedicated
+/// register, so it never shifts the argument registers.
+fn abi_result_type(ty: &str) -> Option<AbiType> {
+    match abi_type(ty) {
+        Some(AbiType::IntegerAggregate(words)) if words > 2 => Some(AbiType::HiddenResultPointer(words)),
+        Some(AbiType::FloatAggregate(words)) if words > 4 => Some(AbiType::HiddenResultPointer(words)),
+        other => other,
+    }
+}
+
 fn render_signature_return(signature: Option<&Signature>) -> String {
     let Some(ty) = signature.and_then(signature_return_type) else {
         return "return x0; /* inferred ABI result; source return type unresolved */".into();
     };
     if ty == "void" { return "return; /* void return supported by recovered signature */".into(); }
-    let register = match abi_type(&ty) {
+    let register = match abi_result_type(&ty) {
         Some(AbiType::Float(4)) => "s0", Some(AbiType::Float(_)) => "d0",
         Some(AbiType::Integer(bytes)) if bytes <= 4 => "w0", Some(AbiType::Integer(_)) => "x0",
         Some(AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words)) => {
@@ -980,6 +981,7 @@ fn render_signature_return(signature: Option<&Signature>) -> String {
             return format!("return aggregate<{ty}>({registers}); /* Apple arm64 known SDK aggregate result */");
         }
         None => return format!("return /* result ABI unresolved for {ty}; aggregate/HFA/indirect-result layout required */;"),
+        Some(AbiType::HiddenResultPointer(_)) => return format!("return /* sret result via hidden pointer in x8 for {ty} */;"),
     };
     format!("return {register}; /* Apple arm64 result for recovered type {ty} */")
 }
@@ -1844,33 +1846,42 @@ fn recover_internal(
             assert_eq!(args[index].general_register, None);
         }
     }
-    #[test] fn sret_hidden_result_pointer_for_large_structs() {
-        // Large struct return via hidden pointer in x0 (sret)
+    #[test] fn a_large_non_hfa_result_is_returned_through_the_x8_result_location() {
+        // CGAffineTransform is 48 bytes of six doubles. It is not a
+        // homogeneous floating-point aggregate of at most four members, so the
+        // result comes back through the indirect result location in x8 and
+        // the callee returns that pointer in x0.
         let signature = Signature { language: "C", source: "test",
-            declaration: "CGRect large_rect(void);".into() }; // CGRect is 32 bytes (> 16 bytes)
+            declaration: "CGAffineTransform affine(CGAffineTransform value);".into() };
+        let rendered = render_signature_return(Some(&signature));
+        assert!(rendered.starts_with("return /* sret result via hidden pointer in x8 for CGAffineTransform */;"), "{rendered}");
+        // The result location is a dedicated register, so the argument
+        // registers are not shifted. The composite argument is passed by
+        // pointer: the caller copies it and passes its address in x0.
         let args = abi_parameters(Some(&signature));
-        // First parameter should be sret pointer in x0
-        assert_eq!(args[0].register, "x0");
-        assert!(args[0].source_type.as_ref().unwrap().starts_with("sret_"));
-        // Next parameter would be at x1 (shifted by sret)
-        // No additional parameters in this case
-        
-        // Test with additional parameters
-        let signature = Signature { language: "C", source: "test",
-            declaration: "CGRect large_rect(int a, long b);".into() };
-        let args = abi_parameters(Some(&signature));
-        assert_eq!(args[0].register, "x0"); // sret pointer
-        assert_eq!(args[1].register, "x1"); // a
-        assert_eq!(args[2].register, "x2"); // b
+        assert_eq!(args.len(), 1);
+        assert!(args[0].register.contains("by-pointer aggregate<CGAffineTransform>(48 bytes) in x0"), "{:?}", args[0]);
     }
-    #[test] fn sret_shifts_objc_parameters() {
-        let objc = objc_method("-[View largeRect:]", "{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8Q").unwrap();
+    #[test] fn a_homogeneous_aggregate_result_stays_in_the_registers() {
+        // CGRect is 32 bytes, but it is a homogeneous floating-point aggregate
+        // of four members, so it is returned in d0-d3 and never indirectly.
+        let signature = Signature { language: "C", source: "test",
+            declaration: "CGRect rect(CGRect value);".into() };
+        assert!(render_signature_return(Some(&signature)).starts_with("return aggregate<CGRect>(d0, d1, d2, d3);"));
+        // The argument is an HFA as well, so it travels in the
+        // floating-point registers too.
+        let args = abi_parameters(Some(&signature));
+        assert!(args[0].register.contains("aggregate<CGRect>(d0, d1, d2, d3)"), "{:?}", args[0]);
+    }
+    #[test] fn the_indirect_result_location_does_not_shift_the_argument_registers() {
+        // The result location is the dedicated x8 register, so self stays in
+        // x0 and _cmd in x1 even when the result comes back indirectly.
+        let objc = objc_method("-[View affine:]", "{CGAffineTransform=dddddd}64@0:8{CGAffineTransform=dddddd}16").unwrap();
         let args = abi_parameters(Some(&objc));
-        // With sret: self=x1, _cmd=x2, sret=x0
-        assert_eq!(args[0].register, "x0"); // sret
-        assert_eq!(args[1].register, "x1"); // self
-        assert_eq!(args[2].register, "x2"); // _cmd
-        assert_eq!(args[3].register, "x3"); // first explicit arg
+        assert_eq!(args[0].register, "x0"); // self
+        assert_eq!(args[1].register, "x1"); // _cmd
+        assert!(args[2].register.contains("by-pointer aggregate<CGAffineTransform>"), "{:?}", args[2]);
+        assert!(render_signature_return(Some(&objc)).starts_with("return /* sret result via hidden pointer in x8 for CGAffineTransform */;"));
     }
     #[test] fn callbacks_blocks_and_array_parameters_decay_to_gp_pointers() {
         let signature = Signature { language: "C", source: "test",

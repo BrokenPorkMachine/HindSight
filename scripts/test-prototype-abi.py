@@ -72,6 +72,14 @@ def run(worker):
             assert "result=return aggregate<NSRange>(x0, x1);" in abi("range:")
             assert "arg0=aggregate<CGRect>(d0, d1, d2, d3)" in abi("rectangle:")
             assert "result=return aggregate<CGRect>(d0, d1, d2, d3);" in abi("rectangle:")
+            # CGAffineTransform is 48 bytes of six doubles, so it is not a
+            # homogeneous aggregate of at most four members: the compiler
+            # passes it by pointer and returns it through the indirect result
+            # location in x8, which is a dedicated register and so does not
+            # shift self or _cmd.
+            assert "arg0=by-pointer aggregate<CGAffineTransform>(48 bytes) in x2" in abi("affine:"), abi("affine:")
+            assert "result=return /* sret result via hidden pointer in x8 for CGAffineTransform */;" in abi("affine:"), abi("affine:")
+            assert "self=x0, _cmd=x1" in abi("affine:"), abi("affine:")
             many = abi("manyFP:b:c:d:e:f:g:h:i:tail:")
             assert "arg7=d7" in many and "arg8=stack argument (slot 0, sp+0x0, 8 bytes" in many, many
             assert "arg9=x2" in many, many
