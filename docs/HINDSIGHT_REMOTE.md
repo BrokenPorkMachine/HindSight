@@ -73,16 +73,30 @@ project and captured source digest; request IDs are idempotent for ten minutes,
 at most two jobs run concurrently, 256 jobs are retained, and only four results
 are kept. Importing a binary does not execute it.
 
-This is a single-user host-wide bearer-token model: every holder of the current
-token can read the open project and submit/cancel its analysis jobs. It does
-not provide individual accounts, multiple project grants, or audit logging.
-Stop/start rotates the token. Do not expose the app through a public address or
+The gateway binds each authenticated bearer token to a persisted remote user.
+Every project snapshot, submission, poll, cancellation, and result read is
+then checked against an explicit per-user, per-project (optionally per-record)
+capability grant, and a request without a grant is answered with a documented
+403 rather than the data. A grant that names one record never covers a
+project-wide request, because that request would expose the records the grant
+does not name. A job belongs to the user that submitted it: another user with
+a grant for the same project cannot poll it, read its result, cancel it, or
+learn that it exists. Users, grants, and a bounded audit log persist in the
+private Application Support directory; bearer tokens remain ephemeral. The
+locally generated token receives a grant for the open project at startup.
+Opening a different project while the gateway runs records a new
+host-authorized grant for that project. Every gateway request is recorded in
+the bounded audit trail with the user, the project, record and request it
+acted on, the status code, the byte counts, the latency and the client
+address. Stop/start rotates the token and clears
+the active remote session while retaining user, grant, and audit history. Target-level
+authorization and an audit review interface remain open. Do not expose the app through a public address or
 port-forward it as a multi-user service.
 
 Remaining remote-product scope:
 
 - [x] Explicit server start/stop, loopback default, private IPv4 configuration, TLS, per-start bearer-token rotation, exact-origin CORS, versioned API, OpenAPI endpoint and truthful capability discovery.
-- [ ] Individual users, multiple project grants, durable audit log and finer-grained project/target authorization.
+- [~] Individual users and per-project/per-record capability grants are enforced for supported project and analysis routes, and a job stays private to the user that submitted it. Users, grants, and bounded audit records persist with schema, size, regular-file, symlink, and permission checks; target-level authorization, grant administration and an audit review interface remain.
 - [ ] Integrity-checked, bounded binary uploads/imports and server-backed projects; importing never launches a binary. Enforce size, storage and analysis-resource limits.
 - [x] Source-bound analysis submission, polling, cancellation and result retrieval, with retry idempotency and stale-source rejection. The result carries the existing disassembly, pseudocode, symbols and evidence artifacts.
 - [ ] Real browser interoperability from a second device; bounded event streaming with sequencing, backpressure, disconnect/reconnect behavior and cancellation.

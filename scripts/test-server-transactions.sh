@@ -19,6 +19,7 @@ CLANG_MODULE_CACHE_PATH=/private/tmp/hindsight-remote-module-cache swiftc \
   -swift-version 5 -strict-concurrency=targeted -emit-executable -o "$test_dir/transactions" \
   "$project_root/Shared/WorkbenchMessages.swift" \
   "$project_root/App/RemoteGateway.swift" \
+  "$project_root/App/RemoteUser.swift" \
   "$project_root/App/RemoteAnalysisTransactions.swift" \
   "$project_root/Tests/RemoteTransactions.swift"
 "$test_dir/transactions"

@@ -20,6 +20,7 @@
     "App/InvestigationLedgerWorkspace.swift",
     "App/RemoteAnalysisTransactions.swift",
     "App/RemoteGateway.swift",
+    "App/RemoteUser.swift",
     "App/RuntimeCorrelationModel.swift",
     "App/RuntimeCorrelationWorkspace.swift",
     "App/TargetWorkspace.swift",
@@ -104,6 +105,7 @@
       "Shared/HostPlatform.swift",
       "Shared/ReconstructionArtifact.swift",
       "App/RemoteGateway.swift",
+      "App/RemoteUser.swift",
       "App/RemoteAnalysisTransactions.swift"
     ],
     "CoordinatorService": [
@@ -134,5 +136,5 @@
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "2534ccf0c10a37ba6c35565feed0c815a891d0d5a232f01ed5b003ab27f0ada6"
+  "project_sha256": "ec8502b950803575438a0dab34c5ab18a20c36e3f821e11088f9b0815fec5ff7"
 }

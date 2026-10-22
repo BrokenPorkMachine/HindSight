@@ -35,7 +35,9 @@ private struct VGSupportDiagnosticsExport: Codable {
 }
 @MainActor
 final class WorkbenchModel: ObservableObject {
-    @Published var project: ProjectSnapshot?
+    @Published var project: ProjectSnapshot? {
+        didSet { syncRemoteProjectGrant() }
+    }
     @Published var selectedID: String? {
         didSet {
             if oldValue != selectedID {
@@ -395,6 +397,16 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var remotePort = "8443"
     @Published private(set) var remoteToken = ""
     @Published private(set) var remoteStatus = "Off"
+    private lazy var remoteUsers: RemoteUserRegistry = {
+        // The Application Support directory is the private per-user location
+        // for the identity store. The temporary directory is only a fallback
+        // for a host that does not publish one.
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let url = support.appendingPathComponent("HindSight/RemoteAccess", isDirectory: true)
+            .appendingPathComponent("registry-v1.json", isDirectory: false)
+        return RemoteUserRegistry(storageURL: url)
+    }()
     private lazy var remoteTransactions = RemoteAnalysisTransactions(backend: .init(
         analyze: { [weak self] recordID, requestID, done in
             guard let self else { return }
@@ -424,13 +436,17 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 })
             }
         }
-    ))
+    ), userRegistry: remoteUsers)
     private lazy var remoteGateway = RemoteGateway(handle: { [weak self] request, reply in
         Task { @MainActor in self?.handleRemoteRequest(request, reply: reply) }
     }, status: { [weak self] value in
         Task { @MainActor in self?.remoteStatus = value }
-    })
+    }, userRegistry: remoteUsers)
     func startRemoteGateway() {
+        guard remoteUsers.persistenceError == nil else {
+            remoteStatus = "Remote access registry unavailable: \(remoteUsers.persistenceError ?? "storage error")"
+            return
+        }
         guard let port = UInt16(remotePort), port > 0 else { remoteStatus = "Invalid port"; return }
         var bytes = [UInt8](repeating: 0, count: 32)
         guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
@@ -441,7 +457,14 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             try remoteGateway.start(certificateLabel: remoteCertificateLabel,
                                     bindAddress: remoteBindAddress,
                                     allowedOrigin: remoteAllowedOrigin,
-                                    port: port, token: token)
+                                    port: port)
+            try bindGatewaySession(token)
+            guard remoteUsers.persistenceError == nil else {
+                remoteGateway.stop()
+                remoteUsers.revokeToken(token)
+                remoteStatus = "Remote access registry write failed: \(remoteUsers.persistenceError ?? "storage error")"
+                return
+            }
             remoteToken = token
             remoteStatus = "Starting…"
         } catch {
@@ -449,13 +472,39 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             remoteStatus = error.localizedDescription
         }
     }
+
+    /// Bind a session token to the local operator and grant that operator
+    /// access to the open project.
+    ///
+    /// Every gateway route is authorized against a grant, so a token that is
+    /// not bound to a granted user can authenticate but cannot read the
+    /// project, submit an analysis, or touch a job.
+    private func bindGatewaySession(_ token: String) throws {
+        let user = remoteUsers.bindToken(token, to: remoteUsers.user(forSubject: "local-gateway"))
+        if let project { grantGatewayUser(user, to: project.path) }
+    }
     func stopRemoteGateway() {
+        remoteUsers.revokeToken(remoteToken)
+        remoteUsers.flush()
         remoteGateway.stop()
         remoteToken = ""
         remoteTransactions.stop()
     }
     private func handleRemoteRequest(_ request: RemoteRequest, reply: @escaping (RemoteResponse) -> Void) {
         remoteTransactions.handle(request, project: project, ready: projectSessionReady, reply: reply)
+    }
+
+    private func grantGatewayUser(_ user: RemoteUser, to projectPath: String) {
+        _ = remoteUsers.grant(userID: user.id, projectPath: projectPath, recordID: nil,
+                              capabilities: RemoteCapability.all, grantedBy: user.id)
+    }
+
+    private func syncRemoteProjectGrant() {
+        guard !remoteToken.isEmpty, let project,
+              let user = remoteUsers.user(for: remoteToken) else { return }
+        // Project switches are an explicit host decision: record a fresh
+        // grant for the newly opened project before its routes can be used.
+        grantGatewayUser(user, to: project.path)
     }
 #if HINDSIGHT_SERVER_TEST
     private var remoteIntegrationSmokeStarted = false
@@ -518,7 +567,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                               userInfo: [NSLocalizedDescriptionKey: "TLS identity import failed: \(identityStatus)"])
             }
             let identity = unsafeBitCast(item as CFTypeRef, to: SecIdentity.self)
-            try remoteGateway.start(identity: identity, port: port, token: token)
+            try remoteGateway.start(identity: identity, port: port)
+            // The smoke session is the host operator, so it holds the same
+            // project grant every authorized route is checked against.
+            try bindGatewaySession(token)
             print("HINDSIGHT_REMOTE_SMOKE_READY")
             fflush(stdout)
         } catch {

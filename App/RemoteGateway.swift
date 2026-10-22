@@ -6,15 +6,54 @@ struct RemoteRequest {
     let method: String
     let path: String
     let body: Data
+    let clientAddress: String?
+    /// The authenticated gateway user. This is assigned only after bearer
+    /// verification; request handlers must not derive identity from headers.
+    let user: RemoteUser?
+
+    init(method: String, path: String, body: Data, clientAddress: String? = nil,
+         user: RemoteUser? = nil) {
+        self.method = method
+        self.path = path
+        self.body = body
+        self.clientAddress = clientAddress
+        self.user = user
+    }
+}
+
+/// What a request actually touched.
+///
+/// The gateway authenticates the caller but does not know which project or
+/// record a request addressed, so the handler reports the scope it acted on
+/// and the audit trail records it with the user and the outcome.
+struct RemoteScope: Codable, Sendable, Hashable {
+    var projectPath: String?
+    var recordID: String?
+    var requestID: String?
 }
 
 struct RemoteResponse {
     let code: Int
     let body: String
+    /// The project, record and request the handler acted on, when it acted
+    /// on one. The gateway records it with the audit entry.
+    var scope: RemoteScope?
+
+    init(code: Int, body: String, scope: RemoteScope? = nil) {
+        self.code = code
+        self.body = body
+        self.scope = scope
+    }
+
     static func json(_ body: String, code: Int = 200) -> Self { .init(code: code, body: body) }
     static func error(_ message: String, code: Int) -> Self {
         let data = try? JSONSerialization.data(withJSONObject: ["error": message])
         return .init(code: code, body: data.map { String(decoding: $0, as: UTF8.self) } ?? "{}")
+    }
+
+    /// The same response with the scope the handler acted on attached.
+    func withScope(_ scope: RemoteScope?) -> Self {
+        Self(code: code, body: body, scope: scope)
     }
 }
 
@@ -23,22 +62,24 @@ final class RemoteGateway {
     private let queue = DispatchQueue(label: "ca.zensoftware.hindsight.remote")
     private var listener: NWListener?
     private var connections: [UUID: NWConnection] = [:]
-    private var secret = ""
     private var boundPort: UInt16 = 0
     private var boundAddress = "127.0.0.1"
     private var allowedOrigin = ""
     private var corsConnections: Set<UUID> = []
     private let handle: (RemoteRequest, @escaping (RemoteResponse) -> Void) -> Void
     private let status: (String) -> Void
+    private let userRegistry: RemoteUserRegistry
 
     init(handle: @escaping (RemoteRequest, @escaping (RemoteResponse) -> Void) -> Void,
-         status: @escaping (String) -> Void) {
+         status: @escaping (String) -> Void,
+         userRegistry: RemoteUserRegistry = RemoteUserRegistry()) {
         self.handle = handle
         self.status = status
+        self.userRegistry = userRegistry
     }
 
-    func start(certificateLabel: String, bindAddress: String = "127.0.0.1", allowedOrigin: String = "", port: UInt16, token: String) throws {
-        guard !certificateLabel.isEmpty, port > 0, token.utf8.count >= 32 else {
+    func start(certificateLabel: String, bindAddress: String = "127.0.0.1", allowedOrigin: String = "", port: UInt16) throws {
+        guard !certificateLabel.isEmpty, port > 0 else {
             throw GatewayError.invalidConfiguration
         }
         let query: [String: Any] = [kSecClass as String: kSecClassIdentity,
@@ -57,11 +98,11 @@ final class RemoteGateway {
         var commonName: CFString?
         guard SecCertificateCopyCommonName(certificate, &commonName) == errSecSuccess,
               commonName as String? == certificateLabel else { throw GatewayError.invalidConfiguration }
-        try start(identity: identity, bindAddress: bindAddress, allowedOrigin: allowedOrigin, port: port, token: token)
+        try start(identity: identity, bindAddress: bindAddress, allowedOrigin: allowedOrigin, port: port)
     }
 
-    func start(identity: SecIdentity, bindAddress: String = "127.0.0.1", allowedOrigin: String = "", port: UInt16, token: String) throws {
-        guard port > 0, token.utf8.count >= 32 else { throw GatewayError.invalidConfiguration }
+    func start(identity: SecIdentity, bindAddress: String = "127.0.0.1", allowedOrigin: String = "", port: UInt16) throws {
+        guard port > 0 else { throw GatewayError.invalidConfiguration }
         let octets = bindAddress.split(separator: ".", omittingEmptySubsequences: false)
         guard octets.count == 4,
               octets.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) && UInt8($0) != nil }),
@@ -85,7 +126,6 @@ final class RemoteGateway {
             listener?.cancel()
             connections.values.forEach { $0.cancel() }
             connections.removeAll()
-            secret = token
             boundPort = port
             boundAddress = bindAddress
             self.allowedOrigin = allowedOrigin
@@ -104,6 +144,14 @@ final class RemoteGateway {
         }
     }
 
+    /// Compatibility entry point for the local smoke fixture and existing
+    /// callers. The token is immediately converted into an ephemeral user.
+    func start(identity: SecIdentity, bindAddress: String = "127.0.0.1", allowedOrigin: String = "", port: UInt16, token: String) throws {
+        guard token.utf8.count >= 32 else { throw GatewayError.invalidConfiguration }
+        userRegistry.bindToken(token, to: userRegistry.user(forSubject: "token:\(token)"))
+        try start(identity: identity, bindAddress: bindAddress, allowedOrigin: allowedOrigin, port: port)
+    }
+
     func stop() {
         queue.sync { stopOnQueue(status: "Off") }
     }
@@ -113,7 +161,6 @@ final class RemoteGateway {
         listener = nil
         connections.values.forEach { $0.cancel() }
         connections.removeAll()
-        secret = ""
         boundPort = 0
         allowedOrigin = ""
         corsConnections.removeAll()
@@ -208,12 +255,27 @@ final class RemoteGateway {
             }
             guard auth.count == 1 else { self.send(connection, id: id, response: .error("unauthorized", code: 401)); return }
             let supplied = auth[0].dropFirst("Authorization:".count).trimmingCharacters(in: .whitespaces)
-            guard supplied.hasPrefix("Bearer "), constantTimeEqual(String(supplied.dropFirst(7)), secret) else {
+            guard supplied.hasPrefix("Bearer ") else {
                 self.send(connection, id: id, response: .error("unauthorized", code: 401)); return
             }
-            handle(.init(method: parsed.method, path: parsed.path, body: body)) { [weak self, weak connection] response in
+            let token = String(supplied.dropFirst(7))
+            guard let user = userRegistry.user(for: token) else {
+                self.send(connection, id: id, response: .error("unauthorized", code: 401)); return
+            }
+            let clientAddr = connection.endpoint.debugDescription
+            let request = RemoteRequest(method: parsed.method, path: parsed.path, body: body,
+                                        clientAddress: clientAddr, user: user)
+            let start = Date()
+            handle(request) { [weak self, weak connection] response in
+                let latency = Int(Date().timeIntervalSince(start) * 1000)
                 guard let self, let connection else { return }
-                self.queue.async { if self.connections[id] != nil { self.send(connection, id: id, response: response) } }
+                self.queue.async {
+                    if self.connections[id] != nil { self.send(connection, id: id, response: response) }
+                    let entry = RemoteAuditEntry(user: user, request: request, response: response,
+                                                 scope: response.scope, clientAddress: clientAddr,
+                                                 latencyMs: latency)
+                    self.userRegistry.record(entry)
+                }
             }
         }
     }
@@ -238,14 +300,6 @@ final class RemoteGateway {
             connection.cancel()
             self?.queue.async { self?.connections.removeValue(forKey: id); self?.corsConnections.remove(id) }
         })
-    }
-
-    private func constantTimeEqual(_ a: String, _ b: String) -> Bool {
-        let left = Array(a.utf8), right = Array(b.utf8)
-        guard left.count == right.count else { return false }
-        var difference: UInt8 = 0
-        for index in left.indices { difference |= left[index] ^ right[index] }
-        return difference == 0
     }
 
     private static func validOrigin(_ value: String) -> Bool {

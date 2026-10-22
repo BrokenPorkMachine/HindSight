@@ -66,9 +66,10 @@ import Foundation
 
     @MainActor static func response(_ jobs: RemoteAnalysisTransactions, _ method: String,
                                     _ path: String, body: Data = Data(),
-                                    project: ProjectSnapshot?, ready: Bool = true) async -> RemoteResponse {
+                                    project: ProjectSnapshot?, ready: Bool = true,
+                                    user: RemoteUser? = nil) async -> RemoteResponse {
         await withCheckedContinuation { continuation in
-            jobs.handle(.init(method: method, path: path, body: body), project: project, ready: ready) {
+            jobs.handle(.init(method: method, path: path, body: body, user: user), project: project, ready: ready) {
                 continuation.resume(returning: $0)
             }
         }
@@ -86,7 +87,9 @@ import Foundation
 
     @MainActor static func main() async throws {
         let fake = FakeCoordinator()
-        let jobs = RemoteAnalysisTransactions(backend: fake.backend)
+        // The protocol-mechanics instance has no registry on purpose, so the
+        // authorization path is exercised separately below.
+        let jobs = RemoteAnalysisTransactions(backend: fake.backend, userRegistry: nil)
         let source = try project()
         func check(_ condition: Bool, _ message: String) {
             precondition(condition, message)
@@ -94,6 +97,67 @@ import Foundation
 
         let capabilities = await response(jobs, "GET", "/v1/capabilities", project: nil)
         check(capabilities.code == 200 && capabilities.body.contains("analysis_jobs"), "capability contract")
+
+        // App-hosted transactions require an authenticated user with an exact
+        // project grant. The fixture-only transaction instance above omits a
+        // registry intentionally, so it can test protocol mechanics in
+        // isolation; this instance verifies the production authorization path.
+        let registry = RemoteUserRegistry()
+        let securedUser = registry.user(forSubject: "fixture-user")
+        // A separate coordinator keeps the authorization checks independent of
+        // the protocol-mechanics instance's submission counters.
+        let securedFake = FakeCoordinator()
+        let secured = RemoteAnalysisTransactions(backend: securedFake.backend, userRegistry: registry)
+        let deniedProject = await response(secured, "GET", "/v1/project", project: source, user: securedUser)
+        check(deniedProject.code == 403, "project access requires a grant")
+        let deniedSubmit = await response(secured, "POST", "/v1/jobs/analysis", body: try body(id: second), project: source, user: securedUser)
+        check(deniedSubmit.code == 403, "analysis submission requires a grant")
+        _ = registry.grant(userID: securedUser.id, projectPath: source.path, recordID: nil,
+                           capabilities: RemoteCapability.all, grantedBy: "fixture-admin")
+        let allowedProject = await response(secured, "GET", "/v1/project", project: source, user: securedUser)
+        check(allowedProject.code == 200, "project grant permits project snapshot")
+        check(allowedProject.scope?.projectPath == source.path, "project read reports its scope")
+        let otherUser = registry.user(forSubject: "fixture-other-user")
+        let otherDenied = await response(secured, "GET", "/v1/project", project: source, user: otherUser)
+        check(otherDenied.code == 403, "grants do not leak between users")
+
+        // A record-scoped grant covers that record and never the whole
+        // project, because a project-wide request would expose the records
+        // the grant does not name.
+        let recordUser = registry.user(forSubject: "fixture-record-user")
+        _ = registry.grant(userID: recordUser.id, projectPath: source.path, recordID: record,
+                           capabilities: RemoteCapability.all, grantedBy: "fixture-admin")
+        let recordProjectDenied = await response(secured, "GET", "/v1/project", project: source, user: recordUser)
+        check(recordProjectDenied.code == 403, "a record-scoped grant does not grant a project-wide read")
+        let recordSubmit = await response(secured, "POST", "/v1/jobs/analysis", body: try body(id: third),
+                                          project: source, user: recordUser)
+        check(recordSubmit.code == 202, "a record-scoped grant covers its own record")
+        check(recordSubmit.scope?.recordID == record && recordSubmit.scope?.requestID == third,
+              "a submission reports the record and request it acted on")
+
+        // A job belongs to the user that submitted it. Another user with a
+        // grant for the same project cannot poll it, read its result, cancel
+        // it, or even learn that it exists.
+        _ = registry.grant(userID: otherUser.id, projectPath: source.path, recordID: nil,
+                           capabilities: RemoteCapability.all, grantedBy: "fixture-admin")
+        let foreignPoll = await response(secured, "GET", "/v1/jobs/\(third)", project: source, user: otherUser)
+        check(foreignPoll.code == 404, "another user cannot poll a foreign job")
+        let foreignResult = await response(secured, "GET", "/v1/jobs/\(third)/result", project: source, user: otherUser)
+        check(foreignResult.code == 404, "another user cannot read a foreign result")
+        let foreignCancel = await response(secured, "DELETE", "/v1/jobs/\(third)", project: source, user: otherUser)
+        check(foreignCancel.code == 404, "another user cannot cancel a foreign job")
+        let ownerPoll = await response(secured, "GET", "/v1/jobs/\(third)", project: source, user: recordUser)
+        check(ownerPoll.code == 200, "the owner polls its own job")
+        // A request ID belongs to its first user, so a retry from another
+        // user is not answered with that job.
+        let foreignRetry = await response(secured, "POST", "/v1/jobs/analysis", body: try body(id: third),
+                                          project: source, user: otherUser)
+        check(foreignRetry.code == 404, "a request ID does not cross users")
+        let ownerCancel = await response(secured, "DELETE", "/v1/jobs/\(third)", project: source, user: recordUser)
+        check(ownerCancel.body.contains("true"), "the owner cancels its own job")
+        check(securedFake.cancellations == [third], "cancel routed to backend")
+        check(fake.submits.isEmpty, "the isolated instance still starts no work")
+
         let openAPI = await response(jobs, "GET", "/v1/openapi.json", project: nil)
         check(openAPI.code == 200 && openAPI.body.contains("\"openapi\":\"3.1.0\""), "OpenAPI endpoint")
         var parsedOpenAPI: [String: Any]?
@@ -116,6 +180,16 @@ import Foundation
         let resultGet = resultPath?["get"] as? [String: Any]
         check(analysisPost?["operationId"] as? String == "submitAnalysis" &&
               resultGet?["operationId"] as? String == "getAnalysisResult", "OpenAPI operation identifiers")
+        // Every route that can deny a caller documents the denial, so a
+        // client is never surprised by a response the contract omits.
+        let projectGet = (paths?["/project"] as? [String: Any])?["get"] as? [String: Any]
+        let jobGet = (paths?["/jobs/{job_id}"] as? [String: Any])?["get"] as? [String: Any]
+        let jobDelete = (paths?["/jobs/{job_id}"] as? [String: Any])?["delete"] as? [String: Any]
+        for (name, operation) in [("project", projectGet), ("analysis", analysisPost),
+                                  ("job", jobGet), ("cancel", jobDelete), ("result", resultGet)] {
+            let responses = operation?["responses"] as? [String: Any]
+            check(responses?["403"] != nil, "OpenAPI documents the 403 denial for \(name)")
+        }
         let components = parsedOpenAPI?["components"] as? [String: Any]
         let schemas = components?["schemas"] as? [String: Any]
         let jobState = schemas?["JobState"] as? [String: Any]

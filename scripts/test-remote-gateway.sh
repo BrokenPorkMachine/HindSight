@@ -17,7 +17,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$fixture_dir/key.pem" \
 openssl pkcs12 -export -inkey "$fixture_dir/key.pem" -in "$fixture_dir/cert.pem" \
   -out "$fixture_dir/identity.p12" -passout pass:test-password
 CLANG_MODULE_CACHE_PATH=/private/tmp/hindsight-remote-module-cache swiftc -emit-executable -o "$fixture_dir/smoke" \
-  "$project_root/App/RemoteGateway.swift" "$project_root/Tests/RemoteGatewaySmoke.swift"
+  "$project_root/App/RemoteUser.swift" "$project_root/App/RemoteGateway.swift" "$project_root/Tests/RemoteGatewaySmoke.swift"
 
 port="${HINDSIGHT_GATEWAY_TEST_PORT:-18449}"
 "$fixture_dir/smoke" "$fixture_dir/identity.p12" "$port" test-password >"$fixture_dir/server.log" 2>&1 &
