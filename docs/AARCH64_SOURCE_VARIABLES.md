@@ -32,6 +32,10 @@ AST reconstruction and canonical memory/FP/flags SSA remain open.
   twice. An `LDP` whose first destination overwrites its addressing base
   captures both accesses' original effective address in an instruction-scoped
   temporary before either load.
+- Memory partition provenance now survives proven 64-bit constant add/subtract
+  from a global or frame pointer. A 32-bit pointer view, dynamic index,
+  pointer-plus-pointer expression, or unsupported arithmetic clears the
+  provenance rather than narrowing an access to a possibly wrong partition.
 
 Analysis requires complete aligned function bytes, at most 128 instructions,
 32 seeds and 64 saved identity slots. The identity fixed point has a 32,768-step

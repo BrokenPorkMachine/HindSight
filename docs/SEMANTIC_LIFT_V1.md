@@ -61,7 +61,7 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v89-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v91-schema122`; the report fields
 and cache-envelope schema are unchanged.
 
 The [source-parameter identity pass](AARCH64_SOURCE_VARIABLES.md) now uses

@@ -461,9 +461,8 @@ enum IrVectorBitwiseOperator {
 /// at that width (with wraparound), carrying no floating-point rounding or
 /// exception behavior. `Q` selects the 128-bit (`Q`) or 64-bit (`D`) view;
 /// the element size comes from `size` (0 = 8-bit, 1 = 16-bit, 2 = 32-bit,
-/// 3 = 64-bit lanes). Like bitwise, a `Q=0` encoding writes only the low 64
-/// bits, so the destination V-register constant is invalidated rather than
-/// partially updated.
+/// 3 = 64-bit lanes). A `Q=0` encoding zeroes the upper 64 bits; this IR does
+/// not retain lane size, so lane-wise arithmetic is not constant-folded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IrVectorArithmeticOperator {
     /// `Vd = Vn + Vm` (`ADD`).
@@ -614,7 +613,7 @@ enum IrOperation {
     SimdStore { source: IrSimdRegister, address: IrMemoryAddress, writeback: Option<IrWriteback> },
     /// Lane-wise vector bitwise operation. Registers carry the architectural
     /// width: `Quad` for the 128-bit `Q` form and `Double` for the 64-bit `D`
-    /// form, because a `Q=0` encoding writes only the low 64 bits.
+    /// form, because a `Q=0` encoding zeroes the upper 64 bits.
     VectorBitwise { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorBitwiseOperator },
     /// Lane-wise vector floating-point three-same binary operation. Registers
     /// carry the architectural width (`Quad`/`Double`); element size (single or
@@ -1607,21 +1606,16 @@ impl IrOperation {
                 let right_value = flow.read_v(right.index as u32);
                 // The destination is also an input for the mask-driven forms.
                 let destination_value = flow.read_v(destination.index as u32);
-                // `Q=0` writes only the low 64 bits and preserves the rest of the
-                // register. Value tracking holds one known bit pattern per
-                // register, so a partial write cannot be represented exactly;
-                // the destination becomes unknown instead of claiming a value.
-                let full_register = destination.width == IrSimdWidth::Quad;
+                // Q=0 results are zero-extended into the full architectural
+                // register, so one 128-bit value is enough to represent them.
+                let width_mask = if destination.width == IrSimdWidth::Quad { u128::MAX } else { u64::MAX as u128 };
                 // Provenance uses the same bounded combination as every other
                 // fold, so an over-budget proof claims no constant at all.
                 let fold = |value: u128, operands: &[&VKnownValue]| {
                     let rest: Vec<u64> = operands[1..].iter().flat_map(|operand| operand.origins.iter().copied()).collect();
-                    combine_origins(&operands[0].origins, &rest, pc).map(|origins| VKnownValue { value, origins })
+                    combine_origins(&operands[0].origins, &rest, pc).map(|origins| VKnownValue { value: value & width_mask, origins })
                 };
-                let known = if !full_register {
-                    None
-                } else {
-                    match operator {
+                let known = match operator {
                         IrVectorBitwiseOperator::Move => left_value.as_ref().and_then(|left| fold(left.value, &[left])),
                         IrVectorBitwiseOperator::And => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value & right.value, &[left, right])),
                         IrVectorBitwiseOperator::Or => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value | right.value, &[left, right])),
@@ -1636,7 +1630,6 @@ impl IrOperation {
                             .and_then(|((left, right), destination)| fold((destination.value & !right.value) | (left.value & right.value), &[left, right, destination])),
                         IrVectorBitwiseOperator::BitInsertIfFalse => left_value.as_ref().zip(right_value.as_ref()).zip(destination_value.as_ref())
                             .and_then(|((left, right), destination)| fold((destination.value & right.value) | (left.value & !right.value), &[left, right, destination])),
-                    }
                 };
                 flow.write_v(destination.index as u32, known.clone());
                 let destination_name = simd_register_name(destination);
@@ -1657,22 +1650,10 @@ impl IrOperation {
                 Some(format!("{destination_name} = {expression};{evidence}"))
             }
             Self::VectorArithmetic { destination, left, right, operator } => {
-                let left_value = flow.read_v(left.index as u32);
-                let right_value = flow.read_v(right.index as u32);
-                let full_register = destination.width == IrSimdWidth::Quad;
-                let fold = |value: u128, operands: &[&VKnownValue]| {
-                    let rest: Vec<u64> = operands[1..].iter().flat_map(|operand| operand.origins.iter().copied()).collect();
-                    combine_origins(&operands[0].origins, &rest, pc).map(|origins| VKnownValue { value, origins })
-                };
-                let known = if !full_register {
-                    None
-                } else {
-                    match operator {
-                        IrVectorArithmeticOperator::Add => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value.wrapping_add(right.value), &[left, right])),
-                        IrVectorArithmeticOperator::Subtract => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value.wrapping_sub(right.value), &[left, right])),
-                        IrVectorArithmeticOperator::Multiply => left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| fold(left.value.wrapping_mul(right.value), &[left, right])),
-                    }
-                };
+                // The IR does not retain the lane element size. Whole-u128
+                // arithmetic would allow carries across lane boundaries, so
+                // no lane-wise integer result is constant-folded here.
+                let known = None;
                 flow.write_v(destination.index as u32, known.clone());
                 let destination_name = simd_register_name(destination);
                 let left_name = simd_register_name(left);
@@ -1686,43 +1667,9 @@ impl IrOperation {
                 Some(format!("{destination_name} = {expression};{evidence}"))
             }
             Self::VectorFloatBinary { destination, left, right, operator } => {
-                let left_value = flow.read_v(left.index as u32);
-                let right_value = flow.read_v(right.index as u32);
-                let full_register = destination.width == IrSimdWidth::Quad;
-                let is_single = left.width == IrSimdWidth::Single;
-                let fold = |value: u128, operands: &[&VKnownValue]| {
-                    let rest: Vec<u64> = operands[1..].iter().flat_map(|operand| operand.origins.iter().copied()).collect();
-                    combine_origins(&operands[0].origins, &rest, pc).map(|origins| VKnownValue { value, origins })
-                };
-                let known = if !full_register {
-                    None
-                } else {
-                    let lanes = if is_single { 4u32 } else { 2u32 };
-                    left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| {
-                        let mut result = 0u128;
-                        for lane in 0..lanes {
-                            let shift = lane * if is_single { 32 } else { 64 };
-                            let mask = if is_single { 0xffff_ffffu128 } else { u128::MAX };
-                            let l_bits = ((left.value >> shift) & mask) as u64;
-                            let r_bits = ((right.value >> shift) & mask) as u64;
-                            let l_val = if is_single { f32::from_bits(l_bits as u32) as f64 } else { f64::from_bits(l_bits) };
-                            let r_val = if is_single { f32::from_bits(r_bits as u32) as f64 } else { f64::from_bits(r_bits) };
-                            let out = match operator {
-                                IrVectorFloatBinaryOperator::Add => l_val + r_val,
-                                IrVectorFloatBinaryOperator::Subtract => l_val - r_val,
-                                IrVectorFloatBinaryOperator::Multiply => l_val * r_val,
-                                IrVectorFloatBinaryOperator::Divide => l_val / r_val,
-                                IrVectorFloatBinaryOperator::Max => f64::max(l_val, r_val),
-                                IrVectorFloatBinaryOperator::Min => f64::min(l_val, r_val),
-                                IrVectorFloatBinaryOperator::MaxNum => l_val.max(r_val),
-                                IrVectorFloatBinaryOperator::MinNum => l_val.min(r_val),
-                            };
-                            let out_bits = if is_single { (out as f32).to_bits() as u64 } else { out.to_bits() };
-                            result |= (out_bits as u128) << shift;
-                        }
-                        fold(result, &[left, right])
-                    })
-                };
+                // This IR variant does not preserve the element size, so a
+                // whole-register f64 fold would be wrong for .4s operations.
+                let known = None;
                 flow.write_v(destination.index as u32, known.clone());
                 let destination_name = simd_register_name(destination);
                 let left_name = simd_register_name(left);
@@ -7836,10 +7783,10 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
         let predecessor_count = block.predecessors.iter().filter(|&&pred| blocks[pred].reachable).count();
         let needs_phi = predecessor_count > 1 || (index == 0 && predecessor_count > 0);
         if needs_phi {
-            for slot in 0..PARTITION_COUNT {
+            for (slot, version) in phi_versions[index].iter_mut().enumerate() {
                 // Reserve the high-bit namespace for merge values; ordinary
                 // write versions remain small, per-partition counters.
-                phi_versions[index][slot] = Some(
+                *version = Some(
                     0x8000_0000 | (index as u32 * PARTITION_COUNT as u32 + slot as u32 + 1),
                 );
             }
@@ -8689,8 +8636,8 @@ pub fn render(
                     format!("{}:m{value}", predecessor.map(|index| format!("B{index}"))
                         .unwrap_or_else(|| "entry".into()))
                 }).collect::<Vec<_>>().join(", ");
-                ssa_budget.emit(&mut out, &format!("  // ssa-mem {} = phi({incoming}) partition={}\n",
-                    format!("m{}", phi.version), phi.partition.name()));
+                ssa_budget.emit(&mut out, &format!("  // ssa-mem m{} = phi({incoming}) partition={}\n",
+                    phi.version, phi.partition.name()));
             }
             for phi in &ssa.phis[bi] {
                 let incoming = phi.incoming.iter().map(|(predecessor, value)| format!("{}:{}", predecessor.map(|index| format!("B{index}")).unwrap_or_else(|| "entry".into()), value.name())).collect::<Vec<_>>().join(", ");
@@ -10793,16 +10740,17 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_vector_write_keeps_the_identity_of_the_preserved_half() {
-        // movi v0.2d, #0 ; fadd d0, d1, d2
-        // The second instruction writes the low 64 bits of v0 and preserves
-        // the upper half, so the published value must name both identities
-        // instead of discarding the preserved half.
-        let words = [0x6f00_e400u32, 0x1e62_2820];
+    fn a_64_bit_vector_write_clears_the_upper_half_of_the_register() {
+        // movi v0.2d, #0 ; add v0.8b, v1.8b, v2.8b
+        // A 64-bit vector form writes the low eight bytes and zeroes the
+        // upper half, so the published value covers the whole register
+        // instead of keeping the identity of the upper half. The
+        // measurement is recorded in docs/AARCH64_SCALAR_FP_EFFECTS.md.
+        let words = [0x6f00_e400u32, 0x0e02_8020];
         let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report.contains("ssa-vector-values 0x1004"), "{report}");
-        assert!(report.contains("v0[0..8)@0x1004+[8..16)@0x1000"), "{report}");
+        assert!(report.contains("defs=[v0[0..16)@0x1004]"), "{report}");
     }
 
     #[test]
@@ -11660,13 +11608,14 @@ mod vector_bitwise_tests {
     }
 
     #[test]
-    fn low_64_bit_forms_do_not_claim_a_full_vector_constant() {
+    fn low_64_bit_bitwise_form_tracks_its_zero_extended_result() {
         let mut flow = Flow::new();
         flow.write_v(3, Some(VKnownValue { value: u128::MAX, origins: vec![0xfe0] }));
         flow.write_v(4, Some(VKnownValue { value: 1, origins: vec![0xfe4] }));
         flow.write_v(5, Some(VKnownValue { value: 2, origins: vec![0xfe8] }));
         lift_operation(decode(0x0e65_1c83, 0x1000), 0x1000).render(&mut flow, 0x1000);
-        assert!(flow.read_v(3).is_none());
+        let result = flow.read_v(3).expect("Q=0 bitwise result is fully known");
+        assert_eq!(result.value >> 64, 0, "upper bits are architecturally zero");
         assert!(flow.read_v(4).is_some() && flow.read_v(5).is_some());
     }
 }
@@ -11711,14 +11660,12 @@ mod vector_arithmetic_tests {
     }
 
     #[test]
-    fn proven_constants_fold_with_wraparound() {
+    fn lane_wise_arithmetic_does_not_fold_as_one_wide_integer() {
         let mut flow = Flow::new();
         flow.write_v(1, Some(VKnownValue { value: 10, origins: vec![0xfe0] }));
         flow.write_v(2, Some(VKnownValue { value: 3, origins: vec![0xfe4] }));
         lift_operation(decode(0x4ea28420, 0x1000), 0x1000).render(&mut flow, 0x1000);
-        let result = flow.read_v(0).expect("proven vector result");
-        assert_eq!(result.value, 13);
-        assert_eq!(result.origins, vec![0xfe0, 0xfe4, 0x1000]);
+        assert!(flow.read_v(0).is_none(), "the IR omits element size and cannot prove lane-wise arithmetic");
     }
 }
 

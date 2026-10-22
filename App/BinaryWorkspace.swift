@@ -514,6 +514,14 @@ struct VGBinaryWorkspace: View {
                             VStack(alignment: .leading) {
                                 Text("\(node.kind) · \(node.provenance) · \(node.id.suffix(12))").font(.caption.monospaced())
                                 Text(node.description).font(.caption.monospaced()).textSelection(.enabled)
+                                ForEach(node.ranges, id: \.self) { span in
+                                    Button {
+                                        selectAddress(span.start)
+                                    } label: {
+                                        Text("Evidence bytes 0x\(String(span.start, radix: 16))..<0x\(String(span.end, radix: 16))")
+                                            .font(.caption.monospaced())
+                                    }.buttonStyle(.link)
+                                }
                             }
                         }
                     }

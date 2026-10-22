@@ -9,9 +9,9 @@
 //!
 //! * a flag write is *partial*. `ANDS` writes `N` and `Z` and leaves `C` and
 //!   `V` alone, so a consumer must not discard the carry it did not write.
-//! * a vector write is *partial*. A `D` form writes the low 64 bits of a
-//!   128-bit register and preserves the upper half, so a consumer must not
-//!   treat a narrow write as replacing the whole register.
+//! * narrow scalar and Q=0 SIMD results zero-extend into the whole 128-bit
+//!   register. Partial vector definitions are still needed for ABI call
+//!   clobbers: `v8`-`v15` preserve their bottom 64 bits.
 
 use super::*;
 
@@ -55,9 +55,9 @@ impl FlagEffects {
 
 /// One byte range of a vector register that an instruction reads or writes.
 ///
-/// A vector access is partial: a `D` form covers the low 64 bits of a
-/// 128-bit register and preserves the upper half, so the range names the
-/// bytes the access really covers.
+/// A vector access range names the bytes whose value identity is read or
+/// defined. Narrow scalar/Q=0 writes define all 16 bytes because the upper
+/// bits are zero; ABI clobbers can still define only a subrange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct VectorRange {
     /// The vector register.
@@ -262,11 +262,11 @@ pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> Vec
     };
     match instruction.portable {
         IrOperation::SimdLoad { destination, .. } => {
-            write(&mut effects, VectorRange::low(destination.index, destination.width.bytes()));
+            write(&mut effects, VectorRange::low(destination.index, 16));
         }
         IrOperation::SimdPairLoad { first, second, .. } => {
-            write(&mut effects, VectorRange::low(first.index, first.width.bytes()));
-            write(&mut effects, VectorRange::low(second.index, second.width.bytes()));
+            write(&mut effects, VectorRange::low(first.index, 16));
+            write(&mut effects, VectorRange::low(second.index, 16));
         }
         // A store reads the value it stores.
         IrOperation::SimdStore { source, .. } => {
@@ -277,7 +277,7 @@ pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> Vec
             read(&mut effects, VectorRange::low(second.index, second.width.bytes()));
         }
         IrOperation::VectorBitwise { destination, left, right, operator } => {
-            write(&mut effects, VectorRange::low(destination.index, destination.width.bytes()));
+            write(&mut effects, VectorRange::low(destination.index, 16));
             read(&mut effects, VectorRange::low(left.index, left.width.bytes()));
             read(&mut effects, VectorRange::low(right.index, right.width.bytes()));
             // The bit-insert forms also read the destination: `BSL`, `BIT` and
@@ -292,12 +292,12 @@ pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> Vec
         IrOperation::VectorFloatBinary { destination, left, right, .. }
         | IrOperation::VectorHalfBinary { destination, left, right, .. }
         | IrOperation::VectorArithmetic { destination, left, right, .. } => {
-            write(&mut effects, VectorRange::low(destination.index, destination.width.bytes()));
+            write(&mut effects, VectorRange::low(destination.index, 16));
             read(&mut effects, VectorRange::low(left.index, left.width.bytes()));
             read(&mut effects, VectorRange::low(right.index, right.width.bytes()));
         }
         IrOperation::VectorFloatUnary { destination, source, .. } => {
-            write(&mut effects, VectorRange::low(destination.index, destination.width.bytes()));
+            write(&mut effects, VectorRange::low(destination.index, 16));
             read(&mut effects, VectorRange::low(source.index, source.width.bytes()));
         }
         IrOperation::VectorImmediate { destination, .. } => {
@@ -390,8 +390,8 @@ pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> Vec
 }
 
 /// Sort and coalesce overlapping or adjacent ranges within a register.
-/// Several scalar FP operations have both a full-register merge dependency
-/// and a low-lane operand; one normalized range avoids duplicate SSA uses.
+/// Coalesce overlapping or adjacent byte ranges before they become SSA
+/// records, keeping each register-file use/definition unique and bounded.
 fn normalize_vector_ranges(mut ranges: Vec<VectorRange>) -> Vec<VectorRange> {
     ranges.sort_by_key(|range| (range.register, range.offset));
     let mut normalized: Vec<VectorRange> = Vec::with_capacity(ranges.len());
@@ -522,9 +522,9 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_vector_write_preserves_the_rest_of_the_register() {
-        // The `D` form writes only the low 64 bits of the register, so the
-        // published range must say so rather than claim the whole register.
+    fn a_64_bit_vector_write_zeros_the_rest_of_the_register() {
+        // Q=0 vector forms write 64 result bits and zero bits 64..128.
+        // The source dependencies remain limited to the low 64 bits.
         let mut instruction = instruction(0x4ea2_1c20);
         instruction.portable = IrOperation::VectorBitwise {
             destination: IrSimdRegister { index: 3, width: IrSimdWidth::Double },
@@ -533,8 +533,34 @@ mod tests {
             operator: IrVectorBitwiseOperator::Or,
         };
         let effects = instruction_vector_effects(&instruction);
-        assert_eq!(effects.writes, vec![VectorRange::low(3, 8)], "{effects:?}");
+        assert_eq!(effects.writes, vec![VectorRange::low(3, 16)], "{effects:?}");
         assert_eq!(effects.reads, vec![VectorRange::low(4, 8), VectorRange::low(5, 8)], "{effects:?}");
+    }
+
+    #[test]
+    fn narrow_simd_loads_define_zero_extended_full_registers() {
+        let address = IrMemoryAddress::BaseOffset {
+            base: IrRegister { class: IrRegisterClass::General, index: 1, bits: 64 },
+            offset: 0,
+        };
+        let mut single = instruction(0xfd00_0000);
+        single.portable = IrOperation::SimdLoad {
+            destination: IrSimdRegister { index: 3, width: IrSimdWidth::Double },
+            address,
+            writeback: None,
+        };
+        assert_eq!(instruction_vector_effects(&single).writes, vec![VectorRange::low(3, 16)]);
+
+        let mut pair = instruction(0xad00_0000);
+        pair.portable = IrOperation::SimdPairLoad {
+            first: IrSimdRegister { index: 4, width: IrSimdWidth::Single },
+            second: IrSimdRegister { index: 5, width: IrSimdWidth::Single },
+            address,
+            bytes: 8,
+            writeback: None,
+        };
+        assert_eq!(instruction_vector_effects(&pair).writes,
+                   vec![VectorRange::low(4, 16), VectorRange::low(5, 16)]);
     }
 
     #[test]
@@ -546,14 +572,17 @@ mod tests {
     }
 
     #[test]
-    fn scalar_float_arithmetic_tracks_fpcr_merge_and_partial_write() {
+    fn scalar_float_arithmetic_writes_the_whole_destination_register() {
         // fadd d0, d1, d2 = 0x1e622820
-        // Scalar double-precision writes the low 64 bits (D register),
-        // preserving the upper 64 bits. The FPCR merge mode is not modeled
-        // here; the conservative claim is a partial write.
+        // The measurement in docs/AARCH64_SCALAR_FP_EFFECTS.md shows that a
+        // scalar floating-point write covers the whole 128-bit destination and
+        // leaves the bits above the lane zero. The write is therefore not a
+        // partial write that preserves the rest of the register, and no
+        // operand other than the two source lanes contributes.
         let effects = instruction_vector_effects(&instruction(0x1e62_2820));
-        assert_eq!(effects.writes, vec![VectorRange::float(0, IrFloatPrecision::Double)], "{effects:?}");
-        assert_eq!(effects.reads, vec![VectorRange::float(1, IrFloatPrecision::Double), VectorRange::float(2, IrFloatPrecision::Double)], "{effects:?}");
+        assert_eq!(effects.writes, vec![VectorRange::low(0, 16)], "{effects:?}");
+        assert_eq!(effects.reads, vec![VectorRange::float(1, IrFloatPrecision::Double),
+                                       VectorRange::float(2, IrFloatPrecision::Double)], "{effects:?}");
     }
 
     #[test]
@@ -611,7 +640,8 @@ mod tests {
         // A vector write names the byte range it covers, so a consumer can
         // tell a whole-register write from a narrow one.
         assert!(report.contains("// ssa-vector 0x100c writes=[v0[0..16)] reads=[v1[0..16),v2[0..16)]"), "{report}");
-        // `FADD D0, D1, D2` writes the low 64 bits of v0, preserving the upper half.
-        assert!(report.contains("// ssa-vector 0x1010 writes=[v0[0..8)] reads=[v1[0..8),v2[0..8)]"), "{report}");
+        // `FADD D0, D1, D2` writes the whole destination register and leaves
+        // the bits above the lane zero, so the write is not a narrow one.
+        assert!(report.contains("// ssa-vector 0x1010 writes=[v0[0..16)] reads=[v1[0..8),v2[0..8)]"), "{report}");
     }
 }

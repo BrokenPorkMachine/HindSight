@@ -103,6 +103,8 @@
         "kind": {
           "enum": [
             "bytes", "decode", "ir-operation", "definition", "use", "phi",
+            "file-definition", "file-use", "file-phi",
+            "memory-definition", "memory-use", "memory-phi",
             "memory-object", "memory-effect", "cfg-block", "cfg-edge", "call",
             "symbol", "metadata", "type", "variable", "hypothesis", "ast-node",
             "validation-run", "analyst-override", "unsupported-effect", "budget-event"
@@ -130,6 +132,7 @@
             "contains", "decodes-to", "lifts-to", "defines", "uses", "flows-to",
             "controls", "calls", "reads", "writes", "aliases", "types",
             "supports", "contradicts", "assumes", "invalidates", "derives",
+            "merges-memory", "defines-memory", "uses-memory",
             "renders-as", "validates", "alternative-to", "overrides"
           ]
         },

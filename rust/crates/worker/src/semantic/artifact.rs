@@ -1253,6 +1253,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         cfg: FunctionCfg { blocks },
     };
     let ssa = build_ssa(&function);
+    let file_ssa = super::file_ssa::build_file_ssa(&function);
     let mut block_ids = Vec::new();
     for (index, block) in function.cfg.blocks.iter().enumerate() {
         let id = builder.record(
@@ -1383,6 +1384,195 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     id
                 };
                 builder.edge(&id, &phi_id, "flows-to")?;
+            }
+        }
+    }
+    // Memory partition versions share the derivation graph with register
+    // values. Entry definitions seed each partition; write definitions and
+    // CFG phis feed explicit memory-use records at the instruction that reads
+    // them. This keeps branch-local writes from appearing as dependencies in
+    // another path and makes alias-wide dependencies navigable in the app.
+    let partitions = MemoryPartition::all();
+    let mut memory_definitions = BTreeMap::<(MemoryPartition, u32), String>::new();
+    for partition in partitions {
+        let id = builder.record("memory-definition", "derived", object([
+            ("partition", partition.name().into()),
+            ("version", 0u64.into()),
+            ("origin", "entry".into()),
+        ]), array([]))?;
+        memory_definitions.insert((partition, 0), id);
+    }
+    for phi in &ssa.memory_phis {
+        let id = builder.record("memory-phi", "derived", object([
+            ("partition", phi.partition.name().into()),
+            ("version", u64::from(phi.version).into()),
+            ("incoming", array(phi.incoming.iter().map(|(predecessor, version)| object([
+                ("predecessor", predecessor.map(|index| (index as u64).into()).unwrap_or(V::Null)),
+                ("version", u64::from(*version).into()),
+            ])))),
+        ]), ranges(function.cfg.blocks[phi.block].start, function.cfg.blocks[phi.block].start + 4))?;
+        builder.edge(&block_ids[phi.block], &id, "merges-memory")?;
+        memory_definitions.insert((phi.partition, phi.version), id);
+    }
+    for version in &ssa.memory_versions {
+        if let Some(written) = version.written_version {
+            let id = builder.record("memory-definition", "derived", object([
+                ("partition", version.partition.name().into()),
+                ("version", u64::from(written).into()),
+                ("origin", "instruction".into()),
+            ]), ranges(version.pc, version.pc + 4))?;
+            builder.edge(&ir_ids[((version.pc - start) / 4) as usize], &id, "defines-memory")?;
+            memory_definitions.insert((version.partition, written), id);
+        }
+    }
+    for phi in &ssa.memory_phis {
+        let phi_id = memory_definitions[&(phi.partition, phi.version)].clone();
+        for (_, incoming) in &phi.incoming {
+            let definition = memory_definitions.get(&(phi.partition, *incoming))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing memory-phi input definition"))?;
+            builder.edge(definition, &phi_id, "flows-to")?;
+        }
+    }
+    for version in &ssa.memory_versions {
+        if !version.read { continue; }
+        let definition = memory_definitions.get(&(version.partition, version.read_version))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing reaching memory definition"))?;
+        let id = builder.record("memory-use", "derived", object([
+            ("partition", version.partition.name().into()),
+            ("version", u64::from(version.read_version).into()),
+            ("ordered", version.ordered.into()),
+            ("exclusive", version.exclusive.into()),
+        ]), ranges(version.pc, version.pc + 4))?;
+        builder.edge(definition, &id, "flows-to")?;
+        builder.edge(&id, &ir_ids[((version.pc - start) / 4) as usize], "uses-memory")?;
+    }
+    // NZCV and SIMD values are part of the derivation graph as structured
+    // records too. The preview's comments are presentation only; these nodes
+    // keep value origins and partial vector ranges available to clients.
+    use super::file_ssa::{FileLocation, FileValue};
+    let location_name = |location: FileLocation| -> String {
+        match location {
+            FileLocation::Flag(bit) => format!("nzcv.{}", super::files::flag_bit_name(bit)),
+            FileLocation::Vector(register) => format!("v{register}"),
+        }
+    };
+    let mut file_origins = BTreeMap::<(FileLocation, SsaOrigin), Vec<(u8, u8)>>::new();
+    let mut collect_file_value = |location: FileLocation, value: &FileValue| {
+        for segment in &value.segments {
+            let ranges = file_origins.entry((location, segment.origin)).or_default();
+            if !ranges.contains(&(segment.offset, segment.bytes)) {
+                ranges.push((segment.offset, segment.bytes));
+            }
+        }
+    };
+    for site in file_ssa.flags.values() {
+        for (bit, value) in &site.defs { collect_file_value(FileLocation::Flag(*bit), value); }
+        for (bit, value) in &site.uses { collect_file_value(FileLocation::Flag(*bit), value); }
+    }
+    for site in file_ssa.vectors.values() {
+        for (register, value) in &site.defs { collect_file_value(FileLocation::Vector(*register), value); }
+        for (register, value) in &site.uses { collect_file_value(FileLocation::Vector(*register), value); }
+    }
+    for phis in &file_ssa.phis {
+        for phi in phis {
+            collect_file_value(phi.location, &phi.value);
+            for (_, value) in &phi.incoming { collect_file_value(phi.location, value); }
+        }
+    }
+    let mut file_definitions = BTreeMap::<(FileLocation, SsaOrigin), String>::new();
+    for ((location, origin), byte_ranges) in file_origins {
+        let evidence_range = match origin {
+            SsaOrigin::Instruction(pc) | SsaOrigin::Barrier(pc) => (pc, pc.saturating_add(4)),
+            SsaOrigin::Phi(block) => function.cfg.blocks.get(block)
+                .map(|block| (block.start, block.start.saturating_add(4)))
+                .unwrap_or((start, start.saturating_add(4))),
+            SsaOrigin::Entry => (start, start.saturating_add(4)),
+        };
+        let id = builder.record(
+            "file-definition",
+            "derived",
+            object([
+                ("location", location_name(location).into()),
+                ("origin", super::file_ssa::origin_name(origin).into()),
+                ("origin_kind", super::file_ssa::origin_kind(origin).into()),
+                ("byte_ranges", array(byte_ranges.into_iter().map(|(offset, bytes)| object([
+                    ("offset", offset.into()), ("bytes", bytes.into()),
+                ])))),
+            ]),
+            ranges(evidence_range.0, evidence_range.1),
+        )?;
+        file_definitions.insert((location, origin), id);
+    }
+    for (&pc, site) in &file_ssa.flags {
+        for (bit, value) in &site.uses {
+            let use_id = builder.record("file-use", "derived", object([
+                ("location", location_name(FileLocation::Flag(*bit)).into()),
+                ("value", value.name(FileLocation::Flag(*bit)).into()),
+            ]), ranges(pc, pc + 4))?;
+            for segment in &value.segments {
+                if let Some(definition) = file_definitions.get(&(FileLocation::Flag(*bit), segment.origin)) {
+                    builder.edge(definition, &use_id, "flows-to")?;
+                }
+            }
+            builder.edge(&use_id, &ir_ids[((pc - start) / 4) as usize], "uses")?;
+        }
+        for (bit, value) in &site.defs {
+            for segment in &value.segments {
+                if let Some(definition) = file_definitions.get(&(FileLocation::Flag(*bit), segment.origin)) {
+                    builder.edge(&ir_ids[((pc - start) / 4) as usize], definition, "defines")?;
+                }
+            }
+        }
+    }
+    for (&pc, site) in &file_ssa.vectors {
+        for (register, value) in &site.uses {
+            let location = FileLocation::Vector(*register);
+            let use_id = builder.record("file-use", "derived", object([
+                ("location", location_name(location).into()),
+                ("value", value.name(location).into()),
+                ("byte_ranges", array(value.segments.iter().map(|segment| object([
+                    ("offset", segment.offset.into()), ("bytes", segment.bytes.into()),
+                ])))),
+            ]), ranges(pc, pc + 4))?;
+            for segment in &value.segments {
+                if let Some(definition) = file_definitions.get(&(location, segment.origin)) {
+                    builder.edge(definition, &use_id, "flows-to")?;
+                }
+            }
+            builder.edge(&use_id, &ir_ids[((pc - start) / 4) as usize], "uses")?;
+        }
+        for (register, value) in &site.defs {
+            let location = FileLocation::Vector(*register);
+            for segment in &value.segments {
+                if let Some(definition) = file_definitions.get(&(location, segment.origin)) {
+                    if matches!(segment.origin, SsaOrigin::Instruction(origin_pc) if origin_pc == pc)
+                        || matches!(segment.origin, SsaOrigin::Barrier(origin_pc) if origin_pc == pc) {
+                        builder.edge(&ir_ids[((pc - start) / 4) as usize], definition, "defines")?;
+                    }
+                }
+            }
+        }
+    }
+    for (block_index, phis) in file_ssa.phis.iter().enumerate() {
+        for phi in phis {
+            let phi_id = builder.record("file-phi", "derived", object([
+                ("location", location_name(phi.location).into()),
+                ("value", phi.value.name(phi.location).into()),
+                ("incoming", array(phi.incoming.iter().map(|(predecessor, value)| object([
+                    ("predecessor", predecessor.map(|index| (index as u64).into()).unwrap_or(V::Null)),
+                    ("value", value.name(phi.location).into()),
+                ])))),
+            ]), ranges(function.cfg.blocks[block_index].start, function.cfg.blocks[block_index].start + 4))?;
+            for (_, incoming) in &phi.incoming {
+                for segment in &incoming.segments {
+                    if let Some(definition) = file_definitions.get(&(phi.location, segment.origin)) {
+                        builder.edge(definition, &phi_id, "flows-to")?;
+                    }
+                }
+            }
+            if let Some(definition) = file_definitions.get(&(phi.location,
+                phi.value.segments.first().map(|segment| segment.origin).unwrap_or(SsaOrigin::Entry))) {
+                builder.edge(&phi_id, definition, "defines")?;
             }
         }
     }
