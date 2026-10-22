@@ -1565,7 +1565,8 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  let facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
- let native=super::reconstruction::NativeEvidence{symbols:facts.symbols.clone(),objc_classes:facts.objc_classes.clone(),objc_layouts:facts.objc_layouts.clone(),objc_function_names:facts.objc_function_names.clone(),export_trie:facts.export_trie.clone(),export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
+ let export_names=export_function_names(&facts.export_trie,&window,&facts.starts,map.address+code.len() as u64);
+ let native=super::reconstruction::NativeEvidence{symbols:facts.symbols.clone(),objc_layouts:facts.objc_layouts.clone(),objc_function_names:facts.objc_function_names.clone(),export_names,export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
  let index=facts.starts.binary_search(&start).map_err(|_|invalid("Start is not an admitted function boundary"))?;
  if index+1==facts.starts.len()&&(code.len() as u64)<map.bytes{return Err(invalid("Final function bound is outside the code scan budget"));}
  let canonical_end=facts.starts.get(index+1).copied().unwrap_or(map.address+map.bytes);
@@ -1600,16 +1601,6 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
  let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
- let native = super::reconstruction::NativeEvidence {
-     symbols: symbols.clone(),
-     objc_classes: objc_classes.clone(),
-     objc_layouts: objc_layouts.clone(),
-     objc_function_names: objc_function_names.clone(),
-     export_trie: export_trie.clone(),
-     export_starts: export_starts.clone(),
-     lc_function_starts: lc_function_starts.clone(),
-     unwind_starts: unwind_starts.clone(),
- };
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
  for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
  for address in &unwind_starts{boundary_sources.entry(*address).or_default().insert("__unwind_info");}

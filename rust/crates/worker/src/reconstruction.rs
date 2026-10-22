@@ -1,7 +1,7 @@
 //! Versioned reconstruction records. No dependency on report/pseudocode parsing.
 use std::{collections::BTreeMap, io};
 
-pub const PASS: &str = "arm64-reconstruction-9";
+pub const PASS: &str = "arm64-reconstruction-12";
 pub const ENGINE: &str = "arm64-analysis-v93-schema122";
 
 /// Native type/image evidence collected from the target runtime.
@@ -9,14 +9,12 @@ pub const ENGINE: &str = "arm64-analysis-v93-schema122";
 pub struct NativeEvidence {
     /// Symbol names from nlist/dyld exports.
     pub symbols: Vec<(u64, String)>,
-    /// Objective-C class graph data (JSON-serialized).
-    pub objc_classes: String,
     /// Objective-C class layouts with ivars/properties/methods.
     pub objc_layouts: Vec<crate::objc::ClassLayout>,
     /// Objective-C IMP function names.
     pub objc_function_names: std::collections::BTreeMap<u64, String>,
-    /// Export trie records (JSON-serialized).
-    pub export_trie: String,
+    /// Exact exported function names keyed by admitted function address.
+    pub export_names: std::collections::BTreeMap<u64, String>,
     /// Export function starts.
     pub export_starts: Vec<u64>,
     /// LC_FUNCTION_STARTS function starts.
@@ -27,7 +25,7 @@ pub struct NativeEvidence {
 
 impl Default for NativeEvidence {
     fn default() -> Self {
-        Self { symbols: Vec::new(), objc_classes: String::new(), objc_layouts: Vec::new(), objc_function_names: std::collections::BTreeMap::new(), export_trie: String::new(), export_starts: Vec::new(), lc_function_starts: Vec::new(), unwind_starts: Vec::new() }
+        Self { symbols: Vec::new(), objc_layouts: Vec::new(), objc_function_names: std::collections::BTreeMap::new(), export_names: std::collections::BTreeMap::new(), export_starts: Vec::new(), lc_function_starts: Vec::new(), unwind_starts: Vec::new() }
     }
 }
 

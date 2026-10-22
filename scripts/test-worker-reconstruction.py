@@ -94,6 +94,13 @@ _hs_ast_large:
     nop
     .endr
     ret
+.globl _hs_ast_barriers
+_hs_ast_barriers:
+    dmb ish
+    dsb sy
+    isb
+    clrex
+    ret
 """)
         main.write_text("// CC0 / public-domain HindSight qualification fixture.\nint main(void){return 0;}\n")
         subprocess.run(["xcrun", "clang", "-target", "arm64-apple-macos14.0", "-O2", str(assembly), str(main), "-o", str(binary)],
@@ -103,7 +110,7 @@ _hs_ast_large:
         ranges = {match[3]: (match[1], match[2]) for line in report["functions"].splitlines()
                   if (match := re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+(\S+)", line))}
         artifacts = {}
-        for name in ["identity", "sum", "join", "flags", "call", "indirect", "opaque", "large"]:
+        for name in ["identity", "sum", "join", "flags", "call", "indirect", "opaque", "large", "barriers"]:
             start, end = ranges["_hs_ast_"+name]
             document = request(worker, binary, "--reconstruct", start, end)
             assert document.get("producer") == "hindsight-reconstruction-v1", document
@@ -121,9 +128,31 @@ _hs_ast_large:
             artifacts[name] = document
         assert artifacts["identity"]["eligibility"]["state"] == "review-only"
         assert artifacts["sum"]["eligibility"]["state"] == "review-only"
+        # Static Mach-O facts must not be mislabeled as observations from a
+        # live dyld/libobjc process. The exact nlist symbol remains target-local.
+        native_symbols = [node["payload"] for node in artifacts["identity"]["nodes"]
+                          if node["kind"] == "symbol" and node["payload"].get("name") == "_hs_ast_identity"]
+        assert native_symbols and any(item["source"] == "macho-nlist" for item in native_symbols), native_symbols
+        assert all(item["address"] == native_symbols[0]["address"] for item in native_symbols), native_symbols
+        assert not any(node["payload"].get("source") == "libobjc-runtime"
+                       for node in artifacts["identity"]["nodes"]), artifacts["identity"]["nodes"]
+        assert not any(node["payload"].get("kind") in {"objc-class-graph", "export-trie"}
+                       for node in artifacts["identity"]["nodes"]), artifacts["identity"]["nodes"]
+        for evidence in artifacts["identity"]["nodes"]:
+            if evidence["payload"].get("kind") in {"export-function-start", "unwind-function-start", "lc-function-starts"}:
+                assert evidence["ranges"] == [], evidence
+                assert int(evidence["payload"]["address"], 0) == int(artifacts["identity"]["function"]["start"], 16), evidence
         assert any(node["kind"] == "phi" for node in artifacts["join"]["nodes"])
         assert artifacts["flags"]["eligibility"]["state"] == "review-only"
         assert any(node["kind"]=="flags-arithmetic" for node in artifacts["flags"]["ast"]["nodes"])
+        barrier_events = [node for node in artifacts["barriers"]["nodes"]
+                          if node["kind"] == "memory-effect" and "effect" in node["payload"]]
+        barrier_events.sort(key=lambda node: int(node["ranges"][0]["start"], 16))
+        assert [(node["payload"]["mnemonic"], node["payload"]["domain"]) for node in barrier_events] == [
+            ("dmb", "ish"), ("dsb", "sy"), ("isb", None), ("clrex", None)], barrier_events
+        assert all(node["ranges"] == [{"start": f"0x{int(artifacts['barriers']['function']['start'], 16) + index * 4:x}",
+                                      "end": f"0x{int(artifacts['barriers']['function']['start'], 16) + index * 4 + 4:x}"}]
+                   for index, node in enumerate(barrier_events)), barrier_events
         # C04: a direct call publishes the caller-visible AAPCS64 contract and
         # keeps its prototype-derived argument and result locations explicitly
         # unresolved until a callee prototype is proven.

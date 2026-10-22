@@ -1025,13 +1025,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     )?;
     builder.edge(&scope, &bounds, "supports")?;
 
-    // Native type/image origins: symbol, type, and variable evidence from
-    // dyld exports, Objective-C runtime, and SDK/Clang prototypes.
-    // These are facts from the target runtime, not derived from the code.
+    // Target-file metadata evidence. These records come from validated static
+    // Mach-O tables; they are not observations from a live target runtime.
     let mut native_symbol_ids: Vec<String> = Vec::new();
     let mut native_type_ids: Vec<String> = Vec::new();
 
-    // Symbol evidence: dyld exports and nlist symbols with their image origins.
+    // Exact nlist symbol evidence.
     for (symbol_address, name) in &native.symbols {
         if *symbol_address >= start && *symbol_address < end {
             let id = builder.record(
@@ -1040,7 +1039,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 object([
                     ("name", name.clone().into()),
                     ("address", address(*symbol_address)),
-                    ("source", "dyld-export".into()),
+                    ("source", "macho-nlist".into()),
                     ("image_origin", "captured-binary".into()),
                 ]),
                 ranges(*symbol_address, *symbol_address + 4),
@@ -1049,24 +1048,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         }
     }
 
-    // Objective-C class/type evidence from the target runtime.
-    if !native.objc_classes.is_empty() {
-        let id = builder.record(
-            "type",
-            "fact",
-            object([
-                ("kind", "objc-class-graph".into()),
-                ("data", native.objc_classes.clone().into()),
-                ("source", "libobjc-runtime".into()),
-                ("image_origin", "captured-binary".into()),
-            ]),
-            ranges(start, end),
-        )?;
-        native_type_ids.push(id);
-    }
-
-    // Objective-C class layouts (ivars, properties, methods) with their proven offsets.
-    for layout in &native.objc_layouts {
+    // Only attach an Objective-C layout when this function is a validated IMP
+    // in that class. The class object is the exact root metadata record; do not
+    // attach the unrelated function's code span or every image class.
+    for layout in native.objc_layouts.iter().filter(|layout| {
+        layout.methods.iter().any(|method| method.implementation == start)
+    }) {
         let id = builder.record(
             "type",
             "fact",
@@ -1093,15 +1080,15 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("readonly", prop.readonly.into()),
                     ("nonatomic", prop.nonatomic.into()),
                 ])))),
-                ("source", "libobjc-runtime".into()),
+                ("source", "macho-objc-metadata".into()),
                 ("image_origin", "captured-binary".into()),
             ]),
-            ranges(start, end),
+            ranges(layout.address, layout.address.saturating_add(40)),
         )?;
         native_type_ids.push(id);
     }
 
-    // Objective-C IMP function names from the target runtime.
+    // Objective-C IMP names derived from validated class/method metadata.
     for (symbol_address, name) in &native.objc_function_names {
         if *symbol_address >= start && *symbol_address < end {
             let id = builder.record(
@@ -1110,7 +1097,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 object([
                     ("name", name.clone().into()),
                     ("address", address(*symbol_address)),
-                    ("source", "objc-imp".into()),
+                    ("source", "macho-objc-imp".into()),
                     ("image_origin", "captured-binary".into()),
                 ]),
                 ranges(*symbol_address, *symbol_address + 4),
@@ -1119,36 +1106,63 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         }
     }
 
-    // Export trie records as symbol evidence.
-    if !native.export_trie.is_empty() {
+    // Export names are already resolved to admitted function addresses. Keep
+    // this function's exact name only; the entire image trie is not a local
+    // source span and does not belong in every function artifact.
+    if let Some(name) = native.export_names.get(&start) {
         let id = builder.record(
             "symbol",
             "fact",
             object([
-                ("kind", "export-trie".into()),
-                ("data", native.export_trie.clone().into()),
+                ("name", name.clone().into()),
+                ("address", address(start)),
                 ("source", "dyld-export-trie".into()),
                 ("image_origin", "captured-binary".into()),
             ]),
-            ranges(start, end),
+            ranges(start, start.saturating_add(4)),
         )?;
         native_symbol_ids.push(id);
     }
 
-    // LC_FUNCTION_STARTS as a metadata hint.
-    if !native.lc_function_starts.is_empty() {
+    // LC_FUNCTION_STARTS is a function-entry fact, not a span covering this
+    // function's executable body.
+    if native.lc_function_starts.contains(&start) {
         let id = builder.record(
             "metadata",
             "fact",
             object([
                 ("kind", "lc-function-starts".into()),
-                ("addresses", array(native.lc_function_starts.iter().map(|a| address(*a)))),
+                ("address", address(start)),
                 ("source", "macho-lc-function-starts".into()),
                 ("image_origin", "captured-binary".into()),
             ]),
-            ranges(start, end),
+            array(Vec::<V>::new()),
         )?;
         native_symbol_ids.push(id);
+    }
+
+    // Publish only exact export/unwind boundary evidence for this function.
+    // These addresses identify metadata claims, not byte spans, so their
+    // evidence ranges are intentionally empty rather than borrowing the code
+    // range as a misleading source location.
+    for (kind, source, addresses) in [
+        ("export-function-start", "macho-export-trie", &native.export_starts),
+        ("unwind-function-start", "macho-unwind-info", &native.unwind_starts),
+    ] {
+        if addresses.contains(&start) {
+            let id = builder.record(
+                "metadata",
+                "fact",
+                object([
+                    ("kind", kind.into()),
+                    ("address", address(start)),
+                    ("source", source.into()),
+                    ("image_origin", "captured-binary".into()),
+                ]),
+                array(Vec::<V>::new()),
+            )?;
+            native_symbol_ids.push(id);
+        }
     }
 
     // Connect native evidence to the bounds hypothesis.
@@ -1581,6 +1595,22 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ]), ranges(version.pc, version.pc + 4))?;
         builder.edge(definition, &id, "flows-to")?;
         builder.edge(&id, &ir_ids[((version.pc - start) / 4) as usize], "uses-memory")?;
+    }
+    for event in &ssa.system_events {
+        let (effect, relation) = match event.mnemonic {
+            "dmb" => ("data-memory-ordering-fence", "orders-memory"),
+            "dsb" => ("data-synchronization-fence", "synchronizes-memory"),
+            "isb" => ("instruction-synchronization-fence", "synchronizes-instructions"),
+            "clrex" => ("exclusive-monitor-clear", "clears-exclusive-monitor"),
+            _ => continue,
+        };
+        let id = builder.record("memory-effect", "fact", object([
+            ("effect", effect.into()),
+            ("mnemonic", event.mnemonic.into()),
+            ("domain", event.domain.map(V::from).unwrap_or(V::Null)),
+            ("memory_values_changed", false.into()),
+        ]), ranges(event.pc, event.pc + 4))?;
+        builder.edge(&ir_ids[((event.pc - start) / 4) as usize], &id, relation)?;
     }
     // NZCV and SIMD values are part of the derivation graph as structured
     // records too. The preview's comments are presentation only; these nodes

@@ -49,6 +49,12 @@ def run(worker):
                 start,end=ranges[objc if name=="objc" else "_"+name]
                 document=request(worker,binary,"--reconstruct",start,end,prototypes=prototypes)
                 ReconstructionArtifact(document)
+                class_layouts=[node["payload"] for node in document["nodes"]
+                               if node["kind"]=="type" and node["payload"].get("kind")=="objc-class-layout"]
+                if name=="objc":
+                    assert any(layout["class_name"]=="HSMachineStateFixture" for layout in class_layouts),class_layouts
+                else:
+                    assert not class_layouts,(name,optimization,class_layouts)
                 candidates=[n for n in document["nodes"] if n["payload"].get("artifact_kind")=="recovered-source"]
                 assert len(candidates)==1,(name,optimization,[n["payload"] for n in document["nodes"] if n["payload"].get("artifact_kind")=="recovered-source-rejection"])
                 generated=candidates[0];source=generated["payload"]["source"];public=generated["payload"]["name"]

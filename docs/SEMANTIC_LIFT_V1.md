@@ -447,4 +447,7 @@ integer SIMD ADD/SUB/MUL lane widths in lifted expressions (for example,
 constants fold lane by lane with element-width modular wraparound, bounded
 operand provenance, and architectural zero-extension for Q=0 results; carries
 never cross lane boundaries. Reconstruction artifacts use pass identity
-`arm64-reconstruction-9` for this change.
+`arm64-reconstruction-12`. DMB/DSB ordering domains and ISB/CLREX system effects
+are also retained as exact-span SSA and artifact events; these events do not
+claim application-memory value writes. Their interactions with surrounding
+memory accesses are not yet represented as pairwise ordering edges.

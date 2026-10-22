@@ -3,7 +3,7 @@
 //! every reachable return proves restored SP, LR and Darwin nonvolatile GPRs.
 use super::*;
 use crate::signatures::SourceSignature;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Symbol {
@@ -767,8 +767,9 @@ pub(super) fn recover(
                     if delta % 4 != 0 || delta / 4 >= trees.len() as u64 {
                         return Err("source branch outside function".into());
                     }
+                    let target_index = (delta / 4) as usize;
                     if t.kind == "goto" {
-                        index = (delta / 4) as usize;
+                        index = target_index;
                         continue;
                     }
                     let condition = read(&t.children[0], &state, &mut dag, pc)?;
@@ -786,7 +787,7 @@ pub(super) fn recover(
                         vec![state.path, condition],
                         pc,
                     )?;
-                    pending.push(((delta / 4) as usize, taken, seen.clone()));
+                    pending.push((target_index, taken, seen.clone()));
                 }
                 _ => statement(t, &mut state, &mut dag, pc)?,
             }

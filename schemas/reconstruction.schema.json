@@ -132,7 +132,8 @@
             "contains", "decodes-to", "lifts-to", "defines", "uses", "flows-to",
             "controls", "calls", "reads", "writes", "aliases", "types",
             "supports", "contradicts", "assumes", "invalidates", "derives",
-            "merges-memory", "defines-memory", "uses-memory",
+            "merges-memory", "defines-memory", "uses-memory", "orders-memory",
+            "synchronizes-memory", "synchronizes-instructions", "clears-exclusive-monitor",
             "renders-as", "validates", "alternative-to", "overrides"
           ]
         },
