@@ -1565,6 +1565,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  let facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let native=super::reconstruction::NativeEvidence{symbols:facts.symbols.clone(),objc_classes:facts.objc_classes.clone(),objc_layouts:facts.objc_layouts.clone(),objc_function_names:facts.objc_function_names.clone(),export_trie:facts.export_trie.clone(),export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
  let index=facts.starts.binary_search(&start).map_err(|_|invalid("Start is not an admitted function boundary"))?;
  if index+1==facts.starts.len()&&(code.len() as u64)<map.bytes{return Err(invalid("Final function bound is outside the code scan budget"));}
  let canonical_end=facts.starts.get(index+1).copied().unwrap_or(map.address+map.bytes);
@@ -1582,7 +1583,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
  let external=super::signatures::external_prototype_database(digest)?;
  let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures};
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,native};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)
@@ -1599,6 +1600,16 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
  let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let native = super::reconstruction::NativeEvidence {
+     symbols: symbols.clone(),
+     objc_classes: objc_classes.clone(),
+     objc_layouts: objc_layouts.clone(),
+     objc_function_names: objc_function_names.clone(),
+     export_trie: export_trie.clone(),
+     export_starts: export_starts.clone(),
+     lc_function_starts: lc_function_starts.clone(),
+     unwind_starts: unwind_starts.clone(),
+ };
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
  for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
  for address in &unwind_starts{boundary_sources.entry(*address).or_default().insert("__unwind_info");}

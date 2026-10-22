@@ -122,7 +122,7 @@ struct ReconstructionArtifact: Sendable {
               let budgets = document["budgets"] as? [String: Any], let limits = budgets["limits"] as? [String: Int], let consumed = budgets["consumed"] as? [String: Int], let exhausted = budgets["exhausted"] as? [String],
               let validation = document["validation"] as? [[String: Any]], let alternatives = document["alternatives"] as? [[String: Any]] else { throw Invalid(message: "Reconstruction identity, schema or bounds mismatch.") }
         try require(Set(document.keys) == ["schema","producer","source_sha256","analysis_engine","scope","function","eligibility","nodes","edges","ast","alternatives","budgets","validation","truncated"], "Unexpected reconstruction fields.")
-        try require(document["analysis_engine"] as? String == "arm64-analysis-v91-schema122" && pass == "arm64-reconstruction-7", "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
+        try require(document["analysis_engine"] as? String == "arm64-analysis-v93-schema122" && pass == "arm64-reconstruction-9", "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
         try require(nodes.count <= 100_000 && edges.count <= 400_000 && astNodes.count <= 100_000 && reasons.count <= 128 && validation.count <= 128 && alternatives.count <= 1024, "Reconstruction record budget exceeded.")
         let scopeKey: [Any] = [pass, settings]
         var identities = Set<String>()

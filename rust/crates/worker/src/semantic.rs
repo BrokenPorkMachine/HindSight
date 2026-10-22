@@ -424,6 +424,11 @@ fn simd_register_name(register: IrSimdRegister) -> String {
         IrSimdWidth::Double => 'd', IrSimdWidth::Quad => 'q',
     }, index = register.index)
 }
+fn vector_arrangement_name(register: IrSimdRegister, element_bits: u8) -> String {
+    let element = match element_bits { 8 => 'b', 16 => 'h', 32 => 's', 64 => 'd', _ => '?' };
+    let lanes = u32::from(register.width.bytes()) * 8 / u32::from(element_bits.max(1));
+    format!("v{}.{lanes}{element}", register.index)
+}
 fn float_register_name(index: u8, precision: IrFloatPrecision) -> String {
     let width = match precision { IrFloatPrecision::Half => IrSimdWidth::Half, IrFloatPrecision::Single => IrSimdWidth::Single, IrFloatPrecision::Double => IrSimdWidth::Double };
     simd_register_name(IrSimdRegister { index, width })
@@ -627,7 +632,7 @@ enum IrOperation {
     /// Lane-wise vector integer arithmetic. Registers carry the architectural
     /// width (`Quad`/`Double`); element size is not tracked because the lane
     /// count is implied by the width and the instruction's arrangement.
-    VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorArithmeticOperator },
+    VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, element_bits: u8, operator: IrVectorArithmeticOperator },
     /// `MOVI` of a replicated 8-bit immediate into a V register. The value is
     /// the proven 128-bit bit pattern, so lane-exact folding can consume it.
     VectorImmediate { destination: u8, value: u128, immediate: u8 },
@@ -1649,15 +1654,34 @@ impl IrOperation {
                 let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
                 Some(format!("{destination_name} = {expression};{evidence}"))
             }
-            Self::VectorArithmetic { destination, left, right, operator } => {
-                // The IR does not retain the lane element size. Whole-u128
-                // arithmetic would allow carries across lane boundaries, so
-                // no lane-wise integer result is constant-folded here.
-                let known = None;
+            Self::VectorArithmetic { destination, left, right, element_bits, operator } => {
+                let left_value = flow.read_v(left.index as u32);
+                let right_value = flow.read_v(right.index as u32);
+                let lane_count = u32::from(destination.width.bytes()) * 8 / u32::from(element_bits);
+                let lane_mask = (1u128 << element_bits) - 1;
+                let width_mask = if destination.width == IrSimdWidth::Quad { u128::MAX } else { u64::MAX as u128 };
+                let known = left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| {
+                    let mut value = 0u128;
+                    for lane in 0..lane_count {
+                        let shift = lane * u32::from(element_bits);
+                        let lhs = (left.value >> shift) & lane_mask;
+                        let rhs = (right.value >> shift) & lane_mask;
+                        let result = match operator {
+                            IrVectorArithmeticOperator::Add => lhs.wrapping_add(rhs),
+                            IrVectorArithmeticOperator::Subtract => lhs.wrapping_sub(rhs),
+                            IrVectorArithmeticOperator::Multiply => lhs.wrapping_mul(rhs),
+                        } & lane_mask;
+                        value |= result << shift;
+                    }
+                    combine_origins(&left.origins, &right.origins, pc).map(|origins| VKnownValue {
+                        value: value & width_mask,
+                        origins,
+                    })
+                });
                 flow.write_v(destination.index as u32, known.clone());
-                let destination_name = simd_register_name(destination);
-                let left_name = simd_register_name(left);
-                let right_name = simd_register_name(right);
+                let destination_name = vector_arrangement_name(destination, element_bits);
+                let left_name = vector_arrangement_name(left, element_bits);
+                let right_name = vector_arrangement_name(right, element_bits);
                 let expression = match operator {
                     IrVectorArithmeticOperator::Add => format!("{left_name} + {right_name}"),
                     IrVectorArithmeticOperator::Subtract => format!("{left_name} - {right_name}"),
@@ -2652,7 +2676,7 @@ enum Operation {
     VectorFloatBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorFloatBinaryOperator },
     VectorFloatUnary { destination: IrSimdRegister, source: IrSimdRegister, operator: IrVectorFloatUnaryOperator },
     VectorHalfBinary { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorHalfBinaryOperator },
-    VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, operator: IrVectorArithmeticOperator },
+    VectorArithmetic { destination: IrSimdRegister, left: IrSimdRegister, right: IrSimdRegister, element_bits: u8, operator: IrVectorArithmeticOperator },
     VectorExtract { destination: Register, source: u8, lane: u8, bits: u8, signed: bool },
     LoadPair {
         dst1: Register,
@@ -3057,8 +3081,8 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::VectorBitwise { destination, left, right, operator } => {
             IrOperation::VectorBitwise { destination, left, right, operator }
         }
-        Operation::VectorArithmetic { destination, left, right, operator } => {
-            IrOperation::VectorArithmetic { destination, left, right, operator }
+        Operation::VectorArithmetic { destination, left, right, element_bits, operator } => {
+            IrOperation::VectorArithmetic { destination, left, right, element_bits, operator }
         }
         Operation::VectorFloatBinary { destination, left, right, operator } => {
             IrOperation::VectorFloatBinary { destination, left, right, operator }
@@ -5200,6 +5224,13 @@ fn decode(word: u32, pc: u64) -> Operation {
         // (bitwise, one-source, multiply-accumulate, etc.) fall through to
         // their own decoders or remain opaque.
         if matches!(opcode, 0b10000 | 0b10011) {
+            let size = ((word >> 22) & 3) as u8;
+            let quad = word & 0x4000_0000 != 0;
+            // The 64-bit/64-bit-lane arrangement is reserved, and integer
+            // MUL has no .2d form even for a 128-bit vector.
+            if (size == 3 && !quad) || (size == 3 && opcode == 0b10011) {
+                return Operation::Opaque;
+            }
             let operator = match opcode {
                 0b10000 => {
                     if word & 0x2000_0000 != 0 { IrVectorArithmeticOperator::Subtract } else { IrVectorArithmeticOperator::Add }
@@ -5207,11 +5238,11 @@ fn decode(word: u32, pc: u64) -> Operation {
                 0b10011 => IrVectorArithmeticOperator::Multiply,
                 _ => unreachable!(),
             };
-            let width = if word & 0x4000_0000 != 0 { IrSimdWidth::Quad } else { IrSimdWidth::Double };
+            let width = if quad { IrSimdWidth::Quad } else { IrSimdWidth::Double };
             let destination = IrSimdRegister { index: (word & 31) as u8, width };
             let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
             let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
-            return Operation::VectorArithmetic { destination, left, right, operator };
+            return Operation::VectorArithmetic { destination, left, right, element_bits: 8 << size, operator };
         }
     }
     // Lane-wise vector floating-point three-same: `0 Q U 0 1110 size 1 Rm
@@ -6854,8 +6885,8 @@ impl Operation {
             Self::VectorBitwise { destination, left, right, operator } => {
                 IrOperation::VectorBitwise { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
             }
-            Self::VectorArithmetic { destination, left, right, operator } => {
-                IrOperation::VectorArithmetic { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
+            Self::VectorArithmetic { destination, left, right, element_bits, operator } => {
+                IrOperation::VectorArithmetic { destination, left, right, element_bits, operator }.render(flow, pc).unwrap_or_default()
             }
             Self::VectorFloatBinary { destination, left, right, operator } => {
                 IrOperation::VectorFloatBinary { destination, left, right, operator }.render(flow, pc).unwrap_or_default()
@@ -11624,48 +11655,72 @@ mod vector_bitwise_tests {
 mod vector_arithmetic_tests {
     use super::*;
 
-    // Independently assembled from the AArch64 three-same integer encoding:
-    // `0 Q U 0 1110 size 0 Rm opcode Rn Rd` with bit 10 = 0. Opcodes:
-    // 10000 (ADD U=0 / SUB U=1), 10011 (MUL). Q selects 128/64-bit view;
-    // size selects the element width (0=8, 1=16, 2=32, 3=64).
-    const CASES: [(u32, &str); 6] = [
-        (0x4ea28420, "q0 = q1 + q2;"),   // ADD, Q, 32-bit
-        (0x0ea28420, "d0 = d1 + d2;"),    // ADD, D, 32-bit
-        (0x6ea28420, "q0 = q1 - q2;"),    // SUB, Q, 32-bit
-        (0x2ea28420, "d0 = d1 - d2;"),    // SUB, D, 32-bit
-        (0x4ea29c20, "q0 = q1 * q2;"),    // MUL, Q, 32-bit
-        (0x0ea29c20, "d0 = d1 * d2;"),    // MUL, D, 32-bit
-    ];
+    // Three-same integer encoding: `0 Q U 0 1110 size 0 Rm opcode Rn Rd`.
+    fn word(quad: bool, size: u8, opcode: u8, subtract: bool) -> u32 {
+        0x0e00_0000 | (u32::from(quad) << 30) | (u32::from(subtract) << 29)
+            | (u32::from(size) << 22) | (2 << 16) | (u32::from(opcode) << 11)
+            | (1 << 5)
+    }
 
     #[test]
-    fn exact_vector_arithmetic_encodings_lift_to_shared_ir() {
-        for (word, expected) in CASES {
-            let operation = decode(word, 0x1000);
-            let portable = lift_operation(operation, 0x1000);
-            assert!(matches!(portable, IrOperation::VectorArithmetic { .. }), "{word:#x}");
-            assert_eq!(portable.render(&mut Flow::new(), 0x1000).unwrap(), expected);
-            assert!(!portable.gpr_effects().barrier);
+    fn every_valid_vector_arithmetic_arrangement_keeps_its_lane_width() {
+        for quad in [false, true] {
+            for size in 0..=3u8 {
+                for (opcode, subtract, symbol) in [(16, false, "+"), (16, true, "-"), (19, false, "*")] {
+                    let encoding = word(quad, size, opcode, subtract);
+                    let valid = (quad || size != 3) && (opcode != 19 || size != 3);
+                    let decoded = decode(encoding, 0x1000);
+                    if !valid {
+                        assert!(matches!(decoded, Operation::Opaque), "reserved encoding {encoding:#010x}");
+                        assert!(lift_operation(decoded, 0x1000).gpr_effects().barrier);
+                        continue;
+                    }
+                    let element_bits = 8 << size;
+                    let lanes = (if quad { 128 } else { 64 }) / element_bits;
+                    let suffix = match element_bits { 8 => 'b', 16 => 'h', 32 => 's', _ => 'd' };
+                    let arrangement = format!("v0.{lanes}{suffix} = v1.{lanes}{suffix} {symbol} v2.{lanes}{suffix};");
+                    let portable = lift_operation(decoded, 0x1000);
+                    assert!(matches!(portable, IrOperation::VectorArithmetic { element_bits: width, .. } if width == element_bits), "{encoding:#010x}");
+                    assert_eq!(portable.render(&mut Flow::new(), 0x1000).unwrap(), arrangement, "{encoding:#010x}");
+                    assert!(!portable.gpr_effects().barrier);
+                }
+            }
         }
     }
 
     #[test]
-    fn low_64_bit_forms_do_not_claim_a_full_vector_constant() {
+    fn low_64_bit_forms_fold_the_zero_extended_full_register_result() {
         let mut flow = Flow::new();
         flow.write_v(3, Some(VKnownValue { value: u128::MAX, origins: vec![0xfe0] }));
         flow.write_v(4, Some(VKnownValue { value: 5, origins: vec![0xfe4] }));
         flow.write_v(5, Some(VKnownValue { value: 7, origins: vec![0xfe8] }));
         lift_operation(decode(0x0ea58483, 0x1000), 0x1000).render(&mut flow, 0x1000);
-        assert!(flow.read_v(3).is_none());
+        assert_eq!(flow.read_v(3).expect("Q=0 result defines a full register").value, 12);
         assert!(flow.read_v(4).is_some() && flow.read_v(5).is_some());
     }
 
     #[test]
-    fn lane_wise_arithmetic_does_not_fold_as_one_wide_integer() {
+    fn lane_wise_arithmetic_wraps_each_lane_and_preserves_provenance() {
         let mut flow = Flow::new();
-        flow.write_v(1, Some(VKnownValue { value: 10, origins: vec![0xfe0] }));
-        flow.write_v(2, Some(VKnownValue { value: 3, origins: vec![0xfe4] }));
-        lift_operation(decode(0x4ea28420, 0x1000), 0x1000).render(&mut flow, 0x1000);
-        assert!(flow.read_v(0).is_none(), "the IR omits element size and cannot prove lane-wise arithmetic");
+        // Four 32-bit lanes: lane 0 wraps, lane 1 adds independently, and
+        // neither carry nor borrow is allowed to cross a lane boundary.
+        flow.write_v(1, Some(VKnownValue { value: 0x0000_0001_ffff_ffff, origins: vec![0xfe0] }));
+        flow.write_v(2, Some(VKnownValue { value: 0x0000_0002_0000_0001, origins: vec![0xfe4] }));
+        let rendered = lift_operation(decode(word(true, 2, 16, false), 0x1000), 0x1000).render(&mut flow, 0x1000).unwrap();
+        let result = flow.read_v(0).expect("known lane inputs fold");
+        assert_eq!(result.value, 0x0000_0003_0000_0000);
+        assert_eq!(result.origins, vec![0xfe0, 0xfe4, 0x1000]);
+        assert!(rendered.contains("constant=0x300000000"));
+
+        // A D-form writes only two 32-bit lanes architecturally, zeroing the
+        // upper 64 bits; a carry from lane 0 must not increment lane 1.
+        flow.write_v(1, Some(VKnownValue { value: u128::MAX, origins: vec![0xfe8] }));
+        flow.write_v(2, Some(VKnownValue { value: 1, origins: vec![0xfec] }));
+        lift_operation(decode(word(false, 2, 16, false), 0x1004), 0x1004).render(&mut flow, 0x1004);
+        let result = flow.read_v(0).expect("known D-form inputs fold");
+        assert_eq!(result.value, 0x0000_0000_ffff_ffff_0000_0000);
+        assert_eq!(result.value >> 64, 0, "Q=0 clears the upper half");
+        assert_eq!(result.origins, vec![0xfe8, 0xfec, 0x1004]);
     }
 }
 

@@ -949,6 +949,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         name,
         boundary_sources,
         signatures,
+        native,
     } = input;
     if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
         return Err(io::Error::new(
@@ -1023,6 +1024,141 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ranges(start, end),
     )?;
     builder.edge(&scope, &bounds, "supports")?;
+
+    // Native type/image origins: symbol, type, and variable evidence from
+    // dyld exports, Objective-C runtime, and SDK/Clang prototypes.
+    // These are facts from the target runtime, not derived from the code.
+    let mut native_symbol_ids: Vec<String> = Vec::new();
+    let mut native_type_ids: Vec<String> = Vec::new();
+
+    // Symbol evidence: dyld exports and nlist symbols with their image origins.
+    for (symbol_address, name) in &native.symbols {
+        if *symbol_address >= start && *symbol_address < end {
+            let id = builder.record(
+                "symbol",
+                "fact",
+                object([
+                    ("name", name.clone().into()),
+                    ("address", address(*symbol_address)),
+                    ("source", "dyld-export".into()),
+                    ("image_origin", "captured-binary".into()),
+                ]),
+                ranges(*symbol_address, *symbol_address + 4),
+            )?;
+            native_symbol_ids.push(id);
+        }
+    }
+
+    // Objective-C class/type evidence from the target runtime.
+    if !native.objc_classes.is_empty() {
+        let id = builder.record(
+            "type",
+            "fact",
+            object([
+                ("kind", "objc-class-graph".into()),
+                ("data", native.objc_classes.clone().into()),
+                ("source", "libobjc-runtime".into()),
+                ("image_origin", "captured-binary".into()),
+            ]),
+            ranges(start, end),
+        )?;
+        native_type_ids.push(id);
+    }
+
+    // Objective-C class layouts (ivars, properties, methods) with their proven offsets.
+    for layout in &native.objc_layouts {
+        let id = builder.record(
+            "type",
+            "fact",
+            object([
+                ("kind", "objc-class-layout".into()),
+                ("class_name", layout.name.clone().into()),
+                ("class_address", address(layout.address)),
+                ("instance_size", u64::from(layout.instance_size).into()),
+                ("ivars", array(layout.ivars.iter().map(|ivar| object([
+                    ("name", ivar.name.clone().into()),
+                    ("encoding", ivar.encoding.clone().into()),
+                    ("offset", u64::from(ivar.offset).into()),
+                    ("size", u64::from(ivar.size).into()),
+                    ("alignment", u64::from(ivar.alignment).into()),
+                    ("offset_pointer", address(ivar.offset_pointer)),
+                ])))),
+                ("properties", array(layout.properties.iter().map(|prop| object([
+                    ("name", prop.name.clone().into()),
+                    ("attributes", prop.attributes.clone().into()),
+                    ("encoding", prop.encoding.clone().into()),
+                    ("getter", prop.getter.clone().into()),
+                    ("setter", prop.setter.clone().map(V::from).unwrap_or(V::Null)),
+                    ("ivar", prop.ivar.clone().map(V::from).unwrap_or(V::Null)),
+                    ("readonly", prop.readonly.into()),
+                    ("nonatomic", prop.nonatomic.into()),
+                ])))),
+                ("source", "libobjc-runtime".into()),
+                ("image_origin", "captured-binary".into()),
+            ]),
+            ranges(start, end),
+        )?;
+        native_type_ids.push(id);
+    }
+
+    // Objective-C IMP function names from the target runtime.
+    for (symbol_address, name) in &native.objc_function_names {
+        if *symbol_address >= start && *symbol_address < end {
+            let id = builder.record(
+                "symbol",
+                "fact",
+                object([
+                    ("name", name.clone().into()),
+                    ("address", address(*symbol_address)),
+                    ("source", "objc-imp".into()),
+                    ("image_origin", "captured-binary".into()),
+                ]),
+                ranges(*symbol_address, *symbol_address + 4),
+            )?;
+            native_symbol_ids.push(id);
+        }
+    }
+
+    // Export trie records as symbol evidence.
+    if !native.export_trie.is_empty() {
+        let id = builder.record(
+            "symbol",
+            "fact",
+            object([
+                ("kind", "export-trie".into()),
+                ("data", native.export_trie.clone().into()),
+                ("source", "dyld-export-trie".into()),
+                ("image_origin", "captured-binary".into()),
+            ]),
+            ranges(start, end),
+        )?;
+        native_symbol_ids.push(id);
+    }
+
+    // LC_FUNCTION_STARTS as a metadata hint.
+    if !native.lc_function_starts.is_empty() {
+        let id = builder.record(
+            "metadata",
+            "fact",
+            object([
+                ("kind", "lc-function-starts".into()),
+                ("addresses", array(native.lc_function_starts.iter().map(|a| address(*a)))),
+                ("source", "macho-lc-function-starts".into()),
+                ("image_origin", "captured-binary".into()),
+            ]),
+            ranges(start, end),
+        )?;
+        native_symbol_ids.push(id);
+    }
+
+    // Connect native evidence to the bounds hypothesis.
+    for sym_id in &native_symbol_ids {
+        builder.edge(&bounds, sym_id, "supports")?;
+    }
+    for type_id in &native_type_ids {
+        builder.edge(&bounds, type_id, "supports")?;
+    }
+
     let mut lifted = Vec::new();
     let mut models = Vec::new();
     let mut ir_ids = Vec::new();

@@ -61,7 +61,7 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v91-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v93-schema122`; the report fields
 and cache-envelope schema are unchanged.
 
 The [source-parameter identity pass](AARCH64_SOURCE_VARIABLES.md) now uses
@@ -440,3 +440,11 @@ memory operations are modeled: `LDAPR`/`LDADD`/`SWP` render
 `dst = ldapr(base);` / `dst = ldadd(base, src);` / `dst = swp(base, src);`
 with the destination as an unknown barrier, and `CAS` renders
 `/* casal expected, desired, base */` preserving value flow.
+
+The current worker identity (`arm64-analysis-v93-schema122`) also preserves
+integer SIMD ADD/SUB/MUL lane widths in lifted expressions (for example,
+`v0.4s`) and treats reserved lane arrangements as opaque barriers. Proven
+constants fold lane by lane with element-width modular wraparound, bounded
+operand provenance, and architectural zero-extension for Q=0 results; carries
+never cross lane boundaries. Reconstruction artifacts use pass identity
+`arm64-reconstruction-9` for this change.
