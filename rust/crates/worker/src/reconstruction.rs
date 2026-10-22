@@ -1,11 +1,11 @@
 //! Versioned reconstruction records. No dependency on report/pseudocode parsing.
 use std::{collections::BTreeMap, io};
 
-pub const PASS: &str = "arm64-reconstruction-12";
-pub const ENGINE: &str = "arm64-analysis-v93-schema122";
+pub const PASS: &str = "arm64-reconstruction-45";
+pub const ENGINE: &str = "arm64-analysis-v96-schema122";
 
 /// Native type/image evidence collected from the target runtime.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct NativeEvidence {
     /// Symbol names from nlist/dyld exports.
     pub symbols: Vec<(u64, String)>,
@@ -23,12 +23,6 @@ pub struct NativeEvidence {
     pub unwind_starts: Vec<u64>,
 }
 
-impl Default for NativeEvidence {
-    fn default() -> Self {
-        Self { symbols: Vec::new(), objc_layouts: Vec::new(), objc_function_names: std::collections::BTreeMap::new(), export_names: std::collections::BTreeMap::new(), export_starts: Vec::new(), lc_function_starts: Vec::new(), unwind_starts: Vec::new() }
-    }
-}
-
 pub struct Input<'a> {
     pub code: &'a [u8],
     pub base: u64,
@@ -41,6 +35,9 @@ pub struct Input<'a> {
     pub name: Option<&'a str>,
     pub boundary_sources: Vec<String>,
     pub signatures: Vec<(String, crate::signatures::Signature)>,
+    /// Exact, source-hash-bound or built-in C prototypes keyed to target
+    /// symbol addresses for direct-call source reconstruction.
+    pub call_prototypes: Vec<(u64, String, crate::signatures::Signature)>,
     pub native: NativeEvidence,
 }
 

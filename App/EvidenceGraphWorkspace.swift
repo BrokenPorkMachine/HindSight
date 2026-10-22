@@ -28,6 +28,7 @@ struct VGEvidenceGraphWorkspace: View {
 
     private var filtered: VGEvidenceGraph { graph.filtered(query: query, provenances: provenances) }
     private var layout: VGEvidenceGraphLayout { filtered.layout() }
+    private var edgeRoutes: [String: VGEvidenceEdgeRoute] { filtered.edgeRoutes(positions: layout.positions) }
     private var selected: VGEvidenceNode? {
         if let selectedNodeID, let node = graph.node(selectedNodeID) { return node }
         return filtered.nodes.first(where: { $0.kind != .investigation }) ?? filtered.nodes.first
@@ -177,14 +178,13 @@ struct VGEvidenceGraphWorkspace: View {
                 ZStack(alignment: .topLeading) {
                     Canvas { context, _ in
                         for edge in filtered.edges {
-                            guard let a = layout.positions[edge.sourceID], let b = layout.positions[edge.targetID] else { continue }
+                            guard let route = edgeRoutes[edge.id] else { continue }
                             var path = Path()
-                            path.move(to: CGPoint(x: a.x, y: a.y))
-                            let midX = (a.x + b.x) / 2
+                            path.move(to: CGPoint(x: route.start.x, y: route.start.y))
                             path.addCurve(
-                                to: CGPoint(x: b.x, y: b.y),
-                                control1: CGPoint(x: midX, y: a.y),
-                                control2: CGPoint(x: midX, y: b.y)
+                                to: CGPoint(x: route.end.x, y: route.end.y),
+                                control1: CGPoint(x: route.control1.x, y: route.control1.y),
+                                control2: CGPoint(x: route.control2.x, y: route.control2.y)
                             )
                             context.stroke(path, with: .color(edgeColor(edge).opacity(0.55)), style: StrokeStyle(lineWidth: edge.relation == .observedAt ? 2.0 : 1.2, dash: dash(edge)))
                         }

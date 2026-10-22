@@ -191,14 +191,24 @@ pub(super) fn instruction_flag_effects(instruction: &LiftedInstruction) -> FlagE
             effects.defines |= FLAG_ALL;
             effects.uses |= condition_code_flags(condition);
         }
+        // `MRS Xt, NZCV` consumes all four condition bits to produce Xt.
+        IrOperation::ReadNZCV { .. } => {
+            effects.uses |= FLAG_ALL;
+        }
+        // `MSR NZCV, Xt` replaces all four PSTATE condition bits. The source
+        // register read is carried separately by the GPR effects.
+        IrOperation::WriteNZCV { .. } => {
+            effects.defines |= FLAG_ALL;
+        }
         // A floating-point compare writes every flag.
         IrOperation::ScalarFloatCompare { .. } => {
             effects.defines |= FLAG_ALL;
         }
-        // `ADC`/`SBC` consume the carry and write no flag. The flag-setting
-        // carry forms stay opaque, so no untracked carry is ever claimed.
-        IrOperation::AddCarry { .. } => {
+        // `ADC`/`SBC` consume C. `ADCS`/`SBCS` additionally define all NZCV
+        // bits, and their carry input is an explicit flag-file use.
+        IrOperation::AddCarry { set_flags, .. } => {
             effects.uses |= FLAG_C;
+            if set_flags { effects.defines |= FLAG_ALL; }
         }
         // A conditional select reads the flags its predicate names.
         IrOperation::ConditionalSelect { condition, .. }
@@ -291,10 +301,18 @@ pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> Vec
         }
         IrOperation::VectorFloatBinary { destination, left, right, .. }
         | IrOperation::VectorHalfBinary { destination, left, right, .. }
-        | IrOperation::VectorArithmetic { destination, left, right, .. } => {
+        => {
             write(&mut effects, VectorRange::low(destination.index, 16));
             read(&mut effects, VectorRange::low(left.index, left.width.bytes()));
             read(&mut effects, VectorRange::low(right.index, right.width.bytes()));
+        }
+        IrOperation::VectorArithmetic { destination, left, right, operator, .. } => {
+            write(&mut effects, VectorRange::low(destination.index, 16));
+            read(&mut effects, VectorRange::low(left.index, left.width.bytes()));
+            read(&mut effects, VectorRange::low(right.index, right.width.bytes()));
+            if matches!(operator, IrVectorArithmeticOperator::MultiplyAccumulate | IrVectorArithmeticOperator::MultiplySubtract) {
+                read(&mut effects, VectorRange::low(destination.index, destination.width.bytes()));
+            }
         }
         IrOperation::VectorFloatUnary { destination, source, .. } => {
             write(&mut effects, VectorRange::low(destination.index, 16));
@@ -479,6 +497,16 @@ mod tests {
     }
 
     #[test]
+    fn flag_setting_carry_consumes_c_and_defines_all_nzcv_bits() {
+        // adcs x0, x1, x2 = 0xba020020; sbcs x0, x1, x2 = 0xfa020020
+        for word in [0xba02_0020, 0xfa02_0020] {
+            let effects = instruction_flag_effects(&instruction(word));
+            assert_eq!(effects.uses, FLAG_C, "{effects:?}");
+            assert_eq!(effects.defines, FLAG_ALL, "{effects:?}");
+        }
+    }
+
+    #[test]
     fn a_conditional_select_reads_the_flags_its_predicate_names() {
         // csel x0, x1, x2, eq = 0x9a821020
         let effects = instruction_flag_effects(&instruction(0x9a82_0020));
@@ -506,6 +534,43 @@ mod tests {
     }
 
     #[test]
+    fn msr_nzcv_defines_all_flags_and_reads_its_gpr_source() {
+        // clang-verified: msr NZCV, x0
+        let instruction = instruction(0xd51b_4200);
+        assert!(matches!(instruction.portable, IrOperation::WriteNZCV { .. }));
+        assert_eq!(instruction_flag_effects(&instruction), FlagEffects { defines: FLAG_ALL, uses: 0 });
+        assert_eq!(instruction.portable.gpr_effects().uses, 1);
+    }
+
+    #[test]
+    fn mrs_nzcv_reads_all_flags_and_defines_only_its_gpr_destination() {
+        // clang-verified: mrs x0, NZCV
+        let instruction = instruction(0xd53b_4200);
+        assert!(matches!(instruction.portable, IrOperation::ReadNZCV { .. }));
+        assert_eq!(instruction_flag_effects(&instruction), FlagEffects { defines: 0, uses: FLAG_ALL });
+        let effects = instruction.portable.gpr_effects();
+        assert_eq!(effects.uses, 0);
+        assert_eq!(effects.definitions, 1);
+        assert!(!effects.barrier);
+    }
+
+    #[test]
+    fn a_reserved_vector_fp_encoding_invalidates_all_register_file_identities() {
+        // FRECPE with Q=0 and 64-bit lanes would form the reserved .1d view.
+        let instruction = instruction(0x0ee1_d820);
+        assert!(matches!(instruction.operation, Operation::Opaque));
+        let gpr = instruction.portable.gpr_effects();
+        assert!(gpr.barrier);
+        assert_eq!(gpr.definitions, u32::MAX);
+        let flags = instruction_flag_effects(&instruction);
+        assert_eq!(flags.defines, FLAG_ALL);
+        assert_eq!(flags.uses, FLAG_ALL);
+        let vectors = instruction_vector_effects(&instruction);
+        assert_eq!(vectors.writes, (0..32).map(|register| VectorRange::low(register, 16)).collect::<Vec<_>>());
+        assert_eq!(vectors.reads, vectors.writes);
+    }
+
+    #[test]
     fn a_call_does_not_preserve_the_flags() {
         // bl #0 = 0x94000000
         let effects = instruction_flag_effects(&instruction(0x9400_0000));
@@ -519,6 +584,77 @@ mod tests {
         let effects = instruction_vector_effects(&instruction(0x4ea2_1c20));
         assert_eq!(effects.writes, vec![VectorRange::low(0, 16)], "{effects:?}");
         assert_eq!(effects.reads, vec![VectorRange::low(1, 16), VectorRange::low(2, 16)], "{effects:?}");
+    }
+
+    #[test]
+    fn vector_multiply_accumulate_reads_the_prior_destination_version() {
+        // `mla v0.8b, v1.8b, v2.8b` and its `mls` neighbor both consume V0.
+        for word in [0x0e22_9420, 0x2e22_9420] {
+            let effects = instruction_vector_effects(&instruction(word));
+            assert!(effects.writes.contains(&VectorRange::low(0, 16)), "{effects:?}");
+            assert!(effects.reads.contains(&VectorRange::low(0, 8)), "accumulator is an input: {effects:?}");
+            assert!(effects.reads.contains(&VectorRange::low(1, 8)), "{effects:?}");
+            assert!(effects.reads.contains(&VectorRange::low(2, 8)), "{effects:?}");
+        }
+    }
+
+    #[test]
+    fn vector_fp_effects_preserve_gpr_and_nzcv_and_keep_q0_zero_extension() {
+        // `fadd v0.2s, v0.2s, v1.2s` (Q=0) and its Q=1 `.4s` counterpart.
+        // A read-modify-write destination remains an input, and Q selects
+        // the exact source-byte range while the architectural write is 128b.
+        for (word, source_bytes) in [(0x0e21_d400, 8), (0x4e21_d400, 16), (0x4e61_d400, 16)] {
+            let binary = instruction(word);
+            assert!(matches!(binary.portable, IrOperation::VectorFloatBinary { .. }));
+            assert_eq!(instruction_vector_effects(&binary), VectorEffects {
+                writes: vec![VectorRange::low(0, 16)],
+                reads: vec![VectorRange::low(0, source_bytes), VectorRange::low(1, source_bytes)],
+            });
+            assert_eq!(binary.portable.gpr_effects().uses, 0);
+            assert_eq!(instruction_flag_effects(&binary), FlagEffects::default());
+        }
+
+        // fadd v0.4h, v1.4h, v2.4h (Q=0, 16-bit lanes).
+        let half = instruction(0x0e42_1420);
+        assert!(matches!(half.portable, IrOperation::VectorHalfBinary { element_bits: 16, .. }));
+        assert_eq!(instruction_vector_effects(&half), VectorEffects {
+            writes: vec![VectorRange::low(0, 16)],
+            reads: vec![VectorRange::low(1, 8), VectorRange::low(2, 8)],
+        });
+        let gpr = half.portable.gpr_effects();
+        assert_eq!((gpr.uses, gpr.definitions, gpr.barrier), (0, 0, false));
+        assert_eq!(instruction_flag_effects(&half), FlagEffects::default());
+
+        // The Q=1 `.8h` form reads all 128 source bits while preserving the
+        // same full-register destination write.
+        let half_quad = instruction(0x4e42_1420);
+        assert!(matches!(half_quad.portable, IrOperation::VectorHalfBinary { element_bits: 16, .. }));
+        assert_eq!(instruction_vector_effects(&half_quad), VectorEffects {
+            writes: vec![VectorRange::low(0, 16)],
+            reads: vec![VectorRange::low(1, 16), VectorRange::low(2, 16)],
+        });
+
+        // frecpe v3.2d, v4.2d (Q=1, 64-bit lanes).
+        let double = instruction(0x4ee1_d883);
+        assert!(matches!(double.portable, IrOperation::VectorFloatUnary { element_bits: 64, .. }));
+        assert_eq!(instruction_vector_effects(&double), VectorEffects {
+            writes: vec![VectorRange::low(3, 16)],
+            reads: vec![VectorRange::low(4, 16)],
+        });
+        let gpr = double.portable.gpr_effects();
+        assert_eq!((gpr.uses, gpr.definitions, gpr.barrier), (0, 0, false));
+        assert_eq!(instruction_flag_effects(&double), FlagEffects::default());
+
+        // frecpe v5.2s, v6.2s (Q=0, 32-bit lanes).
+        let single = instruction(0x0ea1_d8c5);
+        assert!(matches!(single.portable, IrOperation::VectorFloatUnary { element_bits: 32, .. }));
+        assert_eq!(instruction_vector_effects(&single), VectorEffects {
+            writes: vec![VectorRange::low(5, 16)],
+            reads: vec![VectorRange::low(6, 8)],
+        });
+        let gpr = single.portable.gpr_effects();
+        assert_eq!((gpr.uses, gpr.definitions, gpr.barrier), (0, 0, false));
+        assert_eq!(instruction_flag_effects(&single), FlagEffects::default());
     }
 
     #[test]

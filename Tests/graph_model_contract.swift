@@ -64,6 +64,11 @@ struct GraphModelContract {
         precondition(leftBranch.y == rightBranch.y, "narrow viewports must preserve branch siblings on one layer")
         precondition(rightBranch.x - leftBranch.x >= 290, "branch nodes must remain separate")
         precondition(narrow.positions["B0000"]!.x == narrow.width / 2, "entry must be centered above its branches")
+        let wide = graph.layout(availableWidth: 1800, availableHeight: 1200)
+        precondition(wide.positions["B0002"]!.x - wide.positions["B0001"]!.x >= 1100,
+                     "wide flow graphs should spread branch paths across the map")
+        precondition(wide.positions["B0004"]!.y - wide.positions["B0000"]!.y >= 900,
+                     "wide flow graphs should use available vertical map space")
 
         let funcs = VGGraphParser.functions("""
         0x0000000100001000  0x0000000100001020        32 bytes  _main

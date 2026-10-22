@@ -7,6 +7,8 @@ mod names;
 pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
 mod files;
 mod file_ssa;
+#[cfg(test)]
+mod vector_float_tests;
 pub(crate) mod artifact;
 pub use artifact::build as reconstruct_artifact;
 pub use artifact::interpret as interpret_artifact;
@@ -476,6 +478,10 @@ enum IrVectorArithmeticOperator {
     Subtract,
     /// `Vd = Vn * Vm` (`MUL`).
     Multiply,
+    /// `Vd = Vd + Vn * Vm` (`MLA`).
+    MultiplyAccumulate,
+    /// `Vd = Vd - Vn * Vm` (`MLS`).
+    MultiplySubtract,
 }
 /// Lane-wise vector floating-point unary operator (reciprocal estimate).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -576,6 +582,7 @@ fn render_int_float_conversion(destination: IrConversionRegister, source: IrConv
 enum IrOperation {
     Nop,
     Marker { mnemonic: &'static str, domain: Option<&'static str> },
+    ReadNZCV { destination: IrRegister },
     Assign { destination: IrRegister, value: IrOperand },
     Address { destination: IrRegister, value: u64, page: bool },
     Binary { destination: IrRegister, operator: IrBinaryOp, left: IrOperand, right: IrOperand },
@@ -586,13 +593,15 @@ enum IrOperation {
     VariableShift { destination: IrRegister, source: IrRegister, amount: IrRegister, kind: IrVariableShiftKind },
     OneSource { destination: IrRegister, source: IrRegister, kind: IrOneSourceKind },
     ExtractConcat { destination: IrRegister, left: IrRegister, right: IrRegister, lsb: u8 },
-    AddCarry { destination: IrRegister, left: IrRegister, right: IrRegister, subtract: bool },
+    AddCarry { destination: IrRegister, left: IrRegister, right: IrRegister, subtract: bool, set_flags: bool },
     ConditionalSelect { destination: IrRegister, if_true: IrRegister, if_false: IrRegister, condition: IrFlagPredicate, else_op: IrSelectElse },
     Extend { destination: IrRegister, source: IrRegister, signed: bool, from: u8 },
     Extract { destination: IrRegister, source: IrRegister, lsb: u8, width: u8, signed: bool },
     Insert { destination: IrRegister, source: IrRegister, lsb: u8, width: u8, kind: IrInsertKind },
     AddExtended { destination: IrRegister, left: IrRegister, right: IrRegister, subtract: bool, extension: Option<IrExtension>, shift: u8 },
     Compare { kind: IrCompareKind, left: IrRegister, right: IrCompareOperand },
+    /// `MSR NZCV, Xt` replaces all four condition flags with bits 31..28 of Xt.
+    WriteNZCV { source: IrRegister },
     ConditionalCompare { kind: IrCompareKind, left: IrRegister, right: IrCompareOperand, nzcv: u8, condition: u8 },
     MultiplyAdd { destination: IrRegister, left: IrRegister, right: IrRegister, addend: Option<IrRegister>, subtract: bool },
     WideningMultiply { destination: IrRegister, left: IrRegister, right: IrRegister, addend: Option<IrRegister>, subtract: bool, signed: bool, high: bool },
@@ -737,6 +746,8 @@ impl IrOperation {
                 effects.definitions = gpr_mask(destination);
                 effects.uses = gpr_mask(destination);
             }
+            Self::ReadNZCV { destination } => effects.definitions = gpr_mask(destination),
+            Self::WriteNZCV { source } => effects.uses = gpr_mask(source),
             Self::Shift { destination, source, .. }
             | Self::OneSource { destination, source, .. }
             | Self::Extend { destination, source, .. }
@@ -847,6 +858,7 @@ impl IrOperation {
             | Self::Shift { .. } | Self::VariableShift { .. } | Self::OneSource { .. }
             | Self::ExtractConcat { .. } | Self::Extend { .. } | Self::Extract { .. }
             | Self::Insert { .. } | Self::Load { .. } | Self::Store { .. }
+            | Self::AddCarry { .. }
             | Self::LoadPair { .. } | Self::StorePair { .. }
             | Self::SimdPairLoad { .. } | Self::SimdPairStore { .. }
             | Self::AtomicLoad { .. } | Self::AtomicStore { .. }
@@ -855,6 +867,7 @@ impl IrOperation {
             | Self::ScalarFloatBinary { .. }
             | Self::ScalarFloatUnary { .. }
             | Self::ScalarFloatMultiplyAdd(..) | Self::ScalarFloatSelect { .. }
+            | Self::ReadNZCV { .. }
             | Self::SimdLoad { .. } | Self::SimdStore { .. }
             | Self::VectorBitwise { .. } | Self::VectorImmediate { .. }
             | Self::VectorArithmetic { .. } | Self::VectorFloatBinary { .. }
@@ -881,6 +894,11 @@ impl IrOperation {
             Self::Marker { mnemonic, domain } => {
                 Some(match domain {Some(domain)=>format!("/* {mnemonic} {domain} */"),None=>format!("/* {mnemonic} */")})
             },
+            Self::ReadNZCV { destination } => {
+                let destination = destination.target();
+                flow.write(destination, None);
+                Some(format!("{} = mrs(NZCV);", destination.name()))
+            }
             Self::Assign { destination, value } => {
                 let destination = destination.target();
                 let known = match value {
@@ -1049,18 +1067,54 @@ impl IrOperation {
                 };
                 Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known.as_ref())))
             }
-            Self::AddCarry { destination, left, right, subtract } => {
+            Self::AddCarry { destination, left, right, subtract, set_flags } => {
                 let destination = destination.target();
                 let left = left.target();
                 let right = right.target();
-                // PSTATE.C is not modeled, so this must invalidate any prior value.
-                flow.write(destination, None);
+                let carry_in = flow.flags.map(|flags| (flags & files::FLAG_C) != 0);
+                let left_value = flow.read(left);
+                let right_value = flow.read(right);
+                let known = left_value.as_ref().zip(right_value.as_ref()).zip(carry_in)
+                    .and_then(|((left_value, right_value), carry)| {
+                        let width = if destination.wide { 64 } else { 32 };
+                        let mask = if width == 64 { u64::MAX } else { u32::MAX as u64 };
+                        let a = left_value.value & mask;
+                        let b = right_value.value & mask;
+                        let operand = if subtract { !b & mask } else { b };
+                        let wide_sum = a as u128 + operand as u128 + u128::from(carry);
+                        let result = wide_sum as u64 & mask;
+                        let carry_out = wide_sum > mask as u128;
+                        let sign = 1u64 << (width - 1);
+                        let overflow = if subtract {
+                            ((a ^ b) & (a ^ result) & sign) != 0
+                        } else {
+                            ((!(a ^ b)) & (a ^ result) & sign) != 0
+                        };
+                        let mut flags = 0;
+                        if result & sign != 0 { flags |= files::FLAG_N; }
+                        if result == 0 { flags |= files::FLAG_Z; }
+                        if carry_out { flags |= files::FLAG_C; }
+                        if overflow { flags |= files::FLAG_V; }
+                        let mut input_origins = left_value.origins.clone();
+                        input_origins.extend_from_slice(&right_value.origins);
+                        if let Some(flag_origins) = &flow.flag_origins {
+                            input_origins.extend_from_slice(flag_origins);
+                        }
+                        let origins = combine_origins(&input_origins, &[], pc)?;
+                        Some((KnownValue { value: result, origins }, flags))
+                    });
+                let known_value = known.as_ref().map(|(value, _)| value.clone());
+                flow.write(destination, known_value.clone());
+                if set_flags {
+                    flow.flags = known.as_ref().map(|(_, flags)| *flags);
+                    flow.flag_origins = known.as_ref().and_then(|(value, _)| combine_origins(&value.origins, &[], pc));
+                }
                 let expression = if subtract {
                     format!("{} + ~{} + carry", left.name(), right.name())
                 } else {
                     format!("{} + {} + carry", left.name(), right.name())
                 };
-                Some(format!("{} = {expression};", destination.name()))
+                Some(format!("{} = {expression};{}", destination.name(), resolved_suffix(known_value.as_ref())))
             }
             Self::ConditionalSelect { destination, if_true, if_false, condition, else_op } => {
                 let destination = destination.target();
@@ -1192,6 +1246,13 @@ impl IrOperation {
                 flow.flag_origins = ir_compare_origins(left, right, flow, pc).filter(|_| flow.flags.is_some());
                 let operand = render_ir_compare_operand(right);
                 Some(format!("/* {} {}, {operand} */", ir_compare_mnemonic(kind), left.name()))
+            }
+            Self::WriteNZCV { source } => {
+                let source = source.target();
+                let value = flow.read(source);
+                flow.flags = value.as_ref().map(|value| ((value.value >> 28) & 0xf) as u8);
+                flow.flag_origins = value.map(|value| value.origins);
+                Some(format!("/* msr NZCV, {} */", source.name()))
             }
             Self::ConditionalCompare { kind, left, right, nzcv, condition } => {
                 let left = left.target();
@@ -1659,26 +1720,35 @@ impl IrOperation {
             Self::VectorArithmetic { destination, left, right, element_bits, operator } => {
                 let left_value = flow.read_v(left.index as u32);
                 let right_value = flow.read_v(right.index as u32);
+                let accumulator = matches!(operator, IrVectorArithmeticOperator::MultiplyAccumulate | IrVectorArithmeticOperator::MultiplySubtract)
+                    .then(|| flow.read_v(destination.index as u32));
                 let lane_count = u32::from(destination.width.bytes()) * 8 / u32::from(element_bits);
                 let lane_mask = (1u128 << element_bits) - 1;
                 let width_mask = if destination.width == IrSimdWidth::Quad { u128::MAX } else { u64::MAX as u128 };
                 let known = left_value.as_ref().zip(right_value.as_ref()).and_then(|(left, right)| {
+                    let accumulator = if matches!(operator, IrVectorArithmeticOperator::MultiplyAccumulate | IrVectorArithmeticOperator::MultiplySubtract) {
+                        accumulator.as_ref()?.as_ref()
+                    } else { None };
+                    let provenance = combine_origins(&left.origins, &right.origins, pc)?;
+                    let provenance = if let Some(accumulator) = accumulator {
+                        combine_origins(&provenance, &accumulator.origins, pc)?
+                    } else { provenance };
                     let mut value = 0u128;
                     for lane in 0..lane_count {
                         let shift = lane * u32::from(element_bits);
                         let lhs = (left.value >> shift) & lane_mask;
                         let rhs = (right.value >> shift) & lane_mask;
+                        let acc = accumulator.map(|value| (value.value >> shift) & lane_mask).unwrap_or(0);
                         let result = match operator {
                             IrVectorArithmeticOperator::Add => lhs.wrapping_add(rhs),
                             IrVectorArithmeticOperator::Subtract => lhs.wrapping_sub(rhs),
                             IrVectorArithmeticOperator::Multiply => lhs.wrapping_mul(rhs),
+                            IrVectorArithmeticOperator::MultiplyAccumulate => acc.wrapping_add(lhs.wrapping_mul(rhs)),
+                            IrVectorArithmeticOperator::MultiplySubtract => acc.wrapping_sub(lhs.wrapping_mul(rhs)),
                         } & lane_mask;
                         value |= result << shift;
                     }
-                    combine_origins(&left.origins, &right.origins, pc).map(|origins| VKnownValue {
-                        value: value & width_mask,
-                        origins,
-                    })
+                    Some(VKnownValue { value: value & width_mask, origins: provenance })
                 });
                 flow.write_v(destination.index as u32, known.clone());
                 let destination_name = vector_arrangement_name(destination, element_bits);
@@ -1688,6 +1758,8 @@ impl IrOperation {
                     IrVectorArithmeticOperator::Add => format!("{left_name} + {right_name}"),
                     IrVectorArithmeticOperator::Subtract => format!("{left_name} - {right_name}"),
                     IrVectorArithmeticOperator::Multiply => format!("{left_name} * {right_name}"),
+                    IrVectorArithmeticOperator::MultiplyAccumulate => format!("{destination_name} + ({left_name} * {right_name})"),
+                    IrVectorArithmeticOperator::MultiplySubtract => format!("{destination_name} - ({left_name} * {right_name})"),
                 };
                 let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
                 Some(format!("{destination_name} = {expression};{evidence}"))
@@ -1714,7 +1786,7 @@ impl IrOperation {
                     IrVectorFloatBinaryOperator::MinNum => format!("fminnm({left_name}, {right_name})"),
                 };
                 let evidence = known.map(|value| format!(" /* constant={:#x} proven_by=[{}] */", value.value, value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","))).unwrap_or_default();
-                Some(format!("{destination_name} = {expression};{evidence}"))
+                Some(format!("{destination_name} = {expression};{evidence} /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"))
             }
             Self::DirectCall { target } => {
                 flow.clear();
@@ -1780,7 +1852,7 @@ impl IrOperation {
                 Some(format!("{} = {}({});",
                     vector_arrangement_name(destination, element_bits),
                     mnemonic,
-                    vector_arrangement_name(source, element_bits)))
+                    vector_arrangement_name(source, element_bits)) + " /* FPCR/FPSR estimate and exception behavior unresolved */")
             }
             Self::VectorHalfBinary { destination, left, right, element_bits, operator } => {
                 flow.write_v(destination.index as u32, None);
@@ -1797,7 +1869,7 @@ impl IrOperation {
                     IrVectorHalfBinaryOperator::MaxNum => "fmaxnm",
                     IrVectorHalfBinaryOperator::MinNum => "fminnm",
                 };
-                Some(format!("{dest_name} = {mnemonic}({left_name}, {right_name});"))
+                Some(format!("{dest_name} = {mnemonic}({left_name}, {right_name}); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"))
             }
             Self::TargetSpecific => None,
         }
@@ -1950,16 +2022,16 @@ enum BranchTest {
 
 fn sysreg_name(op0: u8, op1: u8, crn: u8, crm: u8, op2: u8) -> String {
     match (op0, op1, crn, crm, op2) {
-        (3, 3, 4, 0, 3) => "NZCV".to_string(),
+        (3, 3, 4, 2, 0) => "NZCV".to_string(),
         (3, 3, 13, 0, 2) => "TPIDR_EL0".to_string(),
         (3, 3, 13, 0, 3) => "TPIDRRO_EL0".to_string(),
         (3, 3, 14, 0, 2) => "CNTVCT_EL0".to_string(),
         (3, 3, 0, 0, 1) => "CTR_EL0".to_string(),
         (3, 3, 0, 0, 2) => "DCZID_EL0".to_string(),
-        (3, 3, 4, 2, 0) => "FPCR".to_string(),
-        (3, 3, 4, 2, 1) => "FPSR".to_string(),
-        (3, 3, 4, 4, 0) => "DAIF".to_string(),
-        (3, 3, 4, 4, 1) => "CurrentEL".to_string(),
+        (3, 3, 4, 4, 0) => "FPCR".to_string(),
+        (3, 3, 4, 4, 1) => "FPSR".to_string(),
+        (3, 3, 4, 2, 1) => "DAIF".to_string(),
+        (3, 0, 4, 2, 2) => "CurrentEL".to_string(),
         (3, 3, 4, 4, 2) => "PAN".to_string(),
         (3, 3, 4, 4, 3) => "UAO".to_string(),
         (3, 3, 4, 4, 4) => "DIT".to_string(),
@@ -2588,6 +2660,7 @@ enum Operation {
         left: Register,
         right: Register,
         subtract: bool,
+        set_flags: bool,
     },
     /// Add/subtract (extended register): `dst = left ± (extend(right) << shift)`.
     ///
@@ -3019,8 +3092,9 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::ExtractConcat { dst, left, right, lsb } => IrOperation::ExtractConcat {
             destination: reg(dst), left: reg(left), right: reg(right), lsb,
         },
-        Operation::AddCarry { dst, left, right, subtract } => IrOperation::AddCarry {
+        Operation::AddCarry { dst, left, right, subtract, set_flags } => IrOperation::AddCarry {
             destination: reg(dst), left: reg(left), right: reg(right), subtract,
+            set_flags,
         },
         Operation::ConditionalSelect { dst, if_true, if_false, cond, else_op } => IrOperation::ConditionalSelect {
             destination: reg(dst), if_true: reg(if_true), if_false: reg(if_false),
@@ -3173,6 +3247,12 @@ fn lift_operation(operation: Operation, pc: u64) -> IrOperation {
         Operation::ScalarFloatCompare { left, right, precision } => IrOperation::ScalarFloatCompare { left, right, precision },
         Operation::ScalarFloatConvert { destination, destination_precision, source, source_precision } => IrOperation::ScalarFloatConvert { destination, destination_precision, source, source_precision },
         Operation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits },
+        Operation::Mrs { op0: 3, op1: 3, crn: 4, crm: 2, op2: 0, dst } => {
+            IrOperation::ReadNZCV { destination: reg(dst) }
+        }
+        Operation::Msr { op0: 3, op1: 3, crn: 4, crm: 2, op2: 0, src } => {
+            IrOperation::WriteNZCV { source: reg(src) }
+        }
         Operation::Call(target) => IrOperation::DirectCall { target },
         Operation::IndirectCall { target } => IrOperation::IndirectCall { target: reg(target) },
         Operation::Branch(target) => IrOperation::Branch { target },
@@ -3474,7 +3554,7 @@ fn decode(word: u32, pc: u64) -> Operation {
     // destination is an unknown barrier and only the shape is rendered. The
     // flag-setting ADCS/SBCS forms (S == 1) and the conditional-compare forms
     // stay opaque, matching the flag-neutral ADD/SUB rule.
-    if word & 0x3fe0_fc00 == 0x1a00_0000 {
+    if word & 0x1fe0_fc00 == 0x1a00_0000 {
         let wide = word >> 31 != 0;
         let rd = word & 31;
         let rn = (word >> 5) & 31;
@@ -3499,6 +3579,7 @@ fn decode(word: u32, pc: u64) -> Operation {
                 stack_pointer: false,
             },
             subtract: word & (1 << 30) != 0,
+            set_flags: word & (1 << 29) != 0,
         };
     }
     // Logical (immediate): flag-neutral AND/ORR/EOR with a bitmask immediate,
@@ -5217,25 +5298,24 @@ fn decode(word: u32, pc: u64) -> Operation {
         };
     }
     // Lane-wise vector three-same integer arithmetic: `0 Q U 0 1110 size 0
-    // Rm opcode Rn Rd` with bit 10 = 0, separating it from the bitwise group
+    // Rm opcode 1 Rn Rd` with bit 21 and bit 10 fixed, separating it from the bitwise group
     // (bit 10 = 1) and the one-source group. Opcodes 10000 (ADD/SUB, U
-    // selects), 10010 (MLA/MLS, not lifted here) and 10011 (MUL). Only
-    // ADD, SUB and MUL are lifted; MLA/MLS remain opaque for now. Q selects
+    // selects), 10010 (MLA/MLS, U selects) and 10011 (MUL). Q selects
     // the 128-bit (`Q`) or 64-bit (`D`) destination view; size selects the
     // element width (0 = 8-bit, 1 = 16-bit, 2 = 32-bit, 3 = 64-bit lanes).
     // These operations interpret each lane as an integer and wrap on overflow;
     // no floating-point rounding or exception state is claimed.
-    if word & 0x9f00_0000 == 0x0e00_0000 {
+    if word & 0x9f20_0400 == 0x0e20_0400 {
         let opcode = (word >> 11) & 0x1f;
-        // Only three-same integer arithmetic is lifted here; other opcodes
-        // (bitwise, one-source, multiply-accumulate, etc.) fall through to
+        // Only the explicitly modeled three-same integer arithmetic opcodes
+        // are lifted here; other opcodes fall through to
         // their own decoders or remain opaque.
-        if matches!(opcode, 0b10000 | 0b10011) {
+        if matches!(opcode, 0b10000 | 0b10010 | 0b10011) {
             let size = ((word >> 22) & 3) as u8;
             let quad = word & 0x4000_0000 != 0;
             // The 64-bit/64-bit-lane arrangement is reserved, and integer
-            // MUL has no .2d form even for a 128-bit vector.
-            if (size == 3 && !quad) || (size == 3 && opcode == 0b10011) {
+            // MUL and MLA/MLS have no .2d form even for a 128-bit vector.
+            if (size == 3 && !quad) || (size == 3 && opcode != 0b10000) {
                 return Operation::Opaque;
             }
             let operator = match opcode {
@@ -5243,6 +5323,8 @@ fn decode(word: u32, pc: u64) -> Operation {
                     if word & 0x2000_0000 != 0 { IrVectorArithmeticOperator::Subtract } else { IrVectorArithmeticOperator::Add }
                 }
                 0b10011 => IrVectorArithmeticOperator::Multiply,
+                0b10010 if word & 0x2000_0000 != 0 => IrVectorArithmeticOperator::MultiplySubtract,
+                0b10010 => IrVectorArithmeticOperator::MultiplyAccumulate,
                 _ => unreachable!(),
             };
             let width = if quad { IrSimdWidth::Quad } else { IrSimdWidth::Double };
@@ -5309,8 +5391,9 @@ fn decode(word: u32, pc: u64) -> Operation {
     // (U = 0) and a different instruction that shares the opcode (U = 1):
     // FADDP/FABD, FMAXP/FMINP, FMAXNMP/FMINNMP, FMULX, FAMAX, FAMIN, FRECPS,
     // FRSQRTS and FSCALE are pairwise or fused forms, so they stay opaque.
-    if word & 0x9f00_8000 == 0x0e00_0000 && word & 0x0020_0000 == 0 && word & 0x400 != 0 {
-        if word & 0x0040_0000 != 0 {
+    if word & 0x9f00_8000 == 0x0e00_0000 && word & 0x0020_0000 == 0
+        && word & 0x400 != 0 && word & 0x0040_0000 != 0
+    {
             let variant = (word >> 23) & 1;
             let u = (word >> 29) & 1;
             let opcode = (word >> 11) & 0x1f;
@@ -5330,9 +5413,8 @@ fn decode(word: u32, pc: u64) -> Operation {
             let left = IrSimdRegister { index: ((word >> 5) & 31) as u8, width };
             let right = IrSimdRegister { index: ((word >> 16) & 31) as u8, width };
             return Operation::VectorHalfBinary { destination, left, right, element_bits: 16, operator };
-        }
-        // fall through: bit 22 = 0 belongs to the integer three-same group.
     }
+    // fall through: bit 22 = 0 belongs to the integer three-same group.
     // Advanced SIMD two-register reciprocal estimate (FRECPE/FRSQRTE).
     // `0 Q U 01110 <op> <sz> 1 Rm 1 10110 Rn Rd`, so bits 15-10 = 0b110110
     // and bit 10 = 0 distinguishes this group from the three-same group.
@@ -6345,10 +6427,10 @@ impl Operation {
                 left,
                 right,
                 subtract,
+                set_flags,
             } => {
-                // The carry input is PSTATE.C, which the preview does not
-                // track, so the result is always an unknown barrier and only
-                // the shape is rendered.
+                // Legacy rendering has no flag-value state; flags-setting
+                // forms therefore preserve their exact shape but remain unknown.
                 flow.write(dst, None);
                 let expression = if subtract {
                     // SBC is `left + ~right + carry` in the architecture
@@ -6358,7 +6440,7 @@ impl Operation {
                 } else {
                     format!("{} + {} + carry", left.name(), right.name())
                 };
-                format!("{} = {expression};", dst.name())
+                format!("{} = {expression};{}", dst.name(), if set_flags { " /* sets NZCV */" } else { "" })
             }
             Self::WideningMultiply {
                 dst,
@@ -6946,8 +7028,14 @@ impl Operation {
                 src,
             } => {
                 let sysreg = sysreg_name(op0, op1, crn, crm, op2);
-                // No tracked register effect; Rt is consumed but value tracking
-                // does not model liveness, so flow is preserved.
+                // NZCV is a tracked architectural file: replace its current
+                // value from bits 31..28 of Rt. Other system registers do not
+                // affect this preview's tracked flag file.
+                if (op0, op1, crn, crm, op2) == (3, 3, 4, 2, 0) {
+                    let value = flow.read(src);
+                    flow.flags = value.as_ref().map(|value| ((value.value >> 28) & 0xf) as u8);
+                    flow.flag_origins = value.map(|value| value.origins);
+                }
                 format!("/* msr {}, {} */", sysreg, src.name())
             }
             Self::LseLoad {
@@ -8835,7 +8923,7 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, render, scalar_float_compare_flags, f16_to_f32_bits, Flow, IrFloatPrecision, Operation};
+    use super::{decode, lift_operation, render, scalar_float_compare_flags, f16_to_f32_bits, Flow, IrFloatPrecision, KnownValue, Operation, Register};
 
     fn lift(word: u32, pc: u64) -> String {
         decode(word, pc).render(&mut Flow::new(), pc)
@@ -8901,19 +8989,19 @@ mod tests {
     #[test]
     fn vector_half_arithmetic_lifts_to_shared_ir() {
         let cases = [
-            (0x0e42_1420, "v0.4h = fadd(v1.4h, v2.4h);"),
-            (0x4e42_1420, "v0.8h = fadd(v1.8h, v2.8h);"),
-            (0x0ec2_1420, "v0.4h = fsub(v1.4h, v2.4h);"),
-            (0x2e42_1c20, "v0.4h = fmul(v1.4h, v2.4h);"),
-            (0x6e42_3c20, "v0.8h = fdiv(v1.8h, v2.8h);"),
-            (0x0e42_3420, "v0.4h = fmax(v1.4h, v2.4h);"),
-            (0x0ec2_3420, "v0.4h = fmin(v1.4h, v2.4h);"),
-            (0x4e42_3420, "v0.8h = fmax(v1.8h, v2.8h);"),
-            (0x4ec2_3420, "v0.8h = fmin(v1.8h, v2.8h);"),
-            (0x0e42_0420, "v0.4h = fmaxnm(v1.4h, v2.4h);"),
-            (0x0ec2_0420, "v0.4h = fminnm(v1.4h, v2.4h);"),
-            (0x4e42_0420, "v0.8h = fmaxnm(v1.8h, v2.8h);"),
-            (0x4ec2_0420, "v0.8h = fminnm(v1.8h, v2.8h);"),
+            (0x0e42_1420, "v0.4h = fadd(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x4e42_1420, "v0.8h = fadd(v1.8h, v2.8h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x0ec2_1420, "v0.4h = fsub(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x2e42_1c20, "v0.4h = fmul(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x6e42_3c20, "v0.8h = fdiv(v1.8h, v2.8h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x0e42_3420, "v0.4h = fmax(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x0ec2_3420, "v0.4h = fmin(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x4e42_3420, "v0.8h = fmax(v1.8h, v2.8h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x4ec2_3420, "v0.8h = fmin(v1.8h, v2.8h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x0e42_0420, "v0.4h = fmaxnm(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x0ec2_0420, "v0.4h = fminnm(v1.4h, v2.4h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x4e42_0420, "v0.8h = fmaxnm(v1.8h, v2.8h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
+            (0x4ec2_0420, "v0.8h = fminnm(v1.8h, v2.8h); /* FPCR/FPSR rounding, exceptions, NaNs and signed-zero behavior unresolved */"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
@@ -8927,12 +9015,12 @@ mod tests {
     #[test]
     fn vector_reciprocal_estimate_lifts_to_shared_ir() {
         let cases = [
-            (0x4ea1_d820, "v0.4s = frecpe(v1.4s);"),
-            (0x4ee1_d820, "v0.2d = frecpe(v1.2d);"),
-            (0x6ea1_d820, "v0.4s = frsqrte(v1.4s);"),
-            (0x6ee1_d820, "v0.2d = frsqrte(v1.2d);"),
-            (0x0ea1_d820, "v0.2s = frecpe(v1.2s);"),
-            (0x2ea1_d820, "v0.2s = frsqrte(v1.2s);"),
+            (0x4ea1_d820, "v0.4s = frecpe(v1.4s); /* FPCR/FPSR estimate and exception behavior unresolved */"),
+            (0x4ee1_d820, "v0.2d = frecpe(v1.2d); /* FPCR/FPSR estimate and exception behavior unresolved */"),
+            (0x6ea1_d820, "v0.4s = frsqrte(v1.4s); /* FPCR/FPSR estimate and exception behavior unresolved */"),
+            (0x6ee1_d820, "v0.2d = frsqrte(v1.2d); /* FPCR/FPSR estimate and exception behavior unresolved */"),
+            (0x0ea1_d820, "v0.2s = frecpe(v1.2s); /* FPCR/FPSR estimate and exception behavior unresolved */"),
+            (0x2ea1_d820, "v0.2s = frsqrte(v1.2s); /* FPCR/FPSR estimate and exception behavior unresolved */"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
@@ -9902,12 +9990,10 @@ mod tests {
     }
 
     #[test]
-    fn flag_setting_carry_and_conditional_compare_forms_stay_opaque() {
-        // ADCS/SBCS set flags (S == 1), like ADDS/SUBS.
-        // adcs x0, x1, x2 = 0xba020020
-        assert!(lift(0xba02_0020, 0x1000).contains("opaque instruction"));
-        // sbcs x0, x1, x2 = 0xfa020020
-        assert!(lift(0xfa02_0020, 0x1000).contains("opaque instruction"));
+    fn flag_setting_carry_forms_lift_and_preserve_their_carry_dependency() {
+        // ADCS/SBCS consume the incoming C bit and define all NZCV bits.
+        assert_eq!(lift(0xba02_0020, 0x1000), "x0 = x1 + x2 + carry; /* sets NZCV */");
+        assert_eq!(lift(0xfa02_0020, 0x1000), "x0 = x1 + ~x2 + carry; /* sets NZCV */");
         // Conditional compare (CCMP/CCMN) is now modeled as a marker (slice 34);
         // see lifts_conditional_comparisons.
     }
@@ -10825,7 +10911,7 @@ mod tests {
         // upper half, so the published value covers the whole register
         // instead of keeping the identity of the upper half. The
         // measurement is recorded in docs/AARCH64_SCALAR_FP_EFFECTS.md.
-        let words = [0x6f00_e400u32, 0x0e02_8020];
+        let words = [0x6f00_e400u32, 0x0e22_8420];
         let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report.contains("ssa-vector-values 0x1004"), "{report}");
@@ -10834,7 +10920,8 @@ mod tests {
 
     #[test]
     fn a_join_merges_the_flag_file_values_that_reach_it() {
-        // Flag file SSA merge at a diamond join is not yet implemented.
+        // The Z flag entering the join comes from either comparison, so the
+        // flag-file SSA must expose a phi with both instruction origins.
         // cmp x0, #5 ; b.eq 0x100c ; cmp x1, #6 ; b.eq 0x1010
         let words = [
             0xf100_141fu32, 0x5400_0040, // cmp x0, #5 ; b.eq +8 (0x100c)
@@ -10843,20 +10930,52 @@ mod tests {
         let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
         let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
         assert!(report.contains("cfg B"), "{report}");
-        // TODO: re-enable when file_ssa produces ssa-file output
-        // assert!(report.contains("ssa-file "), "{report}");
-        // assert!(report.contains("z@B"), "{report}");
-        // assert!(report.contains("@0x1000") && report.contains("@0x1008"), "{report}");
+        assert!(report.contains("ssa-file "), "{report}");
+        assert!(report.contains("z@B"), "{report}");
+        assert!(report.contains("@0x1000") && report.contains("@0x1008"), "{report}");
     }
 
     #[test]
-    fn flag_setting_forms_with_a_destination_stay_opaque() {
-        // ADCS/SBCS set flags and depend on the untracked carry (PSTATE.C), so
-        // they stay opaque. The flag-setting ADDS/SUBS/ANDS/BICS forms are now
+    fn carry_flag_setting_forms_with_a_destination_are_modeled() {
+        // ADCS/SBCS set flags and depend on the incoming PSTATE.C, which the
+        // shared IR carries as an exact flag-file use. Other flag-setting
+        // ADDS/SUBS/ANDS/BICS forms are now
         // modeled like their flag-neutral counterparts, ignoring the untracked
         // PSTATE side effect.
-        assert!(lift(0xba02_0020, 0x1000).contains("opaque instruction")); // adcs x0, x1, x2
-        assert!(lift(0xfa02_0020, 0x1000).contains("opaque instruction")); // sbcs x0, x1, x2
+        assert_eq!(lift(0xba02_0020, 0x1000), "x0 = x1 + x2 + carry; /* sets NZCV */"); // adcs x0, x1, x2
+        assert_eq!(lift(0xfa02_0020, 0x1000), "x0 = x1 + ~x2 + carry; /* sets NZCV */"); // sbcs x0, x1, x2
+    }
+
+    #[test]
+    fn flag_setting_carry_folds_with_known_inputs_and_computes_nzcv() {
+        let operation = lift_operation(decode(0xba02_0020, 0x1000), 0x1000);
+        let mut flow = Flow::new();
+        flow.write(Register { index: 1, wide: true, stack_pointer: false }, Some(KnownValue { value: 1, origins: vec![0xff0] }));
+        flow.write(Register { index: 2, wide: true, stack_pointer: false }, Some(KnownValue { value: 2, origins: vec![0xff4] }));
+        flow.flags = Some(super::files::FLAG_C);
+        let rendered = operation.render(&mut flow, 0x1000).unwrap();
+        assert!(rendered.contains("constant=0x4"), "{rendered}");
+        assert_eq!(flow.read(Register { index: 0, wide: true, stack_pointer: false }).unwrap().value, 4);
+        assert_eq!(flow.flags, Some(0));
+
+        // The 32-bit path must compute carry at bit 31, not at the host's
+        // 64-bit width: 0xffffffff + 0 + 1 wraps to zero with C and Z set.
+        let mut flow = Flow::new();
+        flow.write(Register { index: 1, wide: false, stack_pointer: false }, Some(KnownValue { value: u32::MAX as u64, origins: vec![0xff0] }));
+        flow.write(Register { index: 2, wide: false, stack_pointer: false }, Some(KnownValue { value: 0, origins: vec![0xff4] }));
+        flow.flags = Some(super::files::FLAG_C);
+        lift_operation(decode(0x3a02_0020, 0x1000), 0x1000).render(&mut flow, 0x1000);
+        assert_eq!(flow.read(Register { index: 0, wide: false, stack_pointer: false }).unwrap().value, 0);
+        assert_eq!(flow.flags, Some(super::files::FLAG_C | super::files::FLAG_Z));
+
+        // SBCS with C clear subtracts one extra; 0 - 0 - 1 sets only N.
+        let mut flow = Flow::new();
+        flow.write(Register { index: 1, wide: false, stack_pointer: false }, Some(KnownValue { value: 0, origins: vec![0xff0] }));
+        flow.write(Register { index: 2, wide: false, stack_pointer: false }, Some(KnownValue { value: 0, origins: vec![0xff4] }));
+        flow.flags = Some(0);
+        lift_operation(decode(0x7a02_0020, 0x1000), 0x1000).render(&mut flow, 0x1000);
+        assert_eq!(flow.read(Register { index: 0, wide: false, stack_pointer: false }).unwrap().value, u32::MAX as u64);
+        assert_eq!(flow.flags, Some(super::files::FLAG_N));
     }
 
     #[test]
@@ -10927,11 +11046,50 @@ mod tests {
         assert_eq!(lift(0xd53b_e040, 0x1000), "x0 = mrs(CNTVCT_EL0);");
         assert_eq!(lift(0xd53b_d049, 0x1000), "x9 = mrs(TPIDR_EL0);");
         assert_eq!(lift(0xd53b_d040, 0x1000), "x0 = mrs(TPIDR_EL0);");
+        assert_eq!(lift(0xd53b_4200, 0x1000), "x0 = mrs(NZCV);");
+        assert_eq!(lift(0xd53b_4400, 0x1000), "x0 = mrs(FPCR);");
+        assert_eq!(lift(0xd53b_4420, 0x1000), "x0 = mrs(FPSR);");
+        assert_eq!(lift(0xd53b_4223, 0x1000), "x3 = mrs(DAIF);");
+        assert_eq!(lift(0xd538_4244, 0x1000), "x4 = mrs(CurrentEL);");
         assert_eq!(lift(0xd51b_d040, 0x1000), "/* msr TPIDR_EL0, x0 */");
         assert_eq!(lift(0xd51b_d061, 0x1000), "/* msr TPIDRRO_EL0, x1 */");
         assert_eq!(lift(0xd51c_f1a2, 0x1000), "/* msr S3_4_C15_C1_5, x2 */");
         // Generic system registers fall back to the S-form name.
         assert_eq!(lift(0xd539_f1a9, 0x1000), "x9 = mrs(S3_1_C15_C1_5);");
+        assert_eq!(lift(0xd51b_4200, 0x1000), "/* msr NZCV, x0 */");
+    }
+
+    #[test]
+    fn msr_nzcv_replaces_flag_values_from_the_source_register() {
+        let source = Register { index: 0, wide: true, stack_pointer: false };
+        let known = Some(KnownValue { value: 0xa000_0000, origins: vec![0x1000] });
+        let operation = decode(0xd51b_4200, 0x1004);
+        let mut legacy_flow = Flow::new();
+        legacy_flow.write(source, known.clone());
+        legacy_flow.flags = Some(4);
+        let _ = operation.render(&mut legacy_flow, 0x1004);
+        assert_eq!(legacy_flow.flags, Some(0xa));
+        assert_eq!(legacy_flow.flag_origins, Some(vec![0x1000]));
+
+        let portable = lift_operation(operation, 0x1004);
+        assert!(matches!(portable, super::IrOperation::WriteNZCV { .. }));
+        let mut shared_flow = Flow::new();
+        shared_flow.write(source, known);
+        shared_flow.flags = Some(4);
+        assert_eq!(portable.render(&mut shared_flow, 0x1004).as_deref(), Some("/* msr NZCV, x0 */"));
+        assert_eq!(shared_flow.flags, Some(0xa));
+    }
+
+    #[test]
+    fn mrs_nzcv_is_a_gpr_definition_and_preserves_the_read_flag_value() {
+        let operation = decode(0xd53b_4200, 0x1004);
+        let portable = lift_operation(operation, 0x1004);
+        assert!(matches!(portable, super::IrOperation::ReadNZCV { .. }));
+        let mut flow = Flow::new();
+        flow.flags = Some(0xa);
+        assert_eq!(portable.render(&mut flow, 0x1004).as_deref(), Some("x0 = mrs(NZCV);"));
+        assert_eq!(flow.flags, Some(0xa));
+        assert!(flow.read(Register { index: 0, wide: true, stack_pointer: false }).is_none());
     }
 
     #[test]
@@ -11721,9 +11879,9 @@ mod vector_bitwise_tests {
 mod vector_arithmetic_tests {
     use super::*;
 
-    // Three-same integer encoding: `0 Q U 0 1110 size 0 Rm opcode Rn Rd`.
+    // Three-same integer encoding: `0 Q U 0 1110 size 0 Rm opcode 1 Rn Rd`.
     fn word(quad: bool, size: u8, opcode: u8, subtract: bool) -> u32 {
-        0x0e00_0000 | (u32::from(quad) << 30) | (u32::from(subtract) << 29)
+        0x0e20_0400 | (u32::from(quad) << 30) | (u32::from(subtract) << 29)
             | (u32::from(size) << 22) | (2 << 16) | (u32::from(opcode) << 11)
             | (1 << 5)
     }
@@ -11732,9 +11890,12 @@ mod vector_arithmetic_tests {
     fn every_valid_vector_arithmetic_arrangement_keeps_its_lane_width() {
         for quad in [false, true] {
             for size in 0..=3u8 {
-                for (opcode, subtract, symbol) in [(16, false, "+"), (16, true, "-"), (19, false, "*")] {
+                for (opcode, subtract, symbol) in [
+                    (16, false, "+"), (16, true, "-"), (19, false, "*"),
+                    (18, false, "acc+"), (18, true, "acc-"),
+                ] {
                     let encoding = word(quad, size, opcode, subtract);
-                    let valid = (quad || size != 3) && (opcode != 19 || size != 3);
+                    let valid = (quad || size != 3) && (!matches!(opcode, 18 | 19) || size != 3);
                     let decoded = decode(encoding, 0x1000);
                     if !valid {
                         assert!(matches!(decoded, Operation::Opaque), "reserved encoding {encoding:#010x}");
@@ -11744,7 +11905,11 @@ mod vector_arithmetic_tests {
                     let element_bits = 8 << size;
                     let lanes = (if quad { 128 } else { 64 }) / element_bits;
                     let suffix = match element_bits { 8 => 'b', 16 => 'h', 32 => 's', _ => 'd' };
-                    let arrangement = format!("v0.{lanes}{suffix} = v1.{lanes}{suffix} {symbol} v2.{lanes}{suffix};");
+                    let arrangement = match symbol {
+                        "acc+" => format!("v0.{lanes}{suffix} = v0.{lanes}{suffix} + (v1.{lanes}{suffix} * v2.{lanes}{suffix});"),
+                        "acc-" => format!("v0.{lanes}{suffix} = v0.{lanes}{suffix} - (v1.{lanes}{suffix} * v2.{lanes}{suffix});"),
+                        _ => format!("v0.{lanes}{suffix} = v1.{lanes}{suffix} {symbol} v2.{lanes}{suffix};"),
+                    };
                     let portable = lift_operation(decoded, 0x1000);
                     assert!(matches!(portable, IrOperation::VectorArithmetic { element_bits: width, .. } if width == element_bits), "{encoding:#010x}");
                     assert_eq!(portable.render(&mut Flow::new(), 0x1000).unwrap(), arrangement, "{encoding:#010x}");
@@ -11755,12 +11920,24 @@ mod vector_arithmetic_tests {
     }
 
     #[test]
+    fn integer_three_same_requires_its_fixed_encoding_bits() {
+        let mla = word(false, 0, 18, false);
+        assert_eq!(mla, 0x0e22_9420, "Apple Clang assembler oracle: mla v0.8b, v1.8b, v2.8b");
+        for neighbor in [mla & !(1 << 21), mla & !(1 << 10)] {
+            let decoded = decode(neighbor, 0x1000);
+            assert!(matches!(decoded, Operation::Opaque), "neighbor {neighbor:#010x}");
+            assert!(lift_operation(decoded, 0x1000).gpr_effects().barrier);
+        }
+    }
+
+    #[test]
     fn low_64_bit_forms_fold_the_zero_extended_full_register_result() {
         let mut flow = Flow::new();
         flow.write_v(3, Some(VKnownValue { value: u128::MAX, origins: vec![0xfe0] }));
         flow.write_v(4, Some(VKnownValue { value: 5, origins: vec![0xfe4] }));
         flow.write_v(5, Some(VKnownValue { value: 7, origins: vec![0xfe8] }));
-        lift_operation(decode(0x0ea58483, 0x1000), 0x1000).render(&mut flow, 0x1000);
+        let add_d = 0x0e20_0400 | (5 << 16) | (0b10000 << 11) | (4 << 5) | 3;
+        lift_operation(decode(add_d, 0x1000), 0x1000).render(&mut flow, 0x1000);
         assert_eq!(flow.read_v(3).expect("Q=0 result defines a full register").value, 12);
         assert!(flow.read_v(4).is_some() && flow.read_v(5).is_some());
     }
@@ -11790,10 +11967,36 @@ mod vector_arithmetic_tests {
     }
 
     #[test]
+    fn multiply_accumulate_and_subtract_use_old_destination_per_lane() {
+        for (subtract, word_bits, expected) in [
+            (false, 0x0e22_9420, 0x1700u128),
+            (true, 0x2e22_9420, 0x11f4u128),
+        ] {
+            let mut flow = Flow::new();
+            // Q=0, .8b. Lane 0 wraps; lane 1 is independent.
+            flow.write_v(2, Some(VKnownValue { value: 0x0303u128, origins: vec![0xfe4] }));
+            flow.write_v(1, Some(VKnownValue { value: 0x0102u128, origins: vec![0xfe0] }));
+            flow.write_v(0, Some(VKnownValue { value: 0x14fau128, origins: vec![0xfdc] }));
+            let operation = lift_operation(decode(word_bits, 0x1000), 0x1000);
+            let expected_operator = if subtract { IrVectorArithmeticOperator::MultiplySubtract }
+                else { IrVectorArithmeticOperator::MultiplyAccumulate };
+            assert!(matches!(operation, IrOperation::VectorArithmetic {
+                operator, ..
+            } if operator == expected_operator));
+            operation.render(&mut flow, 0x1000);
+            let result = flow.read_v(0).expect("accumulated vector result is known");
+            assert_eq!(result.value, expected, "subtract={subtract}");
+            assert_eq!(result.value >> 64, 0, "Q=0 clears the upper half");
+            assert!(result.origins.contains(&0xfdc) && result.origins.contains(&0xfe0)
+                && result.origins.contains(&0xfe4) && result.origins.contains(&0x1000));
+        }
+    }
+
+    #[test]
     fn every_legal_lane_width_folds_add_subtract_and_multiply_modularly() {
         for quad in [false, true] {
             for size in 0..=3u8 {
-                let element_bits = 8 << size;
+                let element_bits: u32 = 8 << size;
                 for (opcode, subtract) in [(16, false), (16, true), (19, false)] {
                     if (!quad && size == 3) || (opcode == 19 && size == 3) { continue; }
                     let lane_count = (if quad {128} else {64}) / element_bits;
@@ -11802,7 +12005,7 @@ mod vector_arithmetic_tests {
                     let mut right = 0u128;
                     let mut expected = 0u128;
                     for lane in 0..lane_count {
-                        let shift = lane * u32::from(element_bits);
+                        let shift = lane * element_bits;
                         let lhs = lane_mask;
                         let rhs = u128::from(lane) + 2;
                         left |= lhs << shift;

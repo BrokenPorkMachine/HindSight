@@ -293,6 +293,31 @@ struct AnalysisReport: Codable, Sendable {
         return try? JSONDecoder().decode(AnalysisReport.self, from: rebound)
     }
 
+    /// Explain the failed identity/budget class at the coordinator boundary;
+    /// ordinary callers can keep using the Boolean `matches` predicate.
+    func validationFailure(id: String, digest: String) -> String? {
+        if `protocol` != 1 { return "unsupported protocol version" }
+        if kind != "analysis_result" { return "unexpected result kind" }
+        if request_id != id { return "request ID mismatch" }
+        if source_sha256 != digest { return "captured-source digest mismatch" }
+        if function_count < 0 || symbol_count < 0 || basic_block_count < 0 || analyzed_instructions < 0 {
+            return "negative analysis count"
+        }
+        guard !matches(id: id, digest: digest) else { return nil }
+        if let encoded = try? JSONEncoder().encode(self),
+           let object = (try? JSONSerialization.jsonObject(with: encoded)) as? [String: Any] {
+            for name in Self.jsonFields.sorted() {
+                guard let section = object[name] as? String else { continue }
+                let limit = name == "summary" ? 32_768 : 65_535
+                let size = section.utf8.count
+                if size > limit {
+                    return "analysis section '\(name)' exceeds its \(limit)-byte limit (\(size) bytes)"
+                }
+            }
+        }
+        return "analysis report exceeds a section size bound"
+    }
+
     func matches(id: String, digest: String) -> Bool {
         `protocol` == 1 && kind == "analysis_result" && request_id == id && source_sha256 == digest &&
         function_count >= 0 && symbol_count >= 0 && basic_block_count >= 0 && analyzed_instructions >= 0 &&

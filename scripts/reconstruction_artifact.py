@@ -28,7 +28,7 @@ PASS_VERSION = re.compile(r"[a-z0-9][a-z0-9.+-]{0,63}")
 # Metadata, data, symbol and external evidence may legitimately refer elsewhere
 # in the captured image.
 LOCAL_SPAN_KINDS = {"decode", "ir-operation", "definition", "use", "phi",
-                    "memory-definition", "memory-use", "memory-phi",
+                    "memory-definition", "memory-use", "memory-phi", "memory-access",
                     "file-definition", "file-use", "file-phi",
                     "cfg-block", "cfg-edge", "ast-node"}
 

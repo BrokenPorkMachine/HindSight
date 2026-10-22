@@ -1,11 +1,36 @@
 //! Review AST and derivation graph produced directly from bounded shared IR.
 use super::*;
 use crate::reconstruction::{address, array, object, ranges, Builder, Input, Value as V};
-use std::{collections::BTreeMap, io};
+use std::{collections::{BTreeMap, BTreeSet}, io};
 mod calls;
 mod constraints;
 mod executable;
 mod source;
+
+/// Floating-point arithmetic can consult FPCR and accumulate exceptions in
+/// FPSR. Those system-register effects are not yet represented in machine
+/// state SSA, so they remain explicit blockers even when the data result has
+/// a supported shared-IR operation.
+fn has_unmodeled_fp_status_effect(operation: IrOperation) -> bool {
+    matches!(operation,
+        IrOperation::ScalarFloatBinary { .. }
+        | IrOperation::ScalarFloatMultiplyAdd(_)
+        | IrOperation::ScalarFloatCompare { .. }
+        | IrOperation::ScalarFloatConvert { .. }
+        | IrOperation::ScalarIntFloatConvert { .. }
+        | IrOperation::VectorFloatBinary { .. }
+        | IrOperation::VectorFloatUnary { .. }
+        | IrOperation::VectorHalfBinary { .. }
+    ) || matches!(operation,
+        IrOperation::ScalarFloatUnary {
+            operator: IrFloatUnaryOperator::Sqrt
+                | IrFloatUnaryOperator::Round
+                | IrFloatUnaryOperator::ReciprocalEstimate
+                | IrFloatUnaryOperator::ReciprocalSqrtEstimate
+                | IrFloatUnaryOperator::ReciprocalExponent,
+            ..
+        })
+}
 
 pub(crate) use constraints::{Constraint, ConstraintKind, Solution as ConstraintSolution};
 
@@ -292,6 +317,22 @@ fn model(operation: IrOperation) -> Option<Tree> {
             ]),
             vec![],
         ),
+        IrOperation::ReadNZCV { destination } => tree(
+            "system-register-read",
+            None,
+            object([("register", "NZCV".into())]),
+            vec![reg(destination)],
+        ),
+        IrOperation::WriteNZCV { source } => tree(
+            "system-register-write",
+            None,
+            object([
+                ("register", "NZCV".into()),
+                ("source", source.target().name().into()),
+                ("source_bits", "31..28".into()),
+            ]),
+            vec![reg(source)],
+        ),
         IrOperation::Assign { destination, value } => {
             assign(destination, operand(value, destination.bits))
         }
@@ -387,6 +428,23 @@ fn model(operation: IrOperation) -> Option<Tree> {
                 operand(left, destination.bits),
                 operand(right, destination.bits),
                 destination.bits,
+            ),
+        ),
+        IrOperation::AddCarry { destination, left, right, subtract, set_flags } => assign(
+            destination,
+            tree(
+                "add-with-carry",
+                Some(integer_type(destination.bits)),
+                object([
+                    ("bits", destination.bits.into()),
+                    ("subtract", subtract.into()),
+                    ("set_flags", set_flags.into()),
+                ]),
+                vec![
+                    reg(left),
+                    reg(right),
+                    tree("flag-carry", Some("bool".into()), object([("state", "nzcv".into())]), vec![]),
+                ],
             ),
         ),
         IrOperation::LogicalRegister {
@@ -949,6 +1007,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         name,
         boundary_sources,
         signatures,
+        call_prototypes: prototype_candidates,
         native,
     } = input;
     if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
@@ -1180,6 +1239,11 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     let mut statement_mirrors = Vec::new();
     let mut trees = Vec::new();
     let mut strict_blocked = truncated || exhausted;
+    let mut source_blocked = truncated || exhausted;
+    let mut shared_ir_count = 0u64;
+    let mut modeled_tree_count = 0u64;
+    let mut data_in_code_count = 0u64;
+    let mut unsupported_reason_count = 0u64;
     // A single exact source declaration proves this function's own prototype,
     // which also proves the prototype of a self-recursive call target.
     let self_prototype = if signatures.len() == 1 {
@@ -1188,6 +1252,27 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     } else {
         None
     };
+    let mut prototypes_by_address = BTreeMap::<u64, Vec<(String, crate::signatures::Signature)>>::new();
+    for (target, symbol, prototype) in prototype_candidates {
+        if prototype.language == "C" {
+            prototypes_by_address.entry(target).or_default().push((symbol, prototype));
+        }
+    }
+    if signatures.len() == 1 {
+        let (symbol, prototype) = &signatures[0];
+        prototypes_by_address.entry(start).or_default().push((symbol.clone(), prototype.clone()));
+    }
+    let mut call_prototypes = BTreeMap::<u64, crate::signatures::SourceSignature>::new();
+    for (target, mut candidates) in prototypes_by_address {
+        candidates.sort_by(|left, right| (&left.0, &left.1.declaration).cmp(&(&right.0, &right.1.declaration)));
+        candidates.dedup_by(|left, right| left.0 == right.0 && left.1.declaration == right.1.declaration);
+        if candidates.len() == 1 {
+            let (symbol, prototype) = &candidates[0];
+            if let Some(prototype) = crate::signatures::source_signature(symbol, prototype) {
+                call_prototypes.insert(target, prototype);
+            }
+        }
+    }
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
     for (index, bytes) in body.chunks_exact(4).enumerate() {
         let pc = start + index as u64 * 4;
@@ -1203,6 +1288,9 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             lift_operation(operation, pc)
         };
         let modeled = instruction_model(operation, portable, word);
+        shared_ir_count += u64::from(!matches!(portable, IrOperation::TargetSpecific));
+        modeled_tree_count += u64::from(modeled.is_some());
+        data_in_code_count += u64::from(data);
         let raw = builder.record(
             "bytes",
             "fact",
@@ -1266,6 +1354,28 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 "unadapted-or-unknown-effect"
             });
         }
+        let source_supported_call = modeled.is_some() && !data && match portable {
+            IrOperation::DirectCall { target } if target == start => self_prototype.is_some(),
+            IrOperation::DirectCall { target } => {
+                call_prototypes.contains_key(&target)
+                    && calls::analyze_callee(code, base, target, CALLEE_WINDOW).is_some_and(|summary| {
+                        let callee_saved_gprs = 0x7ff8_0000; // x19 through x30
+                        let callee_saved_vectors = 0x0000_ff00; // low 64-bit v8 through v15
+                        summary.complete
+                            && summary.returns
+                            && !summary.calls
+                            && !summary.loops
+                            && !summary.opaque
+                            && !summary.truncated
+                            && !summary.escaped
+                            && !summary.reads_memory
+                            && !summary.writes_memory
+                            && summary.defined_gprs & callee_saved_gprs == 0
+                            && summary.defined_vectors & callee_saved_vectors == 0
+                    })
+            }
+            _ => false,
+        };
         if matches!(
             portable,
             IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }
@@ -1275,7 +1385,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         if matches!(portable, IrOperation::Marker { .. }) {
             reasons.push("runtime-marker-contract-unqualified");
         }
+        if has_unmodeled_fp_status_effect(portable) {
+            reasons.push("FPCR/FPSR effects are not modeled");
+        }
         strict_blocked |= !reasons.is_empty();
+        source_blocked |= !reasons.is_empty() && !source_supported_call;
+        unsupported_reason_count += reasons.len() as u64;
         for reason in reasons {
             let unknown = builder.record(
                 "unsupported-effect",
@@ -1300,16 +1415,18 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 vec![],
             )
         });
-        // A direct call back into this function's own entry proves the callee
-        // prototype from the function's single exact source declaration. Any
-        // other target keeps its argument and result locations unresolved.
-        let tree = match (&self_prototype, portable) {
-            (Some(prototype), IrOperation::DirectCall { target }) if target == start => {
+        // Direct calls receive ABI locations only from the current exact
+        // declaration or a unique target-symbol prototype candidate.
+        let tree = if let IrOperation::DirectCall { target } = portable {
+            if let Some(prototype) = call_prototypes.get(&target) {
                 let mut tree = tree;
                 tree.attributes = calls::with_prototype_payload(tree.attributes, prototype);
                 tree
+            } else {
+                tree
             }
-            _ => tree,
+        } else {
+            tree
         };
         // A direct call into the captured image admits a bounded observation
         // of what the callee does. The observation is capped and explicitly
@@ -1354,6 +1471,23 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             data,
         });
     }
+    let coverage = builder.record(
+        "metadata",
+        "derived",
+        object([
+            ("artifact_kind", "semantic-coverage".into()),
+            ("scope", "full captured function; one record per decoded instruction".into()),
+            ("instruction_count", (lifted.len() as u64).into()),
+            ("shared_ir_count", shared_ir_count.into()),
+            ("modeled_tree_count", modeled_tree_count.into()),
+            ("data_in_code_count", data_in_code_count.into()),
+            ("unsupported_effect_reason_count", unsupported_reason_count.into()),
+            ("strict_machine_state_blocked", strict_blocked.into()),
+            ("interpretation", "availability counts only; modeled trees do not certify complete architectural or source semantics".into()),
+        ]),
+        ranges(start, end),
+    )?;
+    builder.edge(&bounds, &coverage, "supports")?;
     // One-instruction CFG blocks are a conservative refinement, not a claim
     // that the presentation's constant-pruned block partition is identical.
     let mut blocks = lifted
@@ -1544,6 +1678,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // another path and makes alias-wide dependencies navigable in the app.
     let partitions = MemoryPartition::all();
     let mut memory_definitions = BTreeMap::<(MemoryPartition, u32), String>::new();
+    let mut memory_evidence_by_pc = BTreeMap::<u64, Vec<String>>::new();
     for partition in partitions {
         let id = builder.record("memory-definition", "derived", object([
             ("partition", partition.name().into()),
@@ -1572,6 +1707,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("origin", "instruction".into()),
             ]), ranges(version.pc, version.pc + 4))?;
             builder.edge(&ir_ids[((version.pc - start) / 4) as usize], &id, "defines-memory")?;
+            memory_evidence_by_pc.entry(version.pc).or_default().push(id.clone());
             memory_definitions.insert((version.partition, written), id);
         }
     }
@@ -1595,6 +1731,28 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ]), ranges(version.pc, version.pc + 4))?;
         builder.edge(definition, &id, "flows-to")?;
         builder.edge(&id, &ir_ids[((version.pc - start) / 4) as usize], "uses-memory")?;
+        memory_evidence_by_pc.entry(version.pc).or_default().push(id);
+    }
+    // Preserve instruction-level memory accesses as graph nodes so system
+    // events can point to the nearest accesses in their own basic block.
+    // These are program-order observations only: they do not assert that a
+    // barrier domain covers an access or that unrelated blocks are ordered.
+    let mut accesses_by_pc = BTreeMap::<u64, Vec<&super::SsaMemoryVersion>>::new();
+    for version in &ssa.memory_versions { accesses_by_pc.entry(version.pc).or_default().push(version); }
+    let mut access_ids = BTreeMap::<u64, String>::new();
+    for (pc, versions) in &accesses_by_pc {
+        let reads = versions.iter().filter(|version| version.read)
+            .map(|version| version.partition.name()).collect::<BTreeSet<_>>();
+        let writes = versions.iter().filter(|version| version.written_version.is_some())
+            .map(|version| version.partition.name()).collect::<BTreeSet<_>>();
+        let id = builder.record("memory-access", "derived", object([
+            ("reads", array(reads.into_iter().map(V::from))),
+            ("writes", array(writes.into_iter().map(V::from))),
+            ("ordered", versions.iter().any(|version| version.ordered).into()),
+            ("exclusive", versions.iter().any(|version| version.exclusive).into()),
+        ]), ranges(*pc, *pc + 4))?;
+        builder.edge(&ir_ids[((pc - start) / 4) as usize], &id, "accesses-memory")?;
+        access_ids.insert(*pc, id);
     }
     for event in &ssa.system_events {
         let (effect, relation) = match event.mnemonic {
@@ -1611,6 +1769,41 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("memory_values_changed", false.into()),
         ]), ranges(event.pc, event.pc + 4))?;
         builder.edge(&ir_ids[((event.pc - start) / 4) as usize], &id, relation)?;
+        if let Some(block_index) = function.cfg.blocks.iter().position(|block| block.instructions.contains(&event.pc)) {
+            let nearest = |before: bool| -> Option<u64> {
+                let mut current = block_index;
+                let mut visited = BTreeSet::new();
+                for _ in 0..=function.cfg.blocks.len() {
+                    if !visited.insert(current) { break; }
+                    let block = &function.cfg.blocks[current];
+                    let candidate = block.instructions.iter().copied().filter(|pc| {
+                        if before { *pc < event.pc && access_ids.contains_key(pc) }
+                        else { *pc > event.pc && access_ids.contains_key(pc) }
+                    });
+                    let candidate = if before { candidate.max() } else { candidate.min() };
+                    if candidate.is_some() { return candidate; }
+                    let adjacent = if before {
+                        if block.predecessors.len() != 1 { break; }
+                        let predecessor = block.predecessors[0];
+                        let previous = &function.cfg.blocks[predecessor];
+                        if previous.successors.as_slice() != [current] || previous.instructions.last().copied().map(|pc| pc + 4) != block.instructions.first().copied() { break; }
+                        predecessor
+                    } else {
+                        if block.successors.len() != 1 { break; }
+                        let successor = block.successors[0];
+                        let next = &function.cfg.blocks[successor];
+                        if next.predecessors.as_slice() != [current] || block.instructions.last().copied().map(|pc| pc + 4) != next.instructions.first().copied() { break; }
+                        successor
+                    };
+                    current = adjacent;
+                }
+                None
+            };
+            let before = nearest(true);
+            let after = nearest(false);
+            if let Some(pc) = before { builder.edge(&access_ids[&pc], &id, "program-order-before-event")?; }
+            if let Some(pc) = after { builder.edge(&id, &access_ids[&pc], "program-order-after-event")?; }
+        }
     }
     // NZCV and SIMD values are part of the derivation graph as structured
     // records too. The preview's comments are presentation only; these nodes
@@ -1743,12 +1936,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         }
     }
     let mut recovered_source = None;
-    if !strict_blocked {
+    if !source_blocked {
         let recovery = if signatures.len() == 1 {
             let (name, signature) = &signatures[0];
             crate::signatures::source_signature(name, signature)
                 .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
-                .and_then(|signature| source::recover(start, &trees, &models, signature))
+                .and_then(|signature| source::recover(start, &trees, &models, signature, &call_prototypes))
         } else {
             Err(if signatures.is_empty() {
                 "no exact source signature"
@@ -1773,7 +1966,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ]),
                     array([]),
                 )?;
-                let (root, node) = recovery.emit(&mut builder, &declaration, &ir_ids, start)?;
+                let (root, node) = recovery.emit(&mut builder, &declaration, &ir_ids, &memory_evidence_by_pc, start)?;
                 statements.push(root);
                 recovered_source = Some(node);
             }

@@ -179,6 +179,12 @@ fn expr(t: &Tree) -> Result<String, String> {
         ),
         "select" => format!("(({}) ? ({}) : ({}))", child(0)?, child(1)?, child(2)?),
         "flag-condition" => format!("hs_condition(s->nzcv, {})", condition(t)?),
+        "flag-carry" => "((s->nzcv >> 1) & 1)".into(),
+        "add-with-carry" => format!(
+            "hs_add_carry(s, {}, {}, {}, {}, {}, {})",
+            child(0)?, child(1)?, child(2)?, num(t, "bits"),
+            u8::from(flag(t, "subtract")), u8::from(flag(t, "set_flags")),
+        ),
         "memory-load" => {
             let n = num(t, "bytes");
             if !matches!(n, 1 | 2 | 4 | 8) {
@@ -237,6 +243,18 @@ fn stmt(t: &Tree) -> Result<String, String> {
             let is_sub = if op == "add" { 0 } else { 1 };
             format!("s->nzcv=hs_flags_arith({left},{right},{result},{bits},{is_sub});")
         },
+        "system-register-read" if text(t, "register") == "NZCV" => {
+            if t.children.len() != 1 {
+                return Err("unqualified NZCV read".into());
+            }
+            write_reg(&t.children[0], "((uint64_t)s->nzcv<<28)")?
+        }
+        "system-register-write" if text(t, "register") == "NZCV" => {
+            if t.children.len() != 1 {
+                return Err("unqualified NZCV write".into());
+            }
+            format!("s->nzcv=(uint8_t)(({})>>28)&15;", child(0)?)
+        }
         "memory-store" => {
             let n = num(t, "bytes");
             if !matches!(n, 1 | 2 | 4 | 8) {
@@ -331,7 +349,7 @@ impl Program {
     pub(super) fn source(&self) -> String {
         let mut s = include_str!("bitvector_runtime.h").to_string();
         s.push_str(include_str!("machine_runtime.h"));
-        writeln!(s,"\nint hs_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(self.start)).unwrap();
+        writeln!(s,"\nint hs_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;(void)hs_add_carry;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(self.start)).unwrap();
         for (i, t) in self.body.iter().enumerate() {
             let pc = self.start + i as u64 * 4;
             writeln!(
@@ -448,13 +466,17 @@ impl State {
         }
         Ok(())
     }
-    fn eval(&self, t: &Tree) -> Result<u64, ()> {
-        let child = |i| self.eval(&t.children[i]);
+    fn eval(&mut self, t: &Tree) -> Result<u64, ()> {
+        macro_rules! child {
+            ($i:expr) => {
+                self.eval(&t.children[$i])?
+            };
+        }
         Ok(match t.kind {
             "register" => self.read(t),
             "constant" => num(t, "hex") & mask(num(t, "bits")),
             "unary" => {
-                let v = child(0)?;
+                let v = child!(0);
                 (if text(t, "operator") == "~" {
                     !v
                 } else {
@@ -462,8 +484,8 @@ impl State {
                 }) & mask(num(t, "bits"))
             }
             "binary" => {
-                let a = child(0)?;
-                let b = child(1)?;
+                let a = child!(0);
+                let b = child!(1);
                 let bits = num(t, "bits");
                 (match text(t, "operator") {
                     "+" => a.wrapping_add(b),
@@ -479,8 +501,8 @@ impl State {
             }
             "integer-divide" => {
                 let bits = num(t, "bits");
-                let a = child(0)? & mask(bits);
-                let b = child(1)? & mask(bits);
+                let a = child!(0) & mask(bits);
+                let b = child!(1) & mask(bits);
                 if b == 0 {
                     0
                 } else {
@@ -496,23 +518,53 @@ impl State {
                     }
                 }
             }
-            "extend" => extend(child(0)?, num(t, "from_bits"), flag(t, "signed")),
+            "extend" => extend(child!(0), num(t, "from_bits"), flag(t, "signed")),
             "bit-extract" => extend(
-                child(0)? >> num(t, "lsb"),
+                child!(0) >> num(t, "lsb"),
                 num(t, "width"),
                 flag(t, "signed"),
             ),
             "flag-condition" => u64::from(
                 condition_holds(self.nzcv, lift_flag_predicate(condition(t).unwrap())).unwrap(),
             ),
+            "flag-carry" => u64::from((self.nzcv & 2) != 0),
+            "nzcv-value" => u64::from(self.nzcv) << 28,
+            "add-with-carry" => {
+                let left = child!(0);
+                let right = child!(1);
+                let carry = child!(2) != 0;
+                let bits = num(t, "bits");
+                let mask = mask(bits);
+                let a = left & mask;
+                let b = right & mask;
+                let operand = if flag(t, "subtract") { !b & mask } else { b };
+                let sum = a as u128 + operand as u128 + u128::from(carry);
+                let result = sum as u64 & mask;
+                if flag(t, "set_flags") {
+                    let sign = 1u64 << (bits - 1);
+                    let n = u8::from(result & sign != 0);
+                    let z = u8::from(result == 0);
+                    let c = u8::from(sum > mask as u128);
+                    let v = u8::from(if flag(t, "subtract") {
+                        ((a ^ b) & (a ^ result) & sign) != 0
+                    } else {
+                        ((!(a ^ b)) & (a ^ result) & sign) != 0
+                    });
+                    self.nzcv = (n << 3) | (z << 2) | (c << 1) | v;
+                }
+                result
+            }
             "select" => {
-                if child(0)? != 0 {
-                    child(1)?
+                if child!(0) != 0 {
+                    child!(1)
                 } else {
-                    child(2)?
+                    child!(2)
                 }
             }
-            "memory-load" => self.load(child(0)?, num(t, "bytes"), flag(t, "signed"))?,
+            "memory-load" => {
+                let address = child!(0);
+                self.load(address, num(t, "bytes"), flag(t, "signed"))?
+            }
             _ => unreachable!("validated machine AST expression"),
         })
     }
@@ -565,11 +617,19 @@ impl State {
                 };
                 self.nzcv = (n << 3) | (z << 2) | (c << 1) | v;
             }
-            "memory-store" => self.store(
-                self.eval(&t.children[0])?,
-                self.eval(&t.children[1])?,
-                num(t, "bytes"),
-            )?,
+            "system-register-read" if text(t, "register") == "NZCV" => {
+                let value = u64::from(self.nzcv) << 28;
+                self.write(&t.children[0], value);
+            }
+            "system-register-write" if text(t, "register") == "NZCV" => {
+                let source = self.eval(&t.children[0])?;
+                self.nzcv = ((source >> 28) & 15) as u8;
+            }
+            "memory-store" => {
+                let address = self.eval(&t.children[0])?;
+                let value = self.eval(&t.children[1])?;
+                self.store(address, value, num(t, "bytes"))?
+            }
             "memory-load-pair" => {
                 let a = self.eval(&t.children[0])?;
                 let n = num(t, "bytes_per_value");
@@ -624,6 +684,49 @@ mod tests {
         assert_eq!(result.get("status"), Some(&V::Int(0)));
         let result = program.run([0x7fffffffffffffff, 0, 0, 0, 0, 0, 0, 0], 10);
         assert_eq!(result.get("nzcv"), Some(&V::Int(9)));
+    }
+    #[test]
+    fn add_with_carry_updates_machine_state_and_nzcv_at_both_widths() {
+        let x0 = |result: &V| match result.get("registers") {
+            Some(V::Array(registers)) => registers[0].clone(),
+            _ => panic!("missing x0 in machine-state result"),
+        };
+        let add64 = from_words(&[0xf100_047f, 0xba02_0020, 0xd65f_03c0]).unwrap();
+        let result = add64.run([0, u64::MAX, 0, 1, 0, 0, 0, 0], 10);
+        assert_eq!(result.get("status"), Some(&V::Int(0)));
+        assert_eq!(x0(&result), V::String("0x0".into()));
+        assert_eq!(result.get("nzcv"), Some(&V::Int(6)));
+
+        let sub64 = from_words(&[0xf100_047f, 0xfa02_0020, 0xd65f_03c0]).unwrap();
+        let result = sub64.run([0, 0, 0, 0, 0, 0, 0, 0], 10);
+        assert_eq!(x0(&result), V::String("0xffffffffffffffff".into()));
+        assert_eq!(result.get("nzcv"), Some(&V::Int(8)));
+
+        let add32 = from_words(&[0x7100_047f, 0x3a02_0020, 0xd65f_03c0]).unwrap();
+        let result = add32.run([0, u32::MAX as u64, 0, 1, 0, 0, 0, 0], 10);
+        assert_eq!(x0(&result), V::String("0x0".into()));
+        assert_eq!(result.get("nzcv"), Some(&V::Int(6)));
+    }
+    #[test]
+    fn nzcv_system_register_round_trip_updates_machine_flags() {
+        let program = from_words(&[
+            0xf100_045f, // CMP X2,#1
+            0xd53b_4203, // MRS X3,NZCV
+            0xd51b_421f, // MSR NZCV,XZR
+            0x9a9f_27e4, // CSET X4,CS
+            0xca04_0060, // EOR X0,X3,X4
+            0xd65f_03c0, // RET
+        ]).unwrap();
+        let result = program.run([0, 0, 1, 0, 0, 0, 0, 0], 10);
+        assert_eq!(result.get("status"), Some(&V::Int(0)));
+        assert_eq!(result.get("nzcv"), Some(&V::Int(0)));
+        match result.get("registers") {
+            Some(V::Array(registers)) => {
+                assert_eq!(registers[3], V::String("0x60000000".into()));
+                assert_eq!(registers[4], V::String("0x1".into()));
+            }
+            _ => panic!("missing machine-state registers"),
+        }
     }
     #[test]
     fn unknown_exits_and_unpredictable_aliases_fail_closed() {

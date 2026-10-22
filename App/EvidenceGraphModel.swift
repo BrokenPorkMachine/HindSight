@@ -121,6 +121,13 @@ struct VGEvidenceGraphLayout {
     let visibleNodeIDs: Set<String>
 }
 
+struct VGEvidenceEdgeRoute: Hashable {
+    let start: VGEvidenceGraphPoint
+    let control1: VGEvidenceGraphPoint
+    let control2: VGEvidenceGraphPoint
+    let end: VGEvidenceGraphPoint
+}
+
 struct VGEvidenceGraph: Hashable {
     let nodes: [VGEvidenceNode]
     let edges: [VGEvidenceEdge]
@@ -129,6 +136,49 @@ struct VGEvidenceGraph: Hashable {
 
     func connected(to id: String) -> [VGEvidenceEdge] {
         edges.filter { $0.sourceID == id || $0.targetID == id }
+    }
+
+    /// Route related edges through distinct card ports and bezier channels.
+    /// Stable sorting makes the layout repeatable across launches.
+    func edgeRoutes(positions: [String: VGEvidenceGraphPoint], nodeWidth: Double = 218,
+                    nodeHeight: Double = 72) -> [String: VGEvidenceEdgeRoute] {
+        let outgoing = Dictionary(grouping: edges, by: \.sourceID)
+        let incoming = Dictionary(grouping: edges, by: \.targetID)
+        func offset(for edge: VGEvidenceEdge, peers: [VGEvidenceEdge]) -> Double {
+            let ordered = peers.sorted { $0.id < $1.id }
+            guard ordered.count > 1, let index = ordered.firstIndex(of: edge) else { return 0 }
+            let spacing = min(22, 44 / Double(ordered.count - 1))
+            return (Double(index) - Double(ordered.count - 1) / 2) * spacing
+        }
+        var result: [String: VGEvidenceEdgeRoute] = [:]
+        for edge in edges {
+            guard let source = positions[edge.sourceID], let target = positions[edge.targetID] else { continue }
+            let sourceOffset = offset(for: edge, peers: outgoing[edge.sourceID] ?? [])
+            let targetOffset = offset(for: edge, peers: incoming[edge.targetID] ?? [])
+            let dx = target.x - source.x, dy = target.y - source.y
+            let route: VGEvidenceEdgeRoute
+            if abs(dx) >= nodeWidth * 0.75 {
+                let direction = dx >= 0 ? 1.0 : -1.0
+                let start = VGEvidenceGraphPoint(x: source.x + direction * nodeWidth / 2, y: source.y + sourceOffset)
+                let end = VGEvidenceGraphPoint(x: target.x - direction * nodeWidth / 2, y: target.y + targetOffset)
+                let bend = (sourceOffset - targetOffset) * 0.65
+                let span = end.x - start.x
+                route = VGEvidenceEdgeRoute(start: start,
+                    control1: VGEvidenceGraphPoint(x: start.x + span * 0.38 + bend, y: start.y),
+                    control2: VGEvidenceGraphPoint(x: end.x - span * 0.38 + bend, y: end.y), end: end)
+            } else {
+                let direction = dy >= 0 ? 1.0 : -1.0
+                let start = VGEvidenceGraphPoint(x: source.x + sourceOffset, y: source.y + direction * nodeHeight / 2)
+                let end = VGEvidenceGraphPoint(x: target.x + targetOffset, y: target.y - direction * nodeHeight / 2)
+                let span = end.y - start.y
+                let bend = (sourceOffset - targetOffset) * 0.65
+                route = VGEvidenceEdgeRoute(start: start,
+                    control1: VGEvidenceGraphPoint(x: start.x + bend, y: start.y + span * 0.38),
+                    control2: VGEvidenceGraphPoint(x: end.x + bend, y: end.y - span * 0.38), end: end)
+            }
+            result[edge.id] = route
+        }
+        return result
     }
 
     func filtered(query: String, provenances: Set<VGEvidenceNode.Provenance>) -> VGEvidenceGraph {
@@ -168,18 +218,14 @@ struct VGEvidenceGraph: Hashable {
             .investigation, .function, .address, .staticEvidence, .correlationEvidence,
             .reaEvidence, .runtimeObservation, .memoryObservation, .analystNote, .analystHypothesis
         ]
-        let laneX: [VGEvidenceNode.Kind: Double] = [
-            .investigation: 150,
-            .function: 440,
-            .address: 730,
-            .staticEvidence: 730,
-            .reaEvidence: 730,
-            .correlationEvidence: 730,
-            .runtimeObservation: 1080,
-            .memoryObservation: 1360,
-            .analystNote: 730,
-            .analystHypothesis: 730
-        ]
+        // Keep evidence families in separate lanes across the full canvas.
+        // Co-locating static, runtime, memory and analyst nodes at the center
+        // made otherwise distinct paths collapse into an unreadable bundle.
+        let laneSpacing = 250.0
+        let laneMargin = 150.0
+        let laneX = Dictionary(uniqueKeysWithValues: laneOrder.enumerated().map {
+            ($0.element, laneMargin + Double($0.offset) * laneSpacing)
+        })
 
         var grouped: [VGEvidenceNode.Kind: [VGEvidenceNode]] = [:]
         for node in visible { grouped[node.kind, default: []].append(node) }
@@ -210,7 +256,7 @@ struct VGEvidenceGraph: Hashable {
         let height = max(620, regularBottom)
         return VGEvidenceGraphLayout(
             positions: positions,
-            width: 1500,
+            width: laneMargin * 2 + Double(laneOrder.count - 1) * laneSpacing,
             height: height,
             visibleNodeIDs: Set(visible.map(\.id))
         )

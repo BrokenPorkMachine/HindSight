@@ -69,6 +69,27 @@ struct VGGraphWorkspace: View {
     private var selectedAddressValue: UInt64? { VGGraphParser.address(from: selectedAddress) }
     private var debugPCValue: UInt64? { debugPC.flatMap { VGGraphParser.address(from: $0) } }
 
+    private var routedEdges: [(edge: VGCFGEdge, sourceOffset: Double, targetOffset: Double, channelOffset: Double)] {
+        let visible = graph.edges.filter { !$0.isCall || showCalls }
+        let outgoing = Dictionary(grouping: visible, by: \.sourceBlockID)
+        var incoming: [String: [VGCFGEdge]] = [:]
+        for edge in visible {
+            if let targetID = edge.targetBlockID { incoming[targetID, default: []].append(edge) }
+        }
+        func offset(_ edge: VGCFGEdge, peers: [VGCFGEdge]) -> Double {
+            let ordered = peers.sorted { $0.id < $1.id }
+            guard ordered.count > 1, let index = ordered.firstIndex(of: edge) else { return 0 }
+            let spacing = min(26, Double(nodeWidth) * 0.7 / Double(ordered.count - 1))
+            return (Double(index) - Double(ordered.count - 1) / 2) * spacing
+        }
+        return visible.compactMap { edge in
+            guard let targetID = edge.targetBlockID else { return nil }
+            let source = offset(edge, peers: outgoing[edge.sourceBlockID] ?? [])
+            let target = offset(edge, peers: incoming[targetID] ?? [])
+            return (edge, source, target, (source + target) * 0.55)
+        }
+    }
+
     private func relayout(for viewport: CGSize) {
         guard viewport.width > 1, viewport.height > 1 else { return }
         graphViewportSize = viewport
@@ -320,23 +341,27 @@ struct VGGraphWorkspace: View {
 
     private var edgeCanvas: some View {
         Canvas { context, _ in
-            for edge in graph.edges {
-                if edge.isCall && !showCalls { continue }
+            for routed in routedEdges {
+                let edge = routed.edge
                 guard layout.visibleBlockIDs.contains(edge.sourceBlockID),
                       let targetID = edge.targetBlockID,
                       layout.visibleBlockIDs.contains(targetID),
                       let source = layout.positions[edge.sourceBlockID],
                       let target = layout.positions[targetID] else { continue }
 
-                let start = CGPoint(x: CGFloat(source.x), y: CGFloat(source.y) + nodeHeight / 2)
-                let end = CGPoint(x: CGFloat(target.x), y: CGFloat(target.y) - nodeHeight / 2)
+                let direction: CGFloat = target.y >= source.y ? 1 : -1
+                let start = CGPoint(x: CGFloat(source.x + routed.sourceOffset),
+                                    y: CGFloat(source.y) + direction * nodeHeight / 2)
+                let end = CGPoint(x: CGFloat(target.x + routed.targetOffset),
+                                  y: CGFloat(target.y) - direction * nodeHeight / 2)
                 let delta = max(42.0, abs(end.y - start.y) * 0.42)
+                let channel = CGFloat(routed.channelOffset)
                 var path = Path()
                 path.move(to: start)
                 path.addCurve(
                     to: end,
-                    control1: CGPoint(x: start.x, y: start.y + delta),
-                    control2: CGPoint(x: end.x, y: end.y - delta)
+                    control1: CGPoint(x: start.x + (end.x - start.x) * 0.25 + channel, y: start.y + direction * delta),
+                    control2: CGPoint(x: end.x - (end.x - start.x) * 0.25 + channel, y: end.y - direction * delta)
                 )
 
                 let color: Color = edge.isCall ? .orange : edge.isFallthrough ? .secondary : .accentColor
@@ -345,8 +370,8 @@ struct VGGraphWorkspace: View {
 
                 var arrow = Path()
                 arrow.move(to: CGPoint(x: end.x, y: end.y))
-                arrow.addLine(to: CGPoint(x: end.x - 4.5, y: end.y - 8))
-                arrow.addLine(to: CGPoint(x: end.x + 4.5, y: end.y - 8))
+                arrow.addLine(to: CGPoint(x: end.x - 4.5, y: end.y - direction * 8))
+                arrow.addLine(to: CGPoint(x: end.x + 4.5, y: end.y - direction * 8))
                 arrow.closeSubpath()
                 context.fill(arrow, with: .color(color.opacity(0.72)))
             }

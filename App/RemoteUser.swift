@@ -151,7 +151,8 @@ final class RemoteUserRegistry: @unchecked Sendable {    private struct Store: C
     func user(for token: String) -> RemoteUser? {
         lock.lock(); defer { lock.unlock() }
         guard let match = tokens.first(where: { constantTimeEqual($0.token, token) }) else { return nil }
-        return users[match.userID]
+        guard let user = users[match.userID], user.isActive else { return nil }
+        return user
     }
 
     /// Bind an ephemeral gateway bearer token to a user for this gateway
@@ -167,10 +168,50 @@ final class RemoteUserRegistry: @unchecked Sendable {    private struct Store: C
         return user
     }
 
+    /// Replace an identity's active bearer token without persisting the token.
+    @discardableResult
+    func replaceToken(_ token: String, for userID: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard token.utf8.count >= 32, let user = users[userID], user.isActive else { return false }
+        tokens.removeAll { $0.userID == userID || $0.token == token }
+        if tokens.count >= maxTokens { tokens.removeFirst(tokens.count - maxTokens + 1) }
+        tokens.append((token, userID))
+        return true
+    }
+
     /// Forget a bearer token. The user, the grants and the audit trail stay.
     func revokeToken(_ token: String) {
         lock.lock(); defer { lock.unlock() }
         tokens.removeAll { $0.token == token }
+    }
+
+    /// Revoke all ephemeral bearer tokens when the hosted gateway stops.
+    func revokeAllTokens() {
+        lock.lock(); defer { lock.unlock() }
+        tokens.removeAll(keepingCapacity: true)
+    }
+
+    /// Enable or disable a remote identity. Disabling immediately invalidates
+    /// every in-memory bearer token bound to that user; re-enabling does not
+    /// resurrect those credentials.
+    @discardableResult
+    func setUserActive(_ userID: String, active: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard var user = users[userID] else { return false }
+        guard user.isActive != active else { return true }
+        let previous = user
+        user.isActive = active
+        users[userID] = user
+        if !active { tokens.removeAll { $0.userID == userID } }
+        persist()
+        guard persistenceError == nil else {
+            // In particular, never enable an identity in memory when the
+            // durable authorization state could not be updated. Tokens
+            // revoked during a failed disable remain revoked (fail closed).
+            users[userID] = previous
+            return false
+        }
+        return true
     }
 
     /// Create or retrieve a user by subject (certificate CN or token identifier).
@@ -187,28 +228,58 @@ final class RemoteUserRegistry: @unchecked Sendable {    private struct Store: C
         return user
     }
 
+    /// Create a host-enrolled identity only if its durable record can be
+    /// committed. Enrollment never creates a project grant or persists a token.
+    func enroll(subject: String, name: String) -> RemoteUser? {
+        lock.lock(); defer { lock.unlock() }
+        guard !subject.isEmpty, subject.utf8.count <= 256,
+              !name.isEmpty, name.utf8.count <= 128,
+              usersBySubject[subject] == nil else { return nil }
+        let user = RemoteUser(subject: subject, name: name)
+        users[user.id] = user
+        usersBySubject[subject] = user.id
+        grants[user.id] = []
+        persist()
+        guard persistenceError == nil else {
+            users.removeValue(forKey: user.id)
+            usersBySubject.removeValue(forKey: subject)
+            grants.removeValue(forKey: user.id)
+            return nil
+        }
+        return user
+    }
+
     /// Grant a user access to a project (or specific record) with the given capabilities.
     func grant(userID: String, projectPath: String, recordID: String?, capabilities: Set<String>,
-               grantedBy: String, expires: Date? = nil) -> ProjectGrant {
+               grantedBy: String, expires: Date? = nil) -> ProjectGrant? {
         lock.lock(); defer { lock.unlock() }
         if let existing = grants[userID]?.first(where: {
             $0.isActive && $0.projectPath == projectPath && $0.recordID == recordID &&
             $0.capabilities == capabilities && $0.grantedBy == grantedBy && $0.expires == expires
         }) { return existing }
+        let previous = grants[userID]
         let grant = ProjectGrant(userID: userID, projectPath: projectPath, recordID: recordID,
                                  capabilities: capabilities, created: Date(),
                                  grantedBy: grantedBy, expires: expires)
         grants[userID, default: []].append(grant)
         persist()
+        guard persistenceError == nil else {
+            // Authorization state must never become effective only in memory
+            // when its durable write fails.
+            grants[userID] = previous
+            return nil
+        }
         return grant
     }
 
     /// Revoke a grant.
-    func revokeGrant(userID: String, grantIndex: Int) {
+    @discardableResult
+    func revokeGrant(userID: String, grantIndex: Int) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard let values = grants[userID], values.indices.contains(grantIndex) else { return }
+        guard let values = grants[userID], values.indices.contains(grantIndex) else { return false }
         grants[userID]?.remove(at: grantIndex)
         persist()
+        return persistenceError == nil
     }
 
     /// All grants for a user.

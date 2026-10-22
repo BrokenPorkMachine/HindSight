@@ -11,6 +11,21 @@ typedef struct {
     uint8_t nzcv, memory[HS_MEM_SIZE];
     int fault;
 } hs_state;
+static inline uint64_t hs_add_carry(hs_state *s, uint64_t a, uint64_t b, unsigned carry, unsigned bits, unsigned is_sub, unsigned set_flags) {
+    uint64_t mask=hs_mask(bits), sign=UINT64_C(1)<<(bits-1);
+    a&=mask;b&=mask;
+    uint64_t operand=is_sub?(~b&mask):b;
+    uint64_t partial=a+operand, wide=partial+(carry&1u);
+    unsigned carry_out=bits==64?((partial<a)||(wide<partial)):((wide>>bits)&1u);
+    uint64_t result=wide&mask;
+    if(set_flags) {
+        unsigned n=(unsigned)((result&sign)!=0),z=(unsigned)(result==0),v;
+        if(is_sub)v=(unsigned)((((a^b)&(a^result)&sign)!=0));
+        else v=(unsigned)((((~(a^b))&(a^result)&sign)!=0));
+        s->nzcv=(uint8_t)((n<<3)|(z<<2)|(carry_out<<1)|v);
+    }
+    return result;
+}
 static inline unsigned hs_range(hs_state *s, uint64_t a, unsigned bytes) {
     if(a < HS_MEM_BASE || a-HS_MEM_BASE > HS_MEM_SIZE || bytes > HS_MEM_SIZE-(a-HS_MEM_BASE)) {s->fault=1;return 0;}
     return 1;

@@ -34,6 +34,7 @@ HINDSIGHT_REMOTE_SMOKE_IDENTITY="$fixture_dir/identity.p12" \
 HINDSIGHT_REMOTE_SMOKE_PASSWORD=test-password \
 HINDSIGHT_REMOTE_SMOKE_TOKEN="$token" \
 HINDSIGHT_REMOTE_SMOKE_PORT="$port" \
+HINDSIGHT_RECONSTRUCTION_SMOKE_OUTPUT="$fixture_dir/reconstruction.json" \
   "$app/Contents/MacOS/HindSight" >"$fixture_dir/app.log" 2>&1 &
 app_pid=$!
 
@@ -48,6 +49,13 @@ for _ in {1..120}; do
 done
 if ! jq -e '.records[0].result.captured == true' >/dev/null 2>&1 <<<"$project_json"; then
   echo "App did not expose the imported project snapshot." >&2
+  sed -n '1,90p' "$fixture_dir/app.log" >&2
+  exit 1
+fi
+if ! jq -e --arg digest "$(jq -er '.records[0].result.source_sha256' <<<"$project_json")" \
+    '.schema == 1 and .producer == "hindsight-reconstruction-v1" and .source_sha256 == $digest and .function.start != .function.end and (.nodes | length) > 0 and (.ast.compilable == false)' \
+    "$fixture_dir/reconstruction.json" >/dev/null 2>&1; then
+  echo "Real app → XPC → worker → app reconstruction review transaction failed." >&2
   sed -n '1,90p' "$fixture_dir/app.log" >&2
   exit 1
 fi
@@ -91,7 +99,7 @@ for _ in {1..120}; do
   if jq -e --arg id "$request_id" --arg digest "$digest" \
       '.ok == true and .analysis.request_id == $id and .analysis.source_sha256 == $digest' \
       >/dev/null 2>&1 <<<"$result"; then
-    echo "Real app → XPC coordinator → worker → HTTPS client transaction passed."
+    echo "Real app → XPC → worker → native reconstruction decoder and HTTPS client transactions passed."
     exit 0
   fi
   if ! kill -0 "$app_pid" 2>/dev/null; then sed -n '1,90p' "$fixture_dir/app.log"; exit 1; fi

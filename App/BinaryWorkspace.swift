@@ -468,6 +468,11 @@ struct VGBinaryWorkspace: View {
             Text(reconstructionStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             if let artifact = matchingReconstruction {
                 Text("\(artifact.eligibility) · source \(artifact.digest.prefix(16)) · \(artifact.pass)").font(.caption.monospaced())
+                let coverage = artifact.semanticCoverage
+                Text("Semantic coverage evidence: \(coverage.modeledTrees)/\(coverage.instructions) modeled trees · \(coverage.sharedIR)/\(coverage.instructions) shared IR · \(coverage.dataInCode) data-in-code · \(coverage.unsupportedReasons) blocker reasons")
+                    .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                Text(coverage.strictMachineStateBlocked ? "Strict machine-state output is blocked for this function." : "No strict machine-state blocker was recorded; this does not establish full semantic coverage.")
+                    .font(.caption).foregroundStyle(coverage.strictMachineStateBlocked ? .orange : .secondary)
                 Picker("Output", selection: $sourceSelection) {
                     Text("Review tree").tag("review")
                     ForEach(artifact.sources) { source in Text(source.kind == "recovered-source" ? "Recovered scalar source" : "Machine-state C").tag(source.id) }

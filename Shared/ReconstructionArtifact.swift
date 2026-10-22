@@ -6,6 +6,20 @@ struct ReconstructionRange: Sendable, Hashable {
     let start: UInt64
     let end: UInt64
 }
+
+/// Identity fence for keeping a decoded review artifact attached only to the
+/// project record and analysis revision that produced it.
+struct ReconstructionReviewContext: Sendable, Equatable {
+    let project: String
+    let record: String
+    let analysis: String
+    let digest: String
+
+    func matches(project: String?, record: String?, analysis: String?, digest: String?) -> Bool {
+        self.project == project && self.record == record && self.analysis == analysis && self.digest == digest
+    }
+}
+
 struct ReconstructionSource: Sendable, Identifiable {
     let id: String
     let kind: String
@@ -27,6 +41,14 @@ struct ReconstructionEvidence: Sendable, Identifiable {
     let provenance: String
     let description: String
     let ranges: [ReconstructionRange]
+}
+struct ReconstructionSemanticCoverage: Sendable {
+    let instructions: Int
+    let sharedIR: Int
+    let modeledTrees: Int
+    let dataInCode: Int
+    let unsupportedReasons: Int
+    let strictMachineStateBlocked: Bool
 }
 struct ReconstructionReply: Codable, Sendable {
     let requestID: String
@@ -56,6 +78,7 @@ struct ReconstructionArtifact: Sendable {
     let sources: [ReconstructionSource]
     let expressions: [ReconstructionExpression]
     let evidence: [String: ReconstructionEvidence]
+    let semanticCoverage: ReconstructionSemanticCoverage
     private let incoming: [String: [String]]
 
     struct Invalid: LocalizedError { let message: String; var errorDescription: String? { message } }
@@ -122,7 +145,7 @@ struct ReconstructionArtifact: Sendable {
               let budgets = document["budgets"] as? [String: Any], let limits = budgets["limits"] as? [String: Int], let consumed = budgets["consumed"] as? [String: Int], let exhausted = budgets["exhausted"] as? [String],
               let validation = document["validation"] as? [[String: Any]], let alternatives = document["alternatives"] as? [[String: Any]] else { throw Invalid(message: "Reconstruction identity, schema or bounds mismatch.") }
         try require(Set(document.keys) == ["schema","producer","source_sha256","analysis_engine","scope","function","eligibility","nodes","edges","ast","alternatives","budgets","validation","truncated"], "Unexpected reconstruction fields.")
-        try require(document["analysis_engine"] as? String == "arm64-analysis-v93-schema122" && pass == "arm64-reconstruction-12", "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
+        try require(document["analysis_engine"] as? String == "arm64-analysis-v96-schema122" && pass == "arm64-reconstruction-45", "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
         try require(nodes.count <= 100_000 && edges.count <= 400_000 && astNodes.count <= 100_000 && reasons.count <= 128 && validation.count <= 128 && alternatives.count <= 1024, "Reconstruction record budget exceeded.")
         let scopeKey: [Any] = [pass, settings]
         var identities = Set<String>()
@@ -147,14 +170,37 @@ struct ReconstructionArtifact: Sendable {
             guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) else { return "" }
             return String(text.prefix(4096))
         }
-        let localKinds: Set<String> = ["decode","ir-operation","definition","use","phi","memory-definition","memory-use","memory-phi","file-definition","file-use","file-phi","cfg-block","cfg-edge","ast-node"]
+        let localKinds: Set<String> = ["decode","ir-operation","definition","use","phi","memory-definition","memory-use","memory-phi","memory-access","file-definition","file-use","file-phi","cfg-block","cfg-edge","ast-node"]
         var evidence: [String: ReconstructionEvidence] = [:], sources: [ReconstructionSource] = [], blockers: [String] = [], unsupported = false
+        var semanticCoverage: ReconstructionSemanticCoverage?
+        var decodedCount = 0, sharedIRCount = 0, modeledTreeCount = 0, dataInCodeCount = 0, unsupportedReasonCount = 0
         for node in nodes {
             let id = try check("evidence", node, function: functionID)
             guard let kind = node["kind"] as? String, let provenance = node["epistemic"] as? String, ["fact","derived","assumption","analyst-assertion","rejected"].contains(provenance), let payload = node["payload"] as? [String: Any] else { throw Invalid(message: "Invalid reconstruction evidence.") }
             let ranges = try spans(node, local: localKinds.contains(kind))
             unsupported = unsupported || kind == "unsupported-effect"
+            if kind == "decode" {
+                decodedCount += 1
+                if payload["shared_ir_available"] as? Bool == true { sharedIRCount += 1 }
+                if payload["data_in_code"] as? Bool == true { dataInCodeCount += 1 }
+            } else if kind == "ir-operation" {
+                if !(payload["tree"] is NSNull) { modeledTreeCount += 1 }
+            } else if kind == "unsupported-effect" {
+                unsupportedReasonCount += 1
+            }
             evidence[id] = ReconstructionEvidence(id: id, kind: kind, provenance: provenance, description: description(payload), ranges: ranges)
+            if payload["artifact_kind"] as? String == "semantic-coverage" {
+                guard semanticCoverage == nil,
+                      let instructions = payload["instruction_count"] as? Int,
+                      let sharedIR = payload["shared_ir_count"] as? Int,
+                      let modeledTrees = payload["modeled_tree_count"] as? Int,
+                      let dataInCode = payload["data_in_code_count"] as? Int,
+                      let unsupportedReasons = payload["unsupported_effect_reason_count"] as? Int,
+                      let strictBlocked = payload["strict_machine_state_blocked"] as? Bool,
+                      payload["scope"] as? String == "full captured function; one record per decoded instruction",
+                      (payload["interpretation"] as? String)?.contains("do not certify complete") == true else { throw Invalid(message: "Invalid semantic coverage summary.") }
+                semanticCoverage = ReconstructionSemanticCoverage(instructions: instructions, sharedIR: sharedIR, modeledTrees: modeledTrees, dataInCode: dataInCode, unsupportedReasons: unsupportedReasons, strictMachineStateBlocked: strictBlocked)
+            }
             if let settingsValue = payload["analysis_settings"] as? [String: Any] { try require("sha256:" + (try content(["hindsight-settings-v1", settingsValue])) == settings, "Retained reconstruction settings do not match their digest.") }
             if let kind = payload["artifact_kind"] as? String, ["recovered-source","machine-state-c"].contains(kind), let text = payload["source"] as? String {
                 try require(text.utf8.count <= 1_048_576 && payload["status"] as? String == "generated-uncompiled", "Invalid generated-source status or budget.")
@@ -162,6 +208,9 @@ struct ReconstructionArtifact: Sendable {
             }
             if let reason = payload["reason"] as? String { blockers.append(reason) }
         }
+        guard let semanticCoverage else { throw Invalid(message: "Semantic coverage summary is missing.") }
+        let expectedStrictBlocked = unsupportedReasonCount > 0 || truncated || !exhausted.isEmpty
+        try require(semanticCoverage.instructions == decodedCount && semanticCoverage.sharedIR == sharedIRCount && semanticCoverage.modeledTrees == modeledTreeCount && semanticCoverage.dataInCode == dataInCodeCount && semanticCoverage.unsupportedReasons == unsupportedReasonCount && semanticCoverage.strictMachineStateBlocked == expectedStrictBlocked, "Semantic coverage summary disagrees with instruction evidence.")
         var incoming: [String: [String]] = [:]
         for edge in edges {
             _ = try check("edge", edge, function: functionID)
@@ -212,7 +261,7 @@ struct ReconstructionArtifact: Sendable {
             _ = try check("validation", run, function: functionID)
             try require(run["artifact_sha256"] as? String == candidateDigest && (run["status"] as? String != "passed" || (run["mismatches"] as? [Any])?.isEmpty == true), "Validation belongs to a different reconstruction or contradicts its status.")
         }
-        return Self(json: json, digest: digest, start: start, end: end, pass: pass, settings: settings, eligibility: state, blockers: Array(Set(blockers)).sorted(), review: review, sources: sources, expressions: expressions, evidence: evidence, incoming: incoming)
+        return Self(json: json, digest: digest, start: start, end: end, pass: pass, settings: settings, eligibility: state, blockers: Array(Set(blockers)).sorted(), review: review, sources: sources, expressions: expressions, evidence: evidence, semanticCoverage: semanticCoverage, incoming: incoming)
     }
 
     func why(_ ids: [String], limit: Int = 512) -> [ReconstructionEvidence] {
@@ -222,5 +271,18 @@ struct ReconstructionArtifact: Sendable {
             result.append(node); pending.append(contentsOf: incoming[id] ?? [])
         }
         return result.sorted { $0.id < $1.id }
+    }
+
+    /// Write either the complete review artifact or one of its generated
+    /// sources. Source selection is identity-bound to this validated artifact.
+    func writeReviewExport(sourceID: String? = nil, to url: URL) throws {
+        let text: String
+        if let sourceID {
+            guard let source = sources.first(where: { $0.id == sourceID }) else {
+                throw Invalid(message: "Selected generated source does not belong to this reconstruction artifact.")
+            }
+            text = source.text
+        } else { text = json }
+        try text.write(to: url, atomically: true, encoding: .utf8)
     }
 }

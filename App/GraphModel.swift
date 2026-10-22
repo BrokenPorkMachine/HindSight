@@ -157,7 +157,7 @@ struct VGCFGGraph {
         var successors: [String: [String]] = [:]
         var neighbors: [String: [String]] = [:]
 
-        for edge in edges where !edge.isCall {
+        for edge in edges {
             guard visibleIDs.contains(edge.sourceBlockID), let target = edge.targetBlockID, visibleIDs.contains(target) else { continue }
             successors[edge.sourceBlockID, default: []].append(target)
             neighbors[edge.sourceBlockID, default: []].append(target)
@@ -263,8 +263,21 @@ struct VGCFGGraph {
             let width = shelf.reduce(0.0) { $0 + $1.width } + Double(shelf.count - 1) * componentGap
             var x = (targetWidth - width) / 2
             for component in shelf {
+                let isSingleComponent = components.count == 1
+                let localPoints = Array(component.positions.values)
+                let minX = localPoints.map(\.x).min() ?? 0, maxX = localPoints.map(\.x).max() ?? 0
+                let minY = localPoints.map(\.y).min() ?? 0, maxY = localPoints.map(\.y).max() ?? 0
+                let xScale = isSingleComponent && maxX > minX
+                    ? max(1, (targetWidth - 2 * margin - nodeWidth) / (maxX - minX)) : 1
+                let yScale = isSingleComponent && maxY > minY
+                    ? max(1, (targetHeight - 2 * margin - nodeHeight) / (maxY - minY)) : 1
+                let targetMinY = margin + nodeHeight / 2
                 for (id, point) in component.positions {
-                    positions[id] = VGGraphPoint(x: x + point.x, y: y + point.y)
+                    let expandedX = isSingleComponent
+                        ? targetWidth / 2 + (point.x - (minX + maxX) / 2) * xScale
+                        : x + point.x
+                    let expandedY = isSingleComponent ? targetMinY + (point.y - minY) * yScale : y + point.y
+                    positions[id] = VGGraphPoint(x: expandedX, y: expandedY)
                 }
                 x += component.width + componentGap
             }

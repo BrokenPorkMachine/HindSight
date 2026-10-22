@@ -104,6 +104,13 @@ import Foundation
         // isolation; this instance verifies the production authorization path.
         let registry = RemoteUserRegistry()
         let securedUser = registry.user(forSubject: "fixture-user")
+        let revocationToken = "fixture-revocation-token"
+        _ = registry.bindToken(revocationToken, to: securedUser)
+        check(registry.user(for: revocationToken) == securedUser, "active user token is recognized")
+        check(registry.setUserActive(securedUser.id, active: false), "user can be deactivated")
+        check(registry.user(for: revocationToken) == nil, "deactivation revokes existing bearer token")
+        check(registry.setUserActive(securedUser.id, active: true), "user can be reactivated")
+        check(registry.user(for: revocationToken) == nil, "reactivation does not resurrect old token")
         // A separate coordinator keeps the authorization checks independent of
         // the protocol-mechanics instance's submission counters.
         let securedFake = FakeCoordinator()
@@ -117,7 +124,25 @@ import Foundation
         let allowedProject = await response(secured, "GET", "/v1/project", project: source, user: securedUser)
         check(allowedProject.code == 200, "project grant permits project snapshot")
         check(allowedProject.scope?.projectPath == source.path, "project read reports its scope")
+        check(registry.revokeGrant(userID: securedUser.id, grantIndex: 0), "operator can revoke project grant")
+        let revokedProject = await response(secured, "GET", "/v1/project", project: source, user: securedUser)
+        check(revokedProject.code == 403, "revoked grant blocks the next project request")
         let otherUser = registry.user(forSubject: "fixture-other-user")
+        let enrolled = registry.enroll(subject: "fixture-enrolled", name: "Fixture client")
+        check(enrolled?.name == "Fixture client", "host can persist an enrolled identity")
+        if let enrolled {
+            check(registry.grants(for: enrolled.id).isEmpty, "enrollment grants no project access")
+            _ = registry.bindToken("fixture-enrollment-token", to: enrolled)
+            check(registry.replaceToken("fixture-reissued-enrollment-token", for: enrolled.id),
+                  "active identity can receive a replacement token")
+            check(registry.user(for: "fixture-enrollment-token") == nil,
+                  "reissuing an identity token revokes its previous token")
+            check(registry.user(for: "fixture-reissued-enrollment-token") == enrolled,
+                  "replacement token resolves to the enrolled identity")
+            registry.revokeAllTokens()
+            check(registry.user(for: "fixture-reissued-enrollment-token") == nil,
+                  "gateway shutdown revokes enrolled client tokens")
+        }
         let otherDenied = await response(secured, "GET", "/v1/project", project: source, user: otherUser)
         check(otherDenied.code == 403, "grants do not leak between users")
 
@@ -263,6 +288,40 @@ import Foundation
               "late completion from revoked session must not publish")
         fake.pending.removeValue(forKey: third)?(.success(try analysis(id: third)))
         try await waitForState(jobs, id: third, expected: "completed", project: source)
+
+        let registryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hindsight-remote-registry-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: registryDirectory) }
+        try FileManager.default.createDirectory(at: registryDirectory, withIntermediateDirectories: true)
+        let registryURL = registryDirectory.appendingPathComponent("users.json")
+        let persistent = RemoteUserRegistry(storageURL: registryURL)
+        let persistedUser = persistent.user(forSubject: "persistence-fixture")
+        _ = persistent.grant(userID: persistedUser.id, projectPath: source.path, recordID: nil,
+                             capabilities: RemoteCapability.all, grantedBy: "fixture-admin")
+        check(persistent.setUserActive(persistedUser.id, active: false), "persist user deactivation")
+        let restored = RemoteUserRegistry(storageURL: registryURL)
+        check(restored.allUsers.first(where: { $0.id == persistedUser.id })?.isActive == false,
+              "user activation state survives registry restart")
+        check(restored.grants(for: persistedUser.id).count == 1,
+              "project grants survive registry restart")
+        check(restored.persistenceError == nil, "registry store reloads without validation errors")
+        let savedRegistryURL = registryDirectory.appendingPathComponent("users.saved.json")
+        try FileManager.default.moveItem(at: registryURL, to: savedRegistryURL)
+        try FileManager.default.createDirectory(at: registryURL, withIntermediateDirectories: false)
+        check(!restored.setUserActive(persistedUser.id, active: true),
+              "identity activation fails when durable registry cannot be written")
+        check(restored.allUsers.first(where: { $0.id == persistedUser.id })?.isActive == false,
+              "failed persistence cannot enable an identity in memory")
+        let rejectedGrant = restored.grant(userID: persistedUser.id, projectPath: "/fixture/other-project",
+                                           recordID: nil, capabilities: RemoteCapability.all,
+                                           grantedBy: "fixture-admin")
+        check(rejectedGrant == nil, "grant creation reports durable persistence failure")
+        check(restored.grants(for: persistedUser.id).count == 1,
+              "failed persistence cannot grant project access in memory")
+        check(restored.enroll(subject: "must-not-persist", name: "Rejected") == nil,
+              "enrollment fails when the durable registry cannot be written")
+        check(!restored.allUsers.contains(where: { $0.subject == "must-not-persist" }),
+              "failed enrollment leaves no in-memory identity")
         print("Remote analysis transactional tests passed.")
     }
 }

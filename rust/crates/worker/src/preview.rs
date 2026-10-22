@@ -1584,10 +1584,33 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
  let external=super::signatures::external_prototype_database(digest)?;
  let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,native};
+ let mut call_prototypes=Vec::new();
+ for (address,symbol_name) in &facts.symbols {
+  let signature=super::signatures::symbol(symbol_name)
+   .or_else(||external.get(symbol_name).cloned())
+   .or_else(||external.get(symbol_name.strip_prefix('_').unwrap_or(symbol_name)).cloned());
+  if let Some(signature)=signature { call_prototypes.push((*address,symbol_name.clone(),signature)); }
+ }
+ call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
+ call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,native};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)
+}
+
+// Analysis fields are transported as individually bounded sections. Keep a
+// little room below the protocol's 64 KiB ceiling for a truthful marker.
+const CALL_EFFECT_SUMMARIES_LIMIT: usize = 60 * 1024;
+const CALL_EFFECT_SUMMARIES_TRUNCATION: &str = "... call effect summaries truncated at the 60 KiB section budget\n";
+
+fn append_bounded_call_effect_summary(output: &mut String, row: &str) -> bool {
+    if output.len().saturating_add(row.len()) <= CALL_EFFECT_SUMMARIES_LIMIT {
+        output.push_str(row);
+        return true;
+    }
+    output.push_str(CALL_EFFECT_SUMMARIES_TRUNCATION);
+    false
 }
 
 pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
@@ -1645,7 +1668,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let thunks:std::collections::BTreeSet<u64>=stub_names.iter().filter(|(_,name)|!import_symbols.contains(*name)).map(|(address,_)|*address).collect();
  let typed_call_graph=typed_call_graph_report(&calls,&tail_call_facts,&symbols,&objc_function_names,&export_names,&stub_names,&starts,scan_end,&indirect_facts,&thunks);
 
- // Build call effect summaries from calls
+// Build call effect summaries from calls
  let mut call_effect_summaries = String::new();
  for &(func, site, target) in calls.iter().take(5000) {
      let caller_name = resolved_function_name(func, &symbols, &objc_function_names, &export_names, &stub_names).unwrap_or("<discovered>");
@@ -1653,10 +1676,13 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
       // A stub is a proven import; any other target is a direct call to an
       // address that is not an import stub.
       let edge_type = if stub_names.contains_key(&target) { "import" } else { "direct" };
-     call_effect_summaries.push_str(&format!(
+     let row = format!(
          "effect: caller={func:#018x} ({caller_name}) site={site:#018x} callee={target:#018x} ({callee_name}) type={edge_type} clobbers=gpr:{CALLER_SAVED_GPR},vector:{CALLER_SAVED_VECTOR},nzcv preserved=gpr:{CALLEE_SAVED_GPR},vector:{CALLEE_SAVED_VECTOR},{PRESERVED_SPECIAL} memory=unresolved
 ",
-     ));
+     );
+     if !append_bounded_call_effect_summary(&mut call_effect_summaries, &row) {
+         break;
+     }
  }
 
  // Caller/callee constraint iteration. The caller side states what a call
@@ -1737,6 +1763,16 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
 #[cfg(test)]
 mod tests {
  use super::{explicit_integer_cast,function_parameter_candidates,objc_imp_names,export_function_names,resolved_function_name,unified_symbol_records,unwind_info_starts_from_bytes};
+
+ #[test]
+ fn call_effect_summaries_stay_below_analysis_section_limit() {
+  let mut summaries=String::new();
+  let row="effect: caller=0x0000000000000000 callee=0x0000000000000001\n";
+  while super::append_bounded_call_effect_summary(&mut summaries,row) {}
+  assert!(summaries.len()<=super::CALL_EFFECT_SUMMARIES_LIMIT+super::CALL_EFFECT_SUMMARIES_TRUNCATION.len());
+  assert!(summaries.len()<65_536);
+  assert!(summaries.ends_with(super::CALL_EFFECT_SUMMARIES_TRUNCATION));
+ }
 
  #[test]
  fn compressed_unwind_page_entries_are_relative_to_index_base() {

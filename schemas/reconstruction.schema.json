@@ -104,7 +104,7 @@
           "enum": [
             "bytes", "decode", "ir-operation", "definition", "use", "phi",
             "file-definition", "file-use", "file-phi",
-            "memory-definition", "memory-use", "memory-phi",
+            "memory-definition", "memory-use", "memory-phi", "memory-access",
             "memory-object", "memory-effect", "cfg-block", "cfg-edge", "call",
             "symbol", "metadata", "type", "variable", "hypothesis", "ast-node",
             "validation-run", "analyst-override", "unsupported-effect", "budget-event"
@@ -133,7 +133,9 @@
             "controls", "calls", "reads", "writes", "aliases", "types",
             "supports", "contradicts", "assumes", "invalidates", "derives",
             "merges-memory", "defines-memory", "uses-memory", "orders-memory",
+            "backs-frame-object-version",
             "synchronizes-memory", "synchronizes-instructions", "clears-exclusive-monitor",
+            "accesses-memory", "program-order-before-event", "program-order-after-event",
             "renders-as", "validates", "alternative-to", "overrides"
           ]
         },

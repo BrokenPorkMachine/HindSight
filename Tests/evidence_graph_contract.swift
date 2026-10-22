@@ -51,13 +51,31 @@ struct EvidenceGraphContract {
         precondition(filtered.nodes.count < graph.nodes.count)
         let layout = graph.layout()
         precondition(layout.positions.count == graph.nodes.count)
-        precondition(layout.width >= 1200 && layout.height >= 620)
+        precondition(layout.width >= 2400 && layout.height >= 620,
+                     "evidence families should use the full map width")
+        let staticNode = graph.nodes.first { $0.kind == .staticEvidence }
+        let runtimeNode = graph.nodes.first { $0.kind == .runtimeObservation }
+        if let staticNode, let runtimeNode,
+           let staticPoint = layout.positions[staticNode.id], let runtimePoint = layout.positions[runtimeNode.id] {
+            precondition(abs(staticPoint.x - runtimePoint.x) >= 500,
+                         "static and runtime evidence need distinct map lanes")
+        }
         let points = Array(layout.positions.values)
         for index in points.indices {
             for other in points.indices where other > index {
                 precondition(abs(points[index].x - points[other].x) >= 218 || abs(points[index].y - points[other].y) >= 72,
                              "evidence cards sharing a lane must not overlap")
             }
+        }
+        let routes = graph.edgeRoutes(positions: layout.positions)
+        precondition(routes.count == graph.edges.count)
+        let fanout = Dictionary(grouping: graph.edges, by: \.sourceID).values.first { $0.count > 1 }
+        if let fanout, let first = fanout.first, let second = fanout.dropFirst().first,
+           let firstRoute = routes[first.id], let secondRoute = routes[second.id] {
+            precondition(firstRoute.start != secondRoute.start && firstRoute.control1 != secondRoute.control1,
+                         "parallel evidence paths need separate ports and routing channels")
+        } else {
+            preconditionFailure("contract fixture needs a fan-out to verify edge routing")
         }
         print("evidence graph contract passed: \(graph.nodes.count) nodes, \(graph.edges.count) edges")
     }

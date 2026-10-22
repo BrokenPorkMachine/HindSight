@@ -61,7 +61,7 @@ name or type. Calls, data, and target-specific operations invalidate all GPR
 identities. Implicit call arguments and FP, flags, and memory SSA remain unresolved.
 Phi placement is pruned by GPR liveness over the existing 128-instruction preview;
 SSA evidence has a separate 4,000-byte budget per function with explicit truncation.
-The analysis/cache identity is `arm64-analysis-v93-schema122`; the report fields
+The analysis/cache identity is `arm64-analysis-v96-schema122`; the report fields
 and cache-envelope schema are unchanged.
 
 The [source-parameter identity pass](AARCH64_SOURCE_VARIABLES.md) now uses
@@ -205,13 +205,12 @@ immediate alias). It folds with provenance, and for a 32-bit register `lsb` is
 bounded to 0..31 (a set bit 15 stays opaque); the encoding's `N == sf` and
 `o0 == 0` requirements are enforced. The flag-neutral add/subtract with carry
 renders `dst = left + right + carry;` for `ADC` and `dst = left + ~right + carry;`
-for `SBC` (the architecture adds the inverted operand with carry). Because the
-carry input is `PSTATE.C`, which the preview does not track, the destination is
-always an unknown barrier: the shape is rendered but no constant is ever folded,
-and the write invalidates any previously tracked value of the destination. The
-flag-setting `ADCS`/`SBCS` forms (`S == 1`), like the `ADDS`/`SUBS` forms that
-write a general-purpose register, stay opaque, as
-do the conditional compares that share the class. The add/subtract (extended
+for `SBC` (the architecture adds the inverted operand with carry). The shared
+IR reads `PSTATE.C` from the flag file and folds a result when the operands and
+carry are known; otherwise it invalidates only the destination value. Its
+flag-setting `ADCS`/`SBCS` forms (`S == 1`) additionally define all NZCV bits
+with width-correct carry and overflow. Conditional compares retain their own
+conditional flag effects. The add/subtract (extended
 register) form applies an extension and then an `imm3` left shift to the second
 operand: `ADD` renders `dst = left + (zext(w2, 8) << 2);` and its signed and
 unshifted counterparts (`zext`/`sext` with the `8`/`16`/`32` source width, the
@@ -229,9 +228,11 @@ immediate, shifted-register, and extended-register classes) render
 `/* cmp x0, 0x5 */`, `/* cmp x0, (x1 << 2) */`, and `/* cmp x0, sext(w1, 32) */`,
 and `TST` (the `ANDS` form with `Rd == 31`, immediate or shifted register) renders
 `/* tst x0, 0xff */`. The flag-setting arithmetic and logical forms that also
-write a general-purpose register (`ADDS`/`SUBS`/`ANDS` with `Rd != 31`), `BICS`,
-the conditional compares (`CCMP`/`CCMN`), and the add-with-carry forms stay opaque
-because their PSTATE side effect is not modeled. System-register reads and writes
+write a general-purpose register (`ADDS`/`SUBS`/`ANDS` with `Rd != 31`) use
+shared arithmetic and flag effects. `ADC`/`SBC` consume the incoming carry; their
+`ADCS`/`SBCS` forms additionally define all NZCV bits and fold when operands and
+carry are known. `CCMP`/`CCMN` are modeled as conditional flag-file operations;
+unsupported flag forms remain opaque. System-register reads and writes
 are modeled as `MRS`/`MSR`: `MRS` renders `dst = mrs(TPIDR_EL0);` and makes the
 destination an unknown value (a barrier) because the preview does not track
 system registers, while preserving the other tracked registers (unlike `Opaque`,
@@ -373,9 +374,9 @@ rendered form and its exact word, the same-register rotate collapse, folded
 extracts (including an `lsb == 0` fold whose provenance omits the unused source)
 and rotates, and that an `N != sf` word and a 32-bit word with `imms == 32` stay
 opaque. A synthetic `ADC`/`SBC` sequence asserts each rendered form (including
-the `SBC` inverted-operand shape) and its exact word, that known operands still
-never fold a constant, that a zero-register destination is discarded, and that
-the flag-setting `ADCS`/`SBCS` and the conditional-compare forms stay opaque. A
+the `SBC` inverted-operand shape) and its exact word, that unknown carry prevents
+constant folding, that a zero-register destination is discarded, and that known
+carry plus operands fold `ADCS`/`SBCS` results and NZCV. A
 synthetic `SMULL`/`UMULL`/`SMADDL`/`UMADDL`/`SMSUBL`/`UMSUBL`/`SMULH`/`UMULH`
 sequence asserts each rendered form, the exact multiply words verified against
 `clang -arch arm64`, folded products and quotients with `proven_by` addresses, and
@@ -441,13 +442,20 @@ memory operations are modeled: `LDAPR`/`LDADD`/`SWP` render
 with the destination as an unknown barrier, and `CAS` renders
 `/* casal expected, desired, base */` preserving value flow.
 
-The current worker identity (`arm64-analysis-v93-schema122`) also preserves
-integer SIMD ADD/SUB/MUL lane widths in lifted expressions (for example,
+The current worker identity (`arm64-analysis-v96-schema122`) also preserves
+integer SIMD ADD/SUB/MUL/MLA/MLS lane widths in lifted expressions (for example,
 `v0.4s`) and treats reserved lane arrangements as opaque barriers. Proven
 constants fold lane by lane with element-width modular wraparound, bounded
 operand provenance, and architectural zero-extension for Q=0 results; carries
-never cross lane boundaries. Reconstruction artifacts use pass identity
-`arm64-reconstruction-12`. DMB/DSB ordering domains and ISB/CLREX system effects
-are also retained as exact-span SSA and artifact events; these events do not
-claim application-memory value writes. Their interactions with surrounding
-memory accesses are not yet represented as pairwise ordering edges.
+never cross lane boundaries. Reconstruction pass 13 records MLA/MLS
+old-destination vector reads. Pass 14 publishes FPCR/FPSR blockers and refuses
+strict machine-state output for reachable floating-point status effects that
+are not modeled. DMB/DSB ordering domains and ISB/CLREX system effects remain
+exact-span SSA and artifact events; these events do not claim application-memory
+value writes. Their interactions with surrounding memory accesses are not yet
+represented as pairwise ordering edges.
+
+The v95 decoder identity includes exact three-same integer MLA/MLS decoding;
+reconstruction pass 13 records their old-destination vector read. The native
+qualification assembles all 12 legal arrangements and compares 3,120 lane
+results against the architectural modular oracle.

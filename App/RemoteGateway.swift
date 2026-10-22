@@ -159,6 +159,7 @@ final class RemoteGateway {
     private func stopOnQueue(status value: String) {
         listener?.cancel()
         listener = nil
+        userRegistry.revokeAllTokens()
         connections.values.forEach { $0.cancel() }
         connections.removeAll()
         boundPort = 0

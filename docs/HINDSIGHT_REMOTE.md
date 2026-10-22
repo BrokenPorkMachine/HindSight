@@ -84,19 +84,36 @@ a grant for the same project cannot poll it, read its result, cancel it, or
 learn that it exists. Users, grants, and a bounded audit log persist in the
 private Application Support directory; bearer tokens remain ephemeral. The
 locally generated token receives a grant for the open project at startup.
+Deactivating a persisted user immediately removes every in-memory bearer-token
+binding for that identity; reactivation requires issuing a fresh token.
+If the registry cannot be persisted, identity activation is rolled back in
+memory rather than granting access based only on volatile state. Grant creation
+uses the same fail-closed rule: a failed durable write rolls the new grant back
+in memory and reports failure; a transaction regression test verifies the user
+does not gain access to the project.
 Opening a different project while the gateway runs records a new
 host-authorized grant for that project. Every gateway request is recorded in
 the bounded audit trail with the user, the project, record and request it
 acted on, the status code, the byte counts, the latency and the client
 address. Stop/start rotates the token and clears
-the active remote session while retaining user, grant, and audit history. Target-level
-authorization and an audit review interface remain open. Do not expose the app through a public address or
+the active remote session while retaining user, grant, and audit history. The
+local Settings pane now displays persisted identities/grants, allows a host
+operator to enroll a remote identity and issue or re-issue a one-time,
+in-memory bearer token, disable or re-enable an identity, grant one imported record's
+analysis-job/poll/cancel capabilities to an active identity, revoke an
+individual grant, and show the latest 100 audit entries. Enrollment creates no
+access grant; the host must explicitly grant a record. The grant action is
+record-scoped and never adds project-wide read access. Tokens are not persisted
+and gateway stop revokes every live token; re-enabling an identity also
+requires a newly issued token. Token re-issuance revokes the prior token for
+that identity. Project-wide operator grants and target-level
+authorization remain open. Do not expose the app through a public address or
 port-forward it as a multi-user service.
 
 Remaining remote-product scope:
 
 - [x] Explicit server start/stop, loopback default, private IPv4 configuration, TLS, per-start bearer-token rotation, exact-origin CORS, versioned API, OpenAPI endpoint and truthful capability discovery.
-- [~] Individual users and per-project/per-record capability grants are enforced for supported project and analysis routes, and a job stays private to the user that submitted it. Users, grants, and bounded audit records persist with schema, size, regular-file, symlink, and permission checks; target-level authorization, grant administration and an audit review interface remain.
+- [~] Individual users and per-project/per-record capability grants are enforced for supported project and analysis routes, and a job stays private to the user that submitted it. Users, grants, and bounded audit records persist with schema, size, regular-file, symlink, and permission checks; transaction tests verify grant/deactivation persistence, enrollment rollback, token replacement/revocation, and denial after grant revocation. Settings provides host-controlled identity enrollment, one-time token issuance/re-issuance, identity enable/disable, record-scoped and project-wide grants, individual grant revocation, and a bounded read-only audit viewer. Target-level authorization remains open.
 - [ ] Integrity-checked, bounded binary uploads/imports and server-backed projects; importing never launches a binary. Enforce size, storage and analysis-resource limits.
 - [x] Source-bound analysis submission, polling, cancellation and result retrieval, with retry idempotency and stale-source rejection. The result carries the existing disassembly, pseudocode, symbols and evidence artifacts.
 - [ ] Real browser interoperability from a second device; bounded event streaming with sequencing, backpressure, disconnect/reconnect behavior and cancellation.

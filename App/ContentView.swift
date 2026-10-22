@@ -1087,7 +1087,7 @@ struct ContentView: View {
                         reconstructionStatus: model.reconstructionStatus,
                         reconstructionBusy: model.busy,
                         onReconstruct: model.reconstructFunction,
-                        onCancelReconstruction: model.cancel,
+                        onCancelReconstruction: model.cancelReconstruction,
                         onExportReconstruction: { function, source in model.exportReconstruction(function, source: source) }
                     )
                     .frame(minHeight: 640)

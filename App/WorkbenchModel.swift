@@ -19,6 +19,15 @@ private struct VGAnalysisDecodeResult: Sendable {
     }
 }
 
+private func decodeReconstructionReply(_ text: String, requestID: String, digest: String,
+                                      start: UInt64, end: UInt64) throws -> ReconstructionArtifact {
+    let reply = try JSONDecoder().decode(ReconstructionReply.self, from: Data(text.utf8))
+    guard reply.requestID == requestID, let artifact = reply.artifactJSON else {
+        throw ReconstructionArtifact.Invalid(message: reply.message)
+    }
+    return try ReconstructionArtifact.decode(artifact, digest: digest, start: start, end: end)
+}
+
 struct VGRecentProject: Codable, Hashable, Identifiable {
     let path: String
     let lastOpened: Date
@@ -57,7 +66,8 @@ final class WorkbenchModel: ObservableObject {
     @Published var analysisReport: AnalysisReport?
     @Published private(set) var reconstructionArtifact: ReconstructionArtifact?
     @Published private(set) var reconstructionStatus = "Select a function and request reconstruction."
-    private var reconstructionContext: (project: String, record: String, analysis: String)?
+    private var reconstructionContext: ReconstructionReviewContext?
+    private var reconstructionRequestID: String?
     @Published private(set) var analysisEvidenceIndex: VGAnalysisEvidenceIndex?
     @Published private(set) var analysisEvidenceIndexing = false
     @Published private(set) var analysisEvidenceStatus = "Evidence index unavailable."
@@ -395,6 +405,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var remoteBindAddress = "127.0.0.1"
     @Published var remoteAllowedOrigin = ""
     @Published var remotePort = "8443"
+    @Published var remoteIdentityName = ""
+    @Published private(set) var remoteEnrollmentToken = ""
     @Published private(set) var remoteToken = ""
     @Published private(set) var remoteStatus = "Off"
     private lazy var remoteUsers: RemoteUserRegistry = {
@@ -407,6 +419,92 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             .appendingPathComponent("registry-v1.json", isDirectory: false)
         return RemoteUserRegistry(storageURL: url)
     }()
+    var remoteIdentitiesForSettings: [RemoteUser] { remoteUsers.allUsers }
+    var remoteAuditForSettings: [RemoteAuditEntry] { remoteUsers.recentAudit(limit: 100) }
+    func remoteGrantsForSettings(_ userID: String) -> [ProjectGrant] { remoteUsers.grants(for: userID) }
+    private func generateRemoteBearerToken() -> String? {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+    func enrollRemoteIdentity() {
+        let name = remoteIdentityName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.utf8.count <= 128 else {
+            remoteStatus = "Enter an identity label of 1–128 UTF-8 bytes"
+            return
+        }
+        guard let token = generateRemoteBearerToken() else {
+            remoteStatus = "Enrollment token generation failed"
+            return
+        }
+        let subject = "enrolled:\(UUID().uuidString)"
+        guard let user = remoteUsers.enroll(subject: subject, name: name) else {
+            remoteStatus = "Identity enrollment failed: \(remoteUsers.persistenceError ?? "registry write failed")"
+            return
+        }
+        if !remoteEnrollmentToken.isEmpty { remoteUsers.revokeToken(remoteEnrollmentToken) }
+        _ = remoteUsers.bindToken(token, to: user)
+        remoteEnrollmentToken = token
+        remoteIdentityName = ""
+        remoteStatus = "Identity enrolled. Copy its one-time token, then grant record access."
+    }
+    func issueRemoteIdentityToken(_ userID: String) {
+        guard let identity = remoteUsers.allUsers.first(where: { $0.id == userID && $0.isActive }) else {
+            remoteStatus = "A token can only be issued to an active identity"
+            return
+        }
+        guard let token = generateRemoteBearerToken(), remoteUsers.replaceToken(token, for: identity.id) else {
+            remoteStatus = "Token issuance failed"
+            return
+        }
+        remoteEnrollmentToken = token
+        remoteStatus = "Fresh one-time token issued for \(identity.name ?? identity.subject)"
+    }
+    func grantRemoteRecord(_ recordID: String, to userID: String) {
+        guard let project, project.path.hasPrefix("/"),
+              project.records.contains(where: { $0.id == recordID }),
+              remoteUsers.allUsers.contains(where: { $0.id == userID && $0.isActive }) else {
+            remoteStatus = "Record grant rejected: select an open project and active identity"
+            return
+        }
+        let capabilities: Set<String> = [RemoteCapability.analysisJobs, RemoteCapability.jobPoll,
+                                          RemoteCapability.jobCancel]
+        guard remoteUsers.grant(userID: userID, projectPath: project.path, recordID: recordID,
+                                capabilities: capabilities, grantedBy: "local-operator") != nil else {
+            remoteStatus = "Record grant failed: \(remoteUsers.persistenceError ?? "registry write failed")"
+            return
+        }
+        remoteStatus = "Granted analysis access to record \(recordID)"
+    }
+    func grantRemoteProject(to userID: String) {
+        guard let project, project.path.hasPrefix("/"), !project.records.isEmpty,
+              remoteUsers.allUsers.contains(where: { $0.id == userID && $0.isActive }) else {
+            remoteStatus = "Project grant rejected: select a populated project and active identity"
+            return
+        }
+        let capabilities = RemoteCapability.all
+        guard remoteUsers.grant(userID: userID, projectPath: project.path, recordID: nil,
+                                capabilities: capabilities, grantedBy: "local-operator") != nil else {
+            remoteStatus = "Project grant failed: \(remoteUsers.persistenceError ?? "registry write failed")"
+            return
+        }
+        remoteStatus = "Granted project access for \(project.records.count) records"
+    }
+    func setRemoteIdentityActive(_ userID: String, active: Bool) {
+        guard remoteUsers.setUserActive(userID, active: active) else {
+            remoteStatus = "Remote identity update failed: \(remoteUsers.persistenceError ?? "identity not found")"
+            return
+        }
+        remoteStatus = active ? "Remote identity enabled; issue a fresh token to restore access"
+                              : "Remote identity disabled; active tokens revoked"
+    }
+    func revokeRemoteGrant(_ userID: String, index: Int) {
+        guard remoteUsers.revokeGrant(userID: userID, grantIndex: index) else {
+            remoteStatus = "Remote grant revocation failed: \(remoteUsers.persistenceError ?? "grant not found")"
+            return
+        }
+        remoteStatus = "Remote project grant revoked"
+    }
     private lazy var remoteTransactions = RemoteAnalysisTransactions(backend: .init(
         analyze: { [weak self] recordID, requestID, done in
             guard let self else { return }
@@ -440,7 +538,14 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private lazy var remoteGateway = RemoteGateway(handle: { [weak self] request, reply in
         Task { @MainActor in self?.handleRemoteRequest(request, reply: reply) }
     }, status: { [weak self] value in
-        Task { @MainActor in self?.remoteStatus = value }
+        Task { @MainActor in
+            guard let self else { return }
+            self.remoteStatus = value
+            if value.hasPrefix("Gateway failed:") {
+                self.remoteToken = ""
+                self.remoteEnrollmentToken = ""
+            }
+        }
     }, userRegistry: remoteUsers)
     func startRemoteGateway() {
         guard remoteUsers.persistenceError == nil else {
@@ -484,10 +589,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         if let project { grantGatewayUser(user, to: project.path) }
     }
     func stopRemoteGateway() {
-        remoteUsers.revokeToken(remoteToken)
+        remoteUsers.revokeAllTokens()
         remoteUsers.flush()
         remoteGateway.stop()
         remoteToken = ""
+        remoteEnrollmentToken = ""
         remoteTransactions.stop()
     }
     private func handleRemoteRequest(_ request: RemoteRequest, reply: @escaping (RemoteResponse) -> Void) {
@@ -529,7 +635,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                   let password = environment["HINDSIGHT_REMOTE_SMOKE_PASSWORD"],
                   let token = environment["HINDSIGHT_REMOTE_SMOKE_TOKEN"], token.utf8.count >= 32,
                   let portText = environment["HINDSIGHT_REMOTE_SMOKE_PORT"],
-                  let port = UInt16(portText), port > 0 else {
+                  let port = UInt16(portText), port > 0,
+                  let reconstructionOutput = environment["HINDSIGHT_RECONSTRUCTION_SMOKE_OUTPUT"] else {
                 throw NSError(domain: "HindSightSmoke", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "Incomplete smoke configuration."])
             }
@@ -555,6 +662,52 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             project = importedProject
             connected = true
             projectSessionReady = true
+            guard let record = importedProject.records.first,
+                  let digest = record.result.source_sha256 else {
+                throw NSError(domain: "HindSightSmoke", code: 7,
+                              userInfo: [NSLocalizedDescriptionKey: "Imported record has no captured source identity."])
+            }
+            let analysisID = UUID().uuidString
+            let analysisText = try await remoteSmokeRequest(timeout: 140) { service, done in
+                service.analyzeRecord(record.id, requestID: analysisID, withReply: done)
+            }
+            guard let analysisReply = try? JSONDecoder().decode(AnalysisReply.self, from: Data(analysisText.utf8)),
+                  analysisReply.ok, let analysis = analysisReply.analysis,
+                  analysis.matches(id: analysisID, digest: digest) else {
+                throw NSError(domain: "HindSightSmoke", code: 8,
+                              userInfo: [NSLocalizedDescriptionKey: "Analysis did not match its captured source identity."])
+            }
+            let parsedFunction = analysis.functions.split(whereSeparator: \.isNewline).compactMap { line -> (UInt64, UInt64)? in
+                let fields = line.split(whereSeparator: \.isWhitespace)
+                guard fields.count >= 2 else { return nil }
+                let startText = fields[0].hasPrefix("0x") ? fields[0].dropFirst(2) : fields[0][...]
+                let endText = fields[1].hasPrefix("0x") ? fields[1].dropFirst(2) : fields[1][...]
+                guard let start = UInt64(startText, radix: 16), let end = UInt64(endText, radix: 16), start < end else { return nil }
+                return (start, end)
+            }.first
+            guard let (functionStart, functionEnd) = parsedFunction else {
+                throw NSError(domain: "HindSightSmoke", code: 9,
+                              userInfo: [NSLocalizedDescriptionKey: "Analysis returned no bounded function for reconstruction."])
+            }
+            let reconstructionID = UUID().uuidString
+            let reconstructionText = try await remoteSmokeRequest(timeout: 160) { service, done in
+                service.reconstructFunction(record.id, startAddress: String(functionStart), endAddress: String(functionEnd),
+                                            requestID: reconstructionID, withReply: done)
+            }
+            let artifact = try decodeReconstructionReply(reconstructionText, requestID: reconstructionID,
+                                                         digest: digest, start: functionStart, end: functionEnd)
+            try artifact.writeReviewExport(to: URL(fileURLWithPath: reconstructionOutput))
+            selectedID = record.id
+            analysisRecordID = record.id
+            analysisReport = analysis
+            reconstructionArtifact = artifact
+            reconstructionContext = ReconstructionReviewContext(project: importedProject.path, record: record.id,
+                                                                 analysis: analysisID, digest: digest)
+            guard currentReconstruction?.start == functionStart && currentReconstruction?.end == functionEnd else {
+                throw NSError(domain: "HindSightSmoke", code: 10,
+                              userInfo: [NSLocalizedDescriptionKey: "App rejected the decoded reconstruction review context."])
+            }
+            reconstructionStatus = "Runtime reconstruction artifact decoded and review context verified."
             let identityData = try Data(contentsOf: URL(fileURLWithPath: identityPath))
             var items: CFArray?
             let identityStatus = SecPKCS12Import(identityData as CFData,
@@ -1281,16 +1434,17 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         }
     }
     var currentReconstruction: ReconstructionArtifact? {
-        guard let context = reconstructionContext, context.project == project?.path,
-              context.record == selectedID, context.analysis == currentAnalysis?.request_id,
-              reconstructionArtifact?.digest == selected?.result.source_sha256 else { return nil }
+        guard let context = reconstructionContext,
+              context.matches(project: project?.path, record: selectedID,
+                              analysis: currentAnalysis?.request_id,
+                              digest: selected?.result.source_sha256) else { return nil }
         return reconstructionArtifact
     }
     func reconstructFunction(_ function: VGFunctionRecord) {
         guard !busy, projectServiceReady, let record = selected, let digest = record.result.source_sha256,
               let projectPath = project?.path, let analysis = currentAnalysis else { return }
         let id = UUID().uuidString, generation = navigationGeneration
-        activeRequest = id; busy = true; reconstructionStatus = "Reconstructing the selected function…"
+        activeRequest = id; reconstructionRequestID = id; busy = true; reconstructionStatus = "Reconstructing the selected function…"
         startAnalysisMonitor(requestID: id)
         client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
                        operation: { $0.reconstructFunction(record.id, startAddress: String(function.start), endAddress: String(function.end), requestID: id, withReply: $1) }) { [weak self] result in
@@ -1298,26 +1452,41 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             self.stopAnalysisMonitor()
             let text: String
             do { text = try result.get() }
-            catch { self.busy = false; self.activeRequest = nil; self.reconstructionStatus = error.localizedDescription; return }
+            catch { self.busy = false; self.activeRequest = nil; self.reconstructionRequestID = nil; self.reconstructionStatus = error.localizedDescription; return }
             Task { [weak self] in
                 let decoded = await Task.detached(priority: .userInitiated) { () -> Result<ReconstructionArtifact, Error> in
-                    Result {
-                        let reply = try JSONDecoder().decode(ReconstructionReply.self, from: Data(text.utf8))
-                        guard reply.requestID == id, let artifact = reply.artifactJSON else { throw ReconstructionArtifact.Invalid(message: reply.message) }
-                        return try ReconstructionArtifact.decode(artifact, digest: digest, start: function.start, end: function.end)
-                    }
+                    Result { try decodeReconstructionReply(text, requestID: id, digest: digest,
+                                                           start: function.start, end: function.end) }
                 }.value
                 guard let self, self.activeRequest == id else { return }
-                self.busy = false; self.activeRequest = nil
+                self.busy = false; self.activeRequest = nil; self.reconstructionRequestID = nil
                 guard self.navigationGeneration == generation, self.selectedID == record.id, self.project?.path == projectPath,
                       self.currentAnalysis?.request_id == analysis.request_id else { self.reconstructionStatus = "Discarded reconstruction for an earlier project, artifact or analysis revision."; return }
                 switch decoded {
                 case .success(let artifact):
                     self.reconstructionArtifact = artifact
-                    self.reconstructionContext = (projectPath, record.id, analysis.request_id)
+                    self.reconstructionContext = ReconstructionReviewContext(project: projectPath, record: record.id,
+                                                                             analysis: analysis.request_id, digest: digest)
                     self.reconstructionStatus = "\(artifact.eligibility) · \(artifact.pass). Generated source has not been compiled or executed by the app."
                 case .failure(let error): self.reconstructionStatus = error.localizedDescription
                 }
+            }
+        }
+    }
+    func cancelReconstruction() {
+        guard let id = reconstructionRequestID, activeRequest == id else { return }
+        reconstructionStatus = "Requesting reconstruction cancellation…"
+        client.request(timeout: 10, operation: { service, reply in
+            service.cancelInspection(id) { reply($0 ? "accepted" : "already finished") }
+        }) { [weak self] result in
+            guard let self, self.reconstructionRequestID == id else { return }
+            switch result {
+            case .success(let outcome) where outcome == "accepted":
+                self.reconstructionStatus = "Cancellation accepted; waiting for the worker to stop."
+            case .success:
+                self.reconstructionStatus = "The reconstruction had already finished; validating its reply."
+            case .failure(let error):
+                self.reconstructionStatus = "Cancellation request failed: \(error.localizedDescription)"
             }
         }
     }
@@ -1330,7 +1499,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         panel.message = "Generated source is not a compilation or equivalence guarantee. Its assumptions and evidence remain in the JSON artifact."
         if source == nil { panel.allowedContentTypes = [.json] }
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try (source?.text ?? artifact.json).write(to: url, atomically: true, encoding: .utf8); reconstructionStatus = "Exported \(url.lastPathComponent). No generated code was executed." }
+        do { try artifact.writeReviewExport(sourceID: source?.id, to: url); reconstructionStatus = "Exported \(url.lastPathComponent). No generated code was executed." }
         catch { reconstructionStatus = error.localizedDescription }
     }
     func clearAnalysisCache() {

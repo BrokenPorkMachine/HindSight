@@ -112,7 +112,7 @@ def run(worker):
             ranges = {m[3].split("  source=",1)[0]: (m[1], m[2]) for line in report["functions"].splitlines()
                       if (m := re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+(.+)$", line))}
             objc_name = next(name for name in ranges if "HSMachineStateFixture mix:with:" in name)
-            names = ["hs_c_mix", "hs_c_select", "hs_c_stack", "hs_m_signed_div", "hs_m_word", "hs_m_rotate", "hs_m_loop", "hs_m_memory", "hs_m_alias", "hs_m_pair", "hs_m_keep", "hs_m_flagwrite", "hs_m_addflags", "hs_m_andflags", "objc"]
+            names = ["hs_c_mix", "hs_c_select", "hs_c_stack", "hs_m_signed_div", "hs_m_word", "hs_m_rotate", "hs_m_loop", "hs_m_memory", "hs_m_alias", "hs_m_pair", "hs_m_keep", "hs_m_flagwrite", "hs_m_addflags", "hs_m_addcarry", "hs_m_subcarry", "hs_m_nzcv_roundtrip", "hs_m_andflags", "objc"]
             for name in names:
                 key=objc_name if name == "objc" else "_"+name
                 assert key in ranges, (key, sorted(ranges))
@@ -197,7 +197,7 @@ def run(worker):
                 assert compiled_state(execute([executable]," ".join(f"{v:x}" for v in inputs)+"\n").strip())==result
             assert REQUESTS.request(worker,binary,"--interpret",start,end,"0x0")["kind"]=="error"
         protected=root/"protected.dylib"
-        execute(["xcrun","clang","-target","arm64-apple-macos14.0","-O0","-fstack-protector-all","-dynamiclib",fixture/"machine_state.c","-o",protected])
+        execute(["xcrun","clang","-target","arm64-apple-macos14.0","-O0","-fstack-protector-all","-dynamiclib",fixture/"machine_state.c",fixture/"machine_state.s","-o",protected])
         protected_report=REQUESTS.request(worker,protected,"--analyze")
         row=next(line for line in protected_report["functions"].splitlines() if "_hs_c_stack " in line)
         start,end=row.split()[:2]

@@ -76,6 +76,7 @@ struct HindSightApp: App {
 
 private struct HindSightSettingsView: View {
     @ObservedObject var model: WorkbenchModel
+    @State private var remoteReviewRevision = 0
 
     var body: some View {
         // A SwiftUI Form is List-backed on macOS and shares the NSOutlineView
@@ -134,6 +135,125 @@ private struct HindSightSettingsView: View {
                         Text(model.remoteToken).textSelection(.enabled).font(.system(.caption, design: .monospaced))
                     }
                     settingsNote("Remote access requires a private LAN address, a trusted TLS certificate whose SAN matches the client address, and one exact HTTPS browser origin. Analysis jobs are available; uploads, event streaming, debugger and VM controls are not exposed yet.")
+                    DisclosureGroup("Remote identities and grants") {
+                        HStack {
+                            TextField("New identity label", text: $model.remoteIdentityName)
+                            Button("Enroll") {
+                                model.enrollRemoteIdentity()
+                                remoteReviewRevision &+= 1
+                            }
+                        }
+                        if !model.remoteEnrollmentToken.isEmpty {
+                            Text("One-time bearer token — copy now; not stored on disk")
+                                .font(.caption2).foregroundStyle(.secondary)
+                            Text(model.remoteEnrollmentToken)
+                                .textSelection(.enabled).font(.system(size: 9, design: .monospaced))
+                        }
+                        settingsNote("Enrollment creates an identity and temporary bearer token, but no access grant. Grant access to one record or the whole open project. Project grants include project snapshot reads and analysis for every captured record. Stopping the gateway revokes all live tokens.")
+                        let identities = model.remoteIdentitiesForSettings
+                        if identities.isEmpty {
+                            Text("No remote identities have been recorded.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ForEach(identities, id: \.id) { identity in
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(identity.name ?? identity.subject).font(.caption.weight(.semibold))
+                                        Text(identity.id).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text(identity.isActive ? "Active" : "Disabled")
+                                        .font(.caption2).foregroundStyle(identity.isActive ? .green : .secondary)
+                                    Button(identity.isActive ? "Disable" : "Enable") {
+                                        model.setRemoteIdentityActive(identity.id, active: !identity.isActive)
+                                        remoteReviewRevision &+= 1
+                                    }
+                                    .buttonStyle(.borderless)
+                                    if identity.isActive {
+                                        Button("Issue token") {
+                                            model.issueRemoteIdentityToken(identity.id)
+                                            remoteReviewRevision &+= 1
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                    Menu("Grant record access") {
+                                        if let project = model.project, !project.records.isEmpty {
+                                            ForEach(project.records) { record in
+                                                Button(record.name) {
+                                                    model.grantRemoteRecord(record.id, to: identity.id)
+                                                    remoteReviewRevision &+= 1
+                                                }
+                                            }
+                                        } else {
+                                            Text("Open a project with imported records first")
+                                        }
+                                    }
+                                    .disabled(!identity.isActive || model.project?.records.isEmpty != false)
+                                    .menuStyle(.borderlessButton)
+                                    Button("Grant project access") {
+                                        model.grantRemoteProject(to: identity.id)
+                                        remoteReviewRevision &+= 1
+                                    }
+                                    .disabled(!identity.isActive || model.project?.records.isEmpty != false)
+                                    .buttonStyle(.borderless)
+                                }
+                                ForEach(Array(model.remoteGrantsForSettings(identity.id).enumerated()), id: \.offset) { grantIndex, grant in
+                                    HStack(alignment: .top) {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(grant.projectPath).font(.system(size: 9, design: .monospaced)).textSelection(.enabled)
+                                            Text("\(grant.recordID.map { "Record \($0) · " } ?? "Project-wide · ")\(grant.capabilities.sorted().joined(separator: ", "))\(grant.isExpired ? " · expired" : "")")
+                                                .font(.system(size: 9)).foregroundStyle(.secondary)
+                                        }
+                                        Spacer(minLength: 4)
+                                        Button("Revoke", role: .destructive) {
+                                            model.revokeRemoteGrant(identity.id, index: grantIndex)
+                                            remoteReviewRevision &+= 1
+                                        }
+                                        .font(.caption2)
+                                        .buttonStyle(.borderless)
+                                    }
+                                    .padding(.leading, 10)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                    .font(.caption)
+                    .id(remoteReviewRevision)
+                    DisclosureGroup("Recent remote audit (up to 100 requests)") {
+                        Button("Refresh audit entries") { remoteReviewRevision &+= 1 }
+                            .buttonStyle(.borderless)
+                        let entries = model.remoteAuditForSettings
+                        if entries.isEmpty {
+                            Text("No remote requests have been recorded.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 7) {
+                                ForEach(entries.reversed(), id: \.id) { entry in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        HStack {
+                                            Text("\(entry.method) \(entry.path)").font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                            Spacer()
+                                            Text("\(entry.statusCode)").font(.system(size: 10, design: .monospaced))
+                                                .foregroundStyle(entry.statusCode >= 400 ? .orange : .secondary)
+                                        }
+                                        Text("\(entry.timestamp.formatted(date: .abbreviated, time: .standard)) · user \(entry.userID ?? "unknown") · \(entry.latencyMs) ms · \(entry.bytesIn) in / \(entry.bytesOut) out")
+                                            .font(.system(size: 9)).foregroundStyle(.secondary)
+                                        if let projectPath = entry.projectPath {
+                                            Text(projectPath).font(.system(size: 9, design: .monospaced)).textSelection(.enabled)
+                                        }
+                                    }
+                                    .padding(.vertical, 3)
+                                    Divider()
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 260)
+                    }
+                    .font(.caption)
+                    .id(remoteReviewRevision)
                     Divider()
                     VGReadinessRow(label: "Build", value: buildIdentity)
                     VGReadinessRow(label: "Host", value: hostIdentity)

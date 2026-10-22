@@ -31,6 +31,14 @@ struct AnalysisProtocolContract {
         precondition(Set(object.keys) == AnalysisReport.jsonFields)
         let report = try JSONDecoder().decode(AnalysisReport.self, from: data)
         precondition(report.matches(id: requestID, digest: digest))
+        precondition(report.validationFailure(id: "11111111-1111-1111-1111-111111111111", digest: digest) == "request ID mismatch")
+        precondition(report.validationFailure(id: requestID, digest: String(repeating: "b", count: 64)) == "captured-source digest mismatch")
+        var oversized = object
+        oversized["functions"] = String(repeating: "x", count: 65536)
+        let oversizedReport = try JSONDecoder().decode(AnalysisReport.self,
+            from: JSONSerialization.data(withJSONObject: oversized, options: [.sortedKeys]))
+        precondition(oversizedReport.validationFailure(id: requestID, digest: digest) ==
+                    "analysis section 'functions' exceeds its 65535-byte limit (65536 bytes)")
         let reboundID = "11111111-1111-1111-1111-111111111111"
         let rebound = report.forRequest(reboundID)
         precondition(rebound?.matches(id: reboundID, digest: digest) == true)

@@ -1,6 +1,10 @@
 // CC0 / public-domain qualification source, assembled by Apple Clang.
 .text
 .p2align 2
+.globl _hs_c_leaf_helper
+_hs_c_leaf_helper:
+    add x0, x0, #5
+    ret
 .globl _hs_m_signed_div
 _hs_m_signed_div:
     sdiv x0, x0, x1
@@ -24,6 +28,13 @@ Lagain:
     sub x1, x1, #1
     cbnz x1, Lagain
 Ldone:
+    mov x1, #2
+    cbz x1, Ldone2
+Lagain2:
+    add x0, x0, #1
+    sub x1, x1, #1
+    cbnz x1, Lagain2
+Ldone2:
     ret
 .globl _hs_m_memory
 _hs_m_memory:
@@ -69,6 +80,32 @@ _hs_m_addflags:
     eor x0, x2, x3
     eor x0, x0, x4, lsl #1
     ret
+.globl _hs_m_addcarry
+_hs_m_addcarry:
+    cmp x3, #1
+    adcs x0, x1, x2
+    cset x5, cs
+    cset x6, eq
+    eor x0, x0, x5
+    eor x0, x0, x6, lsl #1
+    ret
+.globl _hs_m_subcarry
+_hs_m_subcarry:
+    cmp x3, #1
+    sbcs x0, x1, x2
+    cset x5, cs
+    cset x6, vs
+    eor x0, x0, x5
+    eor x0, x0, x6, lsl #1
+    ret
+.globl _hs_m_nzcv_roundtrip
+_hs_m_nzcv_roundtrip:
+    cmp x2, #1
+    mrs x3, nzcv
+    msr nzcv, xzr
+    cset x4, cs
+    eor x0, x3, x4
+    ret
 .globl _hs_m_andflags
 _hs_m_andflags:
     ands w0, w0, w1, asr #3
@@ -85,4 +122,46 @@ _hs_m_opaque:
 _hs_m_unpredictable:
     // LDR X0,[X0],#8: writeback destination aliases base.
     .long 0xf8408400
+    ret
+.globl _hs_c_loop_volatile_store
+_hs_c_loop_volatile_store:
+    cbz x1, Lvolatile_done
+Lvolatile_loop:
+    str x1, [x0]
+    sub x1, x1, #1
+    cbnz x1, Lvolatile_loop
+Lvolatile_done:
+    mov x0, x1
+    ret
+.globl _hs_c_loop_volatile_accumulate
+_hs_c_loop_volatile_accumulate:
+    mov x2, xzr
+    mov x3, xzr
+    cbz x1, Laccumulate_done
+Laccumulate_loop:
+    ldr x3, [x0]
+    add x3, x3, x3
+    str x3, [x0]
+    mov x2, x3
+    sub x1, x1, #1
+    cbnz x1, Laccumulate_loop
+Laccumulate_done:
+    mov x0, x2
+    ret
+.globl _hs_c_loop_two_volatile_pointers
+_hs_c_loop_two_volatile_pointers:
+    mov x3, xzr
+    mov x4, xzr
+    mov x5, xzr
+    cbz x2, Ltwo_pointers_done
+Ltwo_pointers_loop:
+    ldr x4, [x0]
+    ldr x5, [x1]
+    add x3, x4, x5
+    str x3, [x0]
+    str x5, [x1]
+    sub x2, x2, #1
+    cbnz x2, Ltwo_pointers_loop
+Ltwo_pointers_done:
+    mov x0, x3
     ret

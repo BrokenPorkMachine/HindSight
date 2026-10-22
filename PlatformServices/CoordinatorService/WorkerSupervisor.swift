@@ -211,7 +211,9 @@ final class WorkerSupervisor {
                     throw WorkbenchError("Unexpected analysis fields.")
                 }
                 let report = try JSONDecoder().decode(AnalysisReport.self, from: data)
-                guard report.matches(id: id, digest: digest) else { throw WorkbenchError("Analysis identity or bounds mismatch.") }
+                if let failure = report.validationFailure(id: id, digest: digest) {
+                    throw WorkbenchError("Analysis identity or bounds mismatch: \(failure).")
+                }
                 self?.updateRecent(id: id, phase: .publishing, detail: "Analysis validated; publishing the bounded result to the workbench.", progressPercent: 99, progressStage: "publish")
                 completion(.success((report, evidenceBox.bundle)))
             } catch {

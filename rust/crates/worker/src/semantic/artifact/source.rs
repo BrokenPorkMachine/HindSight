@@ -16,7 +16,37 @@ struct State {
     registers: Vec<Symbol>,
     flags: Option<usize>,
     frame: BTreeMap<(i64, u64), (Symbol, BTreeSet<u64>)>,
+    external_loads: Vec<ExternalLoad>,
+    external_stores: Vec<ExternalStore>,
+    external_access_pcs: Vec<u64>,
     path: usize,
+    has_call: bool,
+    call_pcs: Vec<u64>,
+    calls: Vec<CallResult>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CallResult {
+    expression: usize,
+    guard: usize,
+    pc: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalStore {
+    address: usize,
+    value: usize,
+    guard: usize,
+    bytes: u64,
+    pc: u64,
+    volatile: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalLoad {
+    expression: usize,
+    address: usize,
+    guard: usize,
+    bytes: u64,
+    pc: u64,
+    volatile: bool,
 }
 struct Expr {
     kind: &'static str,
@@ -52,6 +82,27 @@ impl SourceType {
     fn spelling(&self) -> &str {
         &self.spelling
     }
+}
+
+/// Recover a scalar pointee type only when the declaration names one of the
+/// fixed-width integer types understood by this source slice. The AArch64
+/// load's signed bit alone cannot distinguish `int64_t` from `uint64_t`,
+/// because both use the same 64-bit load instruction.
+fn scalar_pointee_type(pointer: &SourceType) -> Option<SourceType> {
+    if !pointer.pointer { return None; }
+    let base = pointer.spelling.trim().trim_end_matches('*').trim();
+    let base = base.split_whitespace()
+        .filter(|word| !matches!(*word, "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (bits, signed) = match base.as_str() {
+        "int8_t" => (8, true), "uint8_t" => (8, false),
+        "int16_t" => (16, true), "uint16_t" => (16, false),
+        "int32_t" => (32, true), "uint32_t" => (32, false),
+        "int64_t" => (64, true), "uint64_t" => (64, false),
+        _ => return None,
+    };
+    Some(SourceType { spelling: base, bits, signed, pointer: false })
 }
 
 struct Dag {
@@ -137,13 +188,13 @@ impl Dag {
                     Ok(id)
                 } else {
                     let cast = self.add_role("source-cast", "narrowed", format!("((uint{bits}_t)($0))"), vec![id], pc)?;
-                    // A narrowing cast keeps the semantic type only when the
-                    // source type already has the narrowed width; otherwise the
-                    // cast changes the type and the result stays unresolved.
+                    // Preserve a proven source type when this machine-width
+                    // view retains every source bit. Truncation changes the
+                    // value and stays unresolved unless widths agree.
                     let narrowed = match self.type_of(id) {
-                        Some(source_type) if source_type.bits == bits => Some(SourceType {
+                        Some(source_type) if source_type.bits <= bits => Some(SourceType {
                             spelling: source_type.spelling.clone(),
-                            bits,
+                            bits: source_type.bits,
                             signed: source_type.signed,
                             pointer: false,
                         }),
@@ -184,8 +235,7 @@ fn register(t: &Tree) -> Result<(usize, u8), String> {
     };
     Ok((index, number(t, "bits") as u8))
 }
-fn read(t: &Tree, state: &State, dag: &mut Dag, pc: u64) -> Result<Symbol, String> {
-    let child = |i, dag: &mut Dag| read(&t.children[i], state, dag, pc);
+fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, String> {
     if t.kind == "register" {
         let (i, bits) = register(t)?;
         let value = if i == 32 {
@@ -212,11 +262,105 @@ fn read(t: &Tree, state: &State, dag: &mut Dag, pc: u64) -> Result<Symbol, Strin
             };
         return Ok(Symbol::Value(dag.constant(value, pc)?, 64));
     }
+    // A full-width OR with architectural zero copies the operand bits. If a
+    // narrow ABI input leaves upper register bits unqualified, retain the
+    // proven low bits so a narrower declared return remains recoverable; later
+    // full-width uses still fail their width checks.
+    if t.kind == "binary" && attribute(t, "operator") == "|" && t.children.len() == 2 {
+        let is_zero = |child: &Tree| {
+            (child.kind == "register" && register(child).is_ok_and(|(index, _)| index == 32))
+                || (child.kind == "constant" && number(child, "hex") == 0)
+        };
+        let source = if is_zero(&t.children[0]) {
+            Some(&t.children[1])
+        } else if is_zero(&t.children[1]) {
+            Some(&t.children[0])
+        } else {
+            None
+        };
+        if let Some(source) = source {
+            if source.kind == "register" {
+                let (index, bits) = register(source)?;
+                if index < state.registers.len() {
+                    if let Symbol::Value(id, known) = state.registers[index].clone() {
+                        if bits > known {
+                            let source_type = dag.type_of(id).cloned();
+                            let copy = dag.add_role("source-copy", "copy", "$0".into(), vec![id], pc)?;
+                            dag.type_node(copy, source_type);
+                            return Ok(Symbol::Value(copy, known));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut child = |i, dag: &mut Dag| read(&t.children[i], state, dag, pc);
     if t.kind == "memory-load" {
-        let Symbol::Frame(offset) = child(0, dag)? else {
+        let address = child(0, dag)?;
+        let bytes = number(t, "bytes");
+        if !matches!(bytes, 1 | 2 | 4 | 8) {
+            return Err("external memory read width is unsupported".into());
+        }
+        if let Symbol::Value(address_id, _) = &address {
+            let pointer_type = dag.type_of(*address_id).cloned()
+                .filter(|ty| ty.pointer)
+                .ok_or_else(|| format!("external memory address is not a proven pointer (address={address:?}, type={:?})", dag.type_of(*address_id)))?;
+            let volatile = pointer_type.spelling.contains("volatile");
+            let declared_pointee = scalar_pointee_type(&pointer_type).filter(|ty| u64::from(ty.bits) == bytes * 8);
+            if volatile && declared_pointee.is_none() {
+                return Err("volatile reads require an exact fixed-width scalar pointee".into());
+            }
+            let signed = declared_pointee.as_ref().map_or(flag(t, "signed") != 0, |ty| ty.signed);
+            let load_helper = if volatile {
+                format!("hs_vload_{}{}", if signed { "s" } else { "u" }, bytes)
+            } else {
+                format!("hs_load{bytes}")
+            };
+            let loaded = dag.add_role(
+                "source-memory-load",
+                "loaded",
+                format!("{load_helper}((uintptr_t)($0))"),
+                vec![*address_id],
+                pc,
+            )?;
+            dag.nodes[loaded].source_type = Some(declared_pointee.unwrap_or(SourceType {
+                spelling: format!("{}{}_t", if signed { "int" } else { "uint" }, bytes * 8),
+                bits: (bytes * 8) as u8,
+                signed,
+                pointer: false,
+            }));
+            state.external_loads.push(ExternalLoad {
+                expression: loaded,
+                address: *address_id,
+                guard: state.path,
+                bytes,
+                pc,
+                volatile,
+            });
+            state.external_access_pcs.push(pc);
+            let extended = dag.add_role(
+                "source-memory-value",
+                "loaded",
+                format!("hs_extend($0, {}, {})", bytes * 8, flag(t, "signed")),
+                vec![loaded],
+                pc,
+            )?;
+            let (spelling, bits, promoted_signed) = if bytes < 4 {
+                ("int32_t".to_owned(), 32, true)
+            } else {
+                (format!("{}{}_t", if signed { "int" } else { "uint" }, bytes * 8), (bytes * 8) as u8, signed)
+            };
+            dag.type_node(extended, Some(SourceType {
+                spelling,
+                bits,
+                signed: promoted_signed,
+                pointer: false,
+            }));
+            return Ok(Symbol::Value(extended, 64));
+        }
+        let Symbol::Frame(offset) = address else {
             return Err("external or unresolved memory read".into());
         };
-        let bytes = number(t, "bytes");
         frame_range(state, offset, bytes)?;
         let Some(((slot, size), (value, origins))) =
             state.frame.iter().find(|((slot, size), _)| {
@@ -236,6 +380,9 @@ fn read(t: &Tree, state: &State, dag: &mut Dag, pc: u64) -> Result<Symbol, Strin
             }
         }
         let value = dag.value(value, 64, pc)?;
+        let recovered_type = (size == bytes && shift == 0)
+            .then(|| dag.type_of(value).cloned())
+            .flatten();
         let id = dag.add_role(
             "source-frame-reload",
             "slot",
@@ -248,6 +395,7 @@ fn read(t: &Tree, state: &State, dag: &mut Dag, pc: u64) -> Result<Symbol, Strin
             pc,
         )?;
         dag.nodes[id].origins.extend(origins);
+        dag.type_node(id, recovered_type);
         return Ok(Symbol::Value(id, 64));
     }
     if t.kind == "flag-condition" {
@@ -295,6 +443,53 @@ fn read(t: &Tree, state: &State, dag: &mut Dag, pc: u64) -> Result<Symbol, Strin
             }
             .ok_or("frame offset overflow")?;
             return Ok(Symbol::Frame(next));
+        }
+        if let (Symbol::Value(pointer, _), Symbol::Value(_, _)) = (&values[0], &values[1]) {
+            let pointer_type = dag.type_of(*pointer).cloned();
+            if pointer_type.as_ref().is_some_and(|ty| ty.pointer)
+                && !pointer_type.as_ref().is_some_and(|ty| ty.spelling.contains("volatile"))
+            {
+                let op = attribute(t, "operator");
+                let (template, children) = if let Some(offset) = dag.literal(&values[1]) {
+                    (
+                        format!("((uintptr_t)($0) {op} UINT64_C(0x{offset:x}))"),
+                        vec![*pointer],
+                    )
+                } else {
+                    let offset_id = match &values[1] {
+                        Symbol::Value(id, _) if dag.type_of(*id).is_some_and(|ty| !ty.pointer) => *id,
+                        _ => return Err("dynamic pointer offset is not a proven integer".into()),
+                    };
+                    (
+                        format!("((uintptr_t)($0) {op} (uintptr_t)($1))"),
+                        vec![*pointer, offset_id],
+                    )
+                };
+                let id = dag.add_role(
+                    "source-pointer-offset",
+                    "address",
+                    template,
+                    children,
+                    pc,
+                )?;
+                dag.type_node(id, pointer_type);
+                return Ok(Symbol::Value(id, 64));
+            }
+        }
+    }
+    if t.kind == "binary" && attribute(t, "operator") == "|" {
+        let identity = if dag.literal(&values[0]) == Some(0) {
+            Some(values[1].clone())
+        } else if dag.literal(&values[1]) == Some(0) {
+            Some(values[0].clone())
+        } else {
+            None
+        };
+        if let Some(Symbol::Value(id, known)) = identity {
+            let source_type = dag.type_of(id).cloned();
+            let copy = dag.add_role("source-copy", "copy", "$0".into(), vec![id], pc)?;
+            dag.type_node(copy, source_type);
+            return Ok(Symbol::Value(copy, known));
         }
     }
     if values.iter().any(|v| matches!(v, Symbol::Unknown(_))) {
@@ -384,6 +579,12 @@ fn read(t: &Tree, state: &State, dag: &mut Dag, pc: u64) -> Result<Symbol, Strin
             let op = attribute(t, "operator");
             if matches!(op, "==" | "!=") {
                 None
+            } else if matches!(op, "<<" | ">>" | "asr" | "ror") {
+                // C shift expressions retain the promoted left operand's
+                // integer type; the shift count does not participate in the
+                // usual arithmetic conversions. This also keeps declaration
+                // evidence attached to compiler-scaled dynamic array indices.
+                dag.type_of(children[0]).filter(|ty| !ty.pointer).cloned()
             } else {
                 let left = dag.type_of(children[0]);
                 let right = dag.type_of(children[1]);
@@ -452,10 +653,58 @@ fn write(t: &Tree, value: Symbol, state: &mut State, dag: &mut Dag, pc: u64) -> 
     Ok(())
 }
 fn store(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), String> {
-    let Symbol::Frame(offset) = read(&t.children[0], state, dag, pc)? else {
+    let bytes = number(t, "bytes");
+    let address = read(&t.children[0], state, dag, pc)?;
+    if let Symbol::Value(address, _) = address {
+        let pointer = dag
+            .type_of(address)
+            .cloned()
+            .ok_or("external store address has no proven type")?;
+        if !pointer.pointer {
+            return Err("external store requires a proven pointer".into());
+        }
+        let volatile = pointer.spelling.contains("volatile");
+        if pointer.spelling.split_whitespace().any(|word| word == "const") {
+            return Err("external store through a const-qualified pointer is unsupported".into());
+        }
+        if !matches!(bytes, 1 | 2 | 4 | 8) {
+            return Err("external memory write width is unsupported".into());
+        }
+        let value = read(&t.children[1], state, dag, pc)?;
+        let value = dag.value(value, 64, pc)?;
+        let pointee = scalar_pointee_type(&pointer).filter(|ty| u64::from(ty.bits) == bytes * 8);
+        if volatile && pointee.is_none() {
+            return Err("volatile writes require an exact fixed-width scalar pointee".into());
+        }
+        if volatile {
+            let value_type = dag.type_of(value).cloned()
+                .ok_or_else(|| {
+                    let expression = &dag.nodes[value];
+                    format!("volatile store value type is unresolved at expression {value} ({} / {} / {})",
+                        expression.kind, expression.role, expression.template)
+                })?;
+            if !pointee.as_ref().is_some_and(|pointee| {
+                value_type.bits == pointee.bits
+                    && value_type.signed == pointee.signed
+                    && !value_type.pointer
+            }) {
+                return Err("volatile store value and pointee types disagree".into());
+            }
+        }
+        state.external_stores.push(ExternalStore {
+            address,
+            value,
+            guard: state.path,
+            bytes,
+            pc,
+            volatile,
+        });
+        state.external_access_pcs.push(pc);
+        return Ok(());
+    }
+    let Symbol::Frame(offset) = address else {
         return Err("external or escaped memory write".into());
     };
-    let bytes = number(t, "bytes");
     frame_range(state, offset, bytes)?;
     let value = read(&t.children[1], state, dag, pc)?;
     state
@@ -499,7 +748,191 @@ fn frame_objects(state: &State) -> BTreeMap<(i64, u64), u64> {
         })
         .collect()
 }
-fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), String> {
+
+fn zero_test(t: &Tree) -> Option<(usize, bool)> {
+    if t.kind != "binary" || !matches!(attribute(t, "operator"), "==" | "!=") || t.children.len() != 2 {
+        return None;
+    }
+    let (register_tree, constant_tree) = if t.children[0].kind == "register" {
+        (&t.children[0], &t.children[1])
+    } else {
+        (&t.children[1], &t.children[0])
+    };
+    if constant_tree.kind != "constant" || number(constant_tree, "hex") != 0 {
+        return None;
+    }
+    let (register, _) = register(register_tree).ok()?;
+    Some((register, attribute(t, "operator") == "=="))
+}
+
+struct LoopVariable {
+    value: usize,
+    initial: usize,
+}
+
+#[derive(Clone, Debug)]
+struct LoopAssignment {
+    destination: usize,
+    value: usize,
+    pc: u64,
+}
+
+#[derive(Clone, Debug)]
+enum LoopBodyEvent {
+    Assignment(LoopAssignment),
+    Load(ExternalLoad),
+    Store(ExternalStore),
+}
+
+struct SourceLoop {
+    condition: usize,
+    variables: Vec<LoopVariable>,
+    assignments: Vec<LoopAssignment>,
+    loads: Vec<ExternalLoad>,
+    stores: Vec<ExternalStore>,
+    pcs: Vec<u64>,
+}
+
+/// Recognize a natural loop with one zero-test preheader, one complementary
+/// zero-test backedge, and a body with straight-line scalar assignments plus
+/// ordered external stores. Values carried
+/// through the backedge become mutable, named source locals; every update is
+/// still built from the original instruction tree.
+fn natural_loop(
+    start: u64,
+    preheader: usize,
+    trees: &[Tree],
+    state: &mut State,
+    dag: &mut Dag,
+    call_prototypes: &BTreeMap<u64, SourceSignature>,
+) -> Result<Option<(SourceLoop, usize)>, String> {
+    let Some(preheader_tree) = trees.get(preheader).filter(|tree| tree.kind == "conditional-goto") else {
+        return Ok(None);
+    };
+    let header = preheader + 1;
+    let target_index = |target: u64| -> Option<usize> {
+        let delta = target.checked_sub(start)?;
+        (delta % 4 == 0 && delta / 4 < trees.len() as u64).then_some((delta / 4) as usize)
+    };
+    let Some(exit) = target_index(number(preheader_tree, "target")) else { return Ok(None) };
+    let backedges = (header..trees.len()).filter(|&index| {
+        trees[index].kind == "conditional-goto"
+            && target_index(number(&trees[index], "target")) == Some(header)
+    }).collect::<Vec<_>>();
+    if backedges.len() != 1 { return Ok(None); }
+    let tail = backedges[0];
+    if tail <= header || tail + 1 != exit { return Ok(None); }
+    let Some((test_register, exits_on_zero)) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
+    let Some((tail_register, continues_on_zero)) = zero_test(&trees[tail].children[0]) else { return Ok(None) };
+    if test_register != tail_register || exits_on_zero == continues_on_zero {
+        return Ok(None);
+    }
+    // The loop must be a single-entry region. The preheader exit and backedge
+    // are its only control-flow edges; all other body operations are assignments.
+    for (index, tree) in trees.iter().enumerate() {
+        if !matches!(tree.kind, "goto" | "conditional-goto") || index == preheader || index == tail { continue; }
+        if target_index(number(tree, "target")).is_some_and(|target| (header..=tail).contains(&target)) {
+            return Ok(None);
+        }
+    }
+    if !state.external_loads.is_empty() || !state.external_stores.is_empty() || state.has_call {
+        return Ok(None);
+    }
+    let mut written = BTreeSet::new();
+    for tree in &trees[header..tail] {
+        if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
+        if tree.kind == "memory-store" { continue; }
+        let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
+        // x18 through x30, SP and the zero register cannot become loop locals
+        // in this source slice because their ABI restoration rules differ.
+        if register > 17 { return Ok(None); }
+        written.insert(register);
+    }
+    if !written.contains(&test_register) { return Ok(None); }
+
+    let mut variables = Vec::new();
+    let mut variable_by_register = BTreeMap::new();
+    for register in written.iter().copied() {
+        let Symbol::Value(initial, known) = state.registers[register].clone() else { return Ok(None) };
+        if known < 32 { return Ok(None); }
+        let role = if register == test_register { "induction" } else { "accumulator" };
+        let id = dag.nodes.len();
+        let name = format!("hs_{role}_{id}");
+        let value = dag.add_role("source-loop-variable", role, name, vec![], start + header as u64 * 4)?;
+        dag.type_node(value, dag.type_of(initial).cloned());
+        variable_by_register.insert(register, (value, known));
+        variables.push(LoopVariable { value, initial });
+        state.registers[register] = Symbol::Value(value, known);
+    }
+    let test_value = variable_by_register[&test_register].0;
+    let condition_template = if exits_on_zero { "(($0) != UINT64_C(0))" } else { "(($0) == UINT64_C(0))" };
+    let condition = dag.add_role(
+        "source-loop-condition", "condition", condition_template.into(), vec![test_value], start + header as u64 * 4
+    )?;
+    dag.type_node(condition, None);
+
+    let mut assignments = Vec::new();
+    let mut loads = Vec::new();
+    let mut stores = Vec::new();
+    let mut type_conflicts = BTreeSet::new();
+    for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
+        let pc = start + index as u64 * 4;
+        let register = if tree.kind == "assignment" {
+            Some(register(&tree.children[0])?.0)
+        } else {
+            None
+        };
+        let before_flags = state.flags;
+        let before_frame = state.frame.clone();
+        let before_loads = state.external_loads.len();
+        let before_stores = state.external_stores.len();
+        statement(tree, state, dag, pc, call_prototypes)?;
+        if state.flags != before_flags { return Err("loop body changes flags without a loop-carried flag value".into()); }
+        if state.frame != before_frame || state.external_loads.len() < before_loads {
+            return Err("loop body has memory effects without loop-carried memory SSA".into());
+        }
+        let body_loads = state.external_loads.split_off(before_loads);
+        if body_loads.len() > 1 || (tree.kind == "memory-store" && !body_loads.is_empty()) {
+            return Err("loop instruction has an unsupported number of memory reads".into());
+        }
+        loads.extend(body_loads);
+        match register {
+            Some(register) => {
+                if state.external_stores.len() != before_stores {
+                    return Err("loop assignment unexpectedly produced a memory store".into());
+                }
+                let Symbol::Value(value, _) = state.registers[register].clone() else { return Err("loop update depends on unknown bits".into()) };
+                let (destination, known) = variable_by_register[&register];
+                let destination_type = dag.type_of(destination).cloned();
+                let update_type = dag.type_of(value).cloned();
+                match (destination_type, update_type) {
+                    (None, Some(update_type)) => dag.type_node(destination, Some(update_type)),
+                    (Some(current), Some(update)) if current.bits == update.bits && current.signed == update.signed && current.pointer == update.pointer => {}
+                    (Some(_), None) => {}
+                    (None, None) => {}
+                    _ => {
+                        dag.type_node(destination, None);
+                        type_conflicts.insert(destination);
+                    }
+                }
+                assignments.push(LoopAssignment { destination, value, pc });
+                state.registers[register] = Symbol::Value(destination, known);
+            }
+            None => {
+                if state.external_stores.len() != before_stores + 1 {
+                    return Err("loop memory store is not a single external write".into());
+                }
+                stores.push(state.external_stores.pop().expect("store count checked"));
+            }
+        }
+    }
+    if !type_conflicts.is_empty() {
+        return Err("loop-carried value type changes or becomes unresolved".into());
+    }
+    let pcs = (preheader..=tail).map(|index| start + index as u64 * 4).collect();
+    Ok(Some((SourceLoop { condition, variables, assignments, loads, stores, pcs }, exit)))
+}
+fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototypes: &BTreeMap<u64, SourceSignature>) -> Result<(), String> {
     match t.kind {
         "no-op" => Ok(()),
         "assignment" => {
@@ -508,11 +941,48 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), 
         }
         "sequence" => {
             for child in &t.children {
-                statement(child, state, dag, pc)?;
+                statement(child, state, dag, pc, call_prototypes)?;
             }
             Ok(())
         }
         "memory-store" => store(t, state, dag, pc),
+        "call" => {
+            let target = number(t, "target");
+            let callee = call_prototypes.get(&target).ok_or("call has no unique exact scalar prototype")?;
+            if callee.result_spelling == "void" { return Err("void call results are not modeled".into()); }
+            let V::Object(effects) = t.attributes.get("call_effects").ok_or("self-call prototype missing")? else { return Err("self-call prototype missing".into()); };
+            let V::Array(arguments) = effects.get("arguments").ok_or("self-call arguments unresolved")? else { return Err("self-call arguments unresolved".into()); };
+            if arguments.len() != callee.parameters.len() { return Err("call argument prototype mismatch".into()); }
+            let mut children = Vec::new();
+            let mut rendered = Vec::new();
+            for (argument, parameter) in arguments.iter().zip(&callee.parameters) {
+                let V::Object(fields) = argument else { return Err("self-call argument proof malformed".into()); };
+                if fields.get("source_type") != Some(&V::String(parameter.spelling.clone()))
+                    || fields.get("location") != Some(&V::String(format!("x{}", parameter.register))) {
+                return Err("call argument ABI mismatch".into());
+                }
+                let value = dag.value(state.registers[parameter.register as usize].clone(), parameter.bits.max(32), pc)?;
+                let cast = dag.add_role("source-call-argument", "argument", format!("(({})$0)", parameter.spelling), vec![value], pc)?;
+                children.push(cast);
+                rendered.push(format!("${}", children.len()-1));
+            }
+            if effects.get("result") != Some(&object([("source_spelling", callee.result_spelling.clone().into()), ("location", "x0".into())])) {
+                return Err("call result ABI mismatch".into());
+            }
+            let value = dag.add_role("source-call", "value", format!("{}({})", callee.name, rendered.join(", ")), children, pc)?;
+            dag.type_node(value, Some(SourceType { spelling: callee.result_spelling.clone(), bits: callee.result_bits, signed: callee.result_signed, pointer: callee.result_pointer }));
+            for register in 0..=18 { state.registers[register] = Symbol::Unknown(register as u64); }
+            // The call's result width belongs to the callee prototype. The
+            // caller may return a narrower or wider value after further
+            // operations; using its result declaration here loses valid
+            // callee bits or claims bits the callee did not define.
+            state.registers[0] = Symbol::Value(value, callee.result_bits.max(32));
+            state.flags = None;
+            state.has_call = true;
+            state.call_pcs.push(pc);
+            state.calls.push(CallResult { expression: value, guard: state.path, pc });
+            Ok(())
+        }
         "flags-compare" => {
             let a = read(&t.children[0], state, dag, pc)?;
             let b = read(&t.children[1], state, dag, pc)?;
@@ -637,12 +1107,20 @@ pub(super) struct Recovery {
     paths: usize,
     /// The proven frame objects and the memory version each one holds.
     frame_objects: Vec<FrameObject>,
+    external_loads: Vec<ExternalLoad>,
+    external_stores: Vec<ExternalStore>,
+    called_prototypes: Vec<SourceSignature>,
+    calls: Vec<CallResult>,
+    ordered_call_memory: bool,
+    ordered_volatile_accesses: bool,
+    loops: Vec<SourceLoop>,
 }
 pub(super) fn recover(
     start: u64,
     trees: &[Tree],
     operations: &[IrOperation],
     signature: SourceSignature,
+    call_prototypes: &BTreeMap<u64, SourceSignature>,
 ) -> Result<Recovery, String> {
     if operations
         .iter()
@@ -656,7 +1134,13 @@ pub(super) fn recover(
         registers: (0..32).map(Symbol::Unknown).collect(),
         flags: None,
         frame: BTreeMap::new(),
+        external_loads: Vec::new(),
+        external_stores: Vec::new(),
+        external_access_pcs: Vec::new(),
         path: truth,
+        has_call: false,
+        call_pcs: Vec::new(),
+        calls: Vec::new(),
     };
     state.registers[31] = Symbol::Frame(0);
     for parameter in &signature.parameters {
@@ -670,6 +1154,15 @@ pub(super) fn recover(
                 "hs_div",
                 "hs_condition",
                 "hs_compare",
+                "hs_flags_arith",
+                "hs_load1",
+                "hs_load2",
+                "hs_load4",
+                "hs_load8",
+                "hs_store1",
+                "hs_store2",
+                "hs_store4",
+                "hs_store8",
             ]
             .contains(&signature.name.as_str())
         {
@@ -702,6 +1195,7 @@ pub(super) fn recover(
     }
     let mut pending = vec![(0usize, state, BTreeSet::new())];
     let mut returned = Vec::new();
+    let mut source_loops = Vec::new();
     let mut visits = 0;
     // The proven frame objects, keyed by their exact extent. A later write to
     // the same extent replaces the earlier version; a write to a different
@@ -720,8 +1214,16 @@ pub(super) fn recover(
             let pc = start + index as u64 * 4;
             match t.kind {
                 "machine-return" => {
+                    if !source_loops.is_empty()
+                        && (state.has_call || !state.external_loads.is_empty() || !state.external_stores.is_empty())
+                    {
+                        return Err("source loop combined with calls or memory effects is not modeled".into());
+                    }
+                    if state.external_access_pcs.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err("external memory schedule is not in instruction order".into());
+                    }
                     if t.children.len() != 1
-                        || read(&t.children[0], &state, &mut dag, pc)? != Symbol::Unknown(30)
+                        || read(&t.children[0], &mut state, &mut dag, pc)? != Symbol::Unknown(30)
                     {
                         return Err("return target is not the entry link register".into());
                     }
@@ -735,7 +1237,7 @@ pub(super) fn recover(
                     }
                     let value = dag.value(
                         state.registers[0].clone(),
-                        signature.result_bits.max(32),
+                        signature.result_bits,
                         pc,
                     )?;
                     let value = dag.add_role("source-return", "result", "$0".into(), vec![value], pc)?;
@@ -750,7 +1252,7 @@ pub(super) fn recover(
                             pointer: signature.result_pointer,
                         }),
                     );
-                    returned.push((state.path, value));
+                    returned.push((state.path, value, state.external_loads.clone(), state.external_stores.clone(), state.has_call, state.call_pcs.clone(), state.calls.clone()));
                     // The frame objects this path proves join the shared
                     // object map. The same extent keeps the later version.
                     for ((offset, bytes), version) in frame_objects(&state) {
@@ -762,6 +1264,16 @@ pub(super) fn recover(
                     break;
                 }
                 "goto" | "conditional-goto" => {
+                    if t.kind == "conditional-goto" {
+                        if let Some((source_loop, exit)) = natural_loop(
+                            start, index, trees, &mut state, &mut dag, call_prototypes
+                        )? {
+                            for body_index in index + 1..exit { seen.insert(body_index); }
+                            source_loops.push(source_loop);
+                            index = exit;
+                            continue;
+                        }
+                    }
                     let target = number(t, "target");
                     let delta = target.checked_sub(start).ok_or("source tail dependency")?;
                     if delta % 4 != 0 || delta / 4 >= trees.len() as u64 {
@@ -772,7 +1284,7 @@ pub(super) fn recover(
                         index = target_index;
                         continue;
                     }
-                    let condition = read(&t.children[0], &state, &mut dag, pc)?;
+                    let condition = read(&t.children[0], &mut state, &mut dag, pc)?;
                     let condition = dag.value(condition, 64, pc)?;
                     let mut taken = state.clone();
                     taken.path = dag.add(
@@ -789,16 +1301,38 @@ pub(super) fn recover(
                     )?;
                     pending.push((target_index, taken, seen.clone()));
                 }
-                _ => statement(t, &mut state, &mut dag, pc)?,
+                _ => statement(t, &mut state, &mut dag, pc, call_prototypes)?,
             }
             index += 1;
         }
     }
     let paths = returned.len();
-    let Some((_, mut result)) = returned.pop() else {
+    if !source_loops.is_empty() && paths != 1 {
+        return Err("source loop requires one proven exit path".into());
+    }
+    let ordered_call_memory = returned.iter().any(|(_, _, loads, stores, _, _, calls)| calls.iter().any(|call|
+        loads.iter().any(|load| load.pc > call.pc) || stores.iter().any(|store| store.pc > call.pc)));
+    let ordered_volatile_accesses = returned.iter().any(|(_, _, loads, stores, has_call, _, _)| {
+        let volatile = loads.iter().any(|load| load.volatile) || stores.iter().any(|store| store.volatile);
+        volatile && (*has_call || loads.len() + stores.len() > 1)
+    });
+    let Some((_, mut result, mut external_loads, mut external_stores, _, _, mut calls)) = returned.pop() else {
         return Err("no qualified source return".into());
     };
-    while let Some((condition, value)) = returned.pop() {
+    while let Some((condition, value, path_loads, path_stores, _, _, path_calls)) = returned.pop() {
+        for access in path_loads {
+            if !external_loads.contains(&access) {
+                external_loads.push(access);
+            }
+        }
+        for effect in path_stores {
+            if !external_stores.contains(&effect) {
+                external_stores.push(effect);
+            }
+        }
+        for call in path_calls {
+            if !calls.contains(&call) { calls.push(call); }
+        }
         // A join of two return paths keeps the type only when both paths
         // agree on it; otherwise the merged value stays untyped.
         let joined = match (dag.type_of(value), dag.type_of(result)) {
@@ -815,11 +1349,29 @@ pub(super) fn recover(
         dag.type_node(select, joined);
         result = select;
     }
+    let mut called_prototypes = Vec::new();
+    for target in operations.iter().filter_map(|operation| match operation {
+        IrOperation::DirectCall { target } if *target != start => Some(*target),
+        _ => None,
+    }) {
+        if let Some(prototype) = call_prototypes.get(&target) {
+            if !called_prototypes.iter().any(|existing: &SourceSignature| existing.signature.declaration == prototype.signature.declaration) {
+                called_prototypes.push(prototype.clone());
+            }
+        }
+    }
     Ok(Recovery {
         dag,
         result,
         signature,
         paths,
+        external_loads,
+        external_stores,
+        called_prototypes,
+        calls,
+        ordered_call_memory,
+        ordered_volatile_accesses,
+        loops: source_loops,
         frame_objects: objects
             .into_iter()
             .map(|((offset, bytes), version)| FrameObject {
@@ -836,29 +1388,95 @@ impl Recovery {
         builder: &mut Builder,
         declaration: &str,
         ir: &[String],
+        memory_evidence_by_pc: &BTreeMap<u64, Vec<String>>,
         start: u64,
     ) -> io::Result<(String, String)> {
+        let ordered_mixed_accesses = !self.external_loads.is_empty() && !self.external_stores.is_empty();
+        let loop_memory_effects = self.loops.iter().any(|source_loop| !source_loop.loads.is_empty() || !source_loop.stores.is_empty());
+        let ordered_effect_schedule = ordered_mixed_accesses || self.ordered_call_memory || self.ordered_volatile_accesses || loop_memory_effects;
         let mut live = BTreeSet::new();
         let mut pending = vec![self.result];
+        for source_loop in &self.loops {
+            pending.push(source_loop.condition);
+            for variable in &source_loop.variables {
+                pending.extend([variable.value, variable.initial]);
+            }
+            for assignment in &source_loop.assignments {
+                pending.extend([assignment.destination, assignment.value]);
+            }
+            for load in &source_loop.loads {
+                pending.extend([load.expression, load.address, load.guard]);
+            }
+            for store in &source_loop.stores {
+                pending.extend([store.address, store.value, store.guard]);
+            }
+        }
+        while let Some(id) = pending.pop() {
+            if live.insert(id) {
+                pending.extend(self.dag.nodes[id].children.iter().copied());
+            }
+        }
+        let mut loop_local_ids = BTreeSet::new();
+        let mut loop_pending = self.loops.iter().flat_map(|source_loop| {
+            std::iter::once(source_loop.condition)
+                .chain(source_loop.variables.iter().map(|variable| variable.value))
+                .chain(source_loop.assignments.iter().map(|assignment| assignment.value))
+                .chain(source_loop.loads.iter().flat_map(|load| [load.expression, load.address, load.guard]))
+                .chain(source_loop.stores.iter().flat_map(|store| [store.address, store.value, store.guard]))
+        }).collect::<Vec<_>>();
+        while let Some(id) = loop_pending.pop() {
+            if loop_local_ids.insert(id) {
+                loop_pending.extend(self.dag.nodes[id].children.iter().copied());
+            }
+        }
+        for effect in &self.external_stores {
+            pending.extend([effect.address, effect.value, effect.guard]);
+        }
+        if ordered_effect_schedule {
+            pending.extend(self.external_loads.iter().flat_map(|load| [load.expression, load.guard]));
+        }
+        if self.ordered_call_memory {
+            pending.extend(self.calls.iter().flat_map(|call| [call.expression, call.guard]));
+        }
         while let Some(id) = pending.pop() {
             if live.insert(id) {
                 pending.extend(self.dag.nodes[id].children.iter().copied());
             }
         }
         let mut uses = vec![0usize; self.dag.nodes.len()];
+        let mut call_dependent = vec![false; self.dag.nodes.len()];
         for &id in &live {
+            call_dependent[id] = self.dag.nodes[id].kind == "source-call"
+                || self.dag.nodes[id].children.iter().any(|child| call_dependent[*child]);
             for child in &self.dag.nodes[id].children {
                 uses[*child] += 1;
             }
         }
         let mut rendered = BTreeMap::<usize, String>::new();
         let mut asts = BTreeMap::<usize, String>::new();
+        let mut call_invocations = BTreeMap::<usize, String>::new();
         let mut declarations = String::new();
+        let ordered_load_ids = if ordered_effect_schedule {
+            self.external_loads.iter().map(|load| load.expression)
+                .chain(self.loops.iter().flat_map(|source_loop| source_loop.loads.iter().map(|load| load.expression)))
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
         for &id in &live {
             let node = &self.dag.nodes[id];
-            let mut expression = node.template.clone();
+            let mut expression = if ordered_load_ids.contains(&id) { format!("hs_loaded_{id}") } else { node.template.clone() };
             for (index, child) in node.children.iter().enumerate() {
                 expression = expression.replace(&format!("${index}"), &rendered[child]);
+            }
+            if (self.ordered_call_memory || self.ordered_volatile_accesses) && node.kind == "source-call" {
+                let name = format!("hs_call_result_{id}");
+                call_invocations.insert(id, expression);
+                let spelling = node.source_type.as_ref().ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidData, "ordered call has no proven result type",
+                ))?.spelling();
+                declarations.push_str(&format!("    {spelling} {name};\n"));
+                expression = name;
             }
             let children = node.children.iter().map(|i| asts[i].clone()).collect();
             let evidence = node
@@ -909,9 +1527,9 @@ impl Recovery {
                 ]),
             )?;
             asts.insert(id, ast);
-            if expression.len() > 160
+            if !ordered_effect_schedule && !call_dependent[id] && !loop_local_ids.contains(&id) && (expression.len() > 160
                 || (uses[id] > 1 && !matches!(node.kind, "source-constant" | "source-parameter"))
-            {
+            ) {
                 let name = role_name(node, id);
                 declarations.push_str(&format!("    uint64_t {name} = {expression};\n"));
                 expression = name;
@@ -949,7 +1567,292 @@ impl Recovery {
             .map(|p| format!("{} {}", p.spelling, p.name))
             .collect::<Vec<_>>()
             .join(", ");
+        let call_declarations = self.called_prototypes.iter()
+            .map(|prototype| format!("{}\n", prototype.signature.declaration))
+            .collect::<String>();
         let result = &rendered[&self.result];
+        let mut effects_code = String::new();
+        let mut effect_asts = Vec::new();
+        let mut loop_code = String::new();
+        let mut memory_records = Vec::<(V, V)>::new();
+        for source_loop in &self.loops {
+            let loop_pc = *source_loop.pcs.first().unwrap_or(&start);
+            let mut loop_children = vec![asts[&source_loop.condition].clone()];
+            for load in &source_loop.loads {
+                declarations.push_str(&format!("    uint64_t hs_loaded_{};\n", load.expression));
+            }
+            for variable in &source_loop.variables {
+                let name = &rendered[&variable.value];
+                loop_code.push_str(&format!("    uint64_t {name} = {};\n", rendered[&variable.initial]));
+                let binding = builder.ast_spans(
+                    "source-loop-binding",
+                    None,
+                    vec![asts[&variable.value].clone(), asts[&variable.initial].clone()],
+                    &ir.get(((loop_pc - start) / 4) as usize).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
+                    array([object([("start", address(loop_pc)), ("end", address(loop_pc + 4))])]),
+                    object([("template", "uint64_t $0 = $1".into()), ("role", self.dag.nodes[variable.value].role.into())]),
+                )?;
+                loop_children.push(binding);
+            }
+            loop_code.push_str(&format!("    while ({}) {{\n", rendered[&source_loop.condition]));
+            let mut body_events = source_loop.loads.iter().cloned().map(LoopBodyEvent::Load)
+                .chain(source_loop.assignments.iter().cloned().map(LoopBodyEvent::Assignment))
+                .chain(source_loop.stores.iter().cloned().map(LoopBodyEvent::Store)).collect::<Vec<_>>();
+            body_events.sort_by_key(|event| match event {
+                LoopBodyEvent::Load(load) => (load.pc, 0u8),
+                LoopBodyEvent::Assignment(assignment) => (assignment.pc, 1u8),
+                LoopBodyEvent::Store(store) => (store.pc, 2u8),
+            });
+            for event in body_events {
+                match event {
+                    LoopBodyEvent::Load(load) => {
+                        let helper = if load.volatile {
+                            let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
+                            format!("hs_vload_{}{}", if signed { "s" } else { "u" }, load.bytes)
+                        } else {
+                            format!("hs_load{}", load.bytes)
+                        };
+                        let statement = format!("        hs_loaded_{} = {}((uintptr_t)({}));\n",
+                            load.expression, helper, rendered[&load.address]);
+                        if self.dag.literal(&Symbol::Value(load.guard, 64)) == Some(1) {
+                            loop_code.push_str(&statement);
+                        } else {
+                            loop_code.push_str(&format!("        if ({}) {{\n{}        }}\n", rendered[&load.guard], statement));
+                        }
+                        let mut evidence = ir.get(((load.pc - start) / 4) as usize).into_iter().cloned()
+                            .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
+                        evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
+                        let ordering = "per-iteration instruction order under the recovered path guard";
+                        let ast = builder.ast_spans(
+                            "source-memory-read",
+                            None,
+                            vec![asts[&load.address].clone(), asts[&load.expression].clone(), asts[&load.guard].clone()],
+                            &evidence,
+                            array([object([("start", address(load.pc)), ("end", address(load.pc + 4))])]),
+                            object([
+                                ("bytes", load.bytes.into()),
+                                ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
+                                ("ordering", ordering.into()),
+                                ("template", format!("if ($2) {helper}((uintptr_t)($0))").into()),
+                            ]),
+                        )?;
+                        loop_children.push(ast);
+                        memory_records.push((object([
+                            ("artifact_kind", "external-memory-read".into()),
+                            ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
+                            ("bytes", load.bytes.into()),
+                            ("ordering", ordering.into()),
+                            ("guard_ast", asts[&load.guard].clone().into()),
+                            ("address_ast", asts[&load.address].clone().into()),
+                            ("read_ast", asts[&load.expression].clone().into()),
+                        ]), ranges(load.pc, load.pc + 4)));
+                    }
+                    LoopBodyEvent::Assignment(assignment) => {
+                        let target = &rendered[&assignment.destination];
+                        let value = &rendered[&assignment.value];
+                        loop_code.push_str(&format!("        {target} = {value};\n"));
+                        let evidence = ir.get(((assignment.pc - start) / 4) as usize).into_iter().cloned()
+                            .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
+                        let ast = builder.ast_spans(
+                            "source-loop-assignment",
+                            None,
+                            vec![asts[&assignment.destination].clone(), asts[&assignment.value].clone()],
+                            &evidence,
+                            array([object([("start", address(assignment.pc)), ("end", address(assignment.pc + 4))])]),
+                            object([("template", "$0 = $1".into())]),
+                        )?;
+                        loop_children.push(ast);
+                    }
+                    LoopBodyEvent::Store(store) => {
+                        let (helper, partition) = if store.volatile {
+                            let pointee = scalar_pointee_type(self.dag.type_of(store.address).expect("validated volatile pointer type"))
+                                .filter(|ty| u64::from(ty.bits) == store.bytes * 8)
+                                .expect("validated volatile pointee type");
+                            (format!("hs_vstore_{}{}", if pointee.signed { "s" } else { "u" }, store.bytes),
+                             "declaration-proven volatile pointer")
+                        } else {
+                            (format!("hs_store{}", store.bytes), "declaration-proven ordinary pointer")
+                        };
+                        let statement = format!("        {}((uintptr_t)({}), (uint64_t)({}));\n", helper,
+                            rendered[&store.address], rendered[&store.value]);
+                        if self.dag.literal(&Symbol::Value(store.guard, 64)) == Some(1) {
+                            loop_code.push_str(&statement);
+                        } else {
+                            loop_code.push_str(&format!("        if ({}) {{\n{}        }}\n", rendered[&store.guard], statement));
+                        }
+                        let mut evidence = ir.get(((store.pc - start) / 4) as usize).into_iter().cloned()
+                            .chain(std::iter::once(declaration.to_owned()))
+                            .collect::<Vec<_>>();
+                        evidence.extend(memory_evidence_by_pc.get(&store.pc).into_iter().flatten().cloned());
+                        let ordering = "per-iteration instruction order under the recovered path guard";
+                        let ast = builder.ast_spans(
+                            "source-memory-store",
+                            None,
+                            vec![asts[&store.address].clone(), asts[&store.value].clone(), asts[&store.guard].clone()],
+                            &evidence,
+                            array([object([("start", address(store.pc)), ("end", address(store.pc + 4))])]),
+                            object([
+                                ("bytes", store.bytes.into()),
+                                ("partition", partition.into()),
+                                ("ordering", ordering.into()),
+                                ("template", format!("if ($2) {helper}((uintptr_t)($0), (uint64_t)($1))").into()),
+                            ]),
+                        )?;
+                        loop_children.push(ast);
+                        memory_records.push((object([
+                            ("artifact_kind", "external-memory-write".into()),
+                            ("partition", partition.into()),
+                            ("bytes", store.bytes.into()),
+                            ("ordering", ordering.into()),
+                            ("guard_ast", asts[&store.guard].clone().into()),
+                        ]), ranges(store.pc, store.pc + 4)));
+                    }
+                }
+            }
+            loop_code.push_str("    }\n");
+            let evidence = source_loop.pcs.iter().filter_map(|pc| ir.get(((*pc - start) / 4) as usize).cloned())
+                .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
+            let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(*pc + 4))])));
+            let ast = builder.ast_spans(
+                "source-while",
+                None,
+                loop_children,
+                &evidence,
+                origins,
+                object([("template", "while ($0) { ... }".into()), ("control_flow", "single-entry natural loop with one zero-test exit and complementary backedge".into())]),
+            )?;
+            effect_asts.push(ast);
+        }
+        if ordered_effect_schedule {
+            for load in &self.external_loads {
+                effects_code.push_str(&format!("    uint64_t hs_loaded_{};\n", load.expression));
+            }
+        }
+        let mut events = self.external_loads.iter().enumerate().map(|(index, load)| (load.pc, 0u8, index)).chain(
+            self.external_stores.iter().enumerate().map(|(index, store)| (store.pc, 1u8, index))
+        ).chain(self.calls.iter().enumerate().filter(|_| self.ordered_call_memory || self.ordered_volatile_accesses).map(|(index, call)| (call.pc, 2u8, index)))
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| (event.0, event.1));
+        for (pc, event_kind, event_index) in events {
+            if event_kind == 2 {
+                let call = &self.calls[event_index];
+                let invocation = call_invocations.get(&call.expression).ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidData, "ordered call expression was not rendered",
+                ))?;
+                let call_assignment = format!("    {} = {invocation};\n", rendered[&call.expression]);
+                if self.dag.literal(&Symbol::Value(call.guard, 64)) == Some(1) {
+                    effects_code.push_str(&call_assignment);
+                } else {
+                    effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&call.guard], call_assignment));
+                }
+                let evidence = ir.get(((call.pc - start) / 4) as usize).into_iter().cloned()
+                    .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
+                effect_asts.push(builder.ast_spans(
+                    "source-call-event",
+                    None,
+                    vec![asts[&call.expression].clone(), asts[&call.guard].clone()],
+                    &evidence,
+                    array([object([("start", address(call.pc)), ("end", address(call.pc + 4))])]),
+                    object([("template", "call-result = call(arguments)".into()), ("ordering", "instruction order with caller memory effects".into())]),
+                )?);
+                continue;
+            }
+            if event_kind == 0 {
+                if !ordered_effect_schedule { continue; }
+                let load = &self.external_loads[event_index];
+                let helper = if load.volatile {
+                    let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
+                    format!("hs_vload_{}{}", if signed { "s" } else { "u" }, load.bytes)
+                } else { format!("hs_load{}", load.bytes) };
+                let read = format!("    hs_loaded_{} = {}((uintptr_t)({}));\n", load.expression, helper, rendered[&load.address]);
+                if self.dag.literal(&Symbol::Value(load.guard, 64)) == Some(1) {
+                    effects_code.push_str(&read);
+                } else {
+                    effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&load.guard], read));
+                }
+                memory_records.push((object([
+                    ("artifact_kind", "external-memory-read".into()),
+                    ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
+                    ("bytes", load.bytes.into()),
+                    ("ordering", "instruction order under the recovered path guard".into()),
+                    ("guard_ast", asts[&load.guard].clone().into()),
+                    ("address_ast", asts[&load.address].clone().into()),
+                    ("read_ast", asts[&load.expression].clone().into()),
+                ]), ranges(pc, pc + 4)));
+                let mut evidence = ir
+                    .get(((load.pc - start) / 4) as usize)
+                    .into_iter()
+                    .cloned()
+                    .chain(std::iter::once(declaration.to_owned()))
+                    .collect::<Vec<_>>();
+                evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
+                effect_asts.push(builder.ast_spans(
+                    "source-memory-read",
+                    None,
+                    vec![asts[&load.address].clone(), asts[&load.expression].clone(), asts[&load.guard].clone()],
+                    &evidence,
+                    array([object([("start", address(load.pc)), ("end", address(load.pc + 4))])]),
+                    object([
+                        ("bytes", load.bytes.into()),
+                        ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
+                        ("ordering", "instruction order under the recovered path guard".into()),
+                        ("template", format!("if ($2) {helper}((uintptr_t)($0))").into()),
+                    ]),
+                )?);
+                continue;
+            }
+            let effect = &self.external_stores[event_index];
+            let (store_helper, partition, ordering) = if effect.volatile {
+                let pointee = scalar_pointee_type(self.dag.type_of(effect.address).expect("validated volatile pointer type"))
+                    .filter(|ty| u64::from(ty.bits) == effect.bytes * 8)
+                    .expect("validated volatile pointee type");
+                (format!("hs_vstore_{}{}", if pointee.signed { "s" } else { "u" }, effect.bytes),
+                 "declaration-proven volatile pointer", "instruction order under the recovered path guard")
+            } else {
+                (format!("hs_store{}", effect.bytes),
+                 "declaration-proven ordinary pointer", "instruction order under the recovered path guard")
+            };
+            let store = format!(
+                "    {}((uintptr_t)({}), (uint64_t)({}));\n",
+                store_helper,
+                rendered[&effect.address],
+                rendered[&effect.value],
+            );
+            let guard_is_true = self.dag.literal(&Symbol::Value(effect.guard, 64)) == Some(1);
+            if guard_is_true {
+                effects_code.push_str(&store);
+            } else {
+                effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&effect.guard], store));
+            }
+            let mut evidence = ir
+                .get(((effect.pc - start) / 4) as usize)
+                .into_iter()
+                .cloned()
+                .chain(std::iter::once(declaration.to_owned()))
+                .collect::<Vec<_>>();
+            evidence.extend(memory_evidence_by_pc.get(&effect.pc).into_iter().flatten().cloned());
+            let ast = builder.ast_spans(
+                "source-memory-store",
+                None,
+                vec![asts[&effect.address].clone(), asts[&effect.value].clone(), asts[&effect.guard].clone()],
+                &evidence,
+                array([object([("start", address(effect.pc)), ("end", address(effect.pc + 4))])]),
+                object([
+                    ("bytes", effect.bytes.into()),
+                    ("partition", partition.into()),
+                    ("ordering", ordering.into()),
+                    ("template", format!("if ($2) {store_helper}((uintptr_t)($0), (uint64_t)($1))").into()),
+                ]),
+            )?;
+            effect_asts.push(ast);
+            memory_records.push((object([
+                ("artifact_kind", "external-memory-write".into()),
+                ("partition", partition.into()),
+                ("bytes", effect.bytes.into()),
+                ("ordering", ordering.into()),
+                ("guard_ast", asts[&effect.guard].clone().into()),
+            ]), ranges(pc, pc + 4)));
+        }
         let return_code = if s.result_pointer {
             format!(
                 "    return ({}) (uintptr_t)({result});\n",
@@ -967,11 +1870,46 @@ impl Recovery {
             .iter()
             .map(|p| format!("    (void){};\n", p.name))
             .collect::<String>();
-        let output=format!("{headers}{}\n/* Recovered from bounded acyclic IR; ordinary local frame effects eliminated. */\n{} {}({}) {{\n{assertions}    (void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_flags_arith;\n{unused}{declarations}{return_code}}}\n",include_str!("bitvector_runtime.h"),s.result_spelling,s.name,if parameters.is_empty(){"void"}else{&parameters});
+        let mut volatile_helpers = String::new();
+        let mut helpers = BTreeSet::<(bool, u64, bool)>::new();
+        for load in self.external_loads.iter().filter(|load| load.volatile) {
+            let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
+            helpers.insert((false, load.bytes, signed));
+        }
+        for load in self.loops.iter().flat_map(|source_loop| &source_loop.loads).filter(|load| load.volatile) {
+            let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
+            helpers.insert((false, load.bytes, signed));
+        }
+        for store in self.external_stores.iter().filter(|store| store.volatile) {
+            let pointee = scalar_pointee_type(self.dag.type_of(store.address).expect("validated volatile pointer type"))
+                .expect("validated volatile pointee type");
+            helpers.insert((true, store.bytes, pointee.signed));
+        }
+        for store in self.loops.iter().flat_map(|source_loop| &source_loop.stores).filter(|store| store.volatile) {
+            let pointee = scalar_pointee_type(self.dag.type_of(store.address).expect("validated volatile pointer type"))
+                .expect("validated volatile pointee type");
+            helpers.insert((true, store.bytes, pointee.signed));
+        }
+        for (is_store, bytes, signed) in helpers {
+            let bits = bytes * 8;
+            let spelling = format!("{}{}_t", if signed { "int" } else { "uint" }, bits);
+            if is_store {
+                volatile_helpers.push_str(&format!(
+                    "static inline void hs_vstore_{}{}(uintptr_t a, uint64_t x) {{ volatile {spelling} *p=(volatile {spelling} *)a; *p=({spelling})x; }}\n",
+                    if signed { "s" } else { "u" }, bytes
+                ));
+            } else {
+                volatile_helpers.push_str(&format!(
+                    "static inline uint64_t hs_vload_{}{}(uintptr_t a) {{ volatile {spelling} *p=(volatile {spelling} *)a; return (uint64_t)(*p); }}\n",
+                    if signed { "s" } else { "u" }, bytes
+                ));
+            }
+        }
+        let output=format!("{headers}{call_declarations}{}\nstatic inline uint64_t hs_load1(uintptr_t a) {{ uint8_t v; memcpy(&v,(const void *)a,1); return v; }}\nstatic inline uint64_t hs_load2(uintptr_t a) {{ uint16_t v; memcpy(&v,(const void *)a,2); return v; }}\nstatic inline uint64_t hs_load4(uintptr_t a) {{ uint32_t v; memcpy(&v,(const void *)a,4); return v; }}\nstatic inline uint64_t hs_load8(uintptr_t a) {{ uint64_t v; memcpy(&v,(const void *)a,8); return v; }}\nstatic inline void hs_store8(uintptr_t a, uint64_t x) {{ uint64_t v=x; memcpy((void *)a,&v,8); }}\nstatic inline void hs_store4(uintptr_t a, uint64_t x) {{ uint32_t v=(uint32_t)x; memcpy((void *)a,&v,4); }}\nstatic inline void hs_store2(uintptr_t a, uint64_t x) {{ uint16_t v=(uint16_t)x; memcpy((void *)a,&v,2); }}\nstatic inline void hs_store1(uintptr_t a, uint64_t x) {{ uint8_t v=(uint8_t)x; memcpy((void *)a,&v,1); }}\n{volatile_helpers}/* Recovered from bounded structured IR; external memory effects require valid memory; volatile accesses retain instruction order alongside qualified scalar calls on each supported path; loop-carried register values are explicit locals; local frame effects are eliminated. */\n{} {}({}) {{\n{assertions}    (void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_flags_arith;(void)hs_load1;(void)hs_load2;(void)hs_load4;(void)hs_load8;(void)hs_store1;(void)hs_store2;(void)hs_store4;(void)hs_store8;\n{unused}{declarations}{loop_code}{effects_code}{return_code}}}\n",include_str!("bitvector_runtime.h"),s.result_spelling,s.name,if parameters.is_empty(){"void"}else{&parameters});
         let root = builder.ast(
             "source-function",
             Some(&s.result_spelling),
-            vec![asts[&self.result].clone()],
+            effect_asts.into_iter().chain(std::iter::once(asts[&self.result].clone())).collect(),
             declaration,
             (start, start + ir.len() as u64 * 4),
             object([
@@ -995,10 +1933,14 @@ impl Recovery {
                 ),
             ]),
         )?;
-        let node=builder.record("metadata","derived",object([("artifact_kind","recovered-source".into()),("source",output.into()),("status","generated-uncompiled".into()),("name",s.name.clone().into()),("ast_root",root.clone().into()),("declaration",s.signature.declaration.clone().into()),("contract","apple-aapcs64-lp64-pure-acyclic-v1".into()),("observables","declared scalar result and ABI nonvolatile GPR/SP restoration; ordinary private frame only; no volatile/fault/source-fidelity/formal-equivalence claim".into())]),array([]))?;
+        let node=builder.record("metadata","derived",object([("artifact_kind","recovered-source".into()),("source",output.into()),("status","generated-uncompiled".into()),("name",s.name.clone().into()),("ast_root",root.clone().into()),("declaration",s.signature.declaration.clone().into()),("contract","apple-aapcs64-lp64-reads-writes-calls-volatile-call-ordered-natural-loop-guarded-call-events-loop-memory-v14".into()),("observables","declared scalar result, bounded ordinary memory reads and ordered ordinary writes under supported path guards, exact-prototype scalar direct calls whose complete returning callee walk proves no memory reads, writes, or onward calls, supported exact self-recursion, ABI nonvolatile GPR/SP restoration, exact-width volatile accesses scheduled in instruction order with supported calls and path guards, and supported sequential single-entry scalar natural loops with per-iteration ordered external loads and stores; caller memory effects before or after proven calls are emitted in per-path instruction order for bounded acyclic control flow; call instructions still block strict machine-state C; fault/source-fidelity/formal-equivalence behavior is not claimed".into())]),array([]))?;
         builder.edge(declaration, &node, "types")?;
-        let assumption=builder.record("memory-effect","assumption",object([("contract","ordinary private frame/red-zone storage; single-threaded Apple LP64; no volatile or precise fault-state observables".into()),("red_zone_bytes",128u64.into())]),array([]))?;
+        let assumption=builder.record("memory-effect","assumption",object([("contract","ordinary private frame/red-zone storage and valid ordinary external memory reads/writes in instruction order when mixed accesses have a single acyclic path; single-threaded Apple LP64; declaration-proven volatile accesses retain per-path instruction order; calls require exact scalar prototypes and bounded supported callee proofs; no precise fault-state observables".into()),("red_zone_bytes",128u64.into())]),array([]))?;
         builder.edge(&assumption, &node, "assumes")?;
+        for (payload, span) in memory_records {
+            let record = builder.record("memory-effect", "derived", payload, span)?;
+            builder.edge(&record, &node, "supports")?;
+        }
         // Publish the proven frame objects and the memory version each one
         // holds. The alias partition is exact: the frame is private, so two
         // objects are the same location only when their extents are equal.
@@ -1019,6 +1961,11 @@ impl Recovery {
                 ]),
                 ranges(frame_object.version, frame_object.version + 4),
             )?;
+            if let Some(memory_versions) = memory_evidence_by_pc.get(&frame_object.version) {
+                for memory_version in memory_versions {
+                    builder.edge(memory_version, &record, "backs-frame-object-version")?;
+                }
+            }
             builder.edge(&record, &node, "supports")?;
         }
         for id in ir {
@@ -1031,6 +1978,58 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_signature(name: &str, declaration: &str) -> SourceSignature {
+        crate::signatures::source_signature(
+            name,
+            &crate::signatures::Signature {
+                language: "C",
+                declaration: declaration.into(),
+                source: "test declaration",
+            },
+        ).expect("test source signature")
+    }
+
+    #[test]
+    fn call_result_value_width_comes_from_the_callee_prototype() {
+        for (callee_result, caller_result, expected_bits) in [
+            ("uint64_t", "uint32_t", 64),
+            ("uint32_t", "uint64_t", 32),
+        ] {
+            let caller = test_signature("_hs_test", &format!("{caller_result} hs_test(void);"));
+            let callee = test_signature("_hs_helper", &format!("{callee_result} hs_helper(void);"));
+            assert_ne!(caller.result_bits, callee.result_bits, "the regression needs distinct ABI widths");
+            let tree = tree("call", None, object([
+                ("target", 0x2000u64.into()),
+                ("call_effects", object([
+                    ("arguments", array([])),
+                    ("result", object([
+                        ("source_spelling", callee.result_spelling.clone().into()),
+                        ("location", "x0".into()),
+                    ])),
+                ])),
+            ]), vec![]);
+            let mut state = State {
+                registers: (0..33).map(Symbol::Unknown).collect(),
+                flags: None,
+                frame: BTreeMap::new(),
+                external_loads: Vec::new(),
+                external_stores: Vec::new(),
+                external_access_pcs: Vec::new(),
+                path: 0,
+                has_call: false,
+                call_pcs: Vec::new(),
+                calls: Vec::new(),
+            };
+            let mut dag = Dag { nodes: Vec::new() };
+            let prototypes = BTreeMap::from([(0x2000, callee.clone())]);
+            statement(&tree, &mut state, &mut dag, 0x1000, &prototypes)
+                .expect("exact scalar call is modeled");
+            assert!(matches!(state.registers[0], Symbol::Value(_, bits) if bits == expected_bits));
+            let Symbol::Value(value, _) = state.registers[0] else { unreachable!() };
+            assert_eq!(dag.type_of(value).map(SourceType::spelling), Some(callee_result));
+        }
+    }
+
     fn attempt(words: &[u32], declaration: &str) -> Result<Recovery, String> {
         let signature = crate::signatures::source_signature(
             "_hs_test",
@@ -1065,6 +2064,7 @@ mod tests {
                 .map(|(_, portable, _)| *portable)
                 .collect::<Vec<_>>(),
             signature,
+            &BTreeMap::new(),
         )
     }
     #[test]
