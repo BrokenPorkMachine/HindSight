@@ -139,17 +139,21 @@ _hs_ast_large:
         assert isinstance(effect["target"], int), effect
         assert effect["arguments"] == "unresolved: no proven prototype", effect
         assert effect["result"] == "unresolved: no proven prototype", effect
-        # A call may write memory; the summary never suppresses that.
-        assert effect["memory_effect"]["writes"].startswith("unknown"), effect
-        # A direct call into the captured image admits a bounded observation of
-        # the callee. It is explicitly scoped and never claims the callee
-        # provably performs no memory write.
+        # An unproven callee keeps the memory claim unknown; a proven one
+        # refines it below. The summary never suppresses an unobserved write.
+        assert effect["callee_summary"] is not None, effect
+        # A direct call into the captured image admits a whole-function
+        # observation of the callee. The callee here is a leaf `ret`, so the
+        # complete walk proves it writes and reads no memory. The claim names
+        # its scope, so it is never read as a claim about an unobserved callee.
         callee = effect["callee_summary"]
-        assert callee["kind"] == "bounded-callee-observation", callee
+        assert callee["kind"] == "callee-effect-summary", callee
         assert callee["instructions"] >= 1, callee
         assert callee["observed_return"] is True, callee
-        assert "bounded instruction window" in callee["scope"], callee
-        assert effect["memory_effect"]["writes"].startswith("unknown"), effect
+        assert callee["complete"] is True, callee
+        assert "whole reachable callee control flow" in callee["scope"], callee
+        assert callee["memory_effect"]["writes"].startswith("none"), callee
+        assert effect["memory_effect"]["writes"].startswith("none"), effect
         # An indirect call never claims a target.
         indirect_effects = [node["attributes"]["call_effects"] for node in artifacts["indirect"]["ast"]["nodes"]
                             if node["kind"] == "indirect-call" and "call_effects" in node["attributes"]]
@@ -160,6 +164,9 @@ _hs_ast_large:
         indirect = indirect_effects[0]
         assert indirect["call_kind"] == "indirect", indirect
         assert indirect["target"] is None, indirect
+        # An indirect call has no callee summary, so its memory effect stays
+        # explicitly unknown rather than claiming the callee writes nothing.
+        assert indirect["memory_effect"]["writes"].startswith("unknown"), indirect
         assert indirect["dispatch_register"], indirect
         for name in ["opaque"]:
             assert artifacts[name]["eligibility"]["state"] == "blocked"

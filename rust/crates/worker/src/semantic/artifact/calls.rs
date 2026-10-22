@@ -296,15 +296,19 @@ pub(super) fn with_prototype_payload(
     V::Object(fields)
 }
 
-/// Proven effects observed inside a bounded callee window.
+/// Proven effects observed inside a callee's reachable control flow.
 ///
-/// This is a *bounded observation*, not a proof about the whole callee. The
-/// window is capped, and an unmapped instruction or a truncated window keeps
-/// the summary explicitly incomplete so no consumer treats it as a
+/// The walk follows the callee from its entry along every decoded successor,
+/// so it never reads straight through a neighbouring function. The result is
+/// a *whole-function* summary only when the walk was complete: every
+/// reachable instruction decoded within the budget and every reachable path
+/// terminated in a return, a tail transfer or a loop. A budget limit, an
+/// instruction outside the captured image, or an unmodeled instruction keeps
+/// `complete` false, so no consumer treats a bounded observation as a
 /// whole-function fact.
 #[derive(Clone, Debug, Default)]
 pub(super) struct CalleeSummary {
-    /// Instructions actually decoded in the window.
+    /// Instructions actually decoded in the reachable control flow.
     pub instructions: usize,
     /// General-purpose registers the callee defines.
     pub defined_gprs: u32,
@@ -322,23 +326,73 @@ pub(super) struct CalleeSummary {
     pub calls: bool,
     /// Whether the callee's control flow loops instead of reaching a return.
     pub loops: bool,
-    /// Whether an unmapped or data instruction appeared in the window.
+    /// Whether an unmodeled instruction appeared in the reachable flow.
     pub opaque: bool,
-    /// Whether the window ended before the callee terminated.
+    /// Whether the instruction budget ran out with reachable work left.
     pub truncated: bool,
+    /// Whether control left the decodable region of the captured image.
+    pub escaped: bool,
+    /// Whether the observation covers all reachable control flow and every
+    /// reachable path terminates.
+    pub complete: bool,
 }
 
 impl CalleeSummary {
+    /// The memory claim the observation supports.
+    ///
+    /// An observed store or load is a fact. A complete walk with no onward
+    /// call proves the absence of both on every reachable path, because every
+    /// reachable instruction was decoded. Anything else stays unknown: the
+    /// absence of an observed access in an incomplete walk proves nothing.
+    fn memory_effect(&self) -> V {
+        let proven = self.complete && !self.calls;
+        let writes = if self.writes_memory {
+            "observed: a store appears in the reachable callee control flow".to_string()
+        } else if proven {
+            "none: no store appears in the complete reachable callee control flow".to_string()
+        } else {
+            "unknown: not observed in the bounded callee window".to_string()
+        };
+        let reads = if self.reads_memory {
+            "observed: a load appears in the reachable callee control flow".to_string()
+        } else if proven {
+            "none: no load appears in the complete reachable callee control flow".to_string()
+        } else {
+            "unknown: not observed in the bounded callee window".to_string()
+        };
+        object([("writes", writes.into()), ("reads", reads.into())])
+    }
+
+    /// Why the observation is or is not a whole-function summary.
+    fn scope(&self) -> String {
+        if self.complete {
+            return "whole reachable callee control flow; every reachable path terminates".into();
+        }
+        let mut reasons = vec!["reachable callee control flow not fully observed"];
+        if self.truncated {
+            reasons.push("instruction budget exhausted");
+        }
+        if self.escaped {
+            reasons.push("control left the decodable region");
+        }
+        if self.opaque {
+            reasons.push("unmodeled instruction present");
+        }
+        reasons.join("; ")
+    }
+
     /// Render the observation as a structured artifact payload.
     ///
     /// The payload separates what was observed from what stays unknown. A
-    /// bounded window never proves the absence of a memory write, so the
-    /// memory claim records the observation and its limits together.
+    /// bounded walk never proves a memory fact, so the `complete` marker and
+    /// the `scope` reason travel with every observation. The scope string
+    /// names the limits, so a consumer never reads an incomplete walk as a
+    /// whole-function claim.
     pub(super) fn payload(&self) -> V {
         let mut fields: std::collections::BTreeMap<String, V> = std::collections::BTreeMap::new();
         fields.insert(
             "kind".into(),
-            "bounded-callee-observation".into(),
+            "callee-effect-summary".into(),
         );
         fields.insert(
             "instructions".into(),
@@ -368,37 +422,10 @@ impl CalleeSummary {
         fields.insert("loops".into(), self.loops.into());
         fields.insert("opaque".into(), self.opaque.into());
         fields.insert("truncated".into(), self.truncated.into());
-        fields.insert(
-            "scope".into(),
-            V::String(
-                "bounded instruction window; not a whole-function proof".into(),
-            ),
-        );
-        if self.writes_memory {
-            fields.insert(
-                "memory_effect".into(),
-                object([
-                    ("writes", "observed within the bounded callee window".into()),
-                    ("reads", "observed within the bounded callee window".into()),
-                ]),
-            );
-        } else {
-            // The absence of an observed write in a bounded window does not
-            // prove the callee never writes memory.
-            fields.insert(
-                "memory_effect".into(),
-                object([
-                    (
-                        "writes",
-                        "unknown: not observed in the bounded callee window".into(),
-                    ),
-                    (
-                        "reads",
-                        "unknown: not observed in the bounded callee window".into(),
-                    ),
-                ]),
-            );
-        }
+        fields.insert("escaped".into(), self.escaped.into());
+        fields.insert("complete".into(), self.complete.into());
+        fields.insert("scope".into(), V::String(self.scope()));
+        fields.insert("memory_effect".into(), self.memory_effect());
         V::Object(fields)
     }
 }
@@ -546,14 +573,18 @@ pub(super) fn with_non_returning_payload(payload: V, proven: bool) -> V {
     V::Object(fields)
 }
 
-/// Analyze the bounded control flow of a callee inside the captured image.
+/// Analyze the reachable control flow of a callee inside the captured image.
 ///
 /// The walk follows the callee's own control flow rather than reading
 /// straight through the image, so it never decodes an instruction that
 /// belongs to a neighbouring function. It stops at a return, records a
-/// backward branch as an infinite loop, and is capped, so a large or
-/// non-returning callee yields a truncated observation rather than a
-/// complete one. `code` is the captured image text and `base` its address.
+/// backward edge as a loop, and never reads past the captured image.
+///
+/// The observation is a whole-function summary when `complete` is true:
+/// every reachable instruction was decoded within the budget and every
+/// reachable path terminated. It stays explicitly incomplete when the budget
+/// ran out, control left the decodable region, or an unmodeled instruction
+/// was reached. `code` is the captured image text and `base` its address.
 pub(super) fn analyze_callee(
     code: &[u8],
     base: u64,
@@ -572,26 +603,42 @@ pub(super) fn analyze_callee(
     let mut pending: Vec<u64> = vec![base + offset as u64];
     while let Some(pc) = pending.pop() {
         if summary.instructions >= budget {
+            // Reachable work remains, so the observation is capped rather
+            // than complete.
             summary.truncated = true;
             break;
         }
         if !visited.insert(pc) {
-            // The callee's control flow came back to an instruction already
-            // walked: an infinite loop, so it never reaches a return.
-            summary.loops = true;
+            // An instruction already walked needs no second visit. Reaching a
+            // join from a second predecessor is not a loop; only a backward
+            // edge is, and the branch arms below record it.
             continue;
         }
         let Some(word) = read_word(code, base, pc) else {
-            summary.truncated = true;
-            break;
+            // Control left the decodable region of the captured image, so the
+            // callee's behaviour past this point is unknown.
+            summary.escaped = true;
+            continue;
         };
-        let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
+        let operation = super::super::decode(word, pc);
+        let portable = super::super::lift_operation(operation, pc);
+        // The flag and vector files are not part of the shared GPR effects, so
+        // they are recovered from the same per-instruction evidence the SSA
+        // preview publishes rather than re-derived from rendered text.
+        let lifted = super::super::LiftedInstruction { address: pc, word, operation, portable, data: false };
+        let flag_effects = super::super::files::instruction_flag_effects(&lifted);
+        let vector_effects = super::super::files::instruction_vector_effects(&lifted);
         summary.instructions += 1;
+        if flag_effects.defines != 0 {
+            summary.defines_flags = true;
+        }
+        for range in &vector_effects.writes {
+            if range.register < 32 {
+                summary.defined_vectors |= 1u32 << range.register;
+            }
+        }
         let effects = portable.gpr_effects();
         summary.defined_gprs |= effects.definitions;
-        if effects.barrier {
-            summary.opaque = true;
-        }
         match portable {
             super::super::IrOperation::Load { .. }
             | super::super::IrOperation::LoadPair { .. }
@@ -608,23 +655,34 @@ pub(super) fn analyze_callee(
                 summary.writes_memory = true;
             }
             super::super::IrOperation::Return { .. } => {
+                // A return ends the frame. A tail transfer leaves it for
+                // another function; either way control does not fall through.
                 summary.returns = true;
             }
             super::super::IrOperation::DirectCall { .. }
             | super::super::IrOperation::IndirectCall { .. } => {
+                // A call is not an unmodeled instruction: it has a known
+                // caller-visible contract even when its target is unknown.
                 summary.calls = true;
                 pending.push(pc + 4);
             }
             super::super::IrOperation::Branch { target } => {
                 if target <= pc {
-                    // A backward branch is an infinite loop.
+                    // A backward branch is an infinite loop: control never
+                    // reaches a return from this path.
                     summary.loops = true;
                 } else {
                     pending.push(target);
                 }
             }
             super::super::IrOperation::ConditionalBranch { target, .. } => {
-                pending.push(target);
+                // Both arms are reachable, so both are walked. A backward
+                // target is the loop edge; the fallthrough is the exit.
+                if target <= pc {
+                    summary.loops = true;
+                } else {
+                    pending.push(target);
+                }
                 pending.push(pc + 4);
             }
             super::super::IrOperation::IndirectBranch { .. } => {
@@ -636,6 +694,10 @@ pub(super) fn analyze_callee(
             _ => pending.push(pc + 4),
         }
     }
+    // The walk is complete exactly when nothing was left unobserved: the
+    // budget held, control stayed in the decodable region, and every
+    // instruction decoded to a modeled operation.
+    summary.complete = !summary.truncated && !summary.escaped && !summary.opaque;
     Some(summary)
 }
 
@@ -662,15 +724,12 @@ pub(super) fn with_callee_payload(payload: V, summary: &CalleeSummary) -> V {
         return V::Object(fields);
     };
     effects.insert("callee_summary".into(), summary.payload());
-    // The observed callee effects refine the conservative memory claim.
-    if summary.writes_memory {
-        effects.insert(
-            "memory_effect".into(),
-            object([
-                ("writes", "observed within the bounded callee window".into()),
-                ("reads", "observed within the bounded callee window".into()),
-            ]),
-        );
+    // The observation refines the conservative caller-visible memory claim.
+    // An observed access is a fact, and a complete walk with no onward call
+    // proves the absence of both. An incomplete observation keeps the
+    // explicit unknown marker rather than claiming a callee does nothing.
+    if summary.writes_memory || summary.reads_memory || (summary.complete && !summary.calls) {
+        effects.insert("memory_effect".into(), summary.memory_effect());
     }
     fields.insert("call_effects".into(), V::Object(effects));
     V::Object(fields)
@@ -800,12 +859,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unobserved_memory_write_never_claims_the_callee_writes_nothing() {
-        // ret only: no write is observed, but the summary must not claim the
-        // callee provably never writes memory.
+    fn a_complete_leaf_callee_proves_it_writes_no_memory() {
+        // ret only: the whole reachable callee control flow is one terminating
+        // instruction with no store, so the absence of a write is provable.
         let code: Vec<u8> = 0xd65f03c0_u32.to_le_bytes().to_vec();
         let summary = analyze_callee(&code, 0x1000, 0x1000, 16).expect("callee window");
         assert!(!summary.writes_memory);
+        assert!(summary.complete);
+        let V::Object(fields) = summary.payload() else {
+            panic!("callee summary renders as an object")
+        };
+        let V::Object(memory) = fields.get("memory_effect").expect("memory effect") else {
+            panic!("memory effect is an object")
+        };
+        let writes = match memory.get("writes") {
+            Some(V::String(writes)) => writes.as_str(),
+            _ => panic!("memory effect records a string write claim"),
+        };
+        assert!(writes.starts_with("none"), "{writes}");
+    }
+
+    #[test]
+    fn an_incomplete_observation_never_claims_the_callee_writes_nothing() {
+        // An unmodeled instruction leaves the reachable effects unknown, so
+        // the absence of an observed store must not become a claim of none.
+        let code: Vec<u8> = [0xffff_ffff_u32, 0xd65f03c0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let summary = analyze_callee(&code, 0x1000, 0x1000, 16).expect("callee window");
+        assert!(!summary.complete);
+        assert!(summary.opaque);
         let V::Object(fields) = summary.payload() else {
             panic!("callee summary renders as an object")
         };
@@ -817,6 +901,64 @@ mod tests {
             _ => panic!("memory effect records a string write claim"),
         };
         assert!(writes.starts_with("unknown"), "{writes}");
+        // A budget that runs out leaves reachable work unobserved, so it is
+        // incomplete for the same reason.
+        let ret: Vec<u8> = 0xd65f03c0_u32.to_le_bytes().to_vec();
+        let summary = analyze_callee(&ret, 0x1000, 0x1000, 0).expect("callee window");
+        assert!(summary.truncated);
+        assert!(!summary.complete);
+    }
+
+    #[test]
+    fn a_join_from_two_predecessors_is_not_reported_as_a_loop() {
+        // cbz x0, +8 ; b +4 ; ret
+        // Both arms reach the single return at 0x1008. Revisiting the join
+        // from the second predecessor is not a loop.
+        let code: Vec<u8> = [0xb400_0040_u32, 0x1400_0001, 0xd65f03c0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let summary = analyze_callee(&code, 0x1000, 0x1000, 16).expect("callee window");
+        assert!(!summary.loops, "a diamond join is not a loop");
+        assert!(summary.returns);
+        assert!(summary.complete);
+    }
+
+    #[test]
+    fn a_conditional_backward_branch_is_a_loop() {
+        // cbnz x0, .-4 ; ret
+        // The backward target is the loop edge; the fallthrough exits.
+        let code: Vec<u8> = [0xb5ff_ffe0_u32, 0xd65f03c0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let summary = analyze_callee(&code, 0x1000, 0x1000, 16).expect("callee window");
+        assert!(summary.loops, "a backward conditional branch is a loop");
+        assert!(summary.complete);
+    }
+
+    #[test]
+    fn the_summary_records_the_flag_and_vector_files_the_gpr_effects_omit() {
+        // adds x0, x0, #1 ; fadd d0, d1, d2 ; ret
+        let code: Vec<u8> = [0xb100_0400_u32, 0x1e62_2820, 0xd65f03c0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let summary = analyze_callee(&code, 0x1000, 0x1000, 16).expect("callee window");
+        // `ADDS` writes NZCV, so the summary must not publish `false`.
+        assert!(summary.defines_flags, "ADDS writes the flag file");
+        // `FADD` writes the low half of v0, so v0 is defined.
+        assert!(summary.defined_vectors & (1 << 0) != 0, "v0 is defined");
+        assert!(summary.defined_vectors & (1 << 1) == 0, "v1 is only read");
+    }
+
+    #[test]
+    fn a_branch_outside_the_captured_image_leaves_the_walk_incomplete() {
+        // b +0x4000: the target is past the captured bytes.
+        let code: Vec<u8> = 0x1400_1000_u32.to_le_bytes().to_vec();
+        let summary = analyze_callee(&code, 0x1000, 0x1000, 16).expect("callee window");
+        assert!(summary.escaped);
+        assert!(!summary.complete);
     }
 
     #[test]

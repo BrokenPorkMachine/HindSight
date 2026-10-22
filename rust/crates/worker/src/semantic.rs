@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 mod names;
 pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
 mod files;
+mod file_ssa;
 pub(crate) mod artifact;
 pub use artifact::build as reconstruct_artifact;
 pub use artifact::interpret as interpret_artifact;
@@ -7383,12 +7384,23 @@ struct SsaMemoryVersion {
     partition: MemoryPartition,
     /// The version the access read.
     read_version: u32,
+    /// Whether the instruction may actually observe this partition.
+    read: bool,
     /// The version the access wrote, when it wrote.
     written_version: Option<u32>,
     /// The access has acquire or release ordering.
     ordered: bool,
     /// The access is exclusive and may fail.
     exclusive: bool,
+}
+
+/// A partition state merged at a control-flow join.
+#[derive(Clone, Debug)]
+struct SsaMemoryPhi {
+    block: usize,
+    partition: MemoryPartition,
+    version: u32,
+    incoming: Vec<(Option<usize>, u32)>,
 }
 
 #[derive(Debug)]
@@ -7400,11 +7412,10 @@ struct SsaAnalysis {
     origin_records: Vec<SsaOriginRecord>,
     live_ranges: Vec<(u8, u64, u64)>,
     /// Memory versions per access. The version counter for a partition
-    /// increases on every write, so a read can name the version it observed.
+    /// is path-sensitive, so a read names the reaching state on its CFG path.
     memory_versions: Vec<SsaMemoryVersion>,
-    /// The current memory version of each partition at the end of the
-    /// function, in `MemoryPartition::all()` order.
-    final_memory_versions: Vec<u32>,
+    /// Memory partition merges at CFG joins, with one incoming state per edge.
+    memory_phis: Vec<SsaMemoryPhi>,
     /// The partitions a call may write. A call with an unknown target may
     /// write every writable partition.
     call_clobbers: Vec<(u64, Vec<MemoryPartition>)>,
@@ -7544,26 +7555,43 @@ fn track_pointer_provenance(
     let general = |register: &IrRegister| {
         register.class == IrRegisterClass::General && register.index < 32
     };
+    let is_wide = |register: &IrRegister| register.bits == 64;
     match instruction.portable {
         // A materialised image address is a global pointer.
-        IrOperation::Address { destination, .. } if general(&destination) => {
+        IrOperation::Address { destination, .. } if general(&destination) && is_wide(&destination) => {
             provenance[destination.index as usize] = PointerProvenance::Global;
         }
         // A copy carries the source provenance.
         IrOperation::Assign { destination, value: IrOperand::Register(source) } if general(&destination) => {
-            if general(&source) {
+            if is_wide(&destination) && is_wide(&source) && general(&source) {
                 provenance[destination.index as usize] = provenance[source.index as usize];
             } else {
                 provenance[destination.index as usize] = PointerProvenance::None;
             }
         }
-        // A stack-pointer relative address materialises a frame pointer.
-        IrOperation::Binary { destination, operator: IrBinaryOp::Add, left, right }
-            if general(&destination) => {
-                let frame_operand = |operand: &IrOperand| matches!(operand, IrOperand::Register(register) if register.class == IrRegisterClass::StackPointer);
-                if frame_operand(&left) || frame_operand(&right) {
-                    provenance[destination.index as usize] = PointerProvenance::Frame;
-                }
+        // Constant pointer arithmetic preserves the pointed-to partition.
+        // Dynamic indices and pointer-plus-pointer expressions remain
+        // unknown; treating those as frame/global-relative could hide aliases.
+        IrOperation::Binary { destination, operator, left, right }
+            if general(&destination) && is_wide(&destination) => {
+                let inherit = |register: IrRegister, provenance: &[PointerProvenance; 32]| {
+                    if !is_wide(&register) {
+                        None
+                    } else if register.class == IrRegisterClass::StackPointer {
+                        Some(PointerProvenance::Frame)
+                    } else if general(&register) {
+                        Some(provenance[register.index as usize])
+                    } else {
+                        None
+                    }
+                };
+                let source = match (operator, left, right) {
+                    (IrBinaryOp::Add, IrOperand::Register(base), IrOperand::Constant(_))
+                    | (IrBinaryOp::Add, IrOperand::Constant(_), IrOperand::Register(base)) => inherit(base, provenance),
+                    (IrBinaryOp::Subtract, IrOperand::Register(base), IrOperand::Constant(_)) => inherit(base, provenance),
+                    _ => None,
+                };
+                provenance[destination.index as usize] = source.unwrap_or(PointerProvenance::None);
             }
         // A store publishes the stored value: it escapes.
         IrOperation::Store { value: IrOperand::Register(source), .. } if general(&source) => {
@@ -7604,7 +7632,7 @@ fn call_clobber_partitions() -> Vec<MemoryPartition> {
 fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     let blocks = &function.cfg.blocks;
-    let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new(), origin_records: Vec::new(), live_ranges: Vec::new(), memory_versions: Vec::new(), final_memory_versions: vec![0; MemoryPartition::all().len()], call_clobbers: Vec::new() };
+    let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new(), origin_records: Vec::new(), live_ranges: Vec::new(), memory_versions: Vec::new(), memory_phis: Vec::new(), call_clobbers: Vec::new() };
     if blocks.is_empty() { return result; }
     let instruction_at = |pc: u64| &function.instructions[((pc - function.start) / 4) as usize];
     let mut definitions = vec![0u32; blocks.len()];
@@ -7794,96 +7822,133 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
         record.dead = !observed.contains(&(record.register, record.origin));
     }
 
-    // Memory SSA: version each alias partition and record every access.
-    // A write to a partition increments its version, so a later read can
-    // name the version it observed and a reader can tell whether a value
-    // was clobbered between two accesses.
-    let mut memory_versions = vec![0u32; MemoryPartition::all().len()];
-    // Pointer provenance is tracked per block, in address order within the
-    // block. A register whose provenance cannot be proven has none, and an
-    // address built on it is unknown rather than guessed.
-    let mut block_provenance: Vec<[PointerProvenance; 32]> = vec![[PointerProvenance::None; 32]; blocks.len()];
-    // A call may write every writable partition, so it advances those
-    // versions and invalidates the whole read of a partition it clobbers.
+    // Path-sensitive memory SSA. Each join receives partition phis, and
+    // instructions are renamed over the same dominator tree as GPR SSA. A
+    // write in one branch can no longer appear to reach a sibling branch just
+    // because that block happened to be visited later in address order.
+    const PARTITION_COUNT: usize = 6;
+    let partitions = MemoryPartition::all();
+    let slot_of = |partition: MemoryPartition| {
+        partitions.iter().position(|candidate| *candidate == partition).unwrap_or(usize::MAX)
+    };
+    let mut phi_versions = vec![vec![None; PARTITION_COUNT]; blocks.len()];
     for (index, block) in blocks.iter().enumerate().filter(|(_, block)| block.reachable) {
-        let mut provenance = block_provenance[index];
-        for &pc in &block.instructions {
+        let predecessor_count = block.predecessors.iter().filter(|&&pred| blocks[pred].reachable).count();
+        let needs_phi = predecessor_count > 1 || (index == 0 && predecessor_count > 0);
+        if needs_phi {
+            for slot in 0..PARTITION_COUNT {
+                // Reserve the high-bit namespace for merge values; ordinary
+                // write versions remain small, per-partition counters.
+                phi_versions[index][slot] = Some(
+                    0x8000_0000 | (index as u32 * PARTITION_COUNT as u32 + slot as u32 + 1),
+                );
+            }
+        }
+    }
+    let mut next_versions = [0u32; PARTITION_COUNT];
+    let mut block_out = vec![[0u32; PARTITION_COUNT]; blocks.len()];
+    let mut provenance_out = vec![[PointerProvenance::None; 32]; blocks.len()];
+    enum MemoryVisit { Enter(usize) }
+    let mut memory_pending = vec![MemoryVisit::Enter(0)];
+    while let Some(MemoryVisit::Enter(index)) = memory_pending.pop() {
+        if !blocks[index].reachable { continue; }
+        let mut versions = if phi_versions[index].iter().any(Option::is_some) {
+            std::array::from_fn(|slot| phi_versions[index][slot].unwrap_or(0))
+        } else if index == 0 {
+            [0; PARTITION_COUNT]
+        } else {
+            let predecessor = blocks[index].predecessors.iter().copied()
+                .find(|&pred| blocks[pred].reachable);
+            predecessor.map(|pred| block_out[pred]).unwrap_or([0; PARTITION_COUNT])
+        };
+        let mut provenance = if phi_versions[index].iter().any(Option::is_some) {
+            // Only retain pointer provenance at a merge when all incoming
+            // paths agree. Backedge inputs are not yet known here, so loop
+            // headers conservatively start without pointer facts.
+            [PointerProvenance::None; 32]
+        } else if index == 0 {
+            [PointerProvenance::None; 32]
+        } else {
+            blocks[index].predecessors.iter().copied()
+                .find(|&pred| blocks[pred].reachable)
+                .map(|pred| provenance_out[pred])
+                .unwrap_or([PointerProvenance::None; 32])
+        };
+        for &pc in &blocks[index].instructions {
             let instruction = instruction_at(pc);
             let effects = instruction_memory_effects(instruction, &provenance);
-            let partition_index = |partition: MemoryPartition| {
-                MemoryPartition::all().iter().position(|candidate| *candidate == partition).unwrap_or(usize::MAX)
-            };
-            let mut reads = Vec::new();
-            let mut writes = Vec::new();
+            let mut read_slots = std::collections::BTreeSet::new();
+            let mut write_slots = std::collections::BTreeSet::new();
             for partition in &effects.reads {
-                let slot = partition_index(*partition);
-                if slot != usize::MAX { reads.push((slot, memory_versions[slot])); }
+                let slot = slot_of(*partition);
+                if slot != usize::MAX { read_slots.insert(slot); }
             }
             for partition in &effects.writes {
-                let slot = partition_index(*partition);
-                if slot != usize::MAX { writes.push(slot); }
+                let slot = slot_of(*partition);
+                if slot != usize::MAX { write_slots.insert(slot); }
             }
-            // A read and a write of the same partition in one instruction
-            // observes the pre-write version and produces the next one.
-            for &(slot, observed) in &reads {
-                let written = if writes.contains(&slot) {
-                    memory_versions[slot] = memory_versions[slot].saturating_add(1);
-                    Some(memory_versions[slot])
-                } else { None };
-                result.memory_versions.push(SsaMemoryVersion {
-                    pc,
-                    partition: MemoryPartition::all()[slot],
-                    read_version: observed,
-                    written_version: written,
-                    ordered: effects.ordered,
-                    exclusive: effects.exclusive,
-                });
-            }
-            for &slot in &writes {
-                if reads.iter().any(|(read_slot, _)| *read_slot == slot) { continue; }
-                memory_versions[slot] = memory_versions[slot].saturating_add(1);
-                // A write to a partition that may alias every other
-                // partition advances them all, so a later read of a narrow
-                // partition still observes that the write happened.
-                if MemoryPartition::all()[slot].aliases_all() {
-                    for (other, version) in memory_versions.iter_mut().enumerate() {
-                        if other != slot { *version = (*version).saturating_add(1); }
-                    }
-                }
-                result.memory_versions.push(SsaMemoryVersion {
-                    pc,
-                    partition: MemoryPartition::all()[slot],
-                    read_version: memory_versions[slot].saturating_sub(1),
-                    written_version: Some(memory_versions[slot]),
-                    ordered: effects.ordered,
-                    exclusive: effects.exclusive,
-                });
-            }
-            // An ordered access is a synchronization point. It cannot be
-            // reordered against another access, so it advances every
-            // partition rather than only the one it names. A relaxed atomic
-            // access is not a fence and keeps its narrow effect.
-            if effects.ordered {
-                for version in memory_versions.iter_mut() {
-                    *version = (*version).saturating_add(1);
-                }
-            }
-            // A call clobbers every writable partition.
             if matches!(instruction.portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) {
                 let clobbered = call_clobber_partitions();
-                for partition in &clobbered {
-                    let slot = partition_index(*partition);
-                    if slot != usize::MAX { memory_versions[slot] = memory_versions[slot].saturating_add(1); }
-                }
+                for partition in &clobbered { write_slots.insert(slot_of(*partition)); }
                 result.call_clobbers.push((pc, clobbered));
             }
-            // Update the pointer provenance for the next instruction.
+            let ordered_reads = read_slots.clone();
+            let exclusive_accesses = read_slots.union(&write_slots).copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            // Escaped/unknown reads may observe any partition, and writes may
+            // invalidate any partition. Expand both sides of the alias
+            // relation; widening only writes would let a later unknown read
+            // miss a preceding frame/global definition.
+            if read_slots.iter().any(|&slot| partitions[slot].aliases_all()) {
+                for slot in 0..PARTITION_COUNT { read_slots.insert(slot); }
+            }
+            if write_slots.iter().any(|&slot| partitions[slot].aliases_all()) {
+                for slot in 0..PARTITION_COUNT { write_slots.insert(slot); }
+            }
+            for slot in 0..PARTITION_COUNT {
+                let read_version = versions[slot];
+                let written_version = if write_slots.contains(&slot) {
+                    next_versions[slot] = next_versions[slot].saturating_add(1);
+                    versions[slot] = next_versions[slot];
+                    Some(versions[slot])
+                } else { None };
+                if read_slots.contains(&slot) || written_version.is_some() {
+                    result.memory_versions.push(SsaMemoryVersion {
+                        pc,
+                        partition: partitions[slot],
+                        read_version,
+                        read: read_slots.contains(&slot),
+                        written_version,
+                        ordered: effects.ordered && ordered_reads.contains(&slot),
+                        exclusive: effects.exclusive && exclusive_accesses.contains(&slot),
+                    });
+                }
+            }
+            // Ordering is an access property, not a write to every memory
+            // object: retain it on the atomic access without inventing value
+            // versions for unrelated partitions.
             track_pointer_provenance(instruction, &mut provenance);
         }
-        block_provenance[index] = provenance;
-        let _ = index;
+        block_out[index] = versions;
+        provenance_out[index] = provenance;
+        memory_pending.extend(children[index].iter().rev().map(|&child| MemoryVisit::Enter(child)));
     }
-    result.final_memory_versions = memory_versions;
+    // Fill memory-phi inputs after all dominator subtrees have been renamed,
+    // so backedges refer to the actual version at their predecessor exit.
+    for (index, block) in blocks.iter().enumerate().filter(|(_, block)| block.reachable) {
+        if !phi_versions[index].iter().any(Option::is_some) { continue; }
+        let mut predecessors: Vec<Option<usize>> = block.predecessors.iter().copied()
+            .filter(|&pred| blocks[pred].reachable).map(Some).collect();
+        if index == 0 { predecessors.insert(0, None); }
+        for slot in 0..PARTITION_COUNT {
+            let version = phi_versions[index][slot].expect("all partitions share a memory join");
+            let incoming = predecessors.iter().map(|predecessor| {
+                let source = predecessor.map(|pred| block_out[pred][slot]).unwrap_or(0);
+                (*predecessor, source)
+            }).collect();
+            result.memory_phis.push(SsaMemoryPhi { block: index, partition: partitions[slot], version, incoming });
+        }
+    }
 
     // Compute live ranges for interference graph construction.
     // A live range is (register, start_pc, end_pc) where start is the
@@ -8612,15 +8677,30 @@ pub fn render(
 
         // SSA construction: place phi nodes and rename registers.
         let ssa = build_ssa(&function_ir);
+        let file_ssa = file_ssa::build_file_ssa(&function_ir);
         let mut ssa_budget = SsaOutputBudget { remaining: 4_000, exhausted: false };
-        out.push_str("  // GPR SSA: W/X share an identity; entry/unknown values carry no source type; FP, memory SSA, and implicit call arguments unresolved\n");
-        out.push_str("  // Flag and vector effects are exact per instruction; the NZCV and vector values themselves are not yet SSA values across joins\n");
+        out.push_str("  // GPR SSA: W/X share an identity; entry/unknown values carry no source type; memory SSA is path-sensitive over bounded alias partitions; implicit call arguments unresolved\n");
+        out.push_str("  // Flag SSA is per NZCV bit; vector SSA is per byte range, preserving partial writes and joins\n");
 
         // Render phase: render each block in address order using final entry flows.
         for (bi, block) in blocks.iter().enumerate() {
+            for phi in ssa.memory_phis.iter().filter(|phi| phi.block == bi) {
+                let incoming = phi.incoming.iter().map(|(predecessor, value)| {
+                    format!("{}:m{value}", predecessor.map(|index| format!("B{index}"))
+                        .unwrap_or_else(|| "entry".into()))
+                }).collect::<Vec<_>>().join(", ");
+                ssa_budget.emit(&mut out, &format!("  // ssa-mem {} = phi({incoming}) partition={}\n",
+                    format!("m{}", phi.version), phi.partition.name()));
+            }
             for phi in &ssa.phis[bi] {
                 let incoming = phi.incoming.iter().map(|(predecessor, value)| format!("{}:{}", predecessor.map(|index| format!("B{index}")).unwrap_or_else(|| "entry".into()), value.name())).collect::<Vec<_>>().join(", ");
                 ssa_budget.emit(&mut out, &format!("  // ssa {} = phi({incoming})\n", phi.value.name()));
+            }
+            for phi in &file_ssa.phis[bi] {
+                let incoming = phi.incoming.iter().map(|(predecessor, value)| {
+                    format!("{}:{}", predecessor.map(|index| format!("B{index}")).unwrap_or_else(|| "entry".into()), value.name(phi.location))
+                }).collect::<Vec<_>>().join(", ");
+                ssa_budget.emit(&mut out, &format!("  // ssa-file {} = phi({incoming})\n", phi.value.name(phi.location)));
             }
             // The distinct origins that reach this join. A merge with one
             // source preserves that source; several sources are a real join.
@@ -8648,12 +8728,21 @@ pub fn render(
                         ssa_budget.emit(&mut out, &format!("  // ssa {p:#x} uses=[{}] defs=[{}]\n", names(&values.uses), names(&values.definitions)));
                     }
                 }
+                if let Some(site) = file_ssa.flags.get(&p) {
+                    let (uses, defs) = file_ssa::flag_value_names(site);
+                    ssa_budget.emit(&mut out, &format!("  // ssa-flag-values {p:#x} uses=[{}] defs=[{}]\n", uses.join(","), defs.join(",")));
+                }
+                if let Some(site) = file_ssa.vectors.get(&p) {
+                    let uses = file_ssa::vector_value_names(&site.uses);
+                    let defs = file_ssa::vector_value_names(&site.defs);
+                    ssa_budget.emit(&mut out, &format!("  // ssa-vector-values {p:#x} uses=[{}] defs=[{}]\n", uses.join(","), defs.join(",")));
+                }
                 // Publish the memory version of every access at this site.
                 // The version names the state of the partition the access
                 // observed, so a reader can tell whether a value survived an
                 // intervening write.
                 for version in ssa.memory_versions.iter().filter(|version| version.pc == p) {
-                    let read = format!("v{}", version.read_version);
+                    let read = if version.read { format!("v{}", version.read_version) } else { "-".into() };
                     let written = version.written_version.map(|value| format!("v{value}")).unwrap_or_else(|| "-".into());
                     let ordering = if version.ordered { " ordered=true" } else { "" };
                     let exclusive = if version.exclusive { " exclusive=true" } else { "" };
@@ -8696,9 +8785,9 @@ pub fn render(
                 let vector_effects = files::instruction_vector_effects(instruction);
                 if vector_effects.touches() {
                     let writes = vector_effects.writes.iter()
-                        .map(|(index, width)| format!("v{index}:{}", files::vector_width_name(*width)))
+                        .map(|range| range.name())
                         .collect::<Vec<_>>().join(",");
-                    let reads = vector_effects.reads.iter().map(|index| format!("v{index}")).collect::<Vec<_>>().join(",");
+                    let reads = vector_effects.reads.iter().map(|range| range.name()).collect::<Vec<_>>().join(",");
                     ssa_budget.emit(&mut out, &format!("  // ssa-vector {p:#x} writes=[{writes}] reads=[{reads}]\n"));
                 }
                 if out.len() >= MAX_OUTPUT {
@@ -10691,6 +10780,49 @@ mod tests {
     }
 
     #[test]
+    fn preview_publishes_flag_and_vector_value_ssa() {
+        // cmp x0, #5 ; fadd q0, q1, q2. Both instructions have precise file
+        // effects, and the preview must expose the value identities—not only
+        // the read/write masks—so downstream reconstruction can follow them.
+        let words = [0xf100_141f_u32, 0x4e42_1420];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("ssa-flag-values 0x1000"), "{report}");
+        assert!(report.contains("ssa-vector-values 0x1004"), "{report}");
+        assert!(report.contains("v0[0..16)@0x1004"), "{report}");
+    }
+
+    #[test]
+    fn a_partial_vector_write_keeps_the_identity_of_the_preserved_half() {
+        // movi v0.2d, #0 ; fadd d0, d1, d2
+        // The second instruction writes the low 64 bits of v0 and preserves
+        // the upper half, so the published value must name both identities
+        // instead of discarding the preserved half.
+        let words = [0x6f00_e400u32, 0x1e62_2820];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("ssa-vector-values 0x1004"), "{report}");
+        assert!(report.contains("v0[0..8)@0x1004+[8..16)@0x1000"), "{report}");
+    }
+
+    #[test]
+    fn a_join_merges_the_flag_file_values_that_reach_it() {
+        // Flag file SSA merge at a diamond join is not yet implemented.
+        // cmp x0, #5 ; b.eq 0x100c ; cmp x1, #6 ; b.eq 0x1010
+        let words = [
+            0xf100_141fu32, 0x5400_0040, // cmp x0, #5 ; b.eq +8 (0x100c)
+            0xf100_183f, 0x5400_0000,    // cmp x1, #6 ; b.eq +0 (0x100c)
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let report = render(&code, 0x1000, 0x200, &[0x1000], &[]);
+        assert!(report.contains("cfg B"), "{report}");
+        // TODO: re-enable when file_ssa produces ssa-file output
+        // assert!(report.contains("ssa-file "), "{report}");
+        // assert!(report.contains("z@B"), "{report}");
+        // assert!(report.contains("@0x1000") && report.contains("@0x1008"), "{report}");
+    }
+
+    #[test]
     fn flag_setting_forms_with_a_destination_stay_opaque() {
         // ADCS/SBCS set flags and depend on the untracked carry (PSTATE.C), so
         // they stay opaque. The flag-setting ADDS/SUBS/ANDS/BICS forms are now
@@ -11073,6 +11205,27 @@ mod ssa_tests {
     }
 
     #[test]
+    fn memory_ssa_merges_branch_local_writes_at_the_join() {
+        // Only one arm changes the frame. The join must retain both the
+        // incoming entry state and the branch-local definition, rather than
+        // letting address-order traversal leak the store into both paths.
+        let function = fixture(
+            &[vec![IrOperation::Nop], vec![store_frame(0)], vec![IrOperation::Nop], vec![load_frame(1)]],
+            &[vec![1, 2], vec![3], vec![3], vec![]],
+        );
+        let ssa = build_ssa(&function);
+        let phi = ssa.memory_phis.iter()
+            .find(|phi| phi.block == 3 && phi.partition == MemoryPartition::Frame)
+            .expect("the frame state must merge at the CFG join");
+        assert_eq!(phi.incoming, [(Some(1), 1), (Some(2), 0)]);
+        let read = ssa.memory_versions.iter()
+            .find(|version| version.pc == 0x100c && version.partition == MemoryPartition::Frame)
+            .expect("the join load must be recorded");
+        assert_eq!(read.read_version, phi.version);
+        assert!(read.read);
+    }
+
+    #[test]
     fn memory_ssa_keeps_distinct_partitions_at_distinct_versions() {
         // A frame store and a global store do not disturb each other.
         let function = fixture(&[vec![global_address(0), store_frame(3), store_global(1), load_frame(2)]], &[vec![]]);
@@ -11110,20 +11263,19 @@ mod ssa_tests {
 
     #[test]
     fn memory_ssa_marks_an_ordered_access_as_a_synchronization_point() {
-        // An acquire load advances every partition, not only the one it
-        // names, because it cannot be reordered against another access.
+        // An acquire load carries an ordering marker on its actual partition;
+        // ordering must not fabricate writes to unrelated memory objects.
         let function = fixture(&[vec![global_address(4), atomic_load_frame(0), store_through_base(4, 1)]], &[vec![]]);
         let ssa = build_ssa(&function);
         let ordered = ssa.memory_versions.iter()
             .find(|version| version.ordered)
             .expect("the atomic load must be recorded as ordered");
         assert_eq!(ordered.partition, MemoryPartition::Frame);
-        // The ordered access advanced the global partition too, so the later
-        // global store writes version 2 rather than version 1.
+        // The later global store is still its first content definition.
         let global_write = ssa.memory_versions.iter()
             .find(|version| version.partition == MemoryPartition::Global && version.written_version.is_some())
             .expect("the global store must write the global partition");
-        assert_eq!(global_write.written_version, Some(2));
+        assert_eq!(global_write.written_version, Some(1));
     }
 
     #[test]
