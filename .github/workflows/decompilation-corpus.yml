@@ -32,6 +32,8 @@ jobs:
         run: python3 scripts/test-arm64-nameflow.py rust/target/debug/reworker
       - name: Qualify worker reconstruction artifacts
         run: python3 scripts/test-worker-reconstruction.py rust/target/debug/reworker
+      - name: Measure the AArch64 scalar floating-point file effects (Apple Silicon host required)
+        run: bash scripts/test-scalar-fp-effects.sh
       - name: Qualify executable AArch64 machine-state slice (Apple Silicon host required)
         run: python3 scripts/test-machine-state.py rust/target/debug/reworker
       - name: Qualify recovered scalar source (Apple Silicon host required)
