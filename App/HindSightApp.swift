@@ -39,6 +39,36 @@ struct HindSightApp: App {
                 Divider()
                 Button("Copy Diagnostics", action: model.copyDiagnostics)
             }
+            CommandMenu("Reconstruction") {
+                ForEach([("Whole binary", "whole"), ("Current code section", "section"), ("Function at address…", "address")], id: \.1) { scope in
+                    Menu(scope.0) {
+                        Button("Dump All (.c .h .m .n)…") {
+                            model.exportReconstructionScope(scope: scope.1, language: "all",
+                                address: ReconstructionScopePlan.address(model.addressText))
+                        }
+                        Divider()
+                        ForEach([("Dump C (.c)…", "c"), ("Dump Objective-C (.m)…", "objc"),
+                                 ("Dump headers (.h)…", "header"), ("Dump native (.n)…", "native")], id: \.1) { format in
+                            Button(format.0) { model.exportReconstructionScope(scope: scope.1, language: format.1,
+                                address: ReconstructionScopePlan.address(model.addressText)) }
+                        }
+                    }
+                    .disabled(model.busy || !model.projectServiceReady || model.currentAnalysis == nil)
+                }
+                Menu("Dump existing batch") {
+                    Button("Dump All (.c .h .m .n)…") { model.dumpExistingReconstructionBatch() }
+                    Divider()
+                    ForEach([("C (.c)…", ReconstructionExportFormat.c), ("Objective-C (.m)…", .objc),
+                             ("Headers (.h)…", .header), ("Native (.n)…", .native)], id: \.1) { format in
+                        Button(format.0) { model.dumpExistingReconstructionBatch(format: format.1) }
+                    }
+                }.disabled(model.busy || model.selected?.result.source_sha256 == nil)
+                Divider()
+                Button("Resume batch…") { model.reconstructScope("resume", address: nil) }
+                    .disabled(model.busy || !model.projectServiceReady || model.currentAnalysis == nil)
+                Button("Cancel reconstruction", action: model.cancelReconstruction)
+                    .disabled(!model.canCancelReconstruction)
+            }
             CommandMenu("Workspace") {
                 Button("Investigation Home") { model.workspace = "Overview" }
                     .keyboardShortcut("1", modifiers: .command)

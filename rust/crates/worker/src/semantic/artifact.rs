@@ -1037,6 +1037,14 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     let instructions = (end - start) / 4;
     let exhausted = instructions > 128;
     let truncated = high < end;
+    let direct_targets = body.chunks_exact(4).enumerate().filter_map(|(index, bytes)| {
+        let pc = start + index as u64 * 4;
+        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        match lift_operation(decode(word, pc), pc) {
+            IrOperation::DirectCall { target } => Some(target),
+            _ => None,
+        }
+    }).collect::<BTreeSet<_>>();
     let settings = object([
         ("instruction_limit", 128u64.into()),
         ("code_scan_limit", (4 * 1024 * 1024u64).into()),
@@ -1059,6 +1067,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ])
             })),
         ),
+        ("call_signature_candidates", array(prototype_candidates.iter()
+            .filter(|(target, _, _)| direct_targets.contains(target)).map(|(target, symbol, signature)| object([
+            ("target", address(*target)), ("symbol", symbol.clone().into()),
+            ("language", signature.language.into()), ("declaration", signature.declaration.clone().into()),
+            ("source", signature.source.into()),
+        ])))),
     ]);
     let mut builder = Builder::new(source, start, end, architecture, name, settings.clone())?;
     let scope = builder.record(
@@ -1456,6 +1470,37 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             }
             _ => tree,
         };
+        let mut tree = tree;
+        if let IrOperation::DirectCall { target } = portable {
+            if let Some(prototype) = call_prototypes.get(&target).filter(|prototype|
+                matches!(prototype.result_spelling.as_str(), "bool" | "_Bool")) {
+                let upper = native.lc_function_starts.iter().chain(native.export_starts.iter())
+                    .chain(native.unwind_starts.iter()).copied().chain(call_prototypes.keys().copied())
+                    .filter(|boundary| *boundary > target).min().unwrap_or(base + code.len() as u64)
+                    .min(target.saturating_add(CALLEE_WINDOW as u64 * 4));
+                let window = target.checked_sub(base).zip(upper.checked_sub(base))
+                    .and_then(|(lo, hi)| code.get(lo as usize..hi as usize));
+                let data_free = data_ranges.iter().all(|(lo, hi, _)| {
+                    let a = file_offset.saturating_add(target.saturating_sub(base));
+                    let b = file_offset.saturating_add(upper.saturating_sub(base));
+                    a >= *hi || b <= *lo
+                });
+                let proven = source_supported_call && target != start && data_free
+                    && window.is_some_and(|bytes| source::canonical_boolean_callee(bytes, target, prototype));
+                if let V::Object(attributes) = &mut tree.attributes {
+                    if let Some(V::Object(effects)) = attributes.get_mut("call_effects") {
+                        effects.insert("canonical_boolean_result".into(), proven.into());
+                    }
+                }
+                let proof = builder.record("type", "derived", object([
+                    ("artifact_kind", "callee-boolean-result".into()), ("target", address(target)),
+                    ("canonical_boolean_proven", proven.into()),
+                    ("declaration", prototype.signature.declaration.clone().into()),
+                    ("contract", "bounded complete memory-free leaf; source walker proves canonical returns".into()),
+                ]), array([]))?;
+                builder.edge(&proof, &ir, "supports")?;
+            }
+        }
         let (ast, mirror) = tree.emit(&mut builder, &ir, pc)?;
         statements.push(ast);
         statement_mirrors.push(mirror);
@@ -1936,6 +1981,20 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         }
     }
     let mut recovered_source = None;
+    let objc_header=crate::signatures::objc_header_for_imp(start,&native.objc_records,&native.objc_layouts);
+    // A proven declaration remains useful when reachable effects block body
+    // recovery. Do not fabricate one from observations or conflicting types.
+    let source_declaration = if signatures.len() == 1 {
+        let (name, signature) = &signatures[0];
+        if let Some(source_signature) = crate::signatures::source_declaration(name, signature) {
+            let declaration = builder.record("type",
+                if signature.source.contains("analyst") { "analyst-assertion" } else { "derived" },
+                object([("declaration", signature.declaration.clone().into()),
+                        ("source", signature.source.into())]), array([]))?;
+            source::emit_header(&mut builder, &source_signature, &declaration, start, end, objc_header.as_deref())?;
+            Some(declaration)
+        } else { None }
+    } else { None };
     if !source_blocked {
         let recovery = if signatures.len() == 1 {
             let (name, signature) = &signatures[0];
@@ -1952,21 +2011,9 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         };
         match recovery {
             Ok(recovery) => {
-                let (_, signature) = &signatures[0];
-                let declaration = builder.record(
-                    "type",
-                    if signature.source.contains("analyst") {
-                        "analyst-assertion"
-                    } else {
-                        "derived"
-                    },
-                    object([
-                        ("declaration", signature.declaration.clone().into()),
-                        ("source", signature.source.into()),
-                    ]),
-                    array([]),
-                )?;
-                let (root, node) = recovery.emit(&mut builder, &declaration, &ir_ids, &memory_evidence_by_pc, start)?;
+                let declaration = source_declaration.as_ref().expect("recovered source has a validated declaration");
+                let objc_method=objc_header.as_deref().map(|header|(signatures[0].0.as_str(),header));
+                let (root, node) = recovery.emit(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method)?;
                 statements.push(root);
                 recovered_source = Some(node);
             }
@@ -2007,8 +2054,44 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ranges(start, end),
     )?;
     builder.edge(&bounds, &root_mirror, "supports")?;
+    let has_recovered_source = recovered_source.is_some();
     if let Some(source) = recovered_source {
         builder.edge(&root_mirror, &source, "renders-as")?;
+    }
+    // Export the complete available instruction-derived review body even when
+    // strict source/ABI proofs fail. This is code for analyst repair, never a
+    // substitute proof of compilability or an invented original prototype.
+    if !has_recovered_source {
+        let mut available = String::new();
+        for line in rendering.lines() {
+            if available.len() + line.len() + 5 > 1_000_000 {
+                available.push_str("    /* TRUNCATED: review source byte budget exhausted. */\n    hs_unresolved_reconstruction_budget();\n");
+                break;
+            }
+            available.push_str("    ");
+            available.push_str(line);
+            available.push('\n');
+        }
+        let text = format!("/* BEST-EFFORT C-LIKE RECONSTRUCTION: not compilable or ABI-qualified.\n * Symbolic registers/intrinsics and unresolved effects require analyst repair.\n * This review wrapper is NOT the original function prototype.\n * Captured instruction tree truncated: {truncated}.\n */\n#include <stdint.h>\ntypedef struct hs_review_context hs_review_context;\nvoid hs_review_{start:x}(hs_review_context *context) {{\n    (void)context;\n{available}}}\n");
+        {
+            let review = builder.record("metadata", "derived", object([
+                ("artifact_kind", "best-effort-source".into()), ("source", text.into()),
+                ("status", "review-only-uncompiled".into()), ("ast_root", root.clone().into()),
+                ("contract", "instruction-derived C-like code; unresolved symbolic registers/intrinsics; no original ABI, compilation or equivalence claim".into()),
+            ]), array([]))?;
+            builder.edge(&root_mirror, &review, "renders-as")?;
+        }
+    }
+    if source_declaration.is_none() {
+        let is_objc=objc_header.is_some();
+        let text = objc_header.unwrap_or_else(||format!("#pragma once\n/* Original function prototype unresolved.\n * Best-effort review interface only, NOT an original ABI declaration. */\ntypedef struct hs_review_context hs_review_context;\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\nvoid hs_review_{start:x}(hs_review_context *context);\n#ifdef __cplusplus\n}}\n#endif\n"));
+        let header = builder.record("metadata", "derived", object([
+            ("artifact_kind", "best-effort-header".into()), ("source", text.into()),
+            ("status", "review-only-uncompiled".into()),
+            ("languages", array(if is_objc{vec!["objective-c".into(),"objective-c++".into()]}else{vec!["c".into(), "c++".into(), "objective-c".into(), "objective-c++".into()]})),
+            ("contract", if is_objc{"target-local Objective-C class/member declaration evidence; superclass/protocol/type dependencies unresolved; no complete ABI or implementation claim"}else{"review wrapper declaration only; original prototype unresolved; no original ABI or implementation claim"}.into()),
+        ]), array([]))?;
+        builder.edge(&root_mirror, &header, "renders-as")?;
     }
     for mirror in statement_mirrors {
         builder.edge(&mirror, &root_mirror, "derives")?;

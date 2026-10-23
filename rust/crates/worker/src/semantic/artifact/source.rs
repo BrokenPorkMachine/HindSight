@@ -5,6 +5,37 @@ use super::*;
 use crate::signatures::SourceSignature;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Declaration recovery does not depend on proving the implementation body.
+pub(super) fn emit_header(builder: &mut Builder, s: &crate::signatures::SourceDeclaration, declaration: &str,
+                         start: u64, end: u64, objc_header: Option<&str>) -> io::Result<String> {
+    let mut headers = String::from("#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <sys/types.h>\n#include <objc/objc.h>\n");
+    let mentions = |prefix: &str| std::iter::once(s.result_spelling.as_str())
+        .chain(s.parameters.iter().map(|parameter| parameter.0.as_str()))
+        .any(|ty| ty.split(|c: char| c.is_whitespace() || c == '*').any(|word| word.starts_with(prefix)));
+    if mentions("NS") { headers.push_str("/* Foundation SDK declarations require Objective-C or Objective-C++. */\n#if !defined(__OBJC__)\n#error Foundation SDK declarations require Objective-C or Objective-C++\n#endif\n#import <Foundation/Foundation.h>\n"); }
+    if mentions("CF") { headers.push_str("#include <CoreFoundation/CoreFoundation.h>\n"); }
+    if mentions("CG") { headers.push_str("#include <CoreGraphics/CoreGraphics.h>\n"); }
+    if mentions("dispatch_") { headers.push_str("#include <dispatch/dispatch.h>\n"); }
+    let parameters = s.parameters.iter()
+        .map(|parameter| format!("{} {}", parameter.0.replace("_Bool", "bool"), parameter.1))
+        .collect::<Vec<_>>().join(", ");
+    let mut text = format!(
+        "/* Recovered declaration for {start:#x}..{end:#x}; Apple LP64 ABI.\n * Declaration evidence only: implementation recovery and behavioral equivalence are not implied. */\n#pragma once\n{headers}\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n{} {}({});\n#ifdef __cplusplus\n}}\n#endif\n",
+        s.result_spelling.replace("_Bool", "bool"), s.name,
+        if parameters.is_empty() { "void" } else { &parameters });
+    if let Some(declarations)=objc_header { text.push('\n');text.push_str(declarations); }
+    let header = builder.record("metadata", "derived", object([
+        ("artifact_kind", "recovered-header".into()), ("source", text.into()),
+        ("languages", array(if mentions("NS") || objc_header.is_some() { vec!["objective-c".into(), "objective-c++".into()] }
+            else { vec!["c".into(), "c++".into(), "objective-c".into(), "objective-c++".into()] })),
+        ("status", "declaration-only-uncompiled".into()), ("name", s.name.clone().into()),
+        ("declaration", s.signature.declaration.clone().into()),
+        ("contract", if objc_header.is_some(){"exact IMP entry declaration plus target-local class/member review declarations; superclass/protocol/type dependencies unresolved; no complete class ABI or implementation claim"}else{"exact declaration for Apple LP64 and named SDK types; no register-location, implementation or equivalence claim"}.into()),
+    ]), array([]))?;
+    builder.edge(declaration, &header, "types")?;
+    Ok(header)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Symbol {
     Value(usize, u8),
@@ -49,6 +80,11 @@ struct ExternalLoad {
     volatile: bool,
 }
 struct Expr {
+    /// Proven bit pattern, retained through explicitly modeled width views.
+    constant_value: Option<u64>,
+    /// Proven value domain {0,1}, independent of source spelling.
+    boolean_value: bool,
+    boolean_constant: Option<bool>,
     kind: &'static str,
     template: String,
     children: Vec<usize>,
@@ -85,24 +121,49 @@ impl SourceType {
 }
 
 /// Recover a scalar pointee type only when the declaration names one of the
-/// fixed-width integer types understood by this source slice. The AArch64
+/// fixed-width or native Apple LP64 integer types understood by this slice. The AArch64
 /// load's signed bit alone cannot distinguish `int64_t` from `uint64_t`,
 /// because both use the same 64-bit load instruction.
 fn scalar_pointee_type(pointer: &SourceType) -> Option<SourceType> {
     if !pointer.pointer { return None; }
-    let base = pointer.spelling.trim().trim_end_matches('*').trim();
+    let (base, suffix) = pointer.spelling.rsplit_once('*')?;
+    if base.contains('*') || !suffix.split_whitespace().all(|word| matches!(
+        word, "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable"
+    )) { return None; }
     let base = base.split_whitespace()
         .filter(|word| !matches!(*word, "const" | "volatile" | "restrict" | "__restrict" | "__restrict__" | "_Nonnull" | "_Nullable"))
         .collect::<Vec<_>>()
         .join(" ");
     let (bits, signed) = match base.as_str() {
-        "int8_t" => (8, true), "uint8_t" => (8, false),
-        "int16_t" => (16, true), "uint16_t" => (16, false),
-        "int32_t" => (32, true), "uint32_t" => (32, false),
-        "int64_t" => (64, true), "uint64_t" => (64, false),
+        "int8_t" | "char" | "signed char" => (8, true),
+        "uint8_t" | "unsigned char" => (8, false),
+        "int16_t" | "short" | "short int" | "signed short" | "signed short int" => (16, true),
+        "uint16_t" | "unsigned short" | "unsigned short int" => (16, false),
+        "int32_t" | "int" | "signed" | "signed int" => (32, true),
+        "uint32_t" | "unsigned" | "unsigned int" | "CFStringEncoding" => (32, false),
+        "int64_t" | "long" | "long int" | "signed long" | "signed long int" | "long long" | "long long int" | "signed long long" | "signed long long int"
+            | "intptr_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "CFIndex" | "dispatch_once_t"
+            | "CFNumberType" | "CFURLPathStyle" | "CFPropertyListFormat" => (64, true),
+        "uint64_t" | "unsigned long" | "unsigned long int" | "unsigned long long"
+            | "unsigned long long int" | "uintptr_t" | "size_t" | "NSUInteger" | "CFTypeID" | "CFOptionFlags" => (64, false),
+        "bool" | "_Bool" => (8, false),
         _ => return None,
     };
     Some(SourceType { spelling: base, bits, signed, pointer: false })
+}
+
+fn pointee_qualified(pointer: &SourceType, qualifier: &str) -> bool {
+    pointer.spelling.split_once('*').is_some_and(|(pointee, _)|
+        pointee.split_whitespace().any(|word| word == qualifier))
+}
+
+fn volatile_helper(store: bool, bytes: u64, ty: &SourceType) -> (String, String) {
+    let canonical = format!("{}{}_t", if ty.signed { "int" } else { "uint" }, bytes * 8);
+    // Boolean objects may be inspected through unsigned character storage;
+    // other native integers require their actual compatible declared type.
+    let spelling = if matches!(ty.spelling.as_str(), "bool" | "_Bool") { "uint8_t".to_owned() } else { ty.spelling.clone() };
+    let suffix = if spelling == canonical { String::new() } else { format!("_{}", spelling.split_whitespace().collect::<Vec<_>>().join("_")) };
+    (format!("hs_v{}_{}{}{suffix}", if store { "store" } else { "load" }, if ty.signed { "s" } else { "u" }, bytes), spelling)
 }
 
 struct Dag {
@@ -135,7 +196,19 @@ impl Dag {
             origins.extend(self.nodes[*child].origins.iter().copied());
         }
         let id = self.nodes.len();
+        let boolean_value = kind == "source-condition"
+            || (matches!(kind, "source-copy" | "source-cast" | "source-frame-reload" | "source-return")
+                && children.len() == 1 && self.nodes[children[0]].boolean_value)
+            || (kind == "source-select" && children.len() == 3
+                && self.nodes[children[1]].boolean_value && self.nodes[children[2]].boolean_value);
         self.nodes.push(Expr {
+            constant_value: if kind == "source-copy" && children.len() == 1 {
+                self.nodes[children[0]].constant_value
+            } else { None },
+            boolean_value,
+            boolean_constant: if matches!(kind, "source-copy" | "source-cast" | "source-frame-reload" | "source-return") && children.len() == 1 {
+                self.nodes[children[0]].boolean_constant
+            } else { None },
             kind,
             template,
             children,
@@ -146,12 +219,16 @@ impl Dag {
         Ok(id)
     }
     fn constant(&mut self, value: u64, pc: u64) -> Result<usize, String> {
-        self.add(
+        let id = self.add(
             "source-constant",
             format!("UINT64_C(0x{value:x})"),
             vec![],
             pc,
-        )
+        )?;
+        self.nodes[id].boolean_value = value <= 1;
+        self.nodes[id].constant_value = Some(value);
+        self.nodes[id].boolean_constant = if value <= 1 { Some(value == 1) } else { None };
+        Ok(id)
     }
     /// Record the proven source type of an expression.
     ///
@@ -171,15 +248,7 @@ impl Dag {
         let Symbol::Value(id, _) = symbol else {
             return None;
         };
-        let node = &self.nodes[*id];
-        (node.kind == "source-constant")
-            .then(|| {
-                node.template
-                    .strip_prefix("UINT64_C(0x")
-                    .and_then(|s| s.strip_suffix(')'))
-                    .and_then(|s| u64::from_str_radix(s, 16).ok())
-            })
-            .flatten()
+        self.nodes[*id].constant_value
     }
     fn value(&mut self, symbol: Symbol, bits: u8, pc: u64) -> Result<usize, String> {
         match symbol {
@@ -190,7 +259,8 @@ impl Dag {
                     let cast = self.add_role("source-cast", "narrowed", format!("((uint{bits}_t)($0))"), vec![id], pc)?;
                     // Preserve a proven source type when this machine-width
                     // view retains every source bit. Truncation changes the
-                    // value and stays unresolved unless widths agree.
+                    // value: a declaration-proven integer then yields the
+                    // explicit unsigned C cast type, not its old source type.
                     let narrowed = match self.type_of(id) {
                         Some(source_type) if source_type.bits <= bits => Some(SourceType {
                             spelling: source_type.spelling.clone(),
@@ -198,9 +268,13 @@ impl Dag {
                             signed: source_type.signed,
                             pointer: false,
                         }),
+                        Some(source_type) if !source_type.pointer => Some(SourceType {
+                            spelling: format!("uint{bits}_t"), bits, signed: false, pointer: false,
+                        }),
                         _ => None,
                     };
                     self.type_node(cast, narrowed);
+                    self.nodes[cast].constant_value = self.nodes[id].constant_value.map(|value| value & ((1u64 << bits) - 1));
                     Ok(cast)
                 }
             }
@@ -305,14 +379,14 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
             let pointer_type = dag.type_of(*address_id).cloned()
                 .filter(|ty| ty.pointer)
                 .ok_or_else(|| format!("external memory address is not a proven pointer (address={address:?}, type={:?})", dag.type_of(*address_id)))?;
-            let volatile = pointer_type.spelling.contains("volatile");
+            let volatile = pointee_qualified(&pointer_type, "volatile");
             let declared_pointee = scalar_pointee_type(&pointer_type).filter(|ty| u64::from(ty.bits) == bytes * 8);
             if volatile && declared_pointee.is_none() {
                 return Err("volatile reads require an exact fixed-width scalar pointee".into());
             }
             let signed = declared_pointee.as_ref().map_or(flag(t, "signed") != 0, |ty| ty.signed);
             let load_helper = if volatile {
-                format!("hs_vload_{}{}", if signed { "s" } else { "u" }, bytes)
+                volatile_helper(false, bytes, declared_pointee.as_ref().expect("validated volatile pointee")).0
             } else {
                 format!("hs_load{bytes}")
             };
@@ -329,6 +403,10 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 signed,
                 pointer: false,
             }));
+            // Typed Boolean memory is a source-language precondition: the
+            // pointed-to live object must have canonical representation.
+            dag.nodes[loaded].boolean_value = dag.type_of(loaded)
+                .is_some_and(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool"));
             state.external_loads.push(ExternalLoad {
                 expression: loaded,
                 address: *address_id,
@@ -345,6 +423,7 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 vec![loaded],
                 pc,
             )?;
+            dag.nodes[extended].boolean_value = dag.nodes[loaded].boolean_value;
             let (spelling, bits, promoted_signed) = if bytes < 4 {
                 ("int32_t".to_owned(), 32, true)
             } else {
@@ -446,9 +525,10 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
         }
         if let (Symbol::Value(pointer, _), Symbol::Value(_, _)) = (&values[0], &values[1]) {
             let pointer_type = dag.type_of(*pointer).cloned();
-            if pointer_type.as_ref().is_some_and(|ty| ty.pointer)
-                && !pointer_type.as_ref().is_some_and(|ty| ty.spelling.contains("volatile"))
-            {
+            // Computing an address is not a volatile access. Preserve the
+            // declaration here; the eventual load/store validates its width
+            // and retains the volatile event in the ordered access schedule.
+            if pointer_type.as_ref().is_some_and(|ty| ty.pointer) {
                 let op = attribute(t, "operator");
                 let (template, children) = if let Some(offset) = dag.literal(&values[1]) {
                     (
@@ -570,6 +650,23 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
         _ => return Err(format!("unqualified source expression {}", t.kind)),
     };
     let id = dag.add_role("source-expression", role, template, children.clone(), pc)?;
+    dag.nodes[id].boolean_value = match t.kind {
+        "binary" => match attribute(t, "operator") {
+            "==" | "!=" => true,
+            "&" => children.iter().any(|child| dag.nodes[*child].boolean_value),
+            "|" | "^" => children.iter().all(|child| dag.nodes[*child].boolean_value),
+            "+" => children.iter().all(|child| dag.nodes[*child].boolean_value)
+                && children.iter().any(|child| dag.nodes[*child].boolean_constant == Some(false)),
+            _ => false,
+        },
+        "select" => children[1..].iter().all(|child| dag.nodes[*child].boolean_value),
+        "extend" => dag.nodes[children[0]].boolean_value
+            && (flag(t, "signed") == 0 || number(t, "from_bits") > 1),
+        "bit-extract" => (number(t, "width") == 1 && flag(t, "signed") == 0)
+            || (dag.nodes[children[0]].boolean_value && number(t, "lsb") == 0
+                && (flag(t, "signed") == 0 || number(t, "width") > 1)),
+        _ => false,
+    };
     // Propagate the proven type through the operation. An arithmetic or
     // bitwise result keeps the operand type only when both operands agree on
     // it; a comparison yields a condition rather than a value, and a select
@@ -590,7 +687,9 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 let right = dag.type_of(children[1]);
                 match (left, right) {
                     (Some(left), Some(right)) if left == right && !left.pointer => {
-                        Some(left.clone())
+                        Some(if matches!(left.spelling.as_str(), "bool" | "_Bool") {
+                            SourceType { spelling: "int32_t".into(), bits: 32, signed: true, pointer: false }
+                        } else { left.clone() })
                     }
                     _ => None,
                 }
@@ -663,16 +762,35 @@ fn store(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), Stri
         if !pointer.pointer {
             return Err("external store requires a proven pointer".into());
         }
-        let volatile = pointer.spelling.contains("volatile");
-        if pointer.spelling.split_whitespace().any(|word| word == "const") {
+        let volatile = pointee_qualified(&pointer, "volatile");
+        if pointee_qualified(&pointer, "const") {
             return Err("external store through a const-qualified pointer is unsupported".into());
         }
         if !matches!(bytes, 1 | 2 | 4 | 8) {
             return Err("external memory write width is unsupported".into());
         }
         let value = read(&t.children[1], state, dag, pc)?;
-        let value = dag.value(value, 64, pc)?;
+        let mut value = dag.value(value, 64, pc)?;
         let pointee = scalar_pointee_type(&pointer).filter(|ty| u64::from(ty.bits) == bytes * 8);
+        if let Some(boolean) = pointee.as_ref().filter(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool")) {
+            if !dag.nodes[value].boolean_value {
+                return Err("Boolean store representation is not proven canonical".into());
+            }
+            value = dag.add_role("source-cast", "narrowed", format!("(({})$0)", boolean.spelling),
+                                 vec![value], pc)?;
+            dag.type_node(value, Some(boolean.clone()));
+        } else if let Some(integer) = pointee.as_ref().filter(|_| {
+            dag.literal(&Symbol::Value(value, 64)).is_some()
+                || dag.type_of(value).is_some_and(|ty| !ty.pointer && matches!(ty.bits, 8 | 16 | 32 | 64))
+        }) {
+            // The decoded store proves which low bits reach the exact scalar
+            // object. Attach an explicit conversion only for a known constant
+            // or a declaration-proven integer, never an unresolved value.
+            let role = if dag.literal(&Symbol::Value(value, 64)).is_some() { "store_constant" } else { "store_integer" };
+            value = dag.add_role("source-cast", role, format!("(({})$0)", integer.spelling),
+                                 vec![value], pc)?;
+            dag.type_node(value, Some(integer.clone()));
+        }
         if volatile && pointee.is_none() {
             return Err("volatile writes require an exact fixed-width scalar pointee".into());
         }
@@ -859,6 +977,11 @@ fn natural_loop(
         let id = dag.nodes.len();
         let name = format!("hs_{role}_{id}");
         let value = dag.add_role("source-loop-variable", role, name, vec![], start + header as u64 * 4)?;
+        // Inductive {0,1} invariant: seed from the preheader, then require
+        // every write in the modeled body to preserve the same domain.
+        // Never copy a constant fact into a loop-carried variable.
+        dag.nodes[value].boolean_value = dag.nodes[initial].boolean_value
+            && dag.type_of(initial).is_some_and(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool"));
         dag.type_node(value, dag.type_of(initial).cloned());
         variable_by_register.insert(register, (value, known));
         variables.push(LoopVariable { value, initial });
@@ -903,9 +1026,14 @@ fn natural_loop(
                 }
                 let Symbol::Value(value, _) = state.registers[register].clone() else { return Err("loop update depends on unknown bits".into()) };
                 let (destination, known) = variable_by_register[&register];
+                if dag.nodes[destination].boolean_value && !dag.nodes[value].boolean_value {
+                    return Err("loop update does not preserve its canonical Boolean domain".into());
+                }
                 let destination_type = dag.type_of(destination).cloned();
                 let update_type = dag.type_of(value).cloned();
                 match (destination_type, update_type) {
+                    (Some(current), _) if matches!(current.spelling.as_str(), "bool" | "_Bool")
+                        && dag.nodes[value].boolean_value => {}
                     (None, Some(update_type)) => dag.type_node(destination, Some(update_type)),
                     (Some(current), Some(update)) if current.bits == update.bits && current.signed == update.signed && current.pointer == update.pointer => {}
                     (Some(_), None) => {}
@@ -949,7 +1077,6 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
         "call" => {
             let target = number(t, "target");
             let callee = call_prototypes.get(&target).ok_or("call has no unique exact scalar prototype")?;
-            if callee.result_spelling == "void" { return Err("void call results are not modeled".into()); }
             let V::Object(effects) = t.attributes.get("call_effects").ok_or("self-call prototype missing")? else { return Err("self-call prototype missing".into()); };
             let V::Array(arguments) = effects.get("arguments").ok_or("self-call arguments unresolved")? else { return Err("self-call arguments unresolved".into()); };
             if arguments.len() != callee.parameters.len() { return Err("call argument prototype mismatch".into()); }
@@ -962,21 +1089,33 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
                 return Err("call argument ABI mismatch".into());
                 }
                 let value = dag.value(state.registers[parameter.register as usize].clone(), parameter.bits.max(32), pc)?;
+                if matches!(parameter.spelling.as_str(), "bool" | "_Bool") && !dag.nodes[value].boolean_value {
+                    return Err("Boolean call argument representation is not proven canonical".into());
+                }
                 let cast = dag.add_role("source-call-argument", "argument", format!("(({})$0)", parameter.spelling), vec![value], pc)?;
                 children.push(cast);
                 rendered.push(format!("${}", children.len()-1));
             }
-            if effects.get("result") != Some(&object([("source_spelling", callee.result_spelling.clone().into()), ("location", "x0".into())])) {
+            let result_location = if callee.result_bits == 0 { V::Null } else { "x0".into() };
+            if effects.get("result") != Some(&object([("source_spelling", callee.result_spelling.clone().into()), ("location", result_location)])) {
                 return Err("call result ABI mismatch".into());
             }
             let value = dag.add_role("source-call", "value", format!("{}({})", callee.name, rendered.join(", ")), children, pc)?;
+            if matches!(callee.result_spelling.as_str(), "bool" | "_Bool") {
+                if effects.get("canonical_boolean_result") != Some(&V::Bool(true)) {
+                    return Err("callee Boolean return representation is not proven canonical".into());
+                }
+                dag.nodes[value].boolean_value = true;
+            }
             dag.type_node(value, Some(SourceType { spelling: callee.result_spelling.clone(), bits: callee.result_bits, signed: callee.result_signed, pointer: callee.result_pointer }));
             for register in 0..=18 { state.registers[register] = Symbol::Unknown(register as u64); }
             // The call's result width belongs to the callee prototype. The
             // caller may return a narrower or wider value after further
             // operations; using its result declaration here loses valid
             // callee bits or claims bits the callee did not define.
-            state.registers[0] = Symbol::Value(value, callee.result_bits.max(32));
+            if callee.result_bits != 0 {
+                state.registers[0] = Symbol::Value(value, callee.result_bits.max(32));
+            }
             state.flags = None;
             state.has_call = true;
             state.call_pcs.push(pc);
@@ -1190,6 +1329,9 @@ pub(super) fn recover(
                 pointer: parameter.pointer,
             }),
         );
+        if matches!(parameter.spelling.as_str(), "bool" | "_Bool") {
+            dag.nodes[id].boolean_value = true;
+        }
         state.registers[parameter.register as usize] =
             Symbol::Value(id, if bits < 64 { 32 } else { 64 });
     }
@@ -1235,11 +1377,19 @@ pub(super) fn recover(
                             "nonvolatile registers, SP or return target not restored".into()
                         );
                     }
-                    let value = dag.value(
+                    // A void declaration establishes that x0 is not a source
+                    // result. It may be unknown or still contain a pointer.
+                    let value = if signature.result_bits == 0 {
+                        dag.constant(0, pc)?
+                    } else { dag.value(
                         state.registers[0].clone(),
                         signature.result_bits,
                         pc,
-                    )?;
+                    )? };
+                    if matches!(signature.result_spelling.as_str(), "bool" | "_Bool")
+                        && !dag.nodes[value].boolean_value {
+                        return Err("Boolean return representation is not proven canonical".into());
+                    }
                     let value = dag.add_role("source-return", "result", "$0".into(), vec![value], pc)?;
                     // The returned value has the function's declared result
                     // type, which the exact source declaration proves.
@@ -1310,8 +1460,10 @@ pub(super) fn recover(
     if !source_loops.is_empty() && paths != 1 {
         return Err("source loop requires one proven exit path".into());
     }
-    let ordered_call_memory = returned.iter().any(|(_, _, loads, stores, _, _, calls)| calls.iter().any(|call|
-        loads.iter().any(|load| load.pc > call.pc) || stores.iter().any(|store| store.pc > call.pc)));
+    // Calls are execution events regardless of result liveness. Materialize
+    // each result once so expression reuse cannot duplicate an invocation,
+    // and dead results cannot erase a call from the executed path.
+    let ordered_call_memory = returned.iter().any(|path| !path.6.is_empty());
     let ordered_volatile_accesses = returned.iter().any(|(_, _, loads, stores, has_call, _, _)| {
         let volatile = loads.iter().any(|load| load.volatile) || stores.iter().any(|store| store.volatile);
         volatile && (*has_call || loads.len() + stores.len() > 1)
@@ -1382,6 +1534,28 @@ pub(super) fn recover(
             .collect(),
     })
 }
+
+/// Reuse the source walker to prove every reachable return of a bounded,
+/// memory-free leaf has canonical Boolean representation. Callers separately
+/// establish the callee's complete return/effect/ABI summary.
+pub(super) fn canonical_boolean_callee(code: &[u8], start: u64, signature: &SourceSignature) -> bool {
+    if code.is_empty() || code.len() > 128 * 4 || code.len() % 4 != 0 {
+        return false;
+    }
+    let mut trees = Vec::new();
+    let mut operations = Vec::new();
+    for (index, bytes) in code.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        let pc = start + index as u64 * 4;
+        let decoded = decode(word, pc);
+        let operation = lift_operation(decoded, pc);
+        trees.push(instruction_model(decoded, operation, word).unwrap_or_else(|| {
+            tree("unsupported-operation", None, object([]), vec![])
+        }));
+        operations.push(operation);
+    }
+    recover(start, &trees, &operations, signature.clone(), &BTreeMap::new()).is_ok()
+}
 impl Recovery {
     pub(super) fn emit(
         &self,
@@ -1390,6 +1564,7 @@ impl Recovery {
         ir: &[String],
         memory_evidence_by_pc: &BTreeMap<u64, Vec<String>>,
         start: u64,
+        objc_method: Option<(&str,&str)>,
     ) -> io::Result<(String, String)> {
         let ordered_mixed_accesses = !self.external_loads.is_empty() && !self.external_stores.is_empty();
         let loop_memory_effects = self.loops.iter().any(|source_loop| !source_loop.loads.is_empty() || !source_loop.stores.is_empty());
@@ -1475,8 +1650,13 @@ impl Recovery {
                 let spelling = node.source_type.as_ref().ok_or_else(|| io::Error::new(
                     io::ErrorKind::InvalidData, "ordered call has no proven result type",
                 ))?.spelling();
-                declarations.push_str(&format!("    {spelling} {name};\n"));
-                expression = name;
+                if spelling == "void" {
+                    // This node is an execution event with no source value.
+                    expression = String::new();
+                } else {
+                    declarations.push_str(&format!("    {spelling} {name};\n"));
+                    expression = name;
+                }
             }
             let children = node.children.iter().map(|i| asts[i].clone()).collect();
             let evidence = node
@@ -1491,12 +1671,15 @@ impl Recovery {
                     .iter()
                     .map(|pc| object([("start", address(*pc)), ("end", address(*pc + 4))])),
             );
+            let machine_type = if node.kind == "source-call" && node.source_type.as_ref().is_some_and(|ty| ty.bits == 0) {
+                "void"
+            } else { "uint64_t" };
             let ast = builder.ast_spans(
                 node.kind,
                 // The node type stays the machine representation. The proven
                 // semantic type travels in its own attribute so a consumer
                 // never has to read the rendered expression to learn it.
-                Some("uint64_t"),
+                Some(machine_type),
                 children,
                 &evidence,
                 origins,
@@ -1511,7 +1694,8 @@ impl Recovery {
                         }
                         .into(),
                     ),
-                    ("machine_type", "uint64_t".into()),
+                    ("machine_type", machine_type.into()),
+                    ("canonical_boolean_proven", node.boolean_value.into()),
                     (
                         "source_type",
                         match &node.source_type {
@@ -1543,7 +1727,14 @@ impl Recovery {
             rendered.insert(id, expression);
         }
         let s = &self.signature;
-        let mut headers=String::from("#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n#include <sys/types.h>\n#include <objc/objc.h>\n");
+        let mut headers=String::from("#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <string.h>\n#include <sys/types.h>\n#include <objc/objc.h>\n");
+        let boolean_memory_reads = self.external_loads.iter()
+            .chain(self.loops.iter().flat_map(|source_loop| source_loop.loads.iter()))
+            .any(|load| self.dag.type_of(load.expression)
+                .is_some_and(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool")));
+        if boolean_memory_reads {
+            headers.push_str("/* Boolean pointer reads require live Boolean objects with canonical 0/1 representation. */\n");
+        }
         let mentions = |prefix: &str| {
             std::iter::once(s.result_spelling.as_str())
                 .chain(s.parameters.iter().map(|p| p.spelling.as_str()))
@@ -1607,8 +1798,7 @@ impl Recovery {
                 match event {
                     LoopBodyEvent::Load(load) => {
                         let helper = if load.volatile {
-                            let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
-                            format!("hs_vload_{}{}", if signed { "s" } else { "u" }, load.bytes)
+                            volatile_helper(false, load.bytes, self.dag.type_of(load.expression).expect("validated volatile pointee")).0
                         } else {
                             format!("hs_load{}", load.bytes)
                         };
@@ -1668,7 +1858,7 @@ impl Recovery {
                             let pointee = scalar_pointee_type(self.dag.type_of(store.address).expect("validated volatile pointer type"))
                                 .filter(|ty| u64::from(ty.bits) == store.bytes * 8)
                                 .expect("validated volatile pointee type");
-                            (format!("hs_vstore_{}{}", if pointee.signed { "s" } else { "u" }, store.bytes),
+                            (volatile_helper(true, store.bytes, &pointee).0,
                              "declaration-proven volatile pointer")
                         } else {
                             (format!("hs_store{}", store.bytes), "declaration-proven ordinary pointer")
@@ -1739,7 +1929,13 @@ impl Recovery {
                 let invocation = call_invocations.get(&call.expression).ok_or_else(|| io::Error::new(
                     io::ErrorKind::InvalidData, "ordered call expression was not rendered",
                 ))?;
-                let call_assignment = format!("    {} = {invocation};\n", rendered[&call.expression]);
+                let call_assignment = if self.dag.nodes[call.expression].source_type.as_ref()
+                    .is_some_and(|ty| ty.bits == 0) {
+                    format!("    {invocation};\n")
+                } else {
+                    format!("    {} = {invocation};\n    (void){};\n",
+                        rendered[&call.expression], rendered[&call.expression])
+                };
                 if self.dag.literal(&Symbol::Value(call.guard, 64)) == Some(1) {
                     effects_code.push_str(&call_assignment);
                 } else {
@@ -1761,8 +1957,7 @@ impl Recovery {
                 if !ordered_effect_schedule { continue; }
                 let load = &self.external_loads[event_index];
                 let helper = if load.volatile {
-                    let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
-                    format!("hs_vload_{}{}", if signed { "s" } else { "u" }, load.bytes)
+                    volatile_helper(false, load.bytes, self.dag.type_of(load.expression).expect("validated volatile pointee")).0
                 } else { format!("hs_load{}", load.bytes) };
                 let read = format!("    hs_loaded_{} = {}((uintptr_t)({}));\n", load.expression, helper, rendered[&load.address]);
                 if self.dag.literal(&Symbol::Value(load.guard, 64)) == Some(1) {
@@ -1806,7 +2001,7 @@ impl Recovery {
                 let pointee = scalar_pointee_type(self.dag.type_of(effect.address).expect("validated volatile pointer type"))
                     .filter(|ty| u64::from(ty.bits) == effect.bytes * 8)
                     .expect("validated volatile pointee type");
-                (format!("hs_vstore_{}{}", if pointee.signed { "s" } else { "u" }, effect.bytes),
+                (volatile_helper(true, effect.bytes, &pointee).0,
                  "declaration-proven volatile pointer", "instruction order under the recovered path guard")
             } else {
                 (format!("hs_store{}", effect.bytes),
@@ -1853,7 +2048,9 @@ impl Recovery {
                 ("guard_ast", asts[&effect.guard].clone().into()),
             ]), ranges(pc, pc + 4)));
         }
-        let return_code = if s.result_pointer {
+        let return_code = if s.result_bits == 0 {
+            "    return;\n".to_owned()
+        } else if s.result_pointer {
             format!(
                 "    return ({}) (uintptr_t)({result});\n",
                 s.result_spelling
@@ -1863,7 +2060,10 @@ impl Recovery {
         } else {
             format!("    return ({})({result});\n", s.result_spelling)
         };
-        let assertions=format!("    _Static_assert(sizeof(void *) == 8 && sizeof(long) == 8, \"Apple LP64 ABI required\");\n    _Static_assert(sizeof({}) == {}, \"result type layout mismatch\");\n",s.result_spelling,s.result_bits/8)
+        let result_assertion = if s.result_bits == 0 { String::new() } else {
+            format!("    _Static_assert(sizeof({}) == {}, \"result type layout mismatch\");\n", s.result_spelling, s.result_bits / 8)
+        };
+        let assertions=format!("    _Static_assert(sizeof(void *) == 8 && sizeof(long) == 8, \"Apple LP64 ABI required\");\n{result_assertion}")
             + &s.parameters.iter().map(|p|format!("    _Static_assert(sizeof({}) == {}, \"parameter type layout mismatch\");\n",p.spelling,p.bits/8)).collect::<String>();
         let unused = s
             .parameters
@@ -1871,37 +2071,35 @@ impl Recovery {
             .map(|p| format!("    (void){};\n", p.name))
             .collect::<String>();
         let mut volatile_helpers = String::new();
-        let mut helpers = BTreeSet::<(bool, u64, bool)>::new();
+        let mut helpers = BTreeMap::<String, (bool, String)>::new();
         for load in self.external_loads.iter().filter(|load| load.volatile) {
-            let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
-            helpers.insert((false, load.bytes, signed));
+            let (name, spelling) = volatile_helper(false, load.bytes, self.dag.type_of(load.expression).expect("validated volatile pointee"));
+            helpers.insert(name, (false, spelling));
         }
         for load in self.loops.iter().flat_map(|source_loop| &source_loop.loads).filter(|load| load.volatile) {
-            let signed = self.dag.type_of(load.expression).is_some_and(|ty| ty.signed);
-            helpers.insert((false, load.bytes, signed));
+            let (name, spelling) = volatile_helper(false, load.bytes, self.dag.type_of(load.expression).expect("validated volatile pointee"));
+            helpers.insert(name, (false, spelling));
         }
         for store in self.external_stores.iter().filter(|store| store.volatile) {
             let pointee = scalar_pointee_type(self.dag.type_of(store.address).expect("validated volatile pointer type"))
                 .expect("validated volatile pointee type");
-            helpers.insert((true, store.bytes, pointee.signed));
+            let (name, spelling) = volatile_helper(true, store.bytes, &pointee);
+            helpers.insert(name, (true, spelling));
         }
         for store in self.loops.iter().flat_map(|source_loop| &source_loop.stores).filter(|store| store.volatile) {
             let pointee = scalar_pointee_type(self.dag.type_of(store.address).expect("validated volatile pointer type"))
                 .expect("validated volatile pointee type");
-            helpers.insert((true, store.bytes, pointee.signed));
+            let (name, spelling) = volatile_helper(true, store.bytes, &pointee);
+            helpers.insert(name, (true, spelling));
         }
-        for (is_store, bytes, signed) in helpers {
-            let bits = bytes * 8;
-            let spelling = format!("{}{}_t", if signed { "int" } else { "uint" }, bits);
+        for (name, (is_store, spelling)) in helpers {
             if is_store {
                 volatile_helpers.push_str(&format!(
-                    "static inline void hs_vstore_{}{}(uintptr_t a, uint64_t x) {{ volatile {spelling} *p=(volatile {spelling} *)a; *p=({spelling})x; }}\n",
-                    if signed { "s" } else { "u" }, bytes
+                    "static inline void {name}(uintptr_t a, uint64_t x) {{ volatile {spelling} *p=(volatile {spelling} *)a; *p=({spelling})x; }}\n"
                 ));
             } else {
                 volatile_helpers.push_str(&format!(
-                    "static inline uint64_t hs_vload_{}{}(uintptr_t a) {{ volatile {spelling} *p=(volatile {spelling} *)a; return (uint64_t)(*p); }}\n",
-                    if signed { "s" } else { "u" }, bytes
+                    "static inline uint64_t {name}(uintptr_t a) {{ volatile {spelling} *p=(volatile {spelling} *)a; return (uint64_t)(*p); }}\n"
                 ));
             }
         }
@@ -1933,10 +2131,32 @@ impl Recovery {
                 ),
             ]),
         )?;
+        let objc_output=objc_method.and_then(|(name,header)|{
+            let (class,_) = name.get(2..name.len().checked_sub(1)?)?.split_once(' ')?;
+            if !crate::objc::identifier(class)||s.signature.language!="Objective-C / Objective-C++"{return None}
+            let method=s.signature.declaration.strip_suffix(';')?;
+            let arguments=s.parameters.iter().map(|parameter|parameter.name.as_str()).collect::<Vec<_>>().join(", ");
+            let call=format!("{}{}({arguments});",if s.result_spelling=="void"{""}else{"return "},s.name);
+            Some(format!("/* Recovered Objective-C method adapter over the validated IR-derived IMP body below.\n * Category packaging is synthetic; not original source or a complete class implementation.\n * Class/type dependencies and deployment integration still require review. */\n{header}\n{output}\n@interface {class} (HSRecovered_{start:x})\n{method};\n@end\n@implementation {class} (HSRecovered_{start:x})\n{method} {{\n    {call}\n}}\n@end\n"))
+        });
         let node=builder.record("metadata","derived",object([("artifact_kind","recovered-source".into()),("source",output.into()),("status","generated-uncompiled".into()),("name",s.name.clone().into()),("ast_root",root.clone().into()),("declaration",s.signature.declaration.clone().into()),("contract","apple-aapcs64-lp64-reads-writes-calls-volatile-call-ordered-natural-loop-guarded-call-events-loop-memory-v14".into()),("observables","declared scalar result, bounded ordinary memory reads and ordered ordinary writes under supported path guards, exact-prototype scalar direct calls whose complete returning callee walk proves no memory reads, writes, or onward calls, supported exact self-recursion, ABI nonvolatile GPR/SP restoration, exact-width volatile accesses scheduled in instruction order with supported calls and path guards, and supported sequential single-entry scalar natural loops with per-iteration ordered external loads and stores; caller memory effects before or after proven calls are emitted in per-path instruction order for bounded acyclic control flow; call instructions still block strict machine-state C; fault/source-fidelity/formal-equivalence behavior is not claimed".into())]),array([]))?;
+        if let Some(source)=objc_output{
+            let objc=builder.record("metadata","derived",object([
+                ("artifact_kind","recovered-objective-c".into()),("source",source.into()),
+                ("status","generated-uncompiled".into()),("ast_root",root.clone().into()),
+                ("contract","synthetic Objective-C category adapter over the validated recovered IMP body; exact method encoding and argument forwarding; not original class implementation, deployment or source-equivalence qualification".into())]),array([]))?;
+            builder.edge(&node,&objc,"renders-as")?;
+        }
         builder.edge(declaration, &node, "types")?;
         let assumption=builder.record("memory-effect","assumption",object([("contract","ordinary private frame/red-zone storage and valid ordinary external memory reads/writes in instruction order when mixed accesses have a single acyclic path; single-threaded Apple LP64; declaration-proven volatile accesses retain per-path instruction order; calls require exact scalar prototypes and bounded supported callee proofs; no precise fault-state observables".into()),("red_zone_bytes",128u64.into())]),array([]))?;
         builder.edge(&assumption, &node, "assumes")?;
+        if boolean_memory_reads {
+            let boolean_assumption = builder.record("memory-effect", "assumption", object([
+                ("contract", "Boolean pointer reads require live Boolean objects with canonical 0/1 representation; invalid representations are outside recovered-source qualification".into()),
+                ("artifact_kind", "boolean-memory-precondition".into()),
+            ]), array([]))?;
+            builder.edge(&boolean_assumption, &node, "assumes")?;
+        }
         for (payload, span) in memory_records {
             let record = builder.record("memory-effect", "derived", payload, span)?;
             builder.edge(&record, &node, "supports")?;
@@ -2254,9 +2474,127 @@ mod tests {
         assert_eq!(recovery.paths, 2);
     }
     #[test]
+    fn void_returns_do_not_require_an_x0_value_but_keep_effects_and_abi_checks() {
+        let empty = attempt(&[0xd65f03c0], "void hs_test(void);")
+            .expect("void return has no incoming result dependency");
+        assert_eq!(empty.signature.result_bits, 0);
+        let store = attempt(&[0xf9000001, 0xd65f03c0],
+            "void hs_test(uint64_t *destination, uint64_t value);")
+            .expect("void setter retains its memory effect");
+        assert_eq!(store.external_stores.len(), 1);
+        assert_eq!(store.external_stores[0].bytes, 8);
+        assert!(attempt(&[0x91000413, 0xd65f03c0], "void hs_test(void);").is_err(),
+            "void must still reject unrestored x19");
+        assert!(attempt(&[0xd10043ff, 0xd65f03c0], "void hs_test(void);").is_err(),
+            "void must still reject unrestored SP");
+    }
+
+    #[test]
+    fn scalar_pointees_preserve_pointer_depth_and_qualifier_ownership() {
+        let pointer = |spelling: &str| SourceType {
+            spelling: spelling.into(), bits: 64, signed: false, pointer: true,
+        };
+        assert_eq!(scalar_pointee_type(&pointer("const bool * restrict")).unwrap().spelling, "bool");
+        assert!(scalar_pointee_type(&pointer("bool **")).is_none());
+        assert!(scalar_pointee_type(&pointer("int64_t **")).is_none());
+        assert!(pointee_qualified(&pointer("const bool *"), "const"));
+        assert!(!pointee_qualified(&pointer("bool * const"), "const"));
+        assert!(pointee_qualified(&pointer("volatile bool *"), "volatile"));
+        assert!(!pointee_qualified(&pointer("bool * volatile"), "volatile"));
+    }
+
+    #[test]
+    fn constant_bit_patterns_survive_explicit_width_views_and_copies() {
+        let mut dag = Dag { nodes: vec![] };
+        let value = dag.constant(0x1_ffff_ffff, 0x1000).unwrap();
+        let narrowed = dag.value(Symbol::Value(value, 64), 8, 0x1004).unwrap();
+        let copied = dag.add_role("source-copy", "copy", "$0".into(), vec![narrowed], 0x1008).unwrap();
+        assert_eq!(dag.literal(&Symbol::Value(copied, 64)), Some(255));
+        assert_eq!(dag.nodes[copied].origins, BTreeSet::from([0x1000, 0x1004, 0x1008]));
+        let unknown = dag.add("source-parameter", "parameter".into(), vec![], 0x100c).unwrap();
+        let unknown = dag.value(Symbol::Value(unknown, 64), 32, 0x1010).unwrap();
+        assert_eq!(dag.literal(&Symbol::Value(unknown, 64)), None);
+    }
+
+    #[test]
+    fn exact_integer_store_type_can_constrain_a_known_constant() {
+        let recovered = attempt(&[0x52800001, 0xb9000001, 0xd65f03c0],
+            "void hs_test(volatile int *destination);").unwrap();
+        let store = &recovered.external_stores[0];
+        let ty = recovered.dag.type_of(store.value).unwrap();
+        assert_eq!((ty.spelling.as_str(), ty.bits, ty.signed), ("int", 32, true));
+        assert!(attempt(&[0x52800041, 0x39000001, 0xd65f03c0],
+            "void hs_test(volatile bool *destination);").is_err(), "noncanonical Boolean stores remain blocked");
+    }
+
+    #[test]
+    fn exact_integer_stores_convert_declared_scalars_but_not_pointers() {
+        let recovered = attempt(&[0x39000001, 0xd65f03c0],
+            "void hs_test(volatile uint8_t *destination, uint64_t value);").unwrap();
+        let stored = recovered.dag.type_of(recovered.external_stores[0].value).unwrap();
+        assert_eq!((stored.spelling.as_str(), stored.bits, stored.signed), ("uint8_t", 8, false));
+        assert!(attempt(&[0x39000001, 0xd65f03c0],
+            "void hs_test(volatile uint8_t *destination, void *value);").is_err());
+    }
+
+    #[test]
+    fn equal_width_native_volatile_helpers_do_not_alias_distinct_c_types() {
+        let ty = |spelling: &str| SourceType { spelling: spelling.into(), bits: 64, signed: true, pointer: false };
+        let long = volatile_helper(false, 8, &ty("long"));
+        let long_long = volatile_helper(false, 8, &ty("long long"));
+        assert_ne!(long.0, long_long.0);
+        assert_eq!(long.1, "long");
+        assert_eq!(long_long.1, "long long");
+        assert_eq!(volatile_helper(false, 8, &ty("int64_t")).0, "hs_vload_s8");
+    }
+
+    #[test]
+    fn native_lp64_pointees_keep_declared_spelling_width_and_signedness() {
+        for (spellings, bits, signed) in [
+            (vec!["char", "signed char"], 8, true), (vec!["unsigned char"], 8, false),
+            (vec!["short", "short int", "signed short"], 16, true),
+            (vec!["unsigned short", "unsigned short int"], 16, false),
+            (vec!["int", "signed", "signed int"], 32, true),
+            (vec!["unsigned", "unsigned int"], 32, false),
+            (vec!["long", "long int", "long long", "long long int", "intptr_t", "ssize_t", "ptrdiff_t"], 64, true),
+            (vec!["unsigned long", "unsigned long int", "unsigned long long", "unsigned long long int", "uintptr_t", "size_t"], 64, false),
+        ] {
+            for spelling in spellings {
+                let pointer = SourceType { spelling: format!("const volatile {spelling} * restrict"),
+                                           bits: 64, signed: false, pointer: true };
+                let pointee = scalar_pointee_type(&pointer).unwrap();
+                assert_eq!((pointee.spelling.as_str(), pointee.bits, pointee.signed, pointee.pointer),
+                           (spelling, bits, signed, false));
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_results_require_a_canonical_machine_value() {
+        assert!(attempt(&[0xd65f03c0], "bool hs_test(bool value);").is_ok());
+        assert!(attempt(&[0x52800020, 0xd65f03c0], "bool hs_test(void);").is_ok());
+        assert!(attempt(&[0x52800040, 0xd65f03c0], "bool hs_test(void);").is_err());
+        assert!(attempt(&[0xd65f03c0], "bool hs_test(uint8_t value);").is_err());
+        assert!(attempt(&[0x52800020, 0xd65f03c0], "bool hs_test(bool true);").is_err());
+    }
+
+    #[test]
+    fn explicit_signed_integer_spellings_keep_declared_width_and_signedness() {
+        for (spelling, bits) in [("signed short int", 16), ("signed long", 64),
+            ("signed long int", 64), ("signed long long", 64), ("signed long long int", 64)] {
+            let pointer = SourceType { spelling: format!("const volatile {spelling} *"),
+                bits: 64, signed: false, pointer: true };
+            let pointee = scalar_pointee_type(&pointer).expect("standard signed integer pointee");
+            assert_eq!(pointee.spelling, spelling);
+            assert_eq!(pointee.bits, bits);
+            assert!(pointee.signed);
+            assert!(!pointee.pointer);
+            assert!(attempt(&[0xd65f03c0], &format!("{spelling} hs_test({spelling} value);")).is_ok());
+        }
+    }
+    #[test]
     fn unsafe_and_unsupported_source_declarations_are_not_emitted() {
         for declaration in [
-            "void hs_test(void);",
             "uint64_t hs_test(uint64_t first, uint64_t first);",
             "uint64_t hs_test(uint64_t switch);",
             "int; void *hs_test(void);",

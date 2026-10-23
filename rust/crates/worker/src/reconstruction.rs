@@ -1,8 +1,8 @@
 //! Versioned reconstruction records. No dependency on report/pseudocode parsing.
 use std::{collections::BTreeMap, io};
 
-pub const PASS: &str = "arm64-reconstruction-45";
-pub const ENGINE: &str = "arm64-analysis-v96-schema122";
+pub const PASS: &str = "arm64-reconstruction-62";
+pub const ENGINE: &str = "arm64-analysis-v103-schema129";
 
 /// Native type/image evidence collected from the target runtime.
 #[derive(Clone, Debug, Default)]
@@ -11,6 +11,8 @@ pub struct NativeEvidence {
     pub symbols: Vec<(u64, String)>,
     /// Objective-C class layouts with ivars/properties/methods.
     pub objc_layouts: Vec<crate::objc::ClassLayout>,
+    /// Validated target-local method encodings for declaration reconstruction.
+    pub objc_records: String,
     /// Objective-C IMP function names.
     pub objc_function_names: std::collections::BTreeMap<u64, String>,
     /// Exact exported function names keyed by admitted function address.

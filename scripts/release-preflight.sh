@@ -44,14 +44,14 @@ if [[ -d "$app" ]]; then
         "$app/Contents/XPCServices/CoordinatorService.xpc/Contents/MacOS/vg-emu-server"; do
         [[ -x "$executable" ]] || { echo "Release executable missing: $executable" >&2; exit 1; }
         archs="$(/usr/bin/lipo -archs "$executable")"
-        [[ "$archs" == *arm64* && "$archs" == *x86_64* ]] || {
-            echo "Release executable is not universal: $executable ($archs)" >&2
+        [[ "$archs" == *arm64* ]] || {
+            echo "Release executable is missing the official arm64 slice: $executable ($archs)" >&2
             exit 1
         }
-        echo "universal slices: $(basename "$executable") ($archs)"
+        echo "official arm64 slice: $(basename "$executable") ($archs)"
     done
 else
     echo "Release bundle: not built"
 fi
 
-echo "Preflight does not submit notarization or replace the manual Intel/Apple-Silicon qualification matrix."
+echo "Preflight does not submit notarization or replace the manual Apple-Silicon qualification matrix. Intel qualification is experimental and optional."

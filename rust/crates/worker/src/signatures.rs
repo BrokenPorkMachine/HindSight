@@ -20,9 +20,40 @@ pub struct SourceSignature {
     pub result_spelling:String, pub result_bits:u8, pub result_signed:bool, pub result_pointer:bool,
 }
 
+/// Declaration evidence has no register-location or implementation claim.
+pub struct SourceDeclaration {
+    pub signature: Signature, pub name: String, pub result_spelling: String,
+    pub parameters: Vec<(String, String)>,
+}
+
+pub fn source_declaration(name: &str, signature: &Signature) -> Option<SourceDeclaration> {
+    if signature.declaration.contains("...") || signature.language == "C++ / Objective-C++" { return None; }
+    let recovered_name = if signature.language == "Objective-C / Objective-C++" {
+        format!("hs_recovered_imp_{}", name.bytes().map(|b| if b.is_ascii_alphanumeric() { b as char } else { '_' }).collect::<String>())
+    } else { name.strip_prefix('_').unwrap_or(name).to_owned() };
+    if !c_identifier(&recovered_name) { return None; }
+    // Reuse the body path's safe scalar spelling validation, not its argument
+    // register eligibility. Plain FP declarations need no body/FP-mode proof.
+    let safe_type = |ty: &str| matches!(ty.trim(), "float" | "double" | "long double" |
+        "NSRange" | "CFRange" | "CGPoint" | "CGSize" | "CGRect" | "CGAffineTransform") || {
+        let probe = Signature { language: "C", declaration: format!("void hs_declaration_probe({ty} value);"), source: signature.source };
+        source_signature("hs_declaration_probe", &probe).is_some()
+    };
+    let result_spelling = signature_return_type(signature)?;
+    if result_spelling.trim() != "void" && !safe_type(&result_spelling) { return None; }
+    let mut names = std::collections::BTreeSet::new();
+    let mut parameters = Vec::new();
+    for parameter in abi_parameters(Some(signature)) {
+        let ty = parameter.source_type?;
+        if !safe_type(&ty) || !c_identifier(&parameter.name) || !names.insert(parameter.name.clone()) { return None; }
+        parameters.push((ty, parameter.name));
+    }
+    Some(SourceDeclaration { signature: signature.clone(), name: recovered_name, result_spelling, parameters })
+}
+
 fn c_identifier(name:&str)->bool {
     let reserved=["auto","break","case","char","const","continue","default","do","double","else","enum","extern","float","for","goto","if","inline","int","long","register","restrict","return","short","signed","sizeof","static","struct","switch","typedef","union","unsigned","void","volatile","while","_Alignas","_Alignof","_Atomic","_Bool","_Complex","_Generic","_Imaginary","_Noreturn","_Static_assert","_Thread_local"];
-    !name.is_empty()&&name.len()<=256&&!reserved.contains(&name)&&name.bytes().next().is_some_and(|b|b.is_ascii_alphabetic()||b==b'_')&&name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')
+    !name.is_empty()&&name.len()<=256&&!reserved.contains(&name)&&!["bool","true","false"].contains(&name)&&name.bytes().next().is_some_and(|b|b.is_ascii_alphabetic()||b==b'_')&&name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')
 }
 
 /// The proven parameter types of a function, in declaration order, together
@@ -50,13 +81,16 @@ pub fn source_signature(name:&str,signature:&Signature)->Option<SourceSignature>
         if !spelling.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b' '|b'*')){return None}
         let bare=spelling.split(|c:char|c.is_whitespace()||c=='*').filter(|s|!s.is_empty()&&!matches!(*s,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"|"__kindof")).collect::<Vec<_>>().join(" ");
         let native=["void","char","signed char","unsigned char","short","short int","signed short","unsigned short","unsigned short int","int","signed","signed int","unsigned","unsigned int","long","long int","unsigned long","unsigned long int","long long","long long int","unsigned long long","unsigned long long int","int8_t","uint8_t","int16_t","uint16_t","int32_t","uint32_t","int64_t","uint64_t","intptr_t","uintptr_t","size_t","ssize_t","ptrdiff_t","id","Class","SEL","NSInteger","NSUInteger","CFIndex","CFTypeID","CFOptionFlags","CFStringEncoding","CFNumberType","CFURLPathStyle","CFPropertyListFormat","dispatch_once_t","CFTypeRef","CFAllocatorRef","CFStringRef","CFArrayRef","CFDictionaryRef","CFBooleanRef","CFNumberRef","CFDataRef","CFBundleRef","CFURLRef","CFPropertyListRef","CFErrorRef","CFRunLoopRef"];
-        if !native.contains(&bare.as_str()){return None}
+        if !native.contains(&bare.as_str()) && !matches!(bare.as_str(),"bool"|"_Bool"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
         let AbiType::Integer(bytes)=abi_type(&spelling)? else{return None};
         let kind=abi_integer_kind(&spelling)?;
-        if kind==AbiIntegerKind::Boolean{return None}
+        if kind==AbiIntegerKind::Boolean && !matches!(bare.as_str(),"bool"|"_Bool"){return None}
         Some((spelling.trim().to_owned(),bytes*8,kind==AbiIntegerKind::Signed,kind==AbiIntegerKind::Pointer))
     };
-    let (result_spelling,result_bits,result_signed,result_pointer)=scalar(&signature_return_type(signature)?)?;
+    let result_type=signature_return_type(signature)?;
+    let (result_spelling,result_bits,result_signed,result_pointer)=if result_type.trim()=="void" {
+        ("void".to_owned(),0,false,false)
+    }else{scalar(&result_type)?};
     let mut parameters=Vec::new();let mut names=std::collections::BTreeSet::new();
     for parameter in abi_parameters(Some(signature)){
         let (spelling,bits,signed,pointer)=scalar(parameter.source_type.as_deref()?)?;
@@ -79,7 +113,13 @@ pub fn source_candidates(start:u64,names:&[&str],objc_records:&str,external:&BTr
         if address==start{candidates.push((name,signature));}
     }
     candidates.sort_by(|a,b|a.0.cmp(&b.0).then_with(||a.1.declaration.cmp(&b.1.declaration)));
-    candidates.dedup_by(|a,b|a.0==b.0&&a.1==b.1);candidates
+    candidates.dedup_by(|a,b|{
+        let same=a.0==b.0&&a.1.language==b.1.language&&a.1.declaration==b.1.declaration;
+        if same&&a.1.source!=b.1.source{
+            b.1.source="exact SDK ABI catalog corroborated by hash-bound analyst C prototype catalog";
+        }
+        same
+    });candidates
 }
 
 fn objc_signature_candidates(records:&str)->Vec<(u64,(String,Signature))>{
@@ -301,6 +341,49 @@ fn object_declarations(layouts: &[super::objc::ClassLayout]) -> String {
         output.push_str(&declaration);
     }
     output
+}
+
+/// A target-local class review header, never an assertion of complete layout
+/// or implementation. Only one unambiguous IMP owner may supply its members.
+pub fn objc_header_for_imp(address:u64, records:&str, layouts:&[super::objc::ClassLayout])->Option<String>{
+    let mut owners=layouts.iter().filter(|layout|layout.methods.iter().any(|method|method.implementation==address));
+    let owner=owners.next()?;
+    if owners.next().is_some()||!super::objc::identifier(&owner.name){return None}
+    let declaration=object_declarations(std::slice::from_ref(owner));
+    let mut declaration=declaration.strip_suffix("@end\n\n")?.to_owned();
+    let mut relationships=std::collections::BTreeSet::new();
+    for line in records.lines().take(8192).filter(|line|line.starts_with("reconstructed class ")&&line.len()<=4096){
+        let fields=line.split_whitespace().collect::<Vec<_>>();
+        if fields.get(2).and_then(|value|u64::from_str_radix(value.trim_start_matches("0x"),16).ok())!=Some(owner.address)
+            ||!fields.iter().any(|field|*field==format!("name={}",owner.name)){continue}
+        let parent=fields.iter().find_map(|field|field.strip_prefix("super_name="))
+            .filter(|parent|super::objc::identifier(parent)&&*parent!=owner.name).map(str::to_owned);
+        let protocols=fields.iter().find_map(|field|field.strip_prefix("conforms="))
+            .map(|values|values.split(',').filter(|value|super::objc::identifier(value)).take(32).map(str::to_owned).collect::<std::collections::BTreeSet<_>>()).unwrap_or_default();
+        relationships.insert((parent,protocols));
+    }
+    if relationships.len()==1{
+        let (parent,protocols)=relationships.iter().next()?;
+        let inheritance=parent.as_ref().map(|name|format!(" : {name}")).unwrap_or_default();
+        let adoption=if protocols.is_empty(){String::new()}else{format!(" <{}>",protocols.iter().cloned().collect::<Vec<_>>().join(", "))};
+        declaration=declaration.replacen(&format!("@interface {} {{",owner.name),&format!("@interface {}{inheritance}{adoption} {{",owner.name),1);
+        if !protocols.is_empty(){declaration=format!("@protocol {};\n{declaration}",protocols.iter().cloned().collect::<Vec<_>>().join(", "));}
+    }else if relationships.len()>1{declaration.insert_str(0,"/* Conflicting superclass/conformance records: relationships withheld. */\n");}
+    let mut methods=BTreeMap::<String,std::collections::BTreeSet<String>>::new();
+    for (imp,(name,signature)) in objc_signature_candidates(records){
+        let Some((class,selector))=name.get(2..name.len().saturating_sub(1)).and_then(|body|body.split_once(' '))else{continue};
+        let class_method=name.starts_with('+');
+        if class!=owner.name||!owner.methods.iter().any(|method|method.implementation==imp&&method.class_method==class_method)
+            ||!selector.trim_end_matches(':').split(':').all(super::objc::identifier){continue}
+        methods.entry(name).or_default().insert(signature.declaration);
+    }
+    for declarations in methods.values(){
+        if declarations.len()==1{declaration.push_str(declarations.iter().next()?);declaration.push('\n');}
+        else{declaration.push_str("/* Conflicting method type encodings: declaration withheld. */\n");}
+        if declaration.len()>60*1024{return None}
+    }
+    declaration.push_str("@end\n");
+    Some(format!("#pragma once\n/* Reconstructed target-local Objective-C declaration evidence.\n * REVIEW ONLY: superclass, adopted protocols and unsupported types may be unresolved.\n * Field offsets are evidence, not a compilable layout or implementation guarantee.\n * Restore the actual superclass/type dependencies before compiling. */\n#if !defined(__OBJC__)\n#error This reconstructed header requires Objective-C or Objective-C++\n#endif\n#import <Foundation/Foundation.h>\n#import <CoreFoundation/CoreFoundation.h>\n#import <CoreGraphics/CoreGraphics.h>\n{declaration}"))
 }
 
 fn object_layout_for_imp<'a>(layouts:&'a [super::objc::ClassLayout], address:u64, name:&str, signature:Option<&Signature>)->Option<&'a super::objc::ClassLayout>{
@@ -669,15 +752,21 @@ fn split_declarators(arguments: &str) -> Vec<&str> {
 }
 
 fn named_declarator(value: &str, fallback: usize) -> (String, String) {
-    // Parameter arrays decay to pointers. Preserve the declarator's source name.
+    // Only a single scalar-array dimension has the flat pointer ABI modeled
+    // here. Never discard row extents, another pointer level, VLA effects or
+    // trailing syntax and then present the result as an exact declaration.
     if let Some(open) = value.find('[') {
         let head = value[..open].trim_end();
-        if let Some(split) = head.rfind(char::is_whitespace) {
+        let bound = value[open + 1..].strip_suffix(']').map(str::trim);
+        let supported = bound.is_some_and(|bound| bound.is_empty() ||
+            (!bound.starts_with('0') && bound.bytes().all(|b| b.is_ascii_digit()) && bound.parse::<u64>().is_ok()));
+        if let Some(split) = head.rfind(char::is_whitespace).filter(|_| supported) {
             let name = head[split..].trim();
-            if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            if c_identifier(name) {
                 return (format!("{} *", head[..split].trim()), name.into());
             }
         }
+        return (value.into(), format!("arg{fallback}"));
     }
     for marker in ["(*", "(^", "(&"] {
         if let Some(open) = value.find(marker) {
@@ -767,9 +856,9 @@ fn abi_type(ty: &str) -> Option<AbiType> {
         "CGAffineTransform" => AbiType::FloatAggregate(6),
         "float" => AbiType::Float(4), "double" | "long double" | "CGFloat" => AbiType::Float(8),
         "bool" | "_Bool" | "BOOL" | "Boolean" | "char" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" | "Int8" | "UInt8" => AbiType::Integer(1),
-        "short" | "short int" | "signed short" | "unsigned short" | "unsigned short int" | "int16_t" | "uint16_t" | "Int16" | "UInt16" | "unichar" => AbiType::Integer(2),
+        "short" | "short int" | "signed short" | "signed short int" | "unsigned short" | "unsigned short int" | "int16_t" | "uint16_t" | "Int16" | "UInt16" | "unichar" => AbiType::Integer(2),
         "int" | "signed" | "signed int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t" | "Int32" | "UInt32" | "CFStringEncoding" => AbiType::Integer(4),
-        "long" | "long int" | "unsigned long" | "unsigned long int" | "long long" | "long long int" | "unsigned long long" | "unsigned long long int" |
+        "long" | "long int" | "signed long" | "signed long int" | "unsigned long" | "unsigned long int" | "long long" | "long long int" | "signed long long" | "signed long long int" | "unsigned long long" | "unsigned long long int" |
         "int64_t" | "uint64_t" | "Int64" | "UInt64" | "intptr_t" | "uintptr_t" | "size_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "NSUInteger" |
         "CFIndex" | "CFTypeID" | "CFOptionFlags" | "CFNumberType" | "CFURLPathStyle" | "CFPropertyListFormat" | "dispatch_once_t" => AbiType::Integer(8),
         "id" | "Class" | "SEL" | "instancetype" | "dispatch_queue_t" | "dispatch_block_t" |
@@ -794,8 +883,8 @@ fn abi_integer_kind(ty: &str) -> Option<AbiIntegerKind> {
         "CFBundleRef" | "CFURLRef" | "CFPropertyListRef" | "CFErrorRef" | "CFRunLoopRef");
     if pointer { return Some(AbiIntegerKind::Pointer); }
     if matches!(simple.as_str(), "bool" | "_Bool" | "BOOL") { return Some(AbiIntegerKind::Boolean); }
-    let signed = matches!(simple.as_str(), "char" | "signed char" | "short" | "short int" | "signed short" |
-        "int" | "signed" | "signed int" | "long" | "long int" | "long long" | "long long int" |
+    let signed = matches!(simple.as_str(), "char" | "signed char" | "short" | "short int" | "signed short" | "signed short int" |
+        "int" | "signed" | "signed int" | "long" | "long int" | "signed long" | "signed long int" | "long long" | "long long int" | "signed long long" | "signed long long int" |
         "int8_t" | "int16_t" | "int32_t" | "int64_t" | "Int8" | "Int16" | "Int32" | "Int64" |
         "intptr_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "CFIndex" | "dispatch_once_t" |
         "CFNumberType" | "CFURLPathStyle" | "CFPropertyListFormat");
@@ -1622,6 +1711,43 @@ fn recover_internal(
 }
 
 #[cfg(test)] mod tests {
+    #[test]
+    fn source_array_declarators_never_silently_lose_pointer_or_row_shape() {
+        for declaration in ["uint64_t hs_test(uint64_t items[][4]);",
+            "uint64_t hs_test(uint64_t items[3][4]);", "uint64_t hs_test(uint64_t *items[]);",
+            "uint64_t hs_test(uint64_t items[n++]);", "uint64_t hs_test(uint64_t items[4] trailing);"] {
+            let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
+            assert!(source_signature("_hs_test", &signature).is_none(), "body flattened {declaration}");
+            assert!(source_declaration("_hs_test", &signature).is_none(), "header flattened {declaration}");
+        }
+        for declaration in ["uint64_t hs_test(uint64_t items[]);", "uint64_t hs_test(const uint64_t items[4]);"] {
+            let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
+            let recovered = source_signature("_hs_test", &signature).expect("one-dimensional scalar array decay");
+            assert!(recovered.parameters[0].pointer);
+            assert_eq!(recovered.parameters[0].name, "items");
+            assert!(source_declaration("_hs_test", &signature).is_some());
+        }
+    }
+    #[test]
+    fn declarations_are_independent_of_body_register_eligibility() {
+        for declaration in ["double hs_test(double first, float second);",
+            "long double hs_test(long double value);",
+            "NSRange hs_test(NSRange value);", "CFRange hs_test(CFRange value);",
+            "CGPoint hs_test(CGPoint value);", "CGSize hs_test(CGSize value);",
+            "CGRect hs_test(CGRect value);", "CGAffineTransform hs_test(CGAffineTransform value);",
+            "uint64_t hs_test(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h, uint64_t i);"] {
+            let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
+            let recovered = source_declaration("_hs_test", &signature).expect("safe scalar header");
+            assert_eq!(recovered.name, "hs_test");
+            assert!(!recovered.parameters.is_empty());
+            assert!(source_signature("_hs_test", &signature).is_none(), "body ABI remains unsupported");
+        }
+        for declaration in ["Mystery hs_test(Mystery value);", "double hs_test(double switch);",
+            "double hs_test(double value, double value);", "double hs_test(double value, ...);"] {
+            let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
+            assert!(source_declaration("_hs_test", &signature).is_none(), "{declaration}");
+        }
+    }
     use super::*;
     fn member_fixture() -> super::super::objc::ClassLayout {
         use super::super::objc::*;
@@ -1705,6 +1831,18 @@ fn recover_internal(
         assert!(matched.source.contains("encoding ABI validated"));
         assert_eq!(matched.declaration, "- (NSString *)substringFromIndex:(NSUInteger)from;");
     }
+    #[test] fn reconstruction_preserves_sdk_and_external_prototype_disagreements() {
+        let external=BTreeMap::from([("_malloc".to_owned(),Signature{language:"C",declaration:"int malloc(int count);".into(),source:"hash-bound analyst C prototype catalog"})]);
+        let candidates=source_candidates(0x1000,&["_malloc"],"",&external);
+        assert_eq!(candidates.len(),2);
+        assert!(candidates.iter().any(|(_,signature)|signature.declaration=="int malloc(int count);"));
+        assert!(candidates.iter().any(|(_,signature)|signature.source=="exact SDK ABI catalog"));
+        let mut matching=symbol("_malloc").unwrap();
+        matching.source="hash-bound analyst C prototype catalog";
+        let matched=source_candidates(0x1000,&["_malloc"],"",&BTreeMap::from([("_malloc".into(),matching)]));
+        assert_eq!(matched.len(),1,"identical declarations must not block reconstruction as a conflict");
+        assert!(matched[0].1.source.contains("SDK")&&matched[0].1.source.contains("hash-bound"));
+    }
     #[test] fn exact_catalog_and_cpp() {
         assert_eq!(symbol("_CFRelease").unwrap().declaration,"void CFRelease(CFTypeRef cf);");
         assert!(symbol("_CFReleaseExtra").is_none());
@@ -1713,6 +1851,30 @@ fn recover_internal(
         assert_eq!(symbol("__Z7consumeRN3API6WidgetE").unwrap().declaration,"/* return type unresolved */ consume(API::Widget & arg0);");
         assert_eq!(abi_parameters(symbol("__Z7consumeP6Widget").as_ref())[0].register,"x0");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
+    }
+    #[test] fn objc_review_headers_require_one_owner_and_keep_conflicts_unresolved() {
+        let layout=crate::objc::ClassLayout{address:0x2000,name:"Widget".into(),instance_start:8,instance_size:8,
+            ivars:vec![],properties:vec![],methods:vec![crate::objc::MethodLayout{implementation:0x1000,class_method:false}],
+            ivars_complete:true,properties_complete:true};
+        let records=" instance method 0x3000 name=run types=v16@0:8 imp=0x1000 resolved=-[Widget run] confidence=validated\n";
+        let header=objc_header_for_imp(0x1000,records,std::slice::from_ref(&layout)).unwrap();
+        assert!(header.contains("@interface Widget")&&header.contains("- (void)run;"));
+        assert!(header.contains("superclass")&&header.contains("REVIEW ONLY"));
+        let related=format!("reconstructed class 0x2000  name=Widget  super_name=NSObject  conforms=NSCopying,Tracing\n{records}");
+        let related_header=objc_header_for_imp(0x1000,&related,std::slice::from_ref(&layout)).unwrap();
+        assert!(related_header.contains("@interface Widget : NSObject <NSCopying, Tracing>"));
+        assert!(related_header.contains("@protocol NSCopying, Tracing;"));
+        let unrelated=format!("reconstructed class 0x9999  name=Widget  super_name=WrongParent\n{records}");
+        assert!(!objc_header_for_imp(0x1000,&unrelated,std::slice::from_ref(&layout)).unwrap().contains("WrongParent"));
+        let disputed=format!("{related}reconstructed class 0x2000  name=Widget  super_name=OtherParent\n");
+        let disputed_header=objc_header_for_imp(0x1000,&disputed,std::slice::from_ref(&layout)).unwrap();
+        assert!(disputed_header.contains("relationships withheld")&&!disputed_header.contains("Widget : NSObject"));
+        assert!(objc_header_for_imp(0x1004,records,std::slice::from_ref(&layout)).is_none());
+        assert!(objc_header_for_imp(0x1000,records,&[layout.clone(),layout.clone()]).is_none());
+        let conflict=format!("{records} instance method 0x3001 name=run types=q16@0:8 imp=0x1000 resolved=-[Widget run] confidence=validated\n");
+        let header=objc_header_for_imp(0x1000,&conflict,&[layout]).unwrap();
+        assert!(header.contains("Conflicting method type encodings"));
+        assert!(!header.contains("- (void)run;")&&!header.contains("- (long long)run;"));
     }
     #[test] fn hash_bound_external_c_prototypes_supply_types_and_reject_unsafe_records() {
         let digest="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

@@ -37,7 +37,7 @@ Stable distribution requires a detached release manifest next to the notarized a
 }
 ```
 
-Release operators must verify the manifest signature, exact product/version/build/channel, artifact digest and size, minimum OS, both universal slices, analysis engine, and protocol ABI before publishing. A missing, malformed, mismatched, or unverifiable manifest is a release failure; it must not be downgraded to a warning. The existing `scripts/test-release-macos.sh` remains the credentialed build/signing/notarization gate, while `docs/RELEASE_READINESS.md` remains the manual real-host matrix.
+Release operators must verify the manifest signature, exact product/version/build/channel, artifact digest and size, minimum OS, official arm64 slice, analysis engine, and protocol ABI before publishing. A missing, malformed, mismatched, or unverifiable manifest is a release failure; it must not be downgraded to a warning. The existing `scripts/test-release-macos.sh` remains the credentialed build/signing/notarization gate, while `docs/RELEASE_READINESS.md` remains the official Apple-Silicon real-host matrix. Intel is experimental and optional.
 
 ## Retention and locality
 

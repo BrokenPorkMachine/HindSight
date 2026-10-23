@@ -11,6 +11,13 @@ struct GraphModelContract {
         precondition(viewport.pan(centering: CGPoint(x: 1000, y: 1200)) == CGSize(width: -300, height: -600))
         precondition(viewport.fittedZoom(widthOnly: false, maximum: 1) == 0.4)
         let smallViewport = VGCanvasViewport(contentSize: CGSize(width: 200, height: 100), viewportSize: CGSize(width: 400, height: 600), zoom: 1)
+        let scaledMap = VGMinimapProjection(contentSize: CGSize(width: 10000, height: 20000), mapSize: CGSize(width: 190, height: 120))
+        let node = scaledMap.project(CGRect(x: 100, y: 200, width: 290, height: 126))
+        precondition(abs(node.width / node.height - 290.0 / 126.0) < 0.000001)
+        let scaledViewport = VGCanvasViewport(contentSize: CGSize(width: 10000, height: 20000), viewportSize: CGSize(width: 800, height: 600), zoom: 0.8)
+        precondition(scaledViewport.visibleRect.width == 1000 && scaledViewport.visibleRect.height == 750)
+        let mapBounds = scaledMap.project(CGRect(origin: .zero, size: scaledViewport.contentSize))
+        precondition(mapBounds.minX >= 0 && mapBounds.maxX <= 190 && mapBounds.minY >= 0 && mapBounds.maxY <= 120)
         precondition(smallViewport.origin.width == 100)
         precondition(smallViewport.clampedPan(CGSize(width: 50, height: -50)) == .zero)
         for contentSize in [CGSize(width: 1000, height: 4000), CGSize(width: 4000, height: 1000)] {

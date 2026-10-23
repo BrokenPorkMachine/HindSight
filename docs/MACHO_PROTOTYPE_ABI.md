@@ -4,7 +4,10 @@ The ARM64 semantic path reconstructs source declarations from validated
 Objective-C method metadata, exact SDK/API catalog matches and a bounded subset
 of Itanium mangled parameter types. Unknown return types and layouts remain
 explicit. Prototype ABI interpretation is versioned independently as
-`prototype-abi-v10` in analysis/cache/continuity identities.
+`prototype-abi-v12` in analysis/cache/continuity identities. Revision 12 adds
+bool/_Bool declaration recovery; revision 11 admits
+exact void source signatures and distinguishes proven empty argument lists and
+void result locations from unresolved call ABI evidence.
 
 Supported Apple ARM64 LP64 rules include:
 

@@ -29,6 +29,11 @@ class ReleaseGateCoverageTests(unittest.TestCase):
         gate = (ROOT / "scripts/test-app-typecheck.sh").read_text()
         self.assertIn('list-target-swift-sources.py" HindSight', gate)
 
+    def test_macos_gate_keeps_focused_reconstruction_matrices(self):
+        gate = (ROOT / "scripts/test-macos.sh").read_text()
+        for script in ["test-recovered-void.py", "test-recovered-pointees.py", "test-recovered-headers.py"]:
+            self.assertIn(f'python3 "$ROOT/scripts/{script}" "$ROOT/build/rust/debug/reworker"', gate)
+
     def test_coordinator_typecheck_covers_generated_target(self):
         expected = self.target_sources("CoordinatorService")
         self.assertEqual(self.helper_sources("CoordinatorService"), expected)
@@ -63,12 +68,13 @@ class ReleaseGateCoverageTests(unittest.TestCase):
         self.assertIn('if ((${#release_build_args[@]})); then', gate)
         self.assertIn('"\\"analysis\\":true"', smoke)
 
-    def test_release_preflight_is_non_secret_and_checks_universal_bundle(self):
+    def test_release_preflight_is_non_secret_and_checks_official_arm64_bundle(self):
         preflight = (ROOT / "scripts/release-preflight.sh").read_text()
         self.assertIn("security find-identity", preflight)
         self.assertNotIn("notarytool submit", preflight)
         self.assertIn("lipo -archs", preflight)
-        self.assertIn("manual Intel/Apple-Silicon qualification matrix", preflight)
+        self.assertIn("manual Apple-Silicon qualification matrix", preflight)
+        self.assertIn("Intel qualification is experimental and optional", preflight)
 
 
 if __name__ == "__main__":

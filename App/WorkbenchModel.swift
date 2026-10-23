@@ -68,6 +68,9 @@ final class WorkbenchModel: ObservableObject {
     @Published private(set) var reconstructionStatus = "Select a function and request reconstruction."
     private var reconstructionContext: ReconstructionReviewContext?
     private var reconstructionRequestID: String?
+    private var reconstructionBatchRunning = false
+    var canCancelReconstruction: Bool { reconstructionBatchRunning || reconstructionRequestID != nil }
+    private var reconstructionBatchCancelled = false
     @Published private(set) var analysisEvidenceIndex: VGAnalysisEvidenceIndex?
     @Published private(set) var analysisEvidenceIndexing = false
     @Published private(set) var analysisEvidenceStatus = "Evidence index unavailable."
@@ -708,6 +711,217 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                               userInfo: [NSLocalizedDescriptionKey: "App rejected the decoded reconstruction review context."])
             }
             reconstructionStatus = "Runtime reconstruction artifact decoded and review context verified."
+            let batchFunctions = VGGraphParser.functions(analysis.functions,
+                symbolResolver: analysis.symbol_resolver, objcClasses: analysis.objc_classes)
+            guard !batchFunctions.isEmpty, batchFunctions.count <= 32 else {
+                throw ReconstructionArtifact.Invalid(message: "Unexpected integration fixture batch size.")
+            }
+            guard let reviewFunction = batchFunctions.first(where: { $0.start == functionStart && $0.end == functionEnd }) else {
+                throw ReconstructionArtifact.Invalid(message: "Missing scope-export fixture function.")
+            }
+            guard ReconstructionExportFormat.native.source(in: artifact.sources) != nil else {
+                throw ReconstructionArtifact.Invalid(message: "Scope-export integration requires actual machine-state source.")
+            }
+            for format in ReconstructionExportFormat.allCases {
+                let chosen = format.source(in: artifact.sources)
+                let output = reconstructionScopeText(scope: "address", format: format,
+                    functions: [reviewFunction], target: reviewFunction, source: chosen,
+                    digest: digest, projectPath: importedProject.path)
+                if let chosen, let rendered = format.render(chosen) {
+                    guard output.contains(rendered), output.contains("Validated artifact kind: \(chosen.kind)") else {
+                        throw ReconstructionArtifact.Invalid(message: "App export omitted the chosen reconstruction representation.")
+                    }
+                } else {
+                    guard output.contains("No validated \(format.sourceKind) output is available"),
+                          !output.contains("Validated artifact kind:") else {
+                        throw ReconstructionArtifact.Invalid(message: "App export substituted an unavailable reconstruction representation.")
+                    }
+                }
+            }
+            let pageID = UUID().uuidString
+            let pageText = try await remoteSmokeRequest(timeout: 150) { service, done in
+                service.instructionPage(record.id, startWord: "0", forceVerify: true, requestID: pageID, withReply: done)
+            }
+            let pageReply = try JSONDecoder().decode(PageReply.self, from: Data(pageText.utf8))
+            guard pageReply.ok, let page = pageReply.page, page.matches(id: pageID, digest: digest, start: 0) else {
+                throw ReconstructionArtifact.Invalid(message: "Scope integration requires a verified instruction page.")
+            }
+            instructionPage = page
+            pageRecordID = record.id
+            let sectionFunctions = try reconstructionFunctions(scope: "section", address: nil, functions: batchFunctions)
+            let addressFunctions = try reconstructionFunctions(scope: "address", address: functionStart, functions: batchFunctions)
+            guard sectionFunctions.count == batchFunctions.count,
+                  addressFunctions.count == 1, addressFunctions[0].start == functionStart,
+                  addressFunctions[0].end == functionEnd else {
+                throw ReconstructionArtifact.Invalid(message: "App scope selection disagrees with verified fixture bounds.")
+            }
+            let batchDirectory = URL(fileURLWithPath: reconstructionOutput + ".batch", isDirectory: true)
+            try FileManager.default.createDirectory(at: batchDirectory, withIntermediateDirectories: false)
+            reconstructionBatchRunning = true
+            reconstructionBatchCancelled = false
+            busy = true
+            await runReconstructionBatch(functions: batchFunctions, record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "whole",
+                directory: batchDirectory, generation: navigationGeneration)
+            let batchManifest = try Data(contentsOf: batchDirectory.appendingPathComponent("manifest.json"))
+            guard let manifest = try JSONSerialization.jsonObject(with: batchManifest) as? [String: Any],
+                  manifest["source_sha256"] as? String == digest,
+                  manifest["attempted"] as? Int == batchFunctions.count,
+                  let batchEntries = manifest["functions"] as? [[String: Any]],
+                  batchEntries.allSatisfy({ $0["state"] as? String != "failed" }),
+                  !busy, activeRequest == nil, !reconstructionBatchRunning else {
+                throw ReconstructionArtifact.Invalid(message: "App/XPC reconstruction batch or cleanup failed.")
+            }
+            for format in [ReconstructionExportFormat.c, .objc, .header, .native] {
+                let output = batchDirectory.appendingPathComponent("dump-" + format.fileExtension, isDirectory: true)
+                await dumpReconstructionBatch(from: batchDirectory, to: output, format: format, digest: digest)
+                let data = try Data(contentsOf: output.appendingPathComponent("export-manifest.json"))
+                guard let dumped = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      dumped["format"] as? String == format.rawValue,
+                      let available = dumped["available"] as? Int,
+                      let unavailable = dumped["unavailable"] as? Int,
+                      available + unavailable == batchFunctions.count,
+                      format != .native || available == batchFunctions.count,
+                      !busy else {
+                    throw ReconstructionArtifact.Invalid(message: "App reconstruction format dump failed.")
+                }
+            }
+            let allOutput = batchDirectory.appendingPathComponent("dump-all", isDirectory: true)
+            await dumpAllReconstructionBatch(from: batchDirectory, to: allOutput, digest: digest)
+            let allData = try Data(contentsOf: allOutput.appendingPathComponent("export-manifest.json"))
+            guard let allManifest = try JSONSerialization.jsonObject(with: allData) as? [String: Any],
+                  let allFormats = allManifest["formats"] as? [[String: Any]],
+                  allFormats.compactMap({ $0["folder"] as? String }) == ["c", "h", "m", "n"], !busy else {
+                throw ReconstructionArtifact.Invalid(message: "App dump-all export failed.")
+            }
+            // Exercise a real worker reply that the app must reject for stale
+            // source identity; no artifact may be published as successful.
+            let failedDirectory = URL(fileURLWithPath: reconstructionOutput + ".batch-failed", isDirectory: true)
+            try FileManager.default.createDirectory(at: failedDirectory, withIntermediateDirectories: false)
+            let staleDigest = String(repeating: digest == String(repeating: "0", count: 64) ? "1" : "0", count: 64)
+            reconstructionBatchRunning = true
+            reconstructionBatchCancelled = false
+            busy = true
+            await runReconstructionBatch(functions: Array(batchFunctions.prefix(1)), record: record, digest: staleDigest,
+                projectPath: importedProject.path, analysis: analysis, scope: "whole",
+                directory: failedDirectory, generation: navigationGeneration)
+            let failedData = try Data(contentsOf: failedDirectory.appendingPathComponent("manifest.json"))
+            let failed = try JSONSerialization.jsonObject(with: failedData) as? [String: Any]
+            guard failed?["batch_status"] as? String == "completed-with-failures",
+                  failed?["failed_functions"] as? Int == 1, failed?["recovered_functions"] as? Int == 0,
+                  failed?["review_only_functions"] as? Int == 0,
+                  reconstructionStatus.contains("1 failed"), !busy else {
+                throw ReconstructionArtifact.Invalid(message: "Failed app batch was reported as successful output.")
+            }
+            let failedDump = failedDirectory.appendingPathComponent("dump-h", isDirectory: true)
+            await dumpReconstructionBatch(from: failedDirectory, to: failedDump, format: .header, digest: staleDigest)
+            let failedDumpData = try Data(contentsOf: failedDump.appendingPathComponent("export-manifest.json"))
+            let failedDumpManifest = try JSONSerialization.jsonObject(with: failedDumpData) as? [String: Any]
+            guard failedDumpManifest?["available"] as? Int == 0, failedDumpManifest?["unavailable"] as? Int == 1,
+                  failedDumpManifest?["failed_functions"] as? Int == 1, !busy else {
+                throw ReconstructionArtifact.Invalid(message: "Failed batch dump lost its failure count.")
+            }
+            for (scenario, cancelled, generation) in [
+                ("cancelled", true, navigationGeneration), ("stale-context", false, UUID())
+            ] {
+                let directory = URL(fileURLWithPath: reconstructionOutput + ".batch-" + scenario, isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                reconstructionBatchRunning = true
+                reconstructionBatchCancelled = cancelled
+                busy = true
+                await runReconstructionBatch(functions: batchFunctions, record: record, digest: digest,
+                    projectPath: importedProject.path, analysis: analysis, scope: "whole",
+                    directory: directory, generation: generation)
+                let data = try Data(contentsOf: directory.appendingPathComponent("manifest.json"))
+                guard let stopped = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      stopped["attempted"] as? Int == 0,
+                      stopped["cancelled"] as? Bool == cancelled,
+                      !busy, activeRequest == nil, !reconstructionBatchRunning else {
+                    throw ReconstructionArtifact.Invalid(message: "Batch \(scenario) boundary failed.")
+                }
+            }
+            let resumedDirectory = URL(fileURLWithPath: reconstructionOutput + ".batch-resumed", isDirectory: true)
+            try FileManager.default.copyItem(at: URL(fileURLWithPath: reconstructionOutput + ".batch-cancelled"),
+                                            to: resumedDirectory)
+            reconstructionBatchRunning = true
+            reconstructionBatchCancelled = false
+            busy = true
+            await runReconstructionBatch(functions: batchFunctions, record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "resume",
+                directory: resumedDirectory, generation: navigationGeneration, resume: true)
+            let resumedData = try Data(contentsOf: resumedDirectory.appendingPathComponent("manifest.json"))
+            guard let resumed = try JSONSerialization.jsonObject(with: resumedData) as? [String: Any],
+                  resumed["attempted"] as? Int == batchFunctions.count, !busy,
+                  let resumedEntries = resumed["functions"] as? [[String: Any]],
+                  resumedEntries.allSatisfy({ $0["state"] as? String != "failed" }) else {
+                throw ReconstructionArtifact.Invalid(message: "App batch resume failed.")
+            }
+            let partialDirectory = URL(fileURLWithPath: reconstructionOutput + ".batch-partial", isDirectory: true)
+            try FileManager.default.createDirectory(at: partialDirectory, withIntermediateDirectories: false)
+            reconstructionBatchRunning = true
+            reconstructionBatchCancelled = false
+            busy = true
+            let cancelledFormat = await runReconstructionBatch(functions: batchFunctions, record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "whole",
+                directory: partialDirectory, generation: navigationGeneration,
+                format: .native,
+                afterPublication: { self.cancelReconstruction() })
+            let partialData = try Data(contentsOf: partialDirectory.appendingPathComponent("manifest.json"))
+            guard let partial = try JSONSerialization.jsonObject(with: partialData) as? [String: Any],
+                  partial["attempted"] as? Int == 1, partial["cancelled"] as? Bool == true,
+                  partial["requested_format"] as? String == "native", cancelledFormat == nil,
+                  let partialEntries = partial["functions"] as? [[String: Any]],
+                  let firstFiles = partialEntries.first?["files"] as? [[String: Any]] else {
+                throw ReconstructionArtifact.Invalid(message: "Partial batch cancellation failed.")
+            }
+            var timestamps: [String: Date] = [:]
+            for file in firstFiles {
+                guard let name = file["path"] as? String else { continue }
+                timestamps[name] = try partialDirectory.appendingPathComponent(name)
+                    .resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            }
+            let unchangedCheckpoint = try Data(contentsOf: partialDirectory.appendingPathComponent("checkpoint.json"))
+            reconstructionBatchRunning = true; reconstructionBatchCancelled = false; busy = true
+            let changedFormat = await runReconstructionBatch(functions: batchFunctions, record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "resume", directory: partialDirectory,
+                generation: navigationGeneration, resume: true, format: .c)
+            guard changedFormat == nil, !busy,
+                  try Data(contentsOf: partialDirectory.appendingPathComponent("checkpoint.json")) == unchangedCheckpoint else {
+                throw ReconstructionArtifact.Invalid(message: "Resume accepted a changed dump intent or changed its checkpoint.")
+            }
+            reconstructionBatchRunning = true
+            reconstructionBatchCancelled = false
+            busy = true
+            let resumedFormat = await runReconstructionBatch(functions: batchFunctions, record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "resume",
+                directory: partialDirectory, generation: navigationGeneration, resume: true)
+            let completedData = try Data(contentsOf: partialDirectory.appendingPathComponent("manifest.json"))
+            guard let completed = try JSONSerialization.jsonObject(with: completedData) as? [String: Any],
+                  completed["attempted"] as? Int == batchFunctions.count,
+                  completed["retained"] as? Int == 1, completed["requested_format"] as? String == "native",
+                  completed["scope"] as? String == "whole", resumedFormat == .native,
+                  !busy, activeRequest == nil else {
+                throw ReconstructionArtifact.Invalid(message: "Partial batch resume failed.")
+            }
+            for (name, timestamp) in timestamps {
+                guard try partialDirectory.appendingPathComponent(name)
+                    .resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate == timestamp else {
+                    throw ReconstructionArtifact.Invalid(message: "Resume rewrote a completed function file.")
+                }
+            }
+            await finishReconstructionBatchDump(resumedFormat, directory: partialDirectory, digest: digest,
+                projectPath: importedProject.path, recordID: record.id, generation: navigationGeneration)
+            let resumedDump = partialDirectory.appendingPathComponent("dump-n/export-manifest.json")
+            let resumedDumpBytes = try Data(contentsOf: resumedDump)
+            guard let dumped = try JSONSerialization.jsonObject(with: resumedDumpBytes) as? [String: Any],
+                  dumped["available"] as? Int == batchFunctions.count else {
+                throw ReconstructionArtifact.Invalid(message: "Resumed batch did not produce its requested native dump.")
+            }
+            await finishReconstructionBatchDump(resumedFormat, directory: partialDirectory, digest: digest,
+                projectPath: importedProject.path, recordID: record.id, generation: navigationGeneration)
+            guard try Data(contentsOf: resumedDump) == resumedDumpBytes, !busy else {
+                throw ReconstructionArtifact.Invalid(message: "Repeated completion overwrote an existing dump.")
+            }
             let identityData = try Data(contentsOf: URL(fileURLWithPath: identityPath))
             var items: CFArray?
             let identityStatus = SecPKCS12Import(identityData as CFData,
@@ -1474,6 +1688,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         }
     }
     func cancelReconstruction() {
+        if reconstructionBatchRunning { reconstructionBatchCancelled = true }
         guard let id = reconstructionRequestID, activeRequest == id else { return }
         reconstructionStatus = "Requesting reconstruction cancellation…"
         client.request(timeout: 10, operation: { service, reply in
@@ -1490,17 +1705,423 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             }
         }
     }
+    private func chooseReconstructionAddress(_ proposed: UInt64?) -> UInt64? {
+        let alert = NSAlert()
+        alert.messageText = "Function at address"
+        alert.informativeText = "Enter a captured-image virtual address (0x hexadecimal or decimal). The containing discovered function will be selected; no target code is executed."
+        alert.addButton(withTitle: "Choose Function")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(string: proposed.map { "0x" + String($0, radix: 16) } ?? "")
+        field.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        guard let value = ReconstructionScopePlan.address(field.stringValue) else {
+            reconstructionStatus = "Enter a valid unsigned 64-bit hexadecimal or decimal address."
+            return nil
+        }
+        return value
+    }
+
+    private func reconstructionFunctions(scope: String, address: UInt64?, functions: [VGFunctionRecord]) throws -> [VGFunctionRecord] {
+        let section = currentPage.flatMap {
+            ReconstructionScopePlan.section(address: $0.section_address, words: $0.total_words, unitBytes: $0.unitBytes)
+        }
+        return try ReconstructionScopePlan.indices(scope: scope, address: address, section: section,
+            functions: functions.map { ReconstructionRange(start: $0.start, end: $0.end) }).map { functions[$0] }
+    }
+
+    func reconstructScope(_ scope: String, address: UInt64?, format: ReconstructionExportFormat? = nil, dumpAll: Bool = false) {
+        guard !busy, projectServiceReady, let record = selected,
+              let digest = record.result.source_sha256, let projectPath = project?.path,
+              let analysis = currentAnalysis else { return }
+        defer { status = reconstructionStatus }
+        let allFunctions = VGGraphParser.functions(analysis.functions, symbolResolver: analysis.symbol_resolver,
+                                                objcClasses: analysis.objc_classes)
+        var requestedAddress = address
+        if scope == "address" {
+            guard let value = chooseReconstructionAddress(address) else { return }
+            requestedAddress = value
+        }
+        let functions: [VGFunctionRecord]
+        do { functions = try reconstructionFunctions(scope: scope, address: requestedAddress, functions: allFunctions) }
+        catch { reconstructionStatus = error.localizedDescription; return }
+        if scope == "resume" {
+            let panel = NSOpenPanel()
+            panel.title = "Resume Reconstruction Batch"
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            guard panel.runModal() == .OK, let directory = panel.url else { return }
+            let generation = navigationGeneration
+            reconstructionBatchRunning = true
+            reconstructionBatchCancelled = false
+            busy = true
+            Task { [weak self] in
+                guard let self else { return }
+                let completedFormat = await self.runReconstructionBatch(functions: functions, record: record, digest: digest,
+                    projectPath: projectPath, analysis: analysis, scope: scope, directory: directory,
+                    generation: generation, resume: true, format: format, dumpAll: dumpAll)
+                await self.finishReconstructionBatchDump(completedFormat, directory: directory, digest: digest,
+                    projectPath: projectPath, recordID: record.id, generation: generation)
+            }
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = dumpAll ? "Dump all formats (.c .h .m .n)" : format.map { "Dump reconstruction (.\($0.fileExtension))" } ?? "Export Reconstruction Batch"
+        panel.nameFieldStringValue = "binary-reconstruction" + (format.map { "-\($0.fileExtension)" } ?? "")
+        panel.message = "Choose a new directory. Per-function evidence is retained; requested format dumps are placed in a dump subfolder. Unavailable output is reported, not fabricated."
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        do {
+            guard !FileManager.default.fileExists(atPath: directory.path) else {
+                throw ReconstructionArtifact.Invalid(message: "Choose a new directory; existing output is preserved.")
+            }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        } catch { reconstructionStatus = error.localizedDescription; return }
+        let generation = navigationGeneration
+        reconstructionBatchRunning = true
+        reconstructionBatchCancelled = false
+        busy = true
+        Task { [weak self] in
+            guard let self else { return }
+            let completedFormat = await self.runReconstructionBatch(functions: functions, record: record, digest: digest,
+                projectPath: projectPath, analysis: analysis, scope: scope, directory: directory,
+                generation: generation, format: format, dumpAll: dumpAll)
+            await self.finishReconstructionBatchDump(completedFormat, directory: directory, digest: digest,
+                projectPath: projectPath, recordID: record.id, generation: generation)
+        }
+    }
+
+    private func finishReconstructionBatchDump(_ format: ReconstructionExportFormat?, directory: URL,
+                                               digest: String, projectPath: String, recordID: String, generation: UUID) async {
+        guard navigationGeneration == generation, project?.path == projectPath, selectedID == recordID else { return }
+        if !reconstructionBatchCancelled,
+           let checkpoint = try? ReconstructionArtifact.verifiedBatchCheckpoint(at: directory, digest: digest,
+                worker: VGTargetUtilities.buildFingerprint("reworker"), revision: BinaryImportOptions.analysisRevision),
+           let object = try? JSONSerialization.jsonObject(with: checkpoint) as? [String: Any],
+           object["requested_dump_all"] as? Bool == true {
+            await dumpAllReconstructionBatch(from: directory, to: directory.appendingPathComponent("dump-all", isDirectory: true), digest: digest)
+            return
+        }
+        guard let format, !reconstructionBatchCancelled else { status = reconstructionStatus; return }
+        let output = directory.appendingPathComponent("dump-" + format.fileExtension, isDirectory: true)
+        if FileManager.default.fileExists(atPath: output.path)
+            || (try? output.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            reconstructionStatus = "Batch complete; existing dump path preserved. Use Dump existing batch to export to a new directory."
+            status = reconstructionStatus
+            return
+        }
+        await dumpReconstructionBatch(from: directory, to: output, format: format, digest: digest)
+    }
+
+    func dumpExistingReconstructionBatch(format: ReconstructionExportFormat? = nil) {
+        guard !busy, let digest = selected?.result.source_sha256 else { return }
+        defer { status = reconstructionStatus }
+        let source = NSOpenPanel()
+        source.title = "Choose a reconstruction batch"
+        source.canChooseDirectories = true; source.canChooseFiles = false; source.allowsMultipleSelection = false
+        guard source.runModal() == .OK, let directory = source.url else { return }
+        let destination = NSSavePanel()
+        destination.title = format.map { "Dump validated batch (.\($0.fileExtension))" } ?? "Dump all formats (.c .h .m .n)"
+        destination.nameFieldStringValue = "dump-" + (format?.fileExtension ?? "all")
+        destination.message = "Choose a new directory for this format and its retained evidence. Existing files are never overwritten."
+        guard destination.runModal() == .OK, let output = destination.url else { return }
+        Task {
+            if let format { await self.dumpReconstructionBatch(from: directory, to: output, format: format, digest: digest) }
+            else { await self.dumpAllReconstructionBatch(from: directory, to: output, digest: digest) }
+        }
+    }
+
+    private func dumpAllReconstructionBatch(from directory: URL, to output: URL, digest: String) async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        let worker = VGTargetUtilities.buildFingerprint("reworker")
+        let generation = navigationGeneration
+        reconstructionStatus = "Writing verified c/, h/, m/ and n/ dumps…"
+        do {
+            _ = try await Task.detached(priority: .utility) {
+                try ReconstructionArtifact.writeBatchAllFormatExport(from: directory, to: output,
+                    digest: digest, worker: worker, revision: BinaryImportOptions.analysisRevision)
+            }.value
+            guard navigationGeneration == generation else { return }
+            reconstructionStatus = "Dumped all formats to \(output.path) in c/, h/, m/ and n/. Each manifest reports unavailable or failed functions. No code was executed."
+        } catch { if navigationGeneration == generation { reconstructionStatus = error.localizedDescription } }
+        status = reconstructionStatus
+    }
+
+    private func dumpReconstructionBatch(from directory: URL, to output: URL,
+                                         format: ReconstructionExportFormat, digest: String) async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        let worker = VGTargetUtilities.buildFingerprint("reworker")
+        let generation = navigationGeneration
+        reconstructionStatus = "Writing verified .\(format.fileExtension) batch dump…"
+        do {
+            let data = try await Task.detached(priority: .utility) {
+                try ReconstructionArtifact.writeBatchFormatExport(from: directory, to: output,
+                    format: format, digest: digest, worker: worker, revision: BinaryImportOptions.analysisRevision)
+            }.value
+            guard navigationGeneration == generation else { return }
+            let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            reconstructionStatus = "Dumped \(manifest?["available"] as? Int ?? 0) .\(format.fileExtension) files to \(output.path); \(manifest?["unavailable"] as? Int ?? 0) unavailable, \(manifest?["failed_functions"] as? Int ?? 0) functions failed. No code was executed."
+        } catch { if navigationGeneration == generation { reconstructionStatus = error.localizedDescription } }
+        status = reconstructionStatus
+    }
+
+    @discardableResult
+    private func runReconstructionBatch(functions candidates: [VGFunctionRecord], record: ProjectRecord, digest: String,
+                                        projectPath: String, analysis: AnalysisReport, scope: String,
+                                        directory: URL, generation: UUID, resume: Bool = false,
+                                        format: ReconstructionExportFormat? = nil,
+                                        dumpAll: Bool = false,
+                                        afterPublication: (() -> Void)? = nil) async -> ReconstructionExportFormat? {
+            var functions = candidates
+            var requestedFormat = format
+            var requestedDumpAll = dumpAll
+            var requestedScope = scope
+            var entries: [[String: Any]] = []
+            var bytes = 0
+            var lastRequestID: String?
+            defer {
+                if self.activeRequest == lastRequestID {
+                    self.stopAnalysisMonitor()
+                    self.busy = false
+                    self.activeRequest = nil
+                }
+                if self.reconstructionRequestID == lastRequestID { self.reconstructionRequestID = nil }
+                self.reconstructionBatchRunning = false
+            }
+            let worker = VGTargetUtilities.buildFingerprint("reworker")
+            if resume {
+                do {
+                    let data = try await Task.detached(priority: .utility) {
+                        try ReconstructionArtifact.verifiedBatchCheckpoint(at: directory, digest: digest,
+                            worker: worker, revision: BinaryImportOptions.analysisRevision)
+                    }.value
+                    guard let saved = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          saved["project"] as? String == projectPath,
+                          saved["record"] as? String == record.id,
+                          let plan = saved["planned"] as? [[String: String]], !plan.isEmpty, plan.count <= 4096,
+                          let previous = saved["functions"] as? [[String: Any]], previous.count <= plan.count else {
+                        throw ReconstructionArtifact.Invalid(message: "Checkpoint project or function plan changed.")
+                    }
+                    if let savedFormat = saved["requested_format"] as? String, !savedFormat.isEmpty {
+                        guard let restoredFormat = ReconstructionExportFormat(rawValue: savedFormat),
+                              format == nil || format == restoredFormat else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint dump format changed or is unsupported.")
+                        }
+                        requestedFormat = restoredFormat
+                    }
+                    requestedScope = saved["scope"] as? String ?? scope
+                    if let savedAll = saved["requested_dump_all"] as? Bool {
+                        guard !dumpAll || savedAll, !savedAll || format == nil else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint dump-all intent changed.")
+                        }
+                        requestedDumpAll = savedAll
+                    } else if dumpAll {
+                        throw ReconstructionArtifact.Invalid(message: "Checkpoint was not created as dump-all.")
+                    }
+                    guard ["whole", "section", "address", "resume"].contains(requestedScope) else {
+                        throw ReconstructionArtifact.Invalid(message: "Unsupported checkpoint scope.")
+                    }
+                    var restored: [VGFunctionRecord] = []
+                    for range in plan {
+                        guard let function = candidates.first(where: {
+                            $0.startText == range["start"] && String(format: "0x%016llx", $0.end) == range["end"]
+                        }), !restored.contains(where: { $0.start == function.start }) else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint function discovery changed.")
+                        }
+                        restored.append(function)
+                    }
+                    for (entry, function) in zip(previous, restored) {
+                        guard entry["start"] as? String == function.startText,
+                              entry["end"] as? String == String(format: "0x%016llx", function.end) else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint order changed.")
+                        }
+                    }
+                    functions = restored
+                    entries = previous
+                    bytes = saved["output_bytes"] as? Int ?? 0
+                } catch { reconstructionStatus = error.localizedDescription; return nil }
+            }
+            let retainedCount = entries.count
+            func checkpointData() throws -> Data {
+                let outcome = try ReconstructionBatchOutcome(states: entries.map { $0["state"] as? String ?? "invalid" },
+                    planned: functions.count, cancelled: self.reconstructionBatchCancelled)
+                let payload: [String: Any] = [
+                    "schema": 1, "source_sha256": digest, "scope": requestedScope, "project": projectPath,
+                    "requested_format": requestedFormat?.rawValue ?? "", "requested_dump_all": requestedDumpAll,
+                    "record": record.id, "pass": ReconstructionArtifact.passVersion, "worker": worker,
+                    "revision": BinaryImportOptions.analysisRevision,
+                    "planned": functions.map { ["start": $0.startText, "end": String(format: "0x%016llx", $0.end)] },
+                    "discovered": functions.count, "attempted": entries.count, "output_bytes": bytes,
+                    "retained": retainedCount,
+                    "cancelled": self.reconstructionBatchCancelled, "functions": entries,
+                    "complete_discovery": false, "validation": "generated; compilation and behavior unqualified"
+                ]
+                return try JSONSerialization.data(withJSONObject: payload.merging(outcome.metadata) { _, value in value },
+                    options: [.prettyPrinted, .sortedKeys])
+            }
+            do { try checkpointData().write(to: directory.appendingPathComponent("checkpoint.json"), options: .atomic) }
+            catch { reconstructionStatus = error.localizedDescription; return nil }
+            for (index, function) in functions.enumerated() {
+                if index < retainedCount { continue }
+                guard !self.reconstructionBatchCancelled, self.projectServiceReady, self.navigationGeneration == generation,
+                      self.project?.path == projectPath, self.selectedID == record.id,
+                      self.currentAnalysis?.request_id == analysis.request_id else { break }
+                let id = UUID().uuidString
+                lastRequestID = id
+                self.activeRequest = id
+                self.reconstructionRequestID = id
+                self.reconstructionStatus = "Reconstructing \(index + 1)/\(functions.count): \(function.name)"
+                self.startAnalysisMonitor(requestID: id)
+                var entry: [String: Any] = ["start": function.startText,
+                                            "end": String(format: "0x%016llx", function.end), "name": function.name]
+                do {
+                    let text: String = try await withCheckedThrowingContinuation { continuation in
+                        self.client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+                            operation: { $0.reconstructFunction(record.id, startAddress: String(function.start),
+                                endAddress: String(function.end), requestID: id, withReply: $1) }) {
+                            continuation.resume(with: $0)
+                        }
+                    }
+                    let artifact = try await Task.detached(priority: .userInitiated) {
+                        try decodeReconstructionReply(text, requestID: id, digest: digest,
+                                                      start: function.start, end: function.end)
+                    }.value
+                    guard self.navigationGeneration == generation, self.project?.path == projectPath,
+                          self.selectedID == record.id, self.currentAnalysis?.request_id == analysis.request_id else { break }
+                    let remaining = 256 * 1024 * 1024 - bytes
+                    let files = try await Task.detached(priority: .utility) {
+                        try artifact.writeBatchExport(to: directory, maximumBytes: remaining)
+                    }.value
+                    bytes += files.reduce(0) { $0 + $1.bytes }
+                    entry["files"] = files.map { ["path": $0.path, "bytes": $0.bytes, "sha256": $0.sha256] as [String: Any] }
+                    entry["state"] = artifact.sources.contains { $0.kind == "recovered-source" } ? "recovered" : "review-only"
+                    entry["blockers"] = artifact.blockers
+                } catch {
+                    entry["state"] = "failed"
+                    entry["error"] = error.localizedDescription
+                }
+                entries.append(entry)
+                do { try checkpointData().write(to: directory.appendingPathComponent("checkpoint.json"), options: .atomic) }
+                catch { reconstructionStatus = error.localizedDescription; return nil }
+                afterPublication?()
+            }
+            do {
+                try checkpointData().write(to: directory.appendingPathComponent("manifest.json"),
+                                           options: resume ? .atomic : .withoutOverwriting)
+                let outcome = try ReconstructionBatchOutcome(states: entries.map { $0["state"] as? String ?? "invalid" },
+                    planned: functions.count, cancelled: self.reconstructionBatchCancelled)
+                self.reconstructionStatus = "\(outcome.summary) Evidence: \(directory.lastPathComponent). Compilation and behavior remain unqualified."
+            } catch { self.reconstructionStatus = error.localizedDescription; return nil }
+            guard entries.count == functions.count, !reconstructionBatchCancelled,
+                  navigationGeneration == generation, project?.path == projectPath, selectedID == record.id,
+                  currentAnalysis?.request_id == analysis.request_id else { return nil }
+            return requestedFormat
+    }
     func exportReconstruction(_ function: VGFunctionRecord, source: ReconstructionSource?) {
         guard let artifact = currentReconstruction, artifact.start == function.start, artifact.end == function.end,
               source == nil || artifact.sources.contains(where: { $0.id == source?.id }) else { return }
         let panel = NSSavePanel()
         panel.title = source == nil ? "Export Reconstruction Evidence" : "Export Generated Source for Review"
-        panel.nameFieldStringValue = "function-\(String(function.start, radix: 16))" + (source == nil ? ".reconstruction.json" : ".c")
+        panel.nameFieldStringValue = "function-\(String(function.start, radix: 16))" + (source == nil ? ".reconstruction.json" : ["recovered-header", "best-effort-header"].contains(source?.kind ?? "") ? ".h" : source?.kind == "recovered-objective-c" ? ".m" : ".c")
         panel.message = "Generated source is not a compilation or equivalence guarantee. Its assumptions and evidence remain in the JSON artifact."
         if source == nil { panel.allowedContentTypes = [.json] }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { try artifact.writeReviewExport(sourceID: source?.id, to: url); reconstructionStatus = "Exported \(url.lastPathComponent). No generated code was executed." }
         catch { reconstructionStatus = error.localizedDescription }
+    }
+
+    /// Export a bounded, evidence-labelled reconstruction package for the
+    /// selected analysis scope. Whole-binary and section exports include every
+    /// discovered function as an unresolved comment; only a validated current
+    /// function artifact is emitted as generated code.
+    func exportReconstructionScope(scope: String, language: String, address: UInt64?) {
+        if language == "all" {
+            reconstructScope(scope, address: address, dumpAll: true)
+            return
+        }
+        guard let format = ReconstructionExportFormat(rawValue: language) else {
+            reconstructionStatus = "Unsupported reconstruction export format."
+            return
+        }
+        if [.c, .objc, .header, .native].contains(format) {
+            reconstructScope(scope, address: address, format: format)
+            return
+        }
+        guard let analysis = currentAnalysis, let record = selected,
+              let digest = record.result.source_sha256 else {
+            reconstructionStatus = "Analyze a captured binary before exporting reconstruction."
+            return
+        }
+        let allFunctions = VGGraphParser.functions(analysis.functions,
+                                                    symbolResolver: analysis.symbol_resolver,
+                                                    objcClasses: analysis.objc_classes)
+        var requestedAddress = address
+        if scope == "address" {
+            guard let value = chooseReconstructionAddress(address) else { return }
+            requestedAddress = value
+        }
+        let functions: [VGFunctionRecord]
+        do { functions = try reconstructionFunctions(scope: scope, address: requestedAddress, functions: allFunctions) }
+        catch { reconstructionStatus = error.localizedDescription; return }
+        let target = scope == "address" ? functions.first : nil
+        let available = currentReconstruction
+        let reconstructedFunction = functions.first { $0.start == available?.start && $0.end == available?.end }
+        let source: ReconstructionSource?
+        if reconstructedFunction != nil, let available {
+            source = format.source(in: available.sources)
+        } else { source = nil }
+        let output = reconstructionScopeText(scope: scope, format: format,
+                                             functions: functions, target: target,
+                                             source: source, digest: digest,
+                                             projectPath: project?.path ?? "")
+        let panel = NSSavePanel()
+        panel.title = "Export \(scope) \(language) reconstruction"
+        panel.nameFieldStringValue = "hindsight-\(scope)-reconstruction.\(format.fileExtension)"
+        panel.allowedContentTypes = [.sourceCode]
+        panel.allowsOtherFileTypes = format.allowsCustomExtension
+        panel.message = "Generated output is evidence-labelled and may contain unresolved stubs; it has not been compiled or executed by HindSight."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try output.write(to: url, atomically: true, encoding: .utf8)
+            reconstructionStatus = "Exported \(url.lastPathComponent) for \(scope); source digest \(digest.prefix(16))."
+        } catch { reconstructionStatus = error.localizedDescription }
+    }
+
+    private func reconstructionScopeText(scope: String, format: ReconstructionExportFormat,
+                                         functions: [VGFunctionRecord], target: VGFunctionRecord?,
+                                         source: ReconstructionSource?, digest: String,
+                                         projectPath: String) -> String {
+        let date = ISO8601DateFormatter().string(from: Date())
+        func safeComment(_ text: String) -> String {
+            text.replacingOccurrences(of: "*/", with: "* /")
+                .components(separatedBy: .newlines).joined(separator: " ")
+        }
+        var lines = [
+            "/* HindSight \(format.rawValue) reconstruction export.",
+            " * scope=\(scope == "section" ? "current-analyzed-code-section" : scope) functions=\(functions.count) source_sha256=\(digest)",
+            " * project=\(safeComment(projectPath)) generated_at=\(date)",
+            " * Includes at most 4096 discovered functions from bounded analysis.",
+            " * Unreconstructed functions are listed as comments with unresolved ABI.",
+            " * This is a partial reconstruction, not a compilation or",
+            " * equivalence claim. */",
+            ""
+        ]
+        for function in functions {
+            lines.append("// \(function.startText)..0x\(String(function.end, radix: 16)) \(safeComment(function.name)) — consult retained artifact; ABI unresolved without its declaration")
+        }
+        if let source, let rendered = format.render(source) {
+            lines += ["", "// Validated artifact kind: \(source.kind)", rendered]
+        } else {
+            lines.append("// No validated \(format.sourceKind) output is available in this scope; other artifact kinds are not substituted.")
+        }
+        if let target {
+            lines += ["", "/* selected_address=\(target.startText) selected_end=0x\(String(target.end, radix: 16)) */"]
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
     func clearAnalysisCache() {
         guard !busy, projectServiceReady, project != nil else { return }

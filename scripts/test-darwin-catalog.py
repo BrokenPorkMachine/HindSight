@@ -57,6 +57,11 @@ def run(worker):
         native=importlib.util.module_from_spec(spec);spec.loader.exec_module(native)
         helper=Path(directory)/"native-oracle"
         native.compile_helper(helper,[header.with_suffix(".m")])
+        contract = Path(directory) / "reconstruction-artifact-contract"
+        swift_environment = dict(os.environ, CLANG_MODULE_CACHE_PATH=str(Path(directory) / "swift-module-cache"))
+        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/ReconstructionArtifact.swift"),
+                        str(ROOT / "Tests/reconstruction_artifact_contract.swift"), "-o", str(contract)],
+                       env=swift_environment, check=True, capture_output=True, timeout=120)
         oracle=native.collect(helper,["HSNativeCatalogFixture"],[])["classes"][0]
         for optimization in ["-O0", "-O2"]:
             binary = Path(directory) / "sdk-sample"
@@ -76,6 +81,123 @@ def run(worker):
             assert "value=x0" in recovered["call_values"] or "value=x0" in recovered["semantic_preview"]
             assert "// unsigned long HSNativeCatalogCount(unsigned long value) [" in recovered["semantic_preview"]
             assert "HSNativeCatalogCount((unsigned long)0x2);" in recovered["semantic_preview"]
+            # Exercise the actual dump producer, not only analysis pseudocode.
+            boundary = next(re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+_HSNativeCatalogCount\s", line)
+                            for line in recovered["functions"].splitlines()
+                            if re.match(r"^0x[0-9a-f]+\s+0x[0-9a-f]+\s+\d+\s+bytes\s+_HSNativeCatalogCount\s", line))
+            environment = dict(os.environ, HINDSIGHT_PROTOTYPE_DB=str(catalog))
+            output = subprocess.run([str(worker), "--reconstruct", str(binary), digest,
+                                     str(binary.stat().st_size), boundary[1], boundary[2], str(uuid.uuid4())],
+                                    env=environment, check=True, capture_output=True, timeout=120).stdout
+            assert len(output) >= 4 and struct.unpack(">I", output[:4])[0] == len(output)-4
+            artifact = json.loads(output[4:])
+            headers = [node["payload"] for node in artifact["nodes"]
+                       if node["payload"].get("artifact_kind") == "recovered-header"]
+            assert len(headers) == 1, "SDK declaration did not reach reconstructed header"
+            assert "unsigned long HSNativeCatalogCount(unsigned long value);" in headers[0]["source"], headers
+            objc_boundary = next(line.split()[:2] for line in recovered["functions"].splitlines()
+                                 if "-[HSNativeCatalogFixture score:count:]" in line)
+            objc_output = subprocess.run([str(worker), "--reconstruct", str(binary), digest,
+                                          str(binary.stat().st_size), *objc_boundary, str(uuid.uuid4())],
+                                         env=environment, check=True, capture_output=True, timeout=120).stdout
+            assert len(objc_output) >= 4 and struct.unpack(">I", objc_output[:4])[0] == len(objc_output)-4
+            objc_artifact = json.loads(objc_output[4:])
+            objc_headers = [node["payload"] for node in objc_artifact["nodes"]
+                            if node["payload"].get("artifact_kind") in {"recovered-header", "best-effort-header"}]
+            assert len(objc_headers) == 1, "Objective-C IMP lost its declaration evidence"
+            objc_header = objc_headers[0]
+            assert objc_header["languages"] == ["objective-c", "objective-c++"]
+            for text in ["@interface HSNativeCatalogFixture", "@property", "displayLabel", "score:", "rangeForCount:", "_weight"]:
+                assert text in objc_header["source"], f"missing Objective-C header declaration: {text}"
+            assert "hs_review_context" not in objc_header["source"]
+            assert "@interface HSNativeCatalogFixture : NSObject" in objc_header["source"]
+            assert "super_source=dyld-bind" in recovered["objc_classes"]
+            superclass_record = next(line for line in recovered["objc_classes"].splitlines()
+                                     if line.startswith("reconstructed class ") and "name=HSNativeCatalogFixture " in line)
+            provider = re.search(r" super_provider=(\S+)", superclass_record)
+            assert provider and provider[1].startswith(("/usr/lib/", "/System/Library/Frameworks/")), superclass_record
+            assert provider[1] in recovered["dylib_ordinals"]
+            assert "superclass" in objc_header["source"] and "REVIEW ONLY" in objc_header["source"]
+            header_path = Path(directory) / "reconstructed-objc.h"
+            header_path.write_text(objc_header["source"])
+            for language in ["objective-c", "objective-c++"]:
+                subprocess.run(["xcrun", "--sdk", "macosx", "clang", "-target", "arm64-apple-macos14.0",
+                                "-fsyntax-only", "-x", language, str(header_path)],
+                               check=True, capture_output=True, timeout=60)
+            derived_boundary = next(line.split()[:2] for line in recovered["functions"].splitlines()
+                                    if "-[HSNativeCatalogDerived derivedValue]" in line)
+            derived_output = subprocess.run([str(worker), "--reconstruct", str(binary), digest,
+                                             str(binary.stat().st_size), *derived_boundary, str(uuid.uuid4())],
+                                            env=environment, check=True, capture_output=True, timeout=120).stdout
+            derived = json.loads(derived_output[4:])
+            derived_headers = [node["payload"]["source"] for node in derived["nodes"]
+                               if node["payload"].get("artifact_kind") in {"recovered-header", "best-effort-header"}]
+            assert len(derived_headers) == 1
+            assert "@interface HSNativeCatalogDerived : HSNativeCatalogFixture <NSCopying>" in derived_headers[0]
+            assert "@protocol NSCopying;" in derived_headers[0]
+            scalar_boundary = next(line.split()[:2] for line in recovered["functions"].splitlines()
+                                   if "-[HSNativeCatalogFixture scalarCount:]" in line)
+            scalar_output = subprocess.run([str(worker), "--reconstruct", str(binary), digest,
+                                            str(binary.stat().st_size), *scalar_boundary, str(uuid.uuid4())],
+                                           env=environment, check=True, capture_output=True, timeout=120).stdout
+            scalar = json.loads(scalar_output[4:])
+            scalar_artifact_path = Path(directory) / "scalar-artifact.json"
+            scalar_artifact_path.write_bytes(scalar_output[4:])
+            subprocess.run([str(contract), str(scalar_artifact_path), digest,
+                            scalar_boundary[0][2:], scalar_boundary[1][2:]],
+                           env=swift_environment, check=True, capture_output=True, timeout=60)
+            objc_sources = [node["payload"] for node in scalar["nodes"] if node["payload"].get("artifact_kind") == "recovered-objective-c"]
+            assert len(objc_sources) == 1, "qualified scalar IMP did not produce Objective-C code"
+            objc_code = objc_sources[0]["source"]
+            assert "@implementation HSNativeCatalogFixture (HSRecovered_" in objc_code
+            assert "scalarCount:" in objc_code and "return hs_recovered_imp_" in objc_code
+            assert "synthetic" in objc_code and "validated IR-derived IMP body" in objc_code
+            objc_path = Path(directory) / "reconstructed-method.m"
+            objc_path.write_text(objc_code)
+            subprocess.run(["xcrun", "--sdk", "macosx", "clang", "-target", "arm64-apple-macos14.0",
+                            "-fsyntax-only", "-x", "objective-c", str(objc_path)],
+                           check=True, capture_output=True, timeout=60)
+            # A deliberately wrong base method makes this a dispatch check,
+            # not a comparison that could accidentally exercise original code.
+            recovered_c = next(node["payload"] for node in scalar["nodes"]
+                               if node["payload"].get("artifact_kind") == "recovered-source")
+            method = recovered_c["declaration"].removesuffix(";")
+            harness = Path(directory) / "reconstructed-method-run.m"
+            harness.write_text('#include "reconstructed-method.m"\n'
+                               '@implementation HSNativeCatalogFixture\n'
+                               + method + ' { (void)arg0; return 0; }\n@end\n'
+                               'int main(void) { @autoreleasepool {\n'
+                               'HSNativeCatalogFixture *object = [HSNativeCatalogFixture new];\n'
+                               'unsigned long long values[] = {0,1,2,42,0x7fffffffffffffffULL,0xffffffffffffffffULL};\n'
+                               'for (unsigned i=0;i<sizeof(values)/sizeof(values[0]);i++) {\n'
+                               'if ([object scalarCount:values[i]] != values[i]+3) return 1;\n'
+                               '} return 0; } }\n')
+            executable = Path(directory) / "reconstructed-method-run"
+            compiled = subprocess.run(["xcrun", "--sdk", "macosx", "clang", "-target", "arm64-apple-macos14.0",
+                                       optimization, "-fobjc-arc", str(harness), "-framework", "Foundation", "-o", str(executable)],
+                                      capture_output=True, timeout=60)
+            assert compiled.returncode == 0, compiled.stderr.decode(errors="replace")
+            subprocess.run([str(executable)], check=True, capture_output=True, timeout=30)
+            control = Path(directory) / "method-without-adapter.m"
+            control.write_text(harness.read_text().replace('#include "reconstructed-method.m"', '#include "reconstructed-objc.h"', 1))
+            control_executable = Path(directory) / "method-without-adapter"
+            subprocess.run(["xcrun", "--sdk", "macosx", "clang", "-target", "arm64-apple-macos14.0",
+                            optimization, "-fobjc-arc", str(control), "-framework", "Foundation", "-o", str(control_executable)],
+                           check=True, capture_output=True, timeout=60)
+            assert subprocess.run([str(control_executable)], capture_output=True, timeout=30).returncode == 1
+            batch_path = Path(directory) / ("objc-batch" + optimization)
+            subprocess.run([sys.executable, str(ROOT / "scripts/reconstruct-binary.py"), str(binary), str(batch_path),
+                            "--worker", str(worker), "--prototypes", str(catalog),
+                            "--start", scalar_boundary[0], "--end", scalar_boundary[1]],
+                           check=True, capture_output=True, timeout=120)
+            dump_path = Path(directory) / ("objc-dump" + optimization)
+            dumped = subprocess.run([sys.executable, str(ROOT / "scripts/export-reconstruction-batch.py"), str(batch_path), str(dump_path),
+                                    "--format", "objc"], capture_output=True, timeout=60)
+            assert dumped.returncode == 0, dumped.stderr.decode(errors="replace")
+            dump_manifest = json.loads((dump_path / "export-manifest.json").read_bytes())
+            assert dump_manifest["available"] == 1
+            assert dump_manifest["functions"][0]["representation"] == "recovered-objective-c"
+            assert next(dump_path.glob("*.m")).read_text() == objc_code
             pseudo=recovered["semantic_preview"]
             assert "@interface HSNativeCatalogFixture {" in pseudo,pseudo[-16000:]
             assert "getter=displayLabel, setter=setDisplayLabel:" in pseudo
@@ -135,6 +257,7 @@ def run(worker):
             print(f"Apple Clang prototype -> AArch64 pseudocode, ABI name and source-hash rejection passed ({optimization})")
             print(f"Shared macOS/iOS Mach-O/dyld decoder outputs and platform-aware prototype binding passed ({optimization})")
             print(f"Native-oracle ivar/property layouts -> typed declarations and IR-proven field accesses passed ({optimization})")
+            print(f"Recovered Objective-C method passed Swift/batch dumps, syntax, six runtime inputs and failing no-adapter control ({optimization})")
 
 
 if __name__ == "__main__":

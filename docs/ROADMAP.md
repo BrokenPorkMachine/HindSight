@@ -108,7 +108,7 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [x] ARM64 semantic preview: full move-wide immediates (MOVN/MOVZ/MOVK), flag-neutral logical ops (AND/ORR/EOR immediates + shifted register forms), ADR/ADRP, conditional/indirect control flow (B.cond/CBZ/CBNZ/TBZ/TBNZ/BR/BLR with proven constant resolution), shifted arithmetic, multiply-add, sign/zero extends, bitfield extracts, general-register LDR/STR family with scaled/unsigned/register-offset addressing.
 - [x] Scalar FP argument preservation through immediate materialization, GP/FP transfers, FP register copies.
 
-**0.5 exit gate:** stable universal macOS (arm64 + x86_64) build; 8 GiB pressure test; real-target execution; signing/notarization matrix complete; source validator rejects production crash primitives.
+**0.5 exit gate:** stable Apple-Silicon macOS (arm64) candidate build; Intel (x86_64) support is experimental and non-blocking; source validator rejects production crash primitives. Credentialed signing/notarization, real-target, and memory-pressure qualification are intentionally deferred until further notice.
 
 ## 0.6 — Broader Targets + Team Research (in progress)
 
@@ -155,7 +155,7 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [ ] Stable SDK and target protocol (versioned, documented).
 - [ ] Crash recovery and resumable long jobs (worker checkpointing, coordinator recovery).
 - [ ] Performance budgets with regression tests (CI-enforced).
-- [ ] Signed/notarized distribution and updater (sparkle or equivalent).
+- [ ] Signed/notarized distribution and updater (sparkle or equivalent) — intentionally deferred until further notice.
 - [ ] Licensing tiers without crippling offline/local analysis.
 - [ ] Documentation, guided labs, onboarding datasets (legally redistributable), enterprise deployment material.
 

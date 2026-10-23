@@ -6,7 +6,7 @@ struct BinaryImportOptions: Codable, Equatable {
     var load_address: String = "0"
     var file_offset: String = "0"
     static let automatic = BinaryImportOptions()
-    static let analysisRevision = "prototype-abi-v10"
+    static let analysisRevision = "prototype-abi-v19"
     private static func number(_ text: String) -> UInt64? {
         if text.hasPrefix("0x") { return UInt64(text.dropFirst(2), radix: 16) }
         return UInt64(text)
@@ -48,7 +48,36 @@ struct ProjectRecord: Codable, Identifiable {
     var note: String
     var revision: Int
 }
-struct ProjectSnapshot: Codable { let path: String; let records: [ProjectRecord] }
+/// Versioned project boundary shared by the app, Coordinator and remote API.
+///
+/// Older coordinators emitted only `path` and `records`; decoding those
+/// payloads as schema 1 keeps the wire boundary backward compatible while all
+/// newly emitted snapshots identify the v2 contract explicitly.
+struct ProjectSnapshot: Codable {
+    static let currentSchema = 2
+    let schema: Int
+    let path: String
+    let records: [ProjectRecord]
+
+    init(path: String, records: [ProjectRecord], schema: Int = ProjectSnapshot.currentSchema) {
+        self.schema = schema
+        self.path = path
+        self.records = records
+    }
+
+    private enum CodingKeys: String, CodingKey { case schema, path, records }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schema = try container.decodeIfPresent(Int.self, forKey: .schema) ?? 1
+        path = try container.decode(String.self, forKey: .path)
+        records = try container.decode([ProjectRecord].self, forKey: .records)
+        guard schema == 1 || schema == Self.currentSchema else {
+            throw DecodingError.dataCorruptedError(forKey: .schema, in: container,
+                                                   debugDescription: "Unsupported project snapshot schema \(schema)")
+        }
+    }
+}
 struct ServiceReply: Codable {
     let ok: Bool
     let message: String

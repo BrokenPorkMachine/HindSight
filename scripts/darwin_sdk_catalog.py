@@ -1,18 +1,72 @@
 """Apple Clang declarations, retaining source types and canonical ABI types."""
 
 import hashlib
+import argparse
 import json
 import os
 from pathlib import Path
 import re
 import struct
 import subprocess
+import sys
+import uuid
 import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HEADER = ROOT / "native/reconstruction/sdk_declarations.h"
 MAX_AST_BYTES = 4 * 1024 * 1024
+
+
+def sdk_import_candidates(linkage_records):
+    """Select public-system imports, retaining the recorded provider identity.
+
+    This is declaration lookup eligibility, not proof of runtime resolution.
+    Special ordinals, private frameworks, addends and conflicting providers
+    must not seed automatic SDK prototypes.
+    """
+    if not isinstance(linkage_records, str) or len(linkage_records.encode()) > 65535:
+        raise ValueError("linkage records exceed section budget")
+    providers = {}
+    for line in linkage_records.splitlines():
+        match = re.match(r"^symbol=(_[A-Za-z][A-Za-z0-9_]*) import\[\d+\] dylib=(\S+) addend=(-?\d+) weak=(yes|no)(?:\s|$)", line)
+        if not match:
+            continue
+        symbol, provider, addend, _ = match.groups()
+        public = (re.fullmatch(r"/usr/lib/(?:system/)?lib[A-Za-z0-9_.+-]+\.dylib", provider)
+                  or re.fullmatch(r"/System/Library/Frameworks/([A-Za-z][A-Za-z0-9_]*)\.framework/(?:Versions/[A-Za-z0-9]+/)?\1", provider))
+        providers.setdefault(symbol, set()).add((provider, addend, bool(public)))
+    result = []
+    for symbol, identities in sorted(providers.items()):
+        if len(identities) != 1:
+            continue
+        provider, addend, public = next(iter(identities))
+        if public and int(addend) == 0:
+            result.append({"name": symbol[1:], "symbol": symbol, "provider": provider})
+    if len(result) > 128:
+        raise ValueError("SDK import request exceeds 128-symbol budget")
+    return result
+
+
+def collect_import_declarations(binary, report, header=DEFAULT_HEADER, sdk="macosx", target="arm64-apple-macos14.0"):
+    """Collect SDK declarations for eligible imports of one verified capture."""
+    digest = verify_macho_target(binary, target)
+    if report.get("source_sha256") != digest:
+        raise ValueError("analysis source differs from SDK declaration capture")
+    candidates = sdk_import_candidates(report.get("linkage_records", ""))
+    if not candidates:
+        raise ValueError("no eligible public-system imports for SDK lookup")
+    catalog = collect_declarations([item["name"] for item in candidates], header, sdk, target)
+    identities = {item["name"]: item for item in candidates}
+    for record in catalog["functions"]:
+        identity = identities[record["name"]]
+        if record["symbol"] != identity["symbol"]:
+            raise ValueError("SDK declaration linkage differs from captured import")
+        record["captured_provider"] = identity["provider"]
+    catalog["source_sha256"] = digest
+    catalog["import_candidates"] = candidates
+    catalog["scope"] = "Public SDK declarations matched to captured import names/providers; runtime implementation identity and body equivalence remain unproven"
+    return catalog
 
 
 def verify_macho_target(path, target):
@@ -84,6 +138,14 @@ def _parameter(parameter, index, canonical):
     return f"{type_name} {name}"
 
 
+def _parameter_abi_key(types):
+    # Clang emits built-in and header redeclarations together. A parameter's
+    # top-level restrict qualifier is omitted from the function type and does
+    # not change its ABI. Keep pointed-to qualifiers and all other type shape.
+    spelling = types.get("desugaredQualType", types["qualType"])
+    return re.sub(r"\s*(?:\brestrict|\b__restrict|\b__restrict__)\s*$", "", spelling).strip()
+
+
 def _declaration(node, canonical):
     function_type = node["type"]["qualType"]
     if "(" not in function_type or "__attribute__" in function_type:
@@ -142,7 +204,7 @@ def collect_declarations(functions, header=DEFAULT_HEADER, sdk="macosx", target=
             missing.append(name)
             continue
         signatures = {(node.get("type", {}).get("qualType"), tuple(
-            child.get("type", {}).get("desugaredQualType", child.get("type", {}).get("qualType"))
+            _parameter_abi_key(child["type"])
             for child in node.get("inner", []) if child.get("kind") == "ParmVarDecl")) for node in matches}
         if len(signatures) != 1:
             raise ValueError(f"conflicting declarations for {name}")
@@ -185,3 +247,50 @@ def worker_prototypes(catalog, source_sha256):
     if len(output.encode()) > 4 * 1024 * 1024:
         raise ValueError("prototype catalog exceeds worker byte budget")
     return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Match captured public-system imports against Apple SDK declarations.")
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("analysis", type=Path, nargs="?", help="worker analysis JSON for the same captured slice")
+    parser.add_argument("--worker", type=Path, help="analyze the capture directly instead of supplying analysis JSON")
+    parser.add_argument("--sdk", choices=["macosx", "iphoneos", "iphonesimulator"], default="macosx")
+    parser.add_argument("--target", default="arm64-apple-macos14.0")
+    parser.add_argument("--header", type=Path, default=DEFAULT_HEADER)
+    parser.add_argument("--worker-prototypes", action="store_true", help="emit source-bound TSV instead of the full evidence catalog; refuses missing/unsupported declarations")
+    args = parser.parse_args()
+    if (args.analysis is None) == (args.worker is None):
+        parser.error("supply either analysis JSON or --worker, not both")
+    if args.worker is not None:
+        digest = verify_macho_target(args.binary, args.target)
+        environment = dict(os.environ)
+        environment.pop("HINDSIGHT_PROTOTYPE_DB", None)
+        binary = args.binary.resolve(strict=True)
+        result = subprocess.run([str(args.worker.resolve(strict=True)), "--analyze", str(binary), digest,
+                                 str(binary.stat().st_size), str(uuid.uuid4())],
+                                env=environment, check=True, capture_output=True, timeout=120)
+        frame = result.stdout
+        if len(frame) < 4 or len(frame) > 32 * 1024 * 1024 + 4 or struct.unpack(">I", frame[:4])[0] != len(frame)-4:
+            raise ValueError("invalid bounded worker analysis frame")
+        raw = frame[4:]
+    else:
+        with args.analysis.open("rb") as stream:
+            raw = stream.read(32 * 1024 * 1024 + 1)
+    if len(raw) > 32 * 1024 * 1024:
+        raise ValueError("analysis report exceeds byte budget")
+    report = json.loads(raw)
+    if not isinstance(report, dict) or report.get("kind") != "analysis_result":
+        raise ValueError("expected a worker analysis_result document")
+    catalog = collect_import_declarations(args.binary, report, args.header, args.sdk, args.target)
+    if args.worker_prototypes:
+        sys.stdout.write(worker_prototypes(catalog, catalog["source_sha256"]))
+    else:
+        print(json.dumps(catalog, sort_keys=True, indent=2))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"SDK declaration lookup failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

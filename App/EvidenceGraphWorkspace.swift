@@ -7,8 +7,8 @@ struct VGEvidenceGraphWorkspace: View {
 
     @State private var query = ""
     @State private var selectedNodeID: String?
-    @State private var zoom: CGFloat = 0.88
-    @State private var zoomAnchor: CGFloat = 0.88
+    @State private var zoom: CGFloat = 0.8
+    @State private var zoomAnchor: CGFloat = 0.8
     @State private var mapOffset: CGSize = .zero
     @State private var mapOffsetAnchor: CGSize = .zero
     @State private var graphViewportSize: CGSize = .zero
@@ -208,7 +208,7 @@ struct VGEvidenceGraphWorkspace: View {
                     .onEnded { _ in zoomAnchor = zoom }
             )
             .simultaneousGesture(mapPanGesture)
-            .overlay(alignment: .bottomTrailing) { miniMap(viewportSize: proxy.size, maxWidth: min(220, proxy.size.width * 0.32)) }
+            .overlay(alignment: .bottomTrailing) { miniMap(viewportSize: proxy.size) }
             .background(Color(nsColor: .textBackgroundColor).opacity(0.55))
             .onAppear { updateViewport(proxy.size) }
             .onChange(of: proxy.size) { _, size in updateViewport(size) }
@@ -259,8 +259,8 @@ struct VGEvidenceGraphWorkspace: View {
         }
     }
 
-    private func miniMap(viewportSize: CGSize, maxWidth: CGFloat) -> some View {
-        let projection = minimapProjection(maxWidth: maxWidth)
+    private func miniMap(viewportSize: CGSize) -> some View {
+        let projection = minimapProjection
         let visible = canvasViewport(viewportSize).visibleRect
         let viewportRect = projection.project(visible)
         return Canvas { context, _ in
@@ -273,9 +273,8 @@ struct VGEvidenceGraphWorkspace: View {
             }
             for node in filtered.nodes.prefix(180) {
                 guard let p = layout.positions[node.id] else { continue }
-                let projected = projection.project(CGPoint(x: p.x, y: p.y))
-                let rect = CGRect(x: projected.x - 2, y: projected.y - 2, width: 4, height: 4)
-                context.fill(Path(ellipseIn: rect), with: .color(confidenceColor(node.confidence).opacity(0.8)))
+                let rect = projection.project(CGRect(x: p.x - 109, y: p.y - 36, width: 218, height: 72))
+                context.fill(Path(rect), with: .color(confidenceColor(node.confidence).opacity(0.8)))
             }
         }
         .frame(width: projection.mapSize.width, height: projection.mapSize.height)
@@ -284,7 +283,7 @@ struct VGEvidenceGraphWorkspace: View {
             RoundedRectangle(cornerRadius: 3, style: .continuous)
                 .fill(Color.accentColor.opacity(0.08))
                 .overlay { RoundedRectangle(cornerRadius: 3, style: .continuous).stroke(Color.accentColor.opacity(0.88), lineWidth: 1.5) }
-                .frame(width: max(8, viewportRect.width), height: max(8, viewportRect.height))
+                .frame(width: viewportRect.width, height: viewportRect.height)
                 .position(x: viewportRect.midX, y: viewportRect.midY)
                 .allowsHitTesting(false)
         }
@@ -292,18 +291,17 @@ struct VGEvidenceGraphWorkspace: View {
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .gesture(
             DragGesture(minimumDistance: 0)
-                .onChanged { value in jumpToMinimap(value.location, viewportSize: viewportSize, maxWidth: maxWidth) }
+                .onChanged { value in jumpToMinimap(value.location, viewportSize: viewportSize) }
         )
         .padding(12)
     }
 
-    private func minimapProjection(maxWidth: CGFloat) -> VGMinimapProjection {
-        let height = min(150, CGFloat(layout.height) * (maxWidth - 12) / max(CGFloat(layout.width), 1) + 12)
-        return VGMinimapProjection(contentSize: CGSize(width: layout.width, height: layout.height), mapSize: CGSize(width: maxWidth, height: height))
+    private var minimapProjection: VGMinimapProjection {
+        VGMinimapProjection(contentSize: CGSize(width: layout.width, height: layout.height), mapSize: CGSize(width: 190, height: 120))
     }
 
-    private func jumpToMinimap(_ location: CGPoint, viewportSize: CGSize, maxWidth: CGFloat) {
-        mapOffset = canvasViewport(viewportSize).pan(centering: minimapProjection(maxWidth: maxWidth).unproject(location))
+    private func jumpToMinimap(_ location: CGPoint, viewportSize: CGSize) {
+        mapOffset = canvasViewport(viewportSize).pan(centering: minimapProjection.unproject(location))
         mapOffsetAnchor = mapOffset
     }
 
@@ -328,7 +326,7 @@ struct VGEvidenceGraphWorkspace: View {
 
     private func fitGraph(widthOnly: Bool) {
         guard graphViewportSize.width > 1, graphViewportSize.height > 1 else { return }
-        setZoom(canvasViewport(graphViewportSize).fittedZoom(widthOnly: widthOnly, maximum: widthOnly ? 0.88 : 1))
+        setZoom(widthOnly ? 0.8 : canvasViewport(graphViewportSize).fittedZoom(widthOnly: false, maximum: 1))
         mapOffset = .zero
         mapOffsetAnchor = .zero
     }

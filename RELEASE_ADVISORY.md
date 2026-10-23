@@ -1,47 +1,15 @@
-# Release Advisory: HindSight v0.5.12 Release Candidate
+# Release Advisory: HindSight v0.5.13 Release Candidate
 
-This prerelease provides the source package for review. It is not a notarized macOS download. Stable distribution still requires the Developer ID signing and notarization gate and the Intel and Apple Silicon host qualification matrix described in [release readiness](docs/RELEASE_READINESS.md).
+Official platform: macOS 14 or newer on Apple Silicon (`arm64`). Intel builds remain experimental and are not supplied as an official binary release.
 
-## Code Signing Requirements
+This is a research prerelease, not a claim that the reconstruction roadmap is complete. Generated source, declaration-only headers and machine-state output retain separate availability and validation claims.
 
-Stable non-source builds require proper code signing to run:
+## Signing and validation
 
-### For Non-Source Builds (Installer/Download):
-- **Download only from official HindSight sources** to avoid quarantine
-- **Verify digital signatures** using the provided verification tools
-- **Consider building from source** if you need unsigned code for development
+Credentialed Developer ID signing, notarization and manual release-host qualification are intentionally deferred until further notice. The candidate app uses ad-hoc signing for local integrity checks; this does not identify a trusted developer or provide notarization. Gatekeeper may block a downloaded copy. Source builds are also not automatically trusted or notarized.
 
-### For Source Code Builds:
-- **No quarantine required** when building from source
-- **Follow these steps** to build safely:
-  1. Clone the repository: `git clone https://github.com/BrokenPorkMachine/HindSight.git`
-  2. Run the build script: `./build.sh`
-  3. The built application will not be quarantined
+Download only from this repository's GitHub releases and compare the supplied SHA-256 checksums. Checksums establish file identity, not publisher trust or absence of vulnerabilities. Review the release notes for the exact checks run and remaining limitations.
 
-### Security Notes:
-- This application contains signed Mach-O binaries with embedded certificates
-- Building from source provides full transparency of the code
-- Source builds avoid any potential quarantine or notarization issues
+## Building from source
 
-## Recommended Actions
-
-### If you want to run HindSight safely:
-1. **Build from source** (recommended for production use)
-2. **Verify the digital signature** of the binary
-3. **Check the release notes** for any security updates
-
-### If you prefer the pre-built binary:
-1. **Download from official sources only**
-2. **Right-click the installer** and select "Open" to bypass quarantine
-3. **Trust the developer** in Security & Privacy preferences
-
-## Additional Resources
-
-For detailed build instructions and source code verification, refer to:
-- [Project Recreation Guide](docs/PROJECT_RECREATION.md)
-- [Release Qualification Preflight](docs/VALIDATION.md)
-- [Documentation](docs/README.md)
-
-## Contact
-
-If you have questions about code signing or quarantine, please refer to the official HindSight documentation or contact the development team.
+Open `HindSight.xcodeproj`, or run `CONFIGURATION=Release ./scripts/build-app.sh` on a supported macOS development host with Xcode and Rust installed. See [project recreation](docs/PROJECT_RECREATION.md) and [release readiness](docs/RELEASE_READINESS.md) for prerequisites and deferred gates.

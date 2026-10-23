@@ -9,8 +9,8 @@ Usage: ./scripts/qualify-release.sh [options]
 Run HindSight's release checks and save an operator report under build/release-reports/.
 
 Options:
-  --candidate       Run the credential-free universal candidate gate (default).
-  --stable          Run the signed, notarized stable-release gate.
+  --candidate       Run the credential-free Apple-Silicon candidate gate (default).
+  --stable          Run the signed, notarized stable-release gate (deferred; not part of the current release posture).
   --report-dir DIR  Store the report in DIR instead of build/release-reports/.
   --open            Open the verified Release app after a successful gate.
   --help            Show this help.
@@ -108,9 +108,9 @@ Repository revision: $git_revision
 Automated mode: $mode
 Automated gate exit code: $gate_rc
 
-The following checks require a real Intel Mac and an 8 GiB Apple-Silicon Mac. Record
+The following checks require a real Apple-Silicon Mac with the 8 GiB baseline. Record
 results here after each run; do not treat this file as passing until every item is
-verified on the required host.
+verified on the required host. Intel checks are optional experimental evidence.
 
 - [ ] Large-firmware memory-pressure reproduction; record peak RSS and bounded failure/completion. (see scripts/test-memory-pressure.sh)
 - [ ] Real stripped, symbol-rich, data-in-code, and encrypted-metadata arm64 Mach-O inputs.

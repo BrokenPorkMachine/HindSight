@@ -38,5 +38,11 @@ jobs:
         run: python3 scripts/test-machine-state.py rust/target/debug/reworker
       - name: Qualify recovered scalar source (Apple Silicon host required)
         run: python3 scripts/test-recovered-source.py rust/target/debug/reworker
+      - name: Qualify reconstructed void functions and memory effects
+        run: python3 scripts/test-recovered-void.py rust/target/debug/reworker
+      - name: Qualify native LP64 scalar pointee reconstruction
+        run: python3 scripts/test-recovered-pointees.py rust/target/debug/reworker
+      - name: Qualify declaration-only FP, stack and SDK headers with language contracts
+        run: python3 scripts/test-recovered-headers.py rust/target/debug/reworker
       - name: Score decompilation corpus
         run: python3 scripts/run-decompilation-corpus.py --worker rust/target/debug/reworker

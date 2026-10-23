@@ -116,8 +116,8 @@ assert str((R/'App/AnalysisNavigation.swift').resolve()) in actual_app_swift
 assert str((R/'App/AnalysisContinuity.swift').resolve()) in actual_app_swift
 assert 'test-app-typecheck.sh' in (R/'scripts/test-macos.sh').read_text()
 
-# Universal macOS / Intel compatibility contract. Static ARM64 analysis remains
-# cross-host; only host-dependent Apple-Silicon execution features are gated.
+# Official Apple-Silicon macOS contract. Intel remains experimental; static
+# ARM64 analysis is cross-host while host-dependent execution is arm64-only.
 host_platform=(R/'Shared/HostPlatform.swift').read_text()
 assert 'case arm64' in host_platform and 'case x86_64' in host_platform
 assert 'supportsAppleSiliconHypervisor' in host_platform and 'supportsArm64NativeDebugger' in host_platform
@@ -125,7 +125,7 @@ assert 'supportsVectorEmu' in host_platform and 'isAppleSiliconProcess' in host_
 assert 'Shared/HostPlatform.swift' in topology['targets']['HindSight']
 assert 'Shared/HostPlatform.swift' in topology['targets']['CoordinatorService']
 assert "'ARCHS':'arm64 x86_64'" in generator
-assert "ARCHS='arm64 x86_64'" in (R/'scripts/build-app.sh').read_text()
+assert "build_archs='arm64'" in (R/'scripts/build-app.sh').read_text()
 assert "aarch64-apple-darwin" in build_rust and "x86_64-apple-darwin" in build_rust
 assert '/usr/bin/lipo -create' in build_rust
 vector_build=(R/'scripts/build-vector-emu.sh').read_text()
@@ -135,7 +135,7 @@ assert '-target "${arch}-apple-macos14.0"' in app_typecheck
 assert '-target "${arch}-apple-macos14.0"' in coordinator_typecheck
 assert 'for arch in arm64 x86_64' in app_typecheck and 'for arch in arm64 x86_64' in coordinator_typecheck
 assert "generic/platform=macOS" in (R/'scripts/build-app.sh').read_text()
-assert "ARCHS='arm64 x86_64'" in (R/'scripts/build-app.sh').read_text()
+assert 'HINDSIGHT_EXPERIMENTAL_INTEL' in (R/'scripts/build-app.sh').read_text()
 content_host=(R/'App/ContentView.swift').read_text()
 assert 'hostUnavailableWorkspace("Native ARM64 Debugger"' in content_host
 assert 'hostUnavailableWorkspace("Hypervisor RE"' in content_host
@@ -351,7 +351,7 @@ assert (R/'docs/ANALYSIS_QUALITY_BETA14.md').is_file()
 
 # v0.4.2 staged-analysis execution and patch-compatible analysis-cache contract.
 target_model=(R/'Shared/TargetModel.swift').read_text()
-assert 'static let version = "0.5.12"' in target_model
+assert 'static let version = "0.5.13"' in target_model
 assert 'static let releaseChannel = "stable"' in target_model
 assert 'static let isPrerelease = false' in target_model
 assert r'\"release_channel\":\"stable\"' in bridge_caps
@@ -362,7 +362,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v96-schema122"', 'analysisCacheProducerVersion = "0.5.12"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v103-schema129"', 'analysisCacheProducerVersion = "0.5.13"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -515,7 +515,7 @@ assert (R/'docs/ANALYSIS_NAVIGATION_0.4.3.md').is_file()
 analysis_continuity=(R/'App/AnalysisContinuity.swift').read_text()
 for token in ['struct VGAnalysisPin', 'struct VGAnalysisVisit', 'struct VGAnalysisSnapshot', 'struct VGAnalysisDelta',
               'maximumBytes = 1 * 1024 * 1024', 'maximumPins = 128', 'maximumRecent = 96',
-              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v96-schema122']:
+              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v103-schema129']:
     assert token in analysis_continuity, token
 for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'Text("Changes").tag("Changes")',
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:
@@ -721,9 +721,9 @@ for capability in ['modern_macho_metadata_admission','encrypted_metadata_analysi
 assert (R/'docs/ANALYSIS_ADMISSION_BETA7.md').is_file()
 
 # Release metadata must agree across every shipped component.
-release = "0.5.12"
-bundle_release = "0.5.12"
-bundle_build = "5912"
+release = "0.5.13"
+bundle_release = "0.5.13"
+bundle_build = "5913"
 app_info = plistlib.loads((R/'Config/App-Info.plist').read_bytes())
 coordinator_info = plistlib.loads((R/'Config/Coordinator-Info.plist').read_bytes())
 assert app_info['CFBundleShortVersionString'] == bundle_release
@@ -951,8 +951,8 @@ status_doc=(R/'docs/STATUS.md').read_text()
 validation_doc=(R/'docs/VALIDATION.md').read_text()
 macos_doc=(R/'docs/MACOS_VALIDATION.md').read_text()
 readiness_doc=(R/'docs/RELEASE_READINESS.md').read_text()
-assert status_doc.startswith('# HindSight 0.5.12 Status')
-assert validation_doc.startswith('# Validation — HindSight 0.5.12')
+assert status_doc.startswith('# HindSight 0.5.13 Status')
+assert validation_doc.startswith('# Validation — HindSight 0.5.13')
 for token in ['Hotfix 3', 'Function Neighborhoods', 'topology-derived']:
     assert token in status_doc or token in validation_doc, token
 for token in ['Function Neighborhoods', 'AnalysisNavigation.swift', 'AnalysisContinuity.swift', 'objects', 'analysis-cache', 'staging']:

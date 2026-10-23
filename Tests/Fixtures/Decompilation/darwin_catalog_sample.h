@@ -16,5 +16,10 @@ void HSNativeCatalogCallback(void (*callback)(int));
 @property(nonatomic, copy, getter=displayLabel, setter=setDisplayLabel:) NSString *label;
 - (double)score:(double)factor count:(NSUInteger)count;
 - (HSNativeCatalogPair)pair;
+- (unsigned long)scalarCount:(unsigned long)value;
 + (NSRange)rangeForCount:(NSUInteger)count;
+@end
+
+@interface HSNativeCatalogDerived : HSNativeCatalogFixture <NSCopying>
+- (long)derivedValue;
 @end

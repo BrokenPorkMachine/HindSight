@@ -421,7 +421,11 @@ _hs_ast_opaque_memory:
         for name in ["opaque"]:
             assert artifacts[name]["eligibility"]["state"] == "blocked"
             assert any(node["kind"] == "unsupported-effect" for node in artifacts[name]["nodes"])
+            review = [node["payload"] for node in artifacts[name]["nodes"] if node["payload"].get("artifact_kind") == "best-effort-source"]
+            assert len(review) == 1 and "loc_" in review[0]["source"] and "BEST-EFFORT" in review[0]["source"]
+            assert review[0]["status"] == "review-only-uncompiled"
         assert artifacts["large"]["truncated"]
+        assert any("truncated: true" in node["payload"].get("source", "") for node in artifacts["large"]["nodes"])
         assert artifacts["large"]["budgets"]["exhausted"] == ["instructions"]
         assert artifacts["large"]["eligibility"]["state"] == "blocked"
 

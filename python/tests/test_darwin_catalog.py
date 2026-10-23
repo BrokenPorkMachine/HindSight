@@ -4,8 +4,14 @@ import importlib.util
 from pathlib import Path
 import sys
 import struct
+import json
+import subprocess
+import io
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,6 +25,57 @@ def module(name, filename):
 
 NATIVE = module("collect_darwin_evidence", "collect-darwin-evidence.py")
 SDK = module("darwin_sdk_catalog", "darwin_sdk_catalog.py")
+
+
+class SDKImportSelectionTests(unittest.TestCase):
+    def test_redeclaration_comparison_ignores_only_top_level_restrict(self):
+        self.assertEqual(SDK._parameter_abi_key({"qualType": "const void *restrict"}), "const void *")
+        self.assertNotEqual(SDK._parameter_abi_key({"qualType": "const void *restrict"}), "void *")
+        self.assertEqual(SDK._parameter_abi_key({"qualType": "size_t", "desugaredQualType": "unsigned long"}), "unsigned long")
+
+    def test_direct_worker_lookup_validates_frame_and_clears_inherited_prototypes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "capture"
+            binary.write_bytes(b"fixture")
+            worker = Path(directory) / "worker"
+            worker.write_bytes(b"fixture")
+            raw = json.dumps({"kind": "analysis_result", "source_sha256": "a" * 64}).encode()
+            frame = struct.pack(">I", len(raw)) + raw
+            command = ["darwin_sdk_catalog.py", str(binary), "--worker", str(worker)]
+            with patch.object(sys, "argv", command), patch.object(SDK, "verify_macho_target", return_value="a" * 64), patch.object(SDK.subprocess, "run", return_value=SimpleNamespace(stdout=frame)) as run, patch.object(SDK, "collect_import_declarations", return_value={"verified": True}) as collect, patch.dict(SDK.os.environ, {"HINDSIGHT_PROTOTYPE_DB": "/unrelated/catalog"}), redirect_stdout(io.StringIO()) as output:
+                SDK.main()
+                self.assertEqual(json.loads(output.getvalue()), {"verified": True})
+                self.assertNotIn("HINDSIGHT_PROTOTYPE_DB", run.call_args.kwargs["env"])
+                self.assertEqual(run.call_args.args[0][1], "--analyze")
+                self.assertEqual(collect.call_args.args[1]["source_sha256"], "a" * 64)
+                run.return_value.stdout = struct.pack(">I", len(raw)+1) + raw
+                with self.assertRaisesRegex(ValueError, "analysis frame"):
+                    SDK.main()
+                self.assertEqual(collect.call_count, 1)
+
+    def test_import_collector_binds_source_and_retains_provider(self):
+        report = {"source_sha256": "a" * 64, "linkage_records": "symbol=_malloc import[0] dylib=/usr/lib/libSystem.B.dylib addend=0 weak=no stub=0x1000\n"}
+        with patch.object(SDK, "verify_macho_target", return_value="a" * 64), patch.object(SDK, "collect_declarations", return_value={"functions": [{"name": "malloc", "symbol": "_malloc"}]}) as collect:
+            catalog = SDK.collect_import_declarations(Path("capture"), report)
+            self.assertEqual(collect.call_args.args[0], ["malloc"])
+            self.assertEqual(catalog["source_sha256"], "a" * 64)
+            self.assertEqual(catalog["functions"][0]["captured_provider"], "/usr/lib/libSystem.B.dylib")
+            with self.assertRaisesRegex(ValueError, "source differs"):
+                SDK.collect_import_declarations(Path("capture"), {**report, "source_sha256": "b" * 64})
+            self.assertEqual(collect.call_count, 1)
+
+    def test_public_imports_retain_provider_and_reject_ambiguous_or_private_matches(self):
+        def row(symbol, provider, addend=0):
+            return f"symbol={symbol} import[0] dylib={provider} addend={addend} weak=no stub=0x1000\n"
+        records = row("_malloc", "/usr/lib/libSystem.B.dylib")
+        records += row("_CFRelease", "/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation")
+        records += row("_private", "/System/Library/PrivateFrameworks/Hidden.framework/Hidden")
+        records += row("_special", "<special>")
+        records += row("_offset", "/usr/lib/libSystem.B.dylib", 8)
+        records += row("_collision", "/usr/lib/libSystem.B.dylib") + row("_collision", "/tmp/custom.dylib")
+        selected = SDK.sdk_import_candidates(records)
+        self.assertEqual([item["name"] for item in selected], ["CFRelease", "malloc"])
+        self.assertEqual(selected[1]["provider"], "/usr/lib/libSystem.B.dylib")
 
 
 @unittest.skipUnless(sys.platform == "darwin", "native Darwin catalog requires macOS")
@@ -95,6 +152,42 @@ class DarwinCatalogTests(unittest.TestCase):
         emitted = SDK.worker_prototypes(catalog, "1" * 64)
         self.assertIn("# source_sha256=" + "1" * 64, emitted)
         self.assertIn("_HSNativeCatalogCount\tunsigned long HSNativeCatalogCount(unsigned long value);", emitted)
+
+    def test_import_selected_public_sdk_declaration_is_compiler_derived(self):
+        target = self.catalog["architecture"] + "-apple-macos14.0"
+        digest = SDK.verify_macho_target(self.helper, target)
+        report = {"source_sha256": digest, "linkage_records": "symbol=_malloc import[0] dylib=/usr/lib/libSystem.B.dylib addend=0 weak=no stub=0x1000\n"}
+        catalog = SDK.collect_import_declarations(self.helper, report, target=target)
+        self.assertEqual(catalog["missing_functions"], [])
+        record = catalog["functions"][0]
+        self.assertEqual(record["name"], "malloc")
+        self.assertEqual(record["captured_provider"], "/usr/lib/libSystem.B.dylib")
+        self.assertIn("void *", record["abi_declaration"])
+        self.assertIn("_malloc\t", SDK.worker_prototypes(catalog, digest))
+        analysis = Path(self.directory.name) / "sdk-import-analysis.json"
+        analysis.write_text(json.dumps({**report, "kind": "analysis_result"}))
+        command = [sys.executable, str(ROOT / "scripts/darwin_sdk_catalog.py"), str(self.helper), str(analysis), "--target", target]
+        evidence = json.loads(subprocess.run(command, check=True, capture_output=True, timeout=60).stdout)
+        self.assertEqual(evidence["source_sha256"], digest)
+        self.assertEqual(evidence["functions"][0]["captured_provider"], record["captured_provider"])
+        prototypes = subprocess.run([*command, "--worker-prototypes"], check=True, capture_output=True, text=True, timeout=60).stdout
+        self.assertIn("# source_sha256=" + digest, prototypes)
+        self.assertIn("_malloc\t", prototypes)
+
+    def test_direct_lookup_joins_real_worker_imports_to_sdk(self):
+        worker = ROOT / "rust/target/debug/reworker"
+        if not worker.is_file() or self.catalog["architecture"] != "arm64":
+            self.skipTest("requires the built AArch64 worker")
+        command = [sys.executable, str(ROOT / "scripts/darwin_sdk_catalog.py"), str(self.helper),
+                   "--worker", str(worker), "--target", "arm64-apple-macos14.0"]
+        result = subprocess.run(command, capture_output=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        catalog = json.loads(result.stdout)
+        self.assertTrue(catalog["import_candidates"])
+        self.assertTrue(catalog["functions"])
+        names = {item["name"] for item in catalog["import_candidates"]}
+        self.assertTrue(all(record["name"] in names and record["captured_provider"] for record in catalog["functions"]))
+        self.assertEqual(catalog["source_sha256"], SDK.verify_macho_target(self.helper, "arm64-apple-macos14.0"))
 
     def test_callback_declarators_remain_evidence_without_false_scalar_prototype(self):
         record = self.declarations["functions"][1]

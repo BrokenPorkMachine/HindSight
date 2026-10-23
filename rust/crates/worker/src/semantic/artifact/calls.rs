@@ -254,10 +254,7 @@ pub(super) fn with_prototype_payload(
         return V::Object(fields);
     };
     let (arguments, result) = locations_from_prototype(prototype);
-    let arguments = if arguments.is_empty() {
-        V::String("unresolved: no proven prototype".into())
-    } else {
-        array(arguments.iter().map(|argument| {
+    let arguments = array(arguments.iter().map(|argument| {
             object([
                 (
                     "name",
@@ -275,8 +272,7 @@ pub(super) fn with_prototype_payload(
                 ),
                 ("location", argument.location.clone().into()),
             ])
-        }))
-    };
+        }));
     let result = match result {
         Some(result) => object([
             (
@@ -288,7 +284,10 @@ pub(super) fn with_prototype_payload(
             ),
             ("location", result.location.clone().into()),
         ]),
-        None => V::String("unresolved: no proven prototype".into()),
+        None => object([
+            ("source_spelling", "void".into()),
+            ("location", V::Null),
+        ]),
     };
     effects.insert("arguments".into(), arguments);
     effects.insert("result".into(), result);
@@ -815,16 +814,38 @@ mod tests {
     }
 
     #[test]
-    fn a_prototype_without_a_source_signature_yields_no_locations() {
-        // A void return has no result value, and the shared source-signature
-        // recovery does not admit it. The caller therefore keeps the argument
-        // and result locations explicitly unresolved rather than guessing.
+    fn exact_empty_void_prototype_retains_known_absence_in_call_evidence() {
+        let prototype = prototype("void probe(void)");
+        let input = object([
+            ("call_effects", CallSummary::direct(0x1000).payload()),
+        ]);
+        let V::Object(payload) = with_prototype_payload(input, &prototype) else {
+            panic!("call payload must stay an object")
+        };
+        let Some(V::Object(effects)) = payload.get("call_effects") else {
+            panic!("call effects missing")
+        };
+        assert_eq!(effects.get("arguments"), Some(&array([])));
+        assert_eq!(effects.get("result"), Some(&object([
+            ("source_spelling", "void".into()),
+            ("location", V::Null),
+        ])));
+        assert!(effects.contains_key("memory_effect"),
+            "a proven void prototype must retain conservative memory effects");
+    }
+
+    #[test]
+    fn a_void_prototype_has_argument_locations_without_a_result_register() {
         let signature = Signature {
             language: "C",
             declaration: "void probe(int a)".into(),
             source: "test",
         };
-        assert!(crate::signatures::source_signature("probe", &signature).is_none());
+        let prototype = crate::signatures::source_signature("probe", &signature).unwrap();
+        let (arguments, result) = locations_from_prototype(&prototype);
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].location, "x0");
+        assert!(result.is_none(), "void must not invent an x0 result");
     }
 
     #[test]

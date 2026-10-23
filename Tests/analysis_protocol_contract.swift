@@ -3,6 +3,15 @@ import Foundation
 @main
 struct AnalysisProtocolContract {
     static func main() throws {
+        if CommandLine.arguments.count == 3 {
+            let data = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1]))
+            let report = try JSONDecoder().decode(AnalysisReport.self, from: data)
+            precondition(data.count <= WorkbenchProtocolLimits.analysisWorkerFrameBytes)
+            precondition(report.validationFailure(id: report.request_id, digest: CommandLine.arguments[2]) == nil,
+                         "Real worker report failed the native identity/section contract")
+            print("Real worker analysis decoded and passed native identity/section bounds (\(data.count) bytes).")
+            return
+        }
         precondition(WorkbenchProtocolLimits.controlWorkerFrameBytes == 256 * 1024)
         precondition(WorkbenchProtocolLimits.analysisWorkerFrameBytes == 8 * 1024 * 1024)
         precondition(WorkbenchProtocolLimits.defaultXPCReplyBytes == 2 * 1024 * 1024)

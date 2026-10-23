@@ -12,6 +12,342 @@ The first five items build one usable AArch64 source-recreation path. The
 current execution focus is source reconstruction and semantic coverage;
 server readiness and GitHub publication retain their separate gates.
 
+Dump-all shortcut (2026-10-23): both reconstruction menus offer all four formats
+for whole binary, current section and address scopes; existing batches have the
+same shortcut. A single reconstruction batch feeds `c/`, `h/`, `m/` and `n/`
+inside the chosen new destination. Per-format manifests retain unavailable and
+failed counts; the aggregate completion manifest is written only after all four
+exports pass checkpoint identity and aggregate byte-budget checks. Existing
+output is never overwritten. Dump-all intent is checkpointed for app resume.
+Portable artifact contracts and both app typechecks pass. The real app/XPC gate
+verifies all four folders and exact equality with individual format outputs.
+This shortcut does not upgrade review-only code into qualified recovered source.
+
+Objective-C header reconstruction now carries target-local class, ivar,
+property and method declarations into per-function `.h` artifacts for uniquely
+owned IMPs. Where an exact C-callable IMP declaration is available it is retained
+alongside the class review declarations; otherwise the review header replaces
+the generic wrapper. Conflicting method encodings are withheld and ambiguous
+owners do not supply a class. Header language contracts require Objective-C or
+Objective-C++. Superclass/protocol/type dependencies remain explicitly unresolved;
+this is not a complete class-layout or implementation claim. All 370 worker tests
+and 16 artifact contracts pass. The native fixture verifies actual emitted class
+headers at `-O0`/`-O2` and syntax-checks each in Objective-C and Objective-C++.
+Class review headers additionally retain superclass and protocol-adoption names
+when a unique class record matches both the owner metadata address and class
+name. Conflicting relationships remain withheld. A real local-subclass fixture
+verifies `HSNativeCatalogDerived : HSNativeCatalogFixture <NSCopying>` in emitted
+headers at both optimization levels; unrelated-address and contradictory-parent
+unit cases are rejected. External superclass pointers without resolved bind
+evidence remain unresolved rather than being guessed from host runtime state.
+Ordinary legacy dyld binds now provide typed superclass-slot evidence directly
+from the opcode decoder. Only completed streams, checked segment ranges,
+zero-addend non-weak pointer binds and known positive library ordinals may supply
+an external class name; contradictory binds or local/imported names are withheld.
+The actual fixture now recovers `HSNativeCatalogFixture : NSObject` with its
+recorded dyld provider at both optimization levels. Tests cover missing segments,
+range/VA overflow, unsupported/truncated streams and zero-valued operands that
+must not be confused with a DONE opcode. Chained superclass binds remain open.
+
+Supported scalar Objective-C IMPs now additionally emit `recovered-objective-c`:
+the validated IR-derived C-callable body plus a synthetic category method that
+forwards `self`, `_cmd` and the exact declared arguments. `.m` exports prefer this
+representation; `.c` retains the C body. Source review, individual exports,
+retained batches, native/CLI format dumps and dump-all preserve the extra `.m`
+with exact evidence hashes. Category packaging is explicitly synthetic, not
+original source or a complete class implementation. The native fixture checks
+method syntax at `-O0`/`-O2`, passes each actual artifact through the Swift
+decoder/batch/all-format contract, and checks CLI `.m` dumps against the artifact
+bytes. Worker tests (371), strict Clippy, 16 artifact contracts, both app
+typechecks and portable source validation pass; broad Objective-C dispatch,
+FP/aggregate method bodies and behavioral category deployment remain open.
+The scalar method fixture now also compiles and executes the generated category
+over an intentionally incorrect base implementation. Six zero/boundary/wraparound
+inputs pass at `-O0` and `-O2`; a separately compiled no-adapter control fails as
+expected at both levels. This proves the generated adapter is actually selected
+for this fixture, not general category deployment, ARC or dispatch equivalence.
+Declaration matching now collapses byte-identical SDK/external declarations
+while retaining corroborating SDK and hash-bound-catalog provenance. Different
+declarations remain separate conflict candidates; matching provenance alone does
+not establish ABI equivalence for differently spelled types or parameter lists.
+
+Reconstruction linkage integration (pass 62, in progress): per-function requests
+now join validated dyld export names and indirect-symbol call stubs with nlist
+names before declaration lookup. Pointer slots are not admitted as callable
+addresses. SDK and external-catalog disagreements remain separate candidates
+instead of being hidden by lookup precedence. All 369 worker tests pass.
+The native Darwin catalog gate now verifies that a source-bound Apple Clang
+declaration reaches an actual reconstructed header at both `-O0` and `-O2`,
+in addition to existing pseudocode, layout and source-identity checks. Automatic
+SDK discovery in the app, provider-qualified matching, complete class/interface
+exports and general implementation recovery remain open. Review-only fallback
+code is not qualified recovered source. The earlier candidate build predates
+these changes; rebuild/requalification and GitHub publication remain pending.
+
+Public SDK lookup now has a source-bound command-line path documented in
+[SDK_DECLARATION_LOOKUP.md](SDK_DECLARATION_LOOKUP.md). It can consume an analysis
+report or invoke the worker directly, select public import providers, and emit
+Clang declaration evidence or strict worker TSV. The real worker-to-SDK test
+exposed duplicate built-in/header declarations for `fwrite`; comparison now
+ignores only top-level parameter `restrict`, preserving pointed-to qualifiers
+and conflicting type shapes. All 14 catalog tests pass, including the actual
+captured Mach-O → worker imports → SDK declarations path. This is not yet
+automatic app export integration or runtime provider identity qualification.
+
+0.5.13 candidate preparation: flow and evidence graphs now start at 80% zoom;
+both minimaps use a fixed 190×120 surface, aspect-preserving projection of the
+entire graph extent, scaled node bounds and an exact-scale viewport indicator.
+The array declarator regression was reproduced by a failing test: unsupported
+row/pointer-array/VLA shapes could silently flatten. Pass 61 retains supported
+single-dimension scalar-array decay and withholds unsupported shapes. Native
+release qualification is in progress; credentialed gates remain deferred.
+
+SDK scalar memory recovery (pass 60): exact NSInteger/NSUInteger, CF integer
+typedefs and dispatch_once_t pointees now preserve declared types in memory AST
+nodes and volatile helpers. The native matrix passes 648 configurations and
+59,400 comparisons at four optimization levels, with SDK width/signedness static
+assertions, exact helper/AST types, header syntax, UBSan and surrounding-memory
+checks. Non-Foundation implementations compile as C; Foundation cases compile
+as Objective-C. Worker tests (366), strict Clippy, 16 artifact fixtures, portable
+source checks, both app typechecks and real app/XPC integration pass. This does
+not qualify arbitrary typedefs, aggregate memory or dispatch synchronization.
+
+App batch outcome reporting now persists recovered/review-only/failed counts and
+completed/cancelled/incomplete status; failed attempts are no longer described as
+exported artifacts. Native checkpoint validation recomputes the counters, and
+format dumps retain failed-function counts. The real app/XPC gate verifies a
+stale-identity reply produces one failure and no function files; the resulting
+header dump retains that failure and emits no fabricated representation. Existing
+normal, stale-context, cancellation and resume paths pass independently.
+Native contracts reject forged outcome status and each counter while preserving
+legacy checkpoints without the additive summary. Both app typecheck targets,
+16 artifact fixtures and portable source checks pass; manual UI interaction
+qualification remains open.
+
+CLI batch outcome reporting now distinguishes recovered/review-only/failed
+functions in checkpoints and final manifests. Any recorded execution/output
+failure produces a nonzero CLI exit (also on resume), while preserving evidence;
+valid review-only output is not mislabeled as a failure. Native tests verify
+byte-budget failure reporting, retained-failure resume and successful mixed
+recovered/review-only batches. This does not qualify full binary recovery.
+The 92-case native regression passes 4,176 comparisons, including existing
+tamper/SIGKILL-resume checks; the full Python suite passes 230 tests with six
+optional skips.
+
+Language-aware batch qualification now checks every header language explicitly
+listed in the artifact and records compiler-standard/hash-bound per-language
+results. Legacy evidence uses the prior Objective-C/Objective-C++ checks with an
+explicit legacy-default label, not inferred C compatibility. The SDK gate
+verifies 152 successful per-language batch qualification records across four
+optimization levels; portable tests check both current and legacy scheduling.
+The full Python suite passes 229 tests with six optional skips, and the existing
+92-case reconstruction regression passes 4,176 native comparisons plus batch
+tamper rejection and SIGKILL/resume checks with language-aware qualification.
+
+Header language contract (pass 59): worker artifacts now record C-family
+language eligibility explicitly; the native decoder validates it, Source review
+displays it, and native/CLI format manifests retain it. Rehashed invalid language
+contracts are refused before publication. Both app typechecks and real app/XPC
+format dumps/cancellation/resume pass. This is declaration metadata, not body
+equivalence or general language reconstruction.
+The native header gate verifies both C-compatible and Foundation-only headers
+through the actual Swift decoder and all format exports; 40 configurations,
+152 syntax checks, eight language rejections and exact output hashes pass.
+Portable tests pass 228 cases with six optional skips.
+
+SDK declaration expansion (pass 58): exact NSRange/CFRange and CoreGraphics
+point/size/rect/affine-transform prototypes now emit native-SDK-backed headers,
+without aggregate implementation claims. The expanded fixture gate passes 40
+configurations, 152 successful C-family syntax checks and whole-batch exports
+with exact hashes at four optimization levels. Foundation-only declarations
+explicitly require Objective-C/Objective-C++, not fabricated C type substitutes.
+Eight negative language checks verify the clear Foundation diagnostic. Worker
+tests (366), strict Clippy, 16 artifact fixtures, portable source checks, both
+app typecheck targets and real app/XPC dump/cancellation/resume integration pass
+with pass 58. General aggregate body recovery remains open.
+
+Declaration-only expansion (pass 57): header validation no longer depends on
+the body's register-only integer ABI eligibility. Exact float/double/long-double
+and stack-passed scalar prototypes emit headers without invented register
+locations or body claims. The native gate passes 16 configurations, 64 C-family
+syntax checks and whole-batch header exports with exact hash checks. Worker
+tests (366), strict Clippy, 16 artifact fixtures and portable source checks pass;
+unsupported types, variadics and C++ declarations remain withheld. FP/stack
+implementation recovery and general language header reconstruction remain open.
+Both app typecheck targets and the real app/XPC format-dump/cancellation/resume
+gate pass with the declaration-only expansion.
+The 92-case void/call/Boolean regression also passes 4,176 native comparisons,
+tamper rejection and actual CLI SIGKILL/resume checks with pass 57.
+
+Source type expansion (pass 56): ABI classification, source declarations and
+typed pointer recovery now admit explicit `signed short int`, `signed long`,
+`signed long int`, `signed long long` and `signed long long int` spellings.
+The native pointee matrix passes 408 configurations / 37,400 comparisons at
+`-O0/-O1/-O2/-Os`, preserving exact declared volatile access types and checking
+narrowing, returns and surrounding memory under UBSan. Worker tests (365),
+strict Clippy, 16 artifact fixtures, portable source checks and arm64/experimental
+Intel app typechecks pass. Engine/cache/reconstruction versions advance together;
+general typedefs, aggregates and C++/Swift implementation recovery remain open.
+The real app/XPC integration also passes with pass 56, including all four format
+dumps, exact output hashes and requested-format cancellation/resume.
+The broader recovered-source regression passes 544 function/configuration cases
+and 100,640 native comparisons with the same worker.
+
+Discoverable format dump workflow: main-menu **Reconstruction** now offers
+explicit `.c/.m/.h/.n` dumps by whole-binary/current-section/address scope,
+using sequential app/XPC reconstruction rather than current-function review
+fallbacks. Requested formats are exported to a dump subfolder with retained
+evidence, exact hashes and unavailable counts. Existing validated app batches
+can also be dumped without re-analysis. Native dump contracts and both app
+type-check targets pass. The real app/XPC gate exports all four formats and
+independently verifies artifact identity, output hashes and unavailable counts,
+while the existing batch cancellation/resume checks remain green.
+App checkpoints now preserve original scope and requested dump format across
+cancellation/resume; conflicting requests and existing dump destinations are
+preserved without overwriting. The real app/XPC gate verifies resumed native
+dump hashes. CLI format manifests also retain worker/prototype digests, source
+size and original batch scope. Five portable CLI tests cover review-only and
+failed functions, foreign rehashed evidence and refusal-before-publication;
+the full Python gate passes 227 tests with six optional skips.
+CLI resume now independently validates retained evidence graphs, exact generated
+representations and recovery states, not just file hashes, before replacing any
+checkpoint. The native gate rejects seven rehashed evidence/state/identity
+tamper cases in qualification, dump and resume without changing retained
+metadata; valid partial and direct-callee closure resumes still pass. This does
+not qualify recovery across a mid-worker crash or app/service restart.
+The native fixture gate additionally SIGKILLs the real CLI process after its
+first checkpoint and after a second function's files precede its checkpoint.
+Fresh processes resume both cases to the uninterrupted three-function result,
+preserving checkpointed and orphan output bytes and mtimes. Partial-file writes,
+power-loss durability and app/XPC restart remain unqualified.
+The equivalent CLI exporter passes whole-batch and range/address checks,
+exporting 25 bodies, 31 headers and 21 native outputs from the test fixture.
+Manual UI qualification and broader C++/Swift source recovery remain open.
+
+Batch qualification consistency: the qualifier now independently checks each
+retained reconstruction graph and binds source identity, function bounds,
+recovery state and every exported byte before compilation. Compilation uses a
+bounded private byte snapshot, preventing post-verification input changes from
+changing compiler input. Seven rehashed tamper cases are rejected, and a race
+fixture confirms compilation consumes the verified snapshot. These checks do
+not constitute producer authentication or original-image behavioral equivalence.
+The focused gate passes 92 configurations, 4,176 native comparisons and 24
+body-rejection/header cases, including 31 syntax-checked headers and 25 linked
+implementations. Source validation passes 222 tests (six existing optional
+skips) plus native contracts. No app sources changed for this qualification slice.
+
+Large-analysis report bounds: fixed a reproduced `itunescloudd` analysis
+failure where `prototype_conflicts` reached 88,112 bytes and violated the native
+65,535-byte section limit. The producer now uses a 60,000-byte budget, retains
+whole UTF-8 rows, prioritizes conflicts, and reports omitted/displayed counts.
+The same binary now yields 59,641 bytes for this section (largest section:
+61,436 bytes) and passes native identity/section decoding. All 364 worker tests
+and strict Clippy pass. Decoder limits were not raised.
+
+Export representation correctness: `.h`, `.c`/`.m`, and `.n` review exports
+now require header, recovered-body and machine-state artifacts respectively,
+without first-source fallbacks. Unavailable representations stay explicitly
+unresolved; C++/Objective-C++/Swift translations remain commented evidence.
+Native contracts pass all seven formats and both app type-check targets pass.
+Real app/XPC format rendering passes alongside batch, hash and cancellation/
+resume checks. Native integration requires actual machine-state source; the
+save panel permits the custom `.n` extension. Manual save-panel qualification
+remains open.
+
+Pass 55 integer store conversions: declaration-proven integer values can now
+be converted to an exact declared pointee type at the decoded store width.
+Narrow register views carry their explicit unsigned cast type and retain the
+original declaration on the child expression; unresolved and pointer values
+remain blocked. Volatile helpers retain the actual declared pointee type rather
+than an equal-width but possibly C-incompatible typedef; distinct native helpers
+have distinct identities. All 362 worker tests and strict Clippy pass. Expanded
+native qualification passes 288 configurations and 26,400 comparisons, including
+actual volatile helper pointer-type assertions. Source validation passes 222
+tests (six optional skips) plus native contracts; both app type-check targets
+pass. Full source regression passes 544 configurations and 100,640 native
+comparisons; the existing focused gate passes 92 configurations and 4,176
+comparisons, and all 16 worker/native artifact fixtures pass.
+
+Pass 54 constant stores: exact declared integer pointee types now constrain
+known constant stores, including volatile zero/all-ones writes. Structured
+constant-bit evidence survives register-width views and copies without parsing
+rendered expressions. Unknown values and noncanonical Boolean stores remain
+blocked. Expanded native qualification passes 240 configurations and 20,400
+comparisons. All 360 worker tests and strict Clippy pass; source validation
+passes 222 tests (six optional skips) plus native contracts, and both app
+type-check targets pass. Full source regression passes 544 configurations and
+100,640 native comparisons. The existing focused gate passes 92 configurations
+and 4,176 comparisons; all 16 worker/native artifact fixtures pass.
+
+Pass 53 native C pointees: source recovery preserves exact native integer
+spelling, width and signedness through pointer reads and volatile accesses,
+including indexed load/store/exchange schedules. The new native gate passes
+144 configurations and 18,000 comparisons over 12 representative spellings;
+358 worker tests and strict Clippy pass. Full source regression passes 544
+configurations and 100,640 native comparisons; the existing focused gate passes
+92 configurations and 4,176 comparisons. All 16 worker/native artifact fixtures,
+both app type-check targets and source validation (222 tests, six optional
+skips, plus native contracts) pass. Plain `char` assumes the default signed Apple LP64 spelling; alternate
+compiler signedness modes remain outside the qualified contract.
+
+Declaration-only qualification: the batch qualifier now offers an explicit
+`--headers-only` mode with separate retained evidence and a syntax-only claim.
+It does not compile implementations or link a library. Default implementation
+qualification still requires recovered bodies; empty header sets cannot pass.
+The focused gate passes header-only success, implementation-mode refusal,
+missing-declaration refusal and preservation of previous reports. Native
+reconstruction still passes 92 configurations and 4,176 comparisons; source
+validation passes 222 tests (six existing optional skips) plus native contracts.
+
+Scope correctness: reconstruction batches and review exports now share exact
+section/address planning. Current-section exports no longer include unrelated
+sections; missing/overflowing bounds, ambiguous address matches and silently
+truncated scopes are rejected. Address actions offer explicit hex/decimal entry.
+Native scope contracts pass with the 16 artifact fixtures; both app type-check
+targets pass. Real app/XPC verification selects section/address functions from
+a force-verified instruction page and passes the three-function batch, output
+hash, cancellation/resume and HTTPS transaction checks. Manual address-dialog
+interaction remains unqualified.
+
+Pass 52 separates exact declaration/header recovery from body eligibility.
+Supported declarations survive rejected or trap-blocked bodies without claiming
+implementation recovery. Native tests retain and C/C++-parse headers across
+24 body-rejection cases; header-only native decode/export/checkpoint checks
+pass. Batch output has 25 recovered implementations and six review-only entries.
+357 worker tests, strict Clippy, 16 worker/native-decoder artifact fixtures and
+both app type-check targets pass. Full source regression passes 544
+configurations and 100,640 native comparisons. All 31 batch headers pass
+Objective-C/Objective-C++ syntax checks, including the six review-only entries;
+the 25 recovered implementations compile and link separately.
+
+Pass 51 focused checkpoint: indexed volatile Boolean load/store/exchange
+recovery retains proven address types and ordered memory events. The native
+gate passes 92 configurations, 4,176 comparisons and 20 rejected invalid cases;
+batch qualification compiles and links 25 functions with five review-only.
+357 worker tests, strict Clippy and all 16 worker/native-decoder artifact
+fixtures pass. The full source regression passes 544 configurations and
+100,640 native comparisons. Arm64 and experimental Intel app type-checks
+pass; source validation passes 222 tests (six existing optional skips).
+
+Pass 50 focused checkpoint: 357 worker tests and strict Clippy pass; the
+void/call/Boolean native matrix passes 80 configurations, 336 comparisons and
+20 rejection cases. Batch qualification compiles and links 22 recovered
+functions, leaving five explicitly review-only. All 16 worker/native-decoder
+artifact fixtures pass. Source validation passes 222 tests (six existing
+optional skips) plus native contracts. The full pass-50 matrix also passes
+544 configurations and 100,640 native comparisons.
+
+Last full source checkpoint (pass 48, prototype/cache revision 12): 356
+worker tests and strict Clippy pass; 16 worker/native-decoder artifact fixtures
+pass; the full recovered-source matrix passes 544 function/configuration pairs
+and 100,640 native comparisons. The focused void/call/Boolean matrix passes 56
+configurations, 240 native comparisons and eight negative cases. Batch export,
+resume, tamper refusal, direct-callee closure, C/C++ headers, and a linked
+15-function recovered subset are exercised in that focused gate. Full source
+validation passes 222 tests (six existing optional skips) plus native contracts.
+These results qualify the supported slices; the remaining C00–C16 requirements
+and interactive batch/recovery qualification stay open.
+
 1. [~] **Keep the current worker sound.** Vector integer ADD/SUB/MUL and MLA/MLS now retain exact arrangements, reject reserved encodings, and fold with independent lane-width modular wraparound; MLA/MLS read the prior destination as an SSA input, and Q=0 writes prove upper-half zeroing. Reverified on 2026-10-22: 353 worker tests; the 16-variant decompilation corpus (1,006 address-mapped instruction rows); 544 recovered-source function/config pairs (100,640 native comparisons); 36 machine-state functions (5,220 native comparisons); 82 native vector-extract forms (42,640 result comparisons); 12 native MLA/MLS forms (3,120 comparisons); and 40 vector FP forms (9,600 finite-normal native comparisons over `.4h`, `.8h`, `.2s`, `.4s`, and `.2d`). The FP gate excludes NaNs, signed-zero selection, FPCR modes and exception flags. Apple-Clang encoding-table tests cover lane-wise versus pairwise/fused SIMD FP neighbors and reserved `.1d` barriers; vector FP def-use ranges are checked in worker contracts and reconstruction artifacts. Barrier artifacts expose per-instruction read/write partitions and nearest surrounding accesses only across unique contiguous CFG fallthrough, labeled as program order—not proof that a barrier domain orders every access. A frame store–DMB–load fixture verifies emitted links, while a branch-around/join fixture verifies they are withheld across ambiguous control flow. Floating-point reconstruction now records FPCR/FPSR unknown-effect blockers and withholds strict machine-state output when those effects are reachable. Broad SIMD/system fallbacks, domain-specific ordering semantics, and all reconstruction consumers remain under audit. (C01–C03)
 2. [~] **Finish the per-function source review path in the macOS app.** The coordinator request and Source pane are wired in the working tree. A real worker-produced artifact passes the native Swift decoder contract, which rejects a stale source digest, mismatched function bounds, and a tampered dangling graph edge. Its review-context predicate rejects a changed project, record, analysis revision, or source digest; app and coordinator sources typecheck for arm64 and x86_64. The extended macOS integration transaction passed: the test app imported a captured Mach-O, requested source-bound analysis, reconstructed a function through CoordinatorService/XPC and the bundled worker, decoded it with the app’s native helper, checked its review context, and exported/validated the emitted artifact. Flow-graph branches now use available map dimensions, include call edges in component placement, and route fan-outs through distinct ports/channels. Evidence families now occupy separate lanes across the full map, with per-edge routes for fan-outs; layout/route contracts pass. Coordinator analysis failures identify request-ID, digest, count, and section-size mismatch classes; an oversized section diagnostic now reports its field and actual byte count. Reconstruction cancellation now tracks its own request and reports accepted, already-finished, and failed cancellation outcomes; contract coverage confirms origin spans navigate to their instruction addresses. Direct interactive UI qualification of origin selection/cancellation remains open. The reported interactive analysis mismatch is not reproduced by the fixture transaction; its specific input/result remains unverified. (C00/C11/C15)
    System-register audit: corrected NZCV, FPCR, FPSR, DAIF, and CurrentEL encodings. Shared IR now models `MRS/MSR NZCV` with explicit GPR and flag-file effects; other system-register accesses remain conservative and strict export is blocked where their state effects are not modeled. Strict machine-state C and interpretation now execute `MRS/MSR NZCV`; a native readback/write/condition fixture passes in the 36-function, 5,220-comparison machine-state gate. Other system-register state effects remain explicit blockers.
@@ -176,6 +512,14 @@ Acceptance: dominance, phi inputs, interference, def-use, memory versions, read-
 
 ## C04 — Calls, ABI, summaries, and the call graph
 
+Boolean callee results: pass 49 reuses the bounded source walker to prove every
+reachable return of an exact-prototype memory-free leaf is canonical before
+passing the Boolean value into its caller AST. Artifacts retain that proof and
+callee declaration. The native gate accepts a Boolean leaf/caller pair and
+rejects a leaf returning 2 and its caller at all four optimization levels.
+Changing the leaf's declared return type changes the settings digest and
+invalidates the caller proof. Indirect, imported and effectful callees stay open.
+
 Dependencies: C00N names/prototypes/layouts, C02 and C03; basic library types seed the solver before general C05 propagation.
 
 - [~] Complete Apple AAPCS64 parameter/return recovery: GP/FP banks, stack values, homogeneous/arbitrary aggregates, varargs, hidden result/context values, returns, tails, and nonreturning calls. *(in progress — claimed)* Verified progress: the indirect result location is modelled as the dedicated x8 register, so a result that is a composite larger than 16 bytes and is not a homogeneous floating-point aggregate is reported as returned through that location, and the result location never shifts the argument registers. A homogeneous floating-point aggregate of at most four members stays in the floating-point registers whatever its size, so `CGRect` is still reported in d0-d3, and a larger composite argument is reported as passed by pointer in the register that carries the caller's copy. The rule is qualified against the Apple toolchain: a compiler-built fixture returns `CGAffineTransform` through x8 and passes it by pointer, and the prototype-ABI gate asserts both forms. Varargs, stack values, context values, tails, and nonreturning calls remain open.
@@ -191,7 +535,7 @@ Dependencies: C00/C00N seed the library and layouts; iterate with C03/C04 for in
 
 - [~] Import project/SDK C declarations, DWARF/dSYM, structs/unions/enums/typedefs/prototypes, and validated runtime types; persist source and version. *(in progress — claimed)*
 - [~] Preserve native C declarations, Objective-C property/ivar attributes and actual compiler field layouts while propagating them into parameters, locals, fields, method declarations and expressions. *(in progress — claimed)*
-- [~] Solve types bidirectionally across SSA, calls, returns, casts, loads/stores, and pointer arithmetic, separating machine representation, semantic type, and source spelling. *(in progress — claimed)* Recovered-source AST nodes now state their machine representation and their proven semantic type separately: a parameter binding and the returned expression carry the type the exact source declaration proves, a register-width view preserves the source type when it does not discard source bits; a truncating cast remains unresolved unless the widths agree, an arithmetic or bitwise result keeps the operand type only when both operands agree on it, a comparison yields a condition rather than a value, a copy carries its source type unchanged, a join of two return paths keeps the type only when both paths agree, and a computed expression over an unproven operand stays explicitly unresolved. Bidirectional solving across SSA, calls and pointer arithmetic remains open.
+- [~] Solve types bidirectionally across SSA, calls, returns, casts, loads/stores, and pointer arithmetic, separating machine representation, semantic type, and source spelling. *(in progress — claimed)* Recovered-source AST nodes now state their machine representation and their proven semantic type separately: a parameter binding and the returned expression carry the type the exact source declaration proves, a register-width view preserves the source type when it does not discard source bits; a truncating integer view carries its explicit unsigned cast type while pointer or unknown views remain unresolved, an arithmetic or bitwise result keeps the operand type only when both operands agree on it, a comparison yields a condition rather than a value, a copy carries its source type unchanged, a join of two return paths keeps the type only when both paths agree, and a computed expression over an unproven operand stays explicitly unresolved. Bidirectional solving across SSA, calls and pointer arithmetic remains open.
 - [~] Infer stack/global/pointer-relative aggregate layouts and fields from width/offset/use/lifetime/alias evidence; retain incompatible layouts and alternatives. *(in progress — claimed)*
 - [~] Recover signedness, nullability, mutability, constness, ownership, and lifetime only to the degree supported by evidence. *(in progress — claimed)*
 
@@ -229,6 +573,13 @@ Acceptance: regenerated expressions retain def-use and memory/call ordering; bra
 
 ## C08 — Nested source control flow
 
+Boolean loop invariants: pass 48 seeds a canonical {0,1} domain only from a
+declaration-typed Boolean initializer and requires every modeled loop update to
+preserve it. The native counted-toggle fixture passes at four optimization
+levels for zero/odd/even iteration counts. Its noncanonical-update companion
+is rejected. Loop constants are not assumed invariant across iterations;
+general loop/phi solving and broader control flow remain open.
+
 Dependencies: C02–C05, C07.
 
 - [~] Build typed regions for nested conditions, short circuit/ternaries, guards/early exits, loops, multi-exit regions, switches/defaults/fallthrough, tails, and supported exception constructs. *(in progress — claimed)*
@@ -238,6 +589,109 @@ Dependencies: C02–C05, C07.
 Acceptance: nested and optimized fixtures retain all reachable exits and side effects; no extra edge or removed case is justified solely by a pretty rendering.
 
 ## C09 — Reconstructed source export and pseudocode round trip
+
+Boolean source recovery now admits bool/_Bool parameters and returns only when
+structured operation facts prove canonical {0,1} representations. Native
+identity, negation, AND and comparison fixtures pass all four optimization levels;
+noncanonical and unproven returns are rejected. The expanded focused matrix
+covers 52 function/configurations, 200 native comparisons and 14 linked recovered
+functions. Pass 47 and prototype/cache revision 12 identify the new semantics.
+
+Recovered headers: supported scalar C and C-style Objective-C IMP functions
+now retain a worker-produced recovered-header artifact with exact parameter
+and result types, provider includes, function bounds and declaration evidence.
+The Source output menu exposes it as Recovered header (.h), with identity-bound
+export. Headers use C linkage guards for C++ consumers. The 36-configuration
+void/call matrix parses every header as C and C++ and compiles the generated
+implementation against its header before native comparison. Broader C++/Swift
+declaration recovery and whole-image type dependencies remain open.
+Scope-export audit: removed generic argument-list declarations and the invented
+Objective-C wrapper from the whole/address/section export surface. Exports now
+include the current validated worker header or recovered body when its exact
+bounds belong to the requested scope, with unresolved discovered functions
+listed as comments. C++/Swift language translation remains explicitly unresolved;
+their current output retains C/Objective-C evidence as comments. Scope exports
+remain bounded partial exports; automatic whole-binary reconstruction is open.
+The CLI batch path now processes every discovered function or an exact range
+via scripts/reconstruct-binary.py, retaining headers, bodies, machine-state C
+and evidence with a hash/coverage/blocker manifest. The native fixture verifies
+11 discovered functions (10 recovered, one review-only), file hashes and exact
+range selection. App-driven batches, resume and whole-image dependency/link
+qualification remain open.
+CLI resume now publishes per-function atomic checkpoints and verifies source,
+worker, prototype and scope identities plus retained file hashes before
+continuing. Native integration tests grow a one-function batch to all 11
+discovered functions, verify the retained file's modification time is unchanged,
+and reject a changed artifact without overwriting it. App resume and whole-image
+dependency/link qualification remain open.
+App batch implementation: the Source pane now offers whole-binary, verified
+current-code-section and address-function batches, with sequential coordinator
+requests, per-function source/function/revision validation, cancellation between
+functions, retained outputs and a hash/blocker manifest. Batches enforce 4096
+functions and 256 MiB output, refuse existing output directories, and stop when
+the project, record, analysis revision or service readiness changes. App target
+typechecking and existing review contracts cover wiring; interactive batch and
+failure/reconnect qualification still require end-to-end evidence. Resume and
+whole-image dependency/link qualification remain open.
+Native batch publication now uses the shared validated-artifact exporter rather
+than app-local filename/hash logic. It preflights all output paths and byte limits,
+rejects duplicate output kinds and symlink directories, and refuses overwrite.
+The app runs hashing/writes off the main actor. Native contracts exercise budget
+rejection without partial output, file-hash agreement and overwrite/symlink refusal
+on worker-produced artifacts, including a recovered Boolean loop/header fixture.
+The real test app now imports a three-function captured Mach-O, runs the same
+batch routine through CoordinatorService/XPC and the bundled worker, validates
+the artifacts with the native decoder, exports them and independently verifies
+each file hash and bound source/function identity. The full Xcode build and HTTPS
+client transaction pass. Pre-cancelled and stale-context batches export no
+function files and clear active/busy state. Manual menu interaction, in-flight
+cancellation and service failure/reconnect remain unqualified.
+App checkpoint/resume is now implemented: the Source menu accepts an existing
+batch directory, verifies source/worker/pass/cache identities, project/record and
+function-plan consistency, then checks retained artifacts and all source files
+against their hashes and validated native artifact content. Per-function atomic
+checkpoints preserve completed work. The real Xcode/app/XPC/worker gate resumes
+a cancelled three-function batch and verifies resulting exports. Native contracts
+reject a changed worker and tampered retained artifact. Manual menu interaction,
+mid-request cancellation and restart/reconnect remain
+separate qualification work; recorded function failures remain failures on resume.
+Partial-progress recovery now passes the real app/XPC gate: the batch cancels
+after its first published function, resumes with one retained entry, finishes
+the remaining two functions and preserves the original file modification times.
+Independent checks verify all final hashes, function counts, retained count and
+cancel/busy/request cleanup. This qualifies cancellation between functions;
+mid-worker cancellation and recovery across app/service restarts remain open.
+
+Void-function reconstruction (2026-10-22): exact C/Objective-C void declarations
+now admit the existing scalar recovery path without requiring an x0 result.
+Empty functions, ordinary pointer setters and conditional setters compile and
+agree with their originals at -O0/-O1/-O2/-Os. The expanded matrix includes a
+void caller discarding a proven scalar leaf's result: 16 function/configuration
+pairs and 48 native comparisons, with surrounding memory checked under UBSan.
+Discarded calls survive as guarded executable AST events and generated C
+statements; the fixture checks exactly one call event and invocation.
+The same scheduling now applies to all supported scalar callers: discarded
+results retain the call and repeated expression uses share one result local.
+The focused matrix covers 24 function/configuration pairs and 56 native
+comparisons; the full recovered-source matrix still passes 544 function/config
+pairs and 100,640 native comparisons after this scheduling change.
+SP/LR and nonvolatile restoration checks still apply. Calls to exact-prototype
+void leaves now emit standalone guarded statements when the existing callee
+walk proves return, ABI preservation and no external memory effects or onward
+calls. Their AST nodes have void type, no result local is invented, and all
+caller-saved registers including x0 remain unknown after the call. The focused
+matrix covers 36 function/configuration pairs, 88 native comparisons and four
+rejections of attempts to use a void call as an x0 result. The
+void-call fixtures include a conditional call and a call before a pointer
+store, checking guarded AST events and generated call/store instruction order.
+The void call's AST type and machine-type attribute both state void.
+Effectful/imported
+void callees remain open under the existing callee-summary requirements. The dedicated
+scripts/test-recovered-void.py gate runs in the decompilation CI workflow.
+Call evidence now represents an exact zero-argument prototype as an empty
+argument list, and a void result as a proven void type without a result
+register. Missing prototypes retain their unresolved markers and conservative
+memory effects. Regression tests cover both cases independently.
 
 Dependencies: C04–C08 and the machine-state emitter from C01.
 
@@ -249,6 +703,22 @@ Dependencies: C04–C08 and the machine-state emitter from C01.
 Acceptance: exported projects compile under recorded flags and their address/AST/evidence maps validate; no silent stub, zero return, or invented framework behavior makes a function appear complete.
 
 ## C10 — Behavioral validation and reconstruction fidelity
+
+Direct dependency closure: CLI range batches can now include exact discovered
+callees outside their seed range from structured IR call targets. The bounded
+queue deduplicates cycles, persists across resume and records unresolved targets.
+Native integration verifies a single caller range cannot link alone, then
+includes its leaf, compiles and links both recovered functions, and resumes
+without resubmitting completed work. Imported/indirect dependencies and general
+whole-image dependency completeness remain open.
+
+Batch build qualification now verifies all manifest file hashes, compiles recovered
+C/Objective-C functions independently and links them with undefined symbols
+rejected. The native batch fixture links 10 recovered functions, retains one
+unrecovered function in its report, and executes test-owned setter/call-result
+checks against the library. A missing-leaf fixture requires linker failure.
+The report records the manifest hash and compiler identity. Arbitrary whole-image
+dependency completion, ABI breadth and app-integrated build qualification remain open.
 
 Dependencies: C00/C01; expand continuously with C02–C09.
 
@@ -314,6 +784,24 @@ Acceptance: bundle tampering and dependency changes are detected; team assertion
 
 ## C15 — Persistence, resource, and recovery prerequisites
 
+Reconstruction compatibility: producer and native consumer now require pass 55
+for void/Boolean semantics, exact call scheduling, recovered headers and Boolean
+loop invariants, proven Boolean callee results and Boolean pointer access.
+Boolean memory reads retain an explicit canonical-object precondition; stores
+require canonical values. Pointer depth and qualifier ownership remain checked.
+Pass 51 retains volatile pointee types through proven offset calculations;
+the final access still enforces its exact type and event ordering.
+Pass 52 emits supported exact declaration headers independently of body
+eligibility, retaining explicit declaration-only status for blocked functions.
+Pass 53 extends exact scalar pointee typing to admitted native Apple LP64
+integer spellings. Pass 54 adds declaration-constrained constant stores and
+structured constant-bit propagation. Pass 55 adds declaration-proven integer
+store conversions and exact unsigned types for narrowed integer register views.
+The native artifact contract rejects pass-54 documents;
+prototype/cache revision 12 prevents reuse of earlier call-ABI analysis output.
+This versions the changed behavior;
+general checkpoint/schema migration acceptance remains open.
+
 Remote integration companion: [app-hosted server contract and client-readiness/push gate](HINDSIGHT_REMOTE.md). The HindSight application owns the heavy work and streams results to authenticated clients. Client repository/branch placement is deferred until server completion; no remote-server completion is claimed here.
 
 Dependencies: existing project/cache/job model. Implement affected portions with each reconstruction pass.
@@ -328,12 +816,12 @@ Acceptance: interruption/corruption/migration tests preserve completed evidence 
 
 Dependencies: reconstruction qualification, C13–C15 and all applicable release gates.
 
-- [~] Universal signed/notarized distribution, qualified updater/rollback, entitlements, and update authenticity. *(in progress — claimed)*
+- [~] Official macOS Apple-Silicon (arm64) distribution; Intel support is experimental. Updater/rollback, entitlements and update authenticity remain open. Credentialed signing/notarization validation is intentionally deferred until further notice.
 - [~] Licensing tiers that preserve offline/local analysis and documented license-state recovery. *(in progress — claimed)*
 - [~] Guided labs, redistributable datasets, onboarding, complete documentation, and enterprise deployment material. *(in progress — claimed)*
-- [~] Re-run the original 0.1, 0.5, 1.0, native execution, signing/notarization, universal-build, and memory-pressure gates against current artifacts. *(in progress — claimed)*
+- [~] Re-run applicable original 0.1, 0.5, 1.0 and native execution gates against current arm64 artifacts. Intel/universal builds are experimental and non-blocking. Credentialed signing/notarization and manual release-host qualification are intentionally deferred until further notice.
 
-Acceptance: clean-install/update/offline/recovery tests and reproducible lab walkthroughs pass on the supported host matrix. External signing credentials and deployment decisions are requested only when their concrete release step is ready.
+Acceptance: clean-install/update/offline/recovery tests and reproducible lab walkthroughs pass on officially supported macOS arm64 hosts. Credentialed release validation remains deferred until the user re-enables it; no signing credentials are required for current reconstruction work.
 
 ## Traceability: every remaining original checklist item
 

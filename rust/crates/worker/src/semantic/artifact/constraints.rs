@@ -188,33 +188,25 @@ pub(crate) fn solve(caller_claims: Vec<Constraint>, callee_claims: Vec<Constrain
 /// implementations stay separate claims: a conflict is reported as a
 /// conflict, never resolved by preferring one side.
 pub(crate) fn report(solution: &Solution) -> String {
+    const LIMIT: usize = 60_000;
+    // Reserve space for disclosure counts and truncation notice. Append only
+    // whole rows, so UTF-8 and individual claims are never cut in half.
+    fn row(out: &mut String, text: &str) -> bool {
+        if out.len().saturating_add(text.len()) > LIMIT - 512 { return false; }
+        out.push_str(text);
+        true
+    }
     let mut out = String::from("Caller/callee constraints\n===========================\n");
     out.push_str(&format!(
         "Iterations: {}{}\n",
         solution.iterations,
         if solution.exhausted { " (exhausted)" } else { "" }
     ));
-    if let Some(reason) = &solution.exhaustion_reason {
-        out.push_str(&format!("Exhaustion reason: {reason}\n"));
-    }
+    let reason_omitted = solution.exhaustion_reason.as_ref()
+        .is_some_and(|reason| !row(&mut out, &format!("Exhaustion reason: {reason}\n")));
     out.push_str(&format!("Claims: {}\n", solution.constraints.len()));
-    let mut by_callee: BTreeMap<u64, Vec<&Constraint>> = BTreeMap::new();
-    for constraint in &solution.constraints {
-        by_callee.entry(constraint.callee).or_default().push(constraint);
-    }
-    for (callee, claims) in by_callee.iter().take(200) {
-        for constraint in claims.iter().take(24) {
-            let parameter = constraint.index.map(|index| format!("x{index}")).unwrap_or_else(|| "[]".into());
-            out.push_str(&format!(
-                "callee={callee:#018x} site={:#018x} {}{parameter} type={} origin={} strength={:.2}\n",
-                constraint.site,
-                constraint.kind.name(),
-                constraint.spelling,
-                constraint.origin,
-                constraint.strength
-            ));
-        }
-    }
+    // Conflicts must not disappear behind a large list of agreeing claims.
+    let mut displayed_conflicts = 0;
     if solution.conflicts.is_empty() {
         if solution.constraints.is_empty() {
             out.push_str("Conflicts: none. No proven prototype stated a claim on either side of a call, so no agreement is claimed either.\n");
@@ -225,7 +217,7 @@ pub(crate) fn report(solution: &Solution) -> String {
         out.push_str(&format!("Conflicts: {}\n", solution.conflicts.len()));
         for conflict in solution.conflicts.iter().take(200) {
             let parameter = conflict.index.map(|index| format!("x{index}")).unwrap_or_else(|| "[]".into());
-            out.push_str(&format!(
+            if !row(&mut out, &format!(
                 "conflict callee={:#018x} site={:#018x} {}{parameter} caller={} ({}) callee={} ({})\n",
                 conflict.callee,
                 conflict.site,
@@ -234,8 +226,29 @@ pub(crate) fn report(solution: &Solution) -> String {
                 conflict.caller.origin,
                 conflict.callee_side.spelling,
                 conflict.callee_side.origin
-            ));
+            )) { break; }
+            displayed_conflicts += 1;
         }
+    }
+    let mut by_callee: BTreeMap<u64, Vec<&Constraint>> = BTreeMap::new();
+    for constraint in &solution.constraints {
+        by_callee.entry(constraint.callee).or_default().push(constraint);
+    }
+    let mut displayed_claims = 0;
+    'callees: for (callee, claims) in by_callee.iter().take(200) {
+        for constraint in claims.iter().take(24) {
+            let parameter = constraint.index.map(|index| format!("x{index}")).unwrap_or_else(|| "[]".into());
+            if !row(&mut out, &format!(
+                "callee={callee:#018x} site={:#018x} {}{parameter} type={} origin={} strength={:.2}\n",
+                constraint.site, constraint.kind.name(), constraint.spelling, constraint.origin, constraint.strength
+            )) { break 'callees; }
+            displayed_claims += 1;
+        }
+    }
+    out.push_str(&format!("Displayed claims: {displayed_claims}/{}; displayed conflicts: {displayed_conflicts}/{}.\n",
+                          solution.constraints.len(), solution.conflicts.len()));
+    if reason_omitted || displayed_claims < solution.constraints.len() || displayed_conflicts < solution.conflicts.len() {
+        out.push_str("Report truncated: additional claims/conflicts withheld by byte or row budget; omitted evidence is not agreement.\n");
     }
     out
 }
@@ -246,6 +259,33 @@ mod tests {
 
     fn claim(site: u64, callee: u64, kind: ConstraintKind, index: u8, spelling: &str, origin: &'static str) -> Constraint {
         Constraint { site, callee, kind, index: Some(index), spelling: spelling.into(), origin, strength: 0.9 }
+    }
+
+    #[test]
+    fn report_has_a_byte_budget_and_retains_conflicts_before_claim_rows() {
+        let mut solution = solve(
+            vec![claim(1, 2, ConstraintKind::ArgumentType, 0, "signed", "caller-prototype")],
+            vec![claim(1, 2, ConstraintKind::ArgumentType, 0, "unsigned", "callee-prototype")]);
+        solution.constraints.extend((0..1000).map(|index| claim(index, index + 10,
+            ConstraintKind::ArgumentType, 0, &"型".repeat(100), "callee-prototype")));
+        let output = report(&solution);
+        assert!(output.len() <= 60_000);
+        assert!(output.contains("Report truncated:"));
+        assert!(output.contains("displayed conflicts: 1/1"));
+        assert!(output.find("conflict callee=").unwrap() < output.find("type=").unwrap());
+        assert!(output.ends_with("omitted evidence is not agreement.\n"));
+    }
+
+    #[test]
+    fn one_oversized_constraint_cannot_overflow_the_analysis_section() {
+        let mut solution = solve(vec![], vec![]);
+        solution.constraints.push(claim(1, 2, ConstraintKind::ArgumentType, 0,
+            &"x".repeat(100_000), "callee-prototype"));
+        solution.exhaustion_reason = Some("reason".repeat(20_000));
+        let output = report(&solution);
+        assert!(output.len() < 65_536);
+        assert!(output.contains("Displayed claims: 0/1"));
+        assert!(output.contains("Report truncated:"));
     }
 
     #[test]

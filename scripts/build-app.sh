@@ -9,7 +9,11 @@ build_args=("$@")
 if [[ "${HINDSIGHT_SWIFT_DISABLE_SANDBOX:-0}" == "1" ]]; then
     build_args+=("OTHER_SWIFT_FLAGS=\$(inherited) -disable-sandbox")
 fi
-build_command=(xcodebuild -project "$ROOT/HindSight.xcodeproj" -scheme HindSight -configuration "$CONFIGURATION" -destination 'generic/platform=macOS' -derivedDataPath "$ROOT/build/DerivedData" ARCHS='arm64 x86_64' ONLY_ACTIVE_ARCH=NO build)
+# Apple Silicon is the official release target. Intel/universal builds are
+# opt-in experimental builds for development and research.
+build_archs='arm64'
+[[ "${HINDSIGHT_EXPERIMENTAL_INTEL:-0}" == "1" ]] && build_archs='arm64 x86_64'
+build_command=(xcodebuild -project "$ROOT/HindSight.xcodeproj" -scheme HindSight -configuration "$CONFIGURATION" -destination 'generic/platform=macOS' -derivedDataPath "$ROOT/build/DerivedData" ARCHS="$build_archs" ONLY_ACTIVE_ARCH=NO build)
 if (( ${#build_args[@]} > 0 )); then
     build_command+=("${build_args[@]}")
 fi

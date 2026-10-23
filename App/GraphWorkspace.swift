@@ -20,8 +20,8 @@ struct VGGraphWorkspace: View {
     let debugPC: String?
     let onSelectAddress: (String) -> Void
 
-    @State private var zoom: CGFloat = 0.85
-    @State private var zoomAnchor: CGFloat = 0.85
+    @State private var zoom: CGFloat = 0.8
+    @State private var zoomAnchor: CGFloat = 0.8
     @State private var selectedBlockID = ""
     @State private var functionQuery = ""
     @State private var showFunctions = true
@@ -96,8 +96,8 @@ struct VGGraphWorkspace: View {
         layout = graph.layout(
             limit: 240,
             functionStarts: Set(functions.map(\.start)),
-            availableWidth: Double(viewport.width / 0.85),
-            availableHeight: Double(viewport.height / 0.85)
+            availableWidth: Double(viewport.width / 0.8),
+            availableHeight: Double(viewport.height / 0.8)
         )
         fitGraph(widthOnly: true)
     }
@@ -592,9 +592,9 @@ struct VGGraphWorkspace: View {
                     guard let point = layout.positions[block.id] else { continue }
                     let selected = selectedBlock?.id == block.id
                     let executing = debugPCValue.map(block.contains) ?? false
-                    let projected = projection.project(CGPoint(x: point.x, y: point.y))
-                    let rect = CGRect(x: projected.x - 2.4, y: projected.y - 1.7, width: 4.8, height: 3.4)
-                    context.fill(Path(ellipseIn: rect), with: .color(executing ? Color.red : selected ? Color.accentColor : Color.primary.opacity(0.38)))
+                    let rect = projection.project(CGRect(x: CGFloat(point.x) - nodeWidth / 2,
+                        y: CGFloat(point.y) - nodeHeight / 2, width: nodeWidth, height: nodeHeight))
+                    context.fill(Path(rect), with: .color(executing ? Color.red : selected ? Color.accentColor : Color.primary.opacity(0.38)))
                 }
             }
             RoundedRectangle(cornerRadius: 3, style: .continuous)
@@ -603,7 +603,7 @@ struct VGGraphWorkspace: View {
                     RoundedRectangle(cornerRadius: 3, style: .continuous)
                         .stroke(Color.accentColor.opacity(0.88), lineWidth: 1.5)
                 }
-                .frame(width: max(8, viewportRect.width), height: max(8, viewportRect.height))
+                .frame(width: viewportRect.width, height: viewportRect.height)
                 .position(x: viewportRect.midX, y: viewportRect.midY)
                 .allowsHitTesting(false)
         }
@@ -656,7 +656,7 @@ struct VGGraphWorkspace: View {
 
     private func fitGraph(widthOnly: Bool) {
         guard graphViewportSize.width > 1, graphViewportSize.height > 1 else { return }
-        setZoom(canvasViewport(graphViewportSize).fittedZoom(widthOnly: widthOnly, maximum: widthOnly ? 0.85 : 1))
+        setZoom(widthOnly ? 0.8 : canvasViewport(graphViewportSize).fittedZoom(widthOnly: false, maximum: 1))
         mapOffset = .zero
         mapOffsetAnchor = .zero
     }

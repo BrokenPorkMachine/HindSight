@@ -45,8 +45,10 @@ struct VGBinaryWorkspace: View {
     let reconstructionStatus: String
     let reconstructionBusy: Bool
     let onReconstruct: (VGFunctionRecord) -> Void
+    let onReconstructScope: (String, UInt64?) -> Void
     let onCancelReconstruction: () -> Void
     let onExportReconstruction: (VGFunctionRecord, ReconstructionSource?) -> Void
+    let onExportReconstructionScope: (String, String, UInt64?) -> Void
 
     @State private var functionQuery = ""
     @State private var selectedFunctionStart: UInt64?
@@ -459,10 +461,31 @@ struct VGBinaryWorkspace: View {
             HStack {
                 Button("Reconstruct function") { if let function = selectedFunction { onReconstruct(function) } }
                     .disabled(reconstructionBusy || selectedFunction == nil)
+                Menu("Reconstruct scope…") {
+                    Button("Whole binary…") { onReconstructScope("whole", activeAddress) }
+                    Button("Current code section…") { onReconstructScope("section", activeAddress) }
+                    Button("Function at address…") { onReconstructScope("address", activeAddress) }
+                    Button("Resume batch…") { onReconstructScope("resume", activeAddress) }
+                }.disabled(reconstructionBusy)
                 if reconstructionBusy { Button("Cancel", action: onCancelReconstruction) }
                 if let function = selectedFunction, matchingReconstruction != nil {
                     Button("Export evidence…") { onExportReconstruction(function, nil) }
                     if let source = chosenSource { Button("Export source…") { onExportReconstruction(function, source) } }
+                }
+                Menu("Dump reconstruction…") {
+                    ForEach([("Whole binary", "whole"), ("Current section", "section"), ("Jump-to address", "address")], id: \.1) { scope in
+                        Menu(scope.0) {
+                            Button("Dump All (.c .h .m .n)…") {
+                                onExportReconstructionScope(scope.1, "all", activeAddress)
+                            }
+                            Divider()
+                            ForEach([("Dump C (.c)…", "c"), ("C++ review evidence (.cpp)…", "cpp"), ("Dump Objective-C (.m)…", "objc"), ("Objective-C++ review evidence (.mm)…", "objcxx"), ("Dump headers (.h)…", "header"), ("Dump native (.n)…", "native"), ("Swift review evidence (.swift)…", "swift")], id: \.1) { language in
+                                Button(language.0) {
+                                    onExportReconstructionScope(scope.1, language.1, activeAddress)
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Text(reconstructionStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -475,10 +498,14 @@ struct VGBinaryWorkspace: View {
                     .font(.caption).foregroundStyle(coverage.strictMachineStateBlocked ? .orange : .secondary)
                 Picker("Output", selection: $sourceSelection) {
                     Text("Review tree").tag("review")
-                    ForEach(artifact.sources) { source in Text(source.kind == "recovered-source" ? "Recovered scalar source" : "Machine-state C").tag(source.id) }
+                    ForEach(artifact.sources) { source in Text(source.kind == "recovered-source" ? "Recovered scalar source" : source.kind == "recovered-objective-c" ? "Recovered IMP + Objective-C method adapter (.m)" : source.kind == "recovered-header" ? "Recovered header (.h)" : source.kind == "best-effort-source" ? "Best-effort C-like code" : source.kind == "best-effort-header" ? "Review header (ABI unresolved)" : "Machine-state C").tag(source.id) }
                 }.pickerStyle(.menu)
                 Text(chosenSource?.status ?? "Review only; not compilable source").font(.caption).foregroundStyle(.orange)
                 if let source = chosenSource { Text(source.contract).font(.caption.monospaced()).textSelection(.enabled) }
+                if let source = chosenSource, !source.languages.isEmpty {
+                    Text("Header languages: \(source.languages.joined(separator: ", ")) (declaration only)")
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
                 Text(chosenSource?.text ?? artifact.review).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                 if !artifact.blockers.isEmpty {
                     DisclosureGroup("Limitations and source-recovery blockers (\(artifact.blockers.count))") {

@@ -48,7 +48,10 @@ class AnalysisScalabilityContract(unittest.TestCase):
         self.assertIn("symbolication_symbol_names", apple)
         self.assertNotIn("all_symbol_names", apple)
         self.assertIn("function_starts_present=has_function_starts(window)", static)
-        self.assertEqual(self.worker.count("indirect_symbol_data(&mut file,&window,size)?"), 1)
+        analysis = self.worker.split("pub fn analyze(", 1)[1].split("#[cfg(test)]", 1)[0]
+        reconstruction = self.worker.split("fn reconstruction_request(", 1)[1].split("pub fn analyze(", 1)[0]
+        self.assertEqual(analysis.count("indirect_symbol_data(&mut file,&window,size)?"), 1)
+        self.assertEqual(reconstruction.count("indirect_symbol_data(&mut file,&window,size)?"), 1)
 
     def test_relocation_lookup_is_indexed_in_hot_render_paths(self):
         self.assertGreaterEqual(self.worker.count("reloc_by_site"), 4)

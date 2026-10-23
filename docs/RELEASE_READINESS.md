@@ -1,15 +1,15 @@
-# HindSight 0.5.12 — Release readiness
+# HindSight 0.5.13 — Release readiness
 
-HindSight 0.5.12 uses the stable product/release-channel identity in source. That identity is not a substitute for host qualification. A distributable macOS build must pass the universal macOS release gate below and the host-specific matrix on both Intel and Apple Silicon.
+HindSight 0.5.13 officially supports macOS on Apple Silicon (`arm64`). Intel (`x86_64`) remains experimental and is not part of the official release gate. Credentialed distribution and manual host qualification are intentionally deferred until further notice; this document retains the future release procedure.
 
 ## Source invariants already enforced
 
-- Product/service/worker identity is exactly `0.5.12`; release channel is `stable`; bundle build is `5912`.
+- Product/service/worker identity is exactly `0.5.13`; release channel is `stable`; bundle build is `5913`.
 - App and Coordinator require the same version, release channel, ABI, and required capabilities before project actions are enabled.
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
 - Analysis Quality distinguishes coverage from negative evidence; candidate control-flow remains labelled candidate evidence.
-- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v83-schema122` prevents reuse of results from earlier semantic lifts.
+- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v103-schema129` prevents reuse of results from earlier semantic lifts.
 - Existing schema-v1 projects require no database migration for the cache feature.
 - Worker progress records must remain separate from framed stdout and real stderr diagnostics; final evidence publication remains atomic.
 - App and Coordinator macOS Swift type-check source sets are derived directly from `Config/project-topology.json`; `AnalysisNavigation.swift`, `AnalysisContinuity.swift`, and future generated-target Swift files cannot be omitted by stale hand-maintained shell lists.
@@ -21,7 +21,9 @@ HindSight 0.5.12 uses the stable product/release-channel identity in source. Tha
 - Launch-session persistence is coalesced with a 350 ms debounce.
 - The optional REA bridge has a deterministic MCP fixture contract covering handshake, capability gating, progress retention, and fail-closed unavailable-tool behavior; real provider qualification remains manual and local-first.
 
-## Mandatory universal macOS release-host gate
+## Deferred Apple-Silicon macOS release-host gate
+
+Credentialed signing, notarization, Gatekeeper assessment, real-target qualification, memory-pressure qualification, and crash-diagnostics qualification are intentionally deferred until further notice. The procedures below remain retained for a future release decision and are not current completion blockers.
 
 Before supplying credentials, run the non-secret preflight to identify missing
 toolchain, keychain, notarization-profile, or universal-bundle prerequisites:
@@ -82,7 +84,7 @@ contract are supplied.
 
 ## Manual distribution matrix
 
-Before distributing 0.5.12, complete the common matrix on both an Intel Mac and the 8 GiB Apple-Silicon baseline:
+Before distributing 0.5.13, complete the official matrix on an Apple-Silicon Mac using the 8 GiB baseline:
 
 1. Re-run the large firmware image that exposed the beta.12 pressure failure; record peak RSS and confirm bounded dominator behavior.
 2. Analyze several real arm64 Mach-O inputs: stripped, symbol-rich, data-in-code, and encrypted-metadata cases.
@@ -100,12 +102,12 @@ Before distributing 0.5.12, complete the common matrix on both an Intel Mac and 
 14. Inspect `HindSight`, `CoordinatorService`, `reworker`, and `vg-emu-server` with `lipo -archs`; every distributed executable must contain both `arm64` and `x86_64`.
 15. If REA is enabled for the distribution, run a local provider qualification against an approved target and confirm `binary_session` availability, progress, cancellation, bounded response retention, structured Evidence identity, and `.vgcase` restore. The automated deterministic fixture runs during release preflight.
 
-### Intel-only qualification
+### Experimental Intel qualification (optional)
 
-16. Confirm ARM64/ARM64e static analysis, projects, Binary Diff, evidence/review workflows, scripting/plugins, firmware tooling, and VectorEmu work natively in the x86_64 slice.
-17. Confirm Debugger, Hypervisor RE, and SoC Virtualization are visibly closed out with explicit Apple-Silicon requirements from every navigation route, including menus, sidebar/tool cards, restored workspaces, and no-artifact states. Direct Coordinator calls to those backends must fail closed.
+16. If an experimental Intel build is produced, confirm ARM64/ARM64e static analysis, projects, Binary Diff, evidence/review workflows, scripting/plugins, firmware tooling, and VectorEmu work in the x86_64 slice. Failures do not block the official release.
+17. If an experimental Intel build is produced, confirm Debugger, Hypervisor RE, and SoC Virtualization are visibly closed out with explicit Apple-Silicon requirements from every navigation route. Direct Coordinator calls must fail closed.
 
-### Apple-Silicon-only qualification
+### Official Apple-Silicon qualification
 
 18. Exercise authorized native debugger attach/launch/step/breakpoint/memory/module/backtrace against a local ARM64 target.
 19. Exercise Hypervisor/SoC execution create/destroy, RAM access, vCPU registers/run exits, reset, trace, breakpoints, and firmware-load paths.
@@ -114,7 +116,7 @@ Until that matrix is completed on both release hosts, treat the source archive a
 
 ## 0.4.3 analysis-navigation qualification
 
-On the release host, reuse a valid 0.4.2 schema-2 analysis cache and confirm 0.4.3 does not rerun the worker when source SHA-256 and `arm64-analysis-v11-schema66` still match. Exercise Analysis Triage and Navigator with address-bearing, symbol-bearing, and text-only rows; verify Source, Code, CFG, and Symbol routing never invents a destination when the required identity is absent. Select an address/symbol row and verify Related Evidence is bounded and source-labelled.
+On the release host, reuse a valid 0.4.2 schema-2 analysis cache and confirm 0.4.3 does not rerun the worker when source SHA-256 and `arm64-analysis-v103-schema129` still match. Exercise Analysis Triage and Navigator with address-bearing, symbol-bearing, and text-only rows; verify Source, Code, CFG, and Symbol routing never invents a destination when the required identity is absent. Select an address/symbol row and verify Related Evidence is bounded and source-labelled.
 
 ## 0.4.4 investigation-continuity qualification
 

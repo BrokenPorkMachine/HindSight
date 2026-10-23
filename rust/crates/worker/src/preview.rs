@@ -598,6 +598,7 @@ fn objc_ro_record(file:&mut File,secs:&[SectionInfo],size:u64,bits:u64)->io::Res
 }
 fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<(String,Vec<super::objc::ClassLayout>)>{
  let secs=sections(window);let mut out=String::new();let mut layouts=Vec::new();
+ let external_classes=objc_external_class_binds(file,window,size)?;
  let mut classes=0usize;let mut methods=0usize;let mut ivars=0usize;let mut protocols=0usize;let mut properties=0usize;
  for list in secs.iter().filter(|section|section.sect=="__objc_classlist"){
   if list.offset>size||list.size>size-list.offset||list.size>2*1024*1024{continue}
@@ -613,7 +614,14 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<(String,Ve
    let instance_start=le32(&ro[4..8]);let instance_size=le32(&ro[8..12]);
    let conformances=objc_protocol_names(file,&secs,size,protocols_address)?;
    let conforms=if conformances.is_empty(){String::new()}else{format!("  conforms={}",conformances.join(","))};
-   let superclass=objc_class_name(file,&secs,size,super_address)?.map(|value|format!("  super_name={value}")).unwrap_or_default();
+   let local_superclass=objc_class_name(file,&secs,size,super_address)?;
+   let imported_superclass=class_address.checked_add(8).and_then(|slot|external_classes.get(&slot));
+   let superclass=match (local_superclass,imported_superclass){
+    (Some(local),Some((imported,_))) if local!=*imported=>String::new(),
+    (_,Some((name,provider)))=>format!("  super_name={name}  super_source=dyld-bind  super_provider={provider}"),
+    (Some(local),None)=>format!("  super_name={local}"),
+    _=>String::new()
+   };
    out.push_str(&format!("reconstructed class {class_address:#018x}  name={name}  super={super_address:#018x}{superclass}  ro={ro_address:#018x}{conforms} instance_start={instance_start} instance_size={instance_size}\n"));classes+=1;
    let mut declared_methods=objc_method_list(file,&secs,size,methods_address,"instance",Some(&name),&[],&mut out,&mut methods)?;
    // The metaclass uses the same RO layout: methods are at byte 32.
@@ -1138,16 +1146,51 @@ fn indirect_symbol_data(file:&mut File,window:&[u8],size:u64)->io::Result<(Strin
 }
 fn read_uleb(data:&[u8],p:&mut usize)->Option<u64>{let mut v=0u64;let mut shift=0u32;for _ in 0..10{if *p>=data.len(){return None}let b=data[*p];*p+=1;v|=((b&0x7f)as u64)<<shift;if b&0x80==0{return Some(v)}shift+=7;}None}
 fn read_sleb(data:&[u8],p:&mut usize)->Option<i64>{let mut v=0i64;let mut shift=0u32;for _ in 0..10{if *p>=data.len(){return None}let byte=data[*p];*p+=1;v|=((byte&0x7f)as i64)<<shift;shift+=7;if byte&0x80==0{if shift<64&&byte&0x40!=0{v|=(!0i64)<<shift;}return Some(v)}}None}
+fn objc_external_class_binds(file:&mut File,window:&[u8],size:u64)->io::Result<std::collections::BTreeMap<u64,(String,String)>>{
+ let mut result=std::collections::BTreeMap::new();
+ let Some(ranges)=dyld_info_ranges(window)else{return Ok(result)};
+ let (offset,length)=ranges[1];
+ if length==0||length>16*1024*1024||offset>size||length as u64>size-offset{return Ok(result)}
+ let bytes=read_exact_range(file,offset,length)?;
+ let (_,facts)=decode_dyld_bind_stream(&bytes,&dyld_segments(window),"bind",false);
+ let libraries=dylib_ordinal_names(window).into_iter().collect::<std::collections::BTreeMap<_,_>>();
+ let mut by_address=std::collections::BTreeMap::<u64,Vec<DyldBindFact>>::new();
+ for fact in facts{by_address.entry(fact.address).or_default().push(fact);}
+ for (address,mut facts) in by_address{
+  facts.dedup();if facts.len()!=1{continue}let fact=&facts[0];
+  if fact.kind!=1||fact.weak||fact.addend!=0||fact.library<=0{continue}
+  let Some(name)=fact.symbol.strip_prefix("_OBJC_CLASS_$_").filter(|name|super::objc::identifier(name))else{continue};
+  let Some(library)=libraries.get(&fact.library)else{continue};
+  if library.bytes().any(|byte|byte.is_ascii_whitespace()||byte.is_ascii_control()){continue}
+  result.insert(address,(name.to_owned(),library.clone()));
+ }
+ Ok(result)
+}
+
 #[derive(Clone)]
-struct DyldSegment { name:String, vmaddr:u64 }
-fn dyld_segments(window:&[u8])->Vec<DyldSegment>{let mut out=Vec::new();if window.len()<32{return out}let n=le32(&window[16..20]);let mut at=32usize;for _ in 0..n{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8])as usize;if cs<8||at+cs>window.len(){break}if cmd==0x19&&cs>=72{out.push(DyldSegment{name:cstr16(&window[at+8..at+24]),vmaddr:le64(&window[at+24..at+32])});}at+=cs;}out}
+struct DyldSegment { name:String, vmaddr:u64, vmsize:u64 }
+fn dyld_segments(window:&[u8])->Vec<DyldSegment>{let mut out=Vec::new();if window.len()<32{return out}let n=le32(&window[16..20]);let mut at=32usize;for _ in 0..n{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8])as usize;if cs<8||at+cs>window.len(){break}if cmd==0x19&&cs>=72{out.push(DyldSegment{name:cstr16(&window[at+8..at+24]),vmaddr:le64(&window[at+24..at+32]),vmsize:le64(&window[at+32..at+40])});}at+=cs;}out}
 fn dyld_info_ranges(window:&[u8])->Option<[(u64,usize);4]>{if window.len()<32{return None}let n=le32(&window[16..20]);let mut at=32usize;for _ in 0..n{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8])as usize;if cs<8||at+cs>window.len(){break}if (cmd==0x22||cmd==0x80000022)&&cs>=48{return Some([(le32(&window[at+8..at+12])as u64,le32(&window[at+12..at+16])as usize),(le32(&window[at+16..at+20])as u64,le32(&window[at+20..at+24])as usize),(le32(&window[at+24..at+28])as u64,le32(&window[at+28..at+32])as usize),(le32(&window[at+32..at+36])as u64,le32(&window[at+36..at+40])as usize)]);}at+=cs;}None}
 fn dyld_bind_stream(data:&[u8],segments:&[DyldSegment],label:&str,weak_stream:bool)->String{
+ decode_dyld_bind_stream(data,segments,label,weak_stream).0
+}
+#[derive(Clone,Debug,PartialEq,Eq)]
+struct DyldBindFact { address:u64, symbol:String, library:i32, kind:u8, weak:bool, addend:i64 }
+fn decode_dyld_bind_stream(data:&[u8],segments:&[DyldSegment],label:&str,weak_stream:bool)->(String,Vec<DyldBindFact>){
+ let mut facts=Vec::new();
+ let mut completed=false;
  let mut out=String::new();let mut p=0usize;let mut seg=0usize;let mut off=0u64;let mut lib=if weak_stream{-3}else{0};let mut typ=1u8;let mut sym=String::new();let mut weak=false;let mut add=0i64;let ptr=8u64;let mut binds=0usize;
- let emit=|out:&mut String,seg:usize,off:u64,lib:i32,typ:u8,sym:&str,weak:bool,add:i64,op:&str|{let (sn,va)=segments.get(seg).map(|s|(s.name.as_str(),s.vmaddr.saturating_add(off))).unwrap_or(("<segment?>",off));out.push_str(&format!("{label} {op} segment={seg}:{sn} offset={off:#x} address={va:#018x} type={typ} lib_ordinal={lib} weak={} addend={add} symbol={}\n",if weak{"yes"}else{"no"},if sym.is_empty(){"<unset>"}else{sym}));};
- while p<data.len()&&binds<200_000&&out.len()<60_000{let byte=data[p];p+=1;let op=byte&0xf0;let imm=byte&0x0f;match op{
+ let mut emit=|out:&mut String,seg:usize,off:u64,lib:i32,typ:u8,sym:&str,weak:bool,add:i64,op:&str|{let (sn,va)=segments.get(seg).map(|s|(s.name.as_str(),s.vmaddr.saturating_add(off))).unwrap_or(("<segment?>",off));out.push_str(&format!("{label} {op} segment={seg}:{sn} offset={off:#x} address={va:#018x} type={typ} lib_ordinal={lib} weak={} addend={add} symbol={}\n",if weak{"yes"}else{"no"},if sym.is_empty(){"<unset>"}else{sym}));
+  if let Some(segment)=segments.get(seg){if off.checked_add(8).is_some_and(|end|end<=segment.vmsize)&&segment.vmaddr.checked_add(off)==Some(va)&&!sym.is_empty()&&sym.len()<=1024{
+   facts.push(DyldBindFact{address:va,symbol:sym.into(),library:lib,kind:typ,weak,addend:add});
+  }}
+ };
+ while p<data.len()&&binds<200_000&&out.len()<60_000{let byte=data[p];p+=1;let op=byte&0xf0;let imm=byte&0x0f;if byte==0&&label=="bind"{completed=true;}match op{
   0x00=>{if label=="lazy-bind"{seg=0;off=0;lib=0;typ=1;sym.clear();weak=false;add=0}else{break}},0x10=>lib=imm as i32,0x20=>{let Some(v)=read_uleb(data,&mut p)else{break};lib=v.min(i32::MAX as u64)as i32},0x30=>lib=if imm==0{0}else{(0xf0|imm)as i8 as i32},0x40=>{weak=imm&1!=0;let start=p;while p<data.len()&&data[p]!=0{p+=1}if p>=data.len(){break}sym=String::from_utf8_lossy(&data[start..p]).into_owned();p+=1},0x50=>typ=imm,0x60=>{let Some(v)=read_sleb(data,&mut p)else{break};add=v},0x70=>{seg=imm as usize;let Some(v)=read_uleb(data,&mut p)else{break};off=v},0x80=>{let Some(v)=read_uleb(data,&mut p)else{break};off=off.saturating_add(v)},0x90=>{emit(&mut out,seg,off,lib,typ,&sym,weak,add,"bind");off=off.saturating_add(ptr);binds+=1},0xa0=>{emit(&mut out,seg,off,lib,typ,&sym,weak,add,"bind+uleb");let Some(v)=read_uleb(data,&mut p)else{break};off=off.saturating_add(ptr).saturating_add(v);binds+=1},0xb0=>{emit(&mut out,seg,off,lib,typ,&sym,weak,add,"bind+scaled");off=off.saturating_add(ptr.saturating_mul(imm as u64+1));binds+=1},0xc0=>{let Some(count)=read_uleb(data,&mut p)else{break};let Some(skip)=read_uleb(data,&mut p)else{break};for _ in 0..count.min(200_000-binds as u64){emit(&mut out,seg,off,lib,typ,&sym,weak,add,"bind-repeat");off=off.saturating_add(ptr).saturating_add(skip);binds+=1;if out.len()>=60_000{break}}},_=>break}}
- if out.is_empty(){out.push_str(&format!("No decoded {label} operations were recovered.\n"));}out
+ // Typed consumers require a completed ordinary stream. Display-only rows
+ // may still explain unsupported/truncated streams, but cannot seed types.
+ if !completed||data[p..].iter().any(|byte|*byte!=0){facts.clear();}
+ if out.is_empty(){out.push_str(&format!("No decoded {label} operations were recovered.\n"));}(out,facts)
 }
 fn dyld_rebase_stream(data:&[u8],segments:&[DyldSegment])->String{let mut out=String::new();let mut p=0usize;let mut seg=0usize;let mut off=0u64;let mut typ=1u8;let ptr=8u64;let mut count=0usize;let emit=|out:&mut String,seg:usize,off:u64,typ:u8,op:&str|{let(sn,va)=segments.get(seg).map(|s|(s.name.as_str(),s.vmaddr.saturating_add(off))).unwrap_or(("<segment?>",off));out.push_str(&format!("rebase {op} segment={seg}:{sn} offset={off:#x} address={va:#018x} type={typ}\n"));};while p<data.len()&&count<200_000&&out.len()<60_000{let b=data[p];p+=1;let op=b&0xf0;let imm=b&0xf;match op{0x00=>break,0x10=>typ=imm,0x20=>{seg=imm as usize;let Some(v)=read_uleb(data,&mut p)else{break};off=v},0x30=>{let Some(v)=read_uleb(data,&mut p)else{break};off=off.saturating_add(v)},0x40=>off=off.saturating_add(imm as u64*ptr),0x50=>for _ in 0..imm{emit(&mut out,seg,off,typ,"repeat-imm");off=off.saturating_add(ptr);count+=1},0x60=>{let Some(n)=read_uleb(data,&mut p)else{break};for _ in 0..n.min(200_000-count as u64){emit(&mut out,seg,off,typ,"repeat-uleb");off=off.saturating_add(ptr);count+=1}},0x70=>{let Some(skip)=read_uleb(data,&mut p)else{break};emit(&mut out,seg,off,typ,"once+skip");off=off.saturating_add(ptr).saturating_add(skip);count+=1},0x80=>{let Some(n)=read_uleb(data,&mut p)else{break};let Some(skip)=read_uleb(data,&mut p)else{break};for _ in 0..n.min(200_000-count as u64){emit(&mut out,seg,off,typ,"repeat+skip");off=off.saturating_add(ptr).saturating_add(skip);count+=1}},_=>break}}if out.is_empty(){out.push_str("No decoded legacy dyld rebase operations were recovered.\n");}out}
 fn dyld_linking_records(file:&mut File,window:&[u8],size:u64)->io::Result<String>{let Some(ranges)=dyld_info_ranges(window)else{return Ok("No LC_DYLD_INFO/LC_DYLD_INFO_ONLY opcode payload is present; this image may use chained fixups exclusively.\n".into())};let segs=dyld_segments(window);let mut out=String::new();for (i,(off,len)) in ranges.into_iter().enumerate(){let label=["rebase","bind","weak-bind","lazy-bind"][i];if len==0{continue}if len>16*1024*1024||off>size||len as u64>size-off{out.push_str(&format!("{label}: payload failed bounds validation.\n"));continue}let data=read_exact_range(file,off,len)?;if i==0{out.push_str(&dyld_rebase_stream(&data,&segs))}else{out.push_str(&dyld_bind_stream(&data,&segs,label,i==2))}}if out.is_empty(){out.push_str("LC_DYLD_INFO is present but its rebase/bind streams are empty.\n");}Ok(out)}
@@ -1540,6 +1583,13 @@ fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,cod
  Ok(FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts})
 }
 
+fn reconstruction_symbols(symbols:&[(u64,String)],exports:&std::collections::BTreeMap<u64,String>,indirect:&[(String,String,u64)])->Vec<(u64,String)>{
+ let mut result=symbols.to_vec();
+ result.extend(exports.iter().map(|(address,name)|(*address,name.clone())));
+ result.extend(indirect.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
+ result.sort();result.dedup();result
+}
+
 pub fn reconstruct(path:&str,digest:&str,size:&str,start:&str,end:&str,id:&str)->io::Result<String>{
  reconstruction_request(path,digest,size,start,end,id,None)
 }
@@ -1566,7 +1616,11 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  let facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
  let export_names=export_function_names(&facts.export_trie,&window,&facts.starts,map.address+code.len() as u64);
- let native=super::reconstruction::NativeEvidence{symbols:facts.symbols.clone(),objc_layouts:facts.objc_layouts.clone(),objc_function_names:facts.objc_function_names.clone(),export_names,export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
+ // Use the same validated export/stub names as analysis. Undefined nlist
+ // symbols alone do not identify the address of an imported call target.
+ let (_,_,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;
+ let signature_symbols=reconstruction_symbols(&facts.symbols,&export_names,&indirect_facts);
+ let native=super::reconstruction::NativeEvidence{symbols:signature_symbols.clone(),objc_layouts:facts.objc_layouts.clone(),objc_records:facts.objc_classes.clone(),objc_function_names:facts.objc_function_names.clone(),export_names,export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
  let index=facts.starts.binary_search(&start).map_err(|_|invalid("Start is not an admitted function boundary"))?;
  if index+1==facts.starts.len()&&(code.len() as u64)<map.bytes{return Err(invalid("Final function bound is outside the code scan budget"));}
  let canonical_end=facts.starts.get(index+1).copied().unwrap_or(map.address+map.bytes);
@@ -1575,8 +1629,8 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  if facts.lc_function_starts.contains(&start){sources.push("LC_FUNCTION_STARTS".into());}
  if facts.unwind_starts.contains(&start){sources.push("__unwind_info".into());}
  if facts.direct_call_starts.contains(&start){sources.push("direct BL target candidate".into());}
- let names=facts.symbols.iter().filter(|(address,_)|*address==start).map(|(_,name)|name.as_str()).collect::<std::collections::BTreeSet<_>>();
- if !names.is_empty(){sources.push("exact nlist symbol".into());}
+ let names=signature_symbols.iter().filter(|(address,_)|*address==start).map(|(_,name)|name.as_str()).collect::<std::collections::BTreeSet<_>>();
+ if facts.symbols.iter().any(|(address,_)|*address==start){sources.push("exact nlist symbol".into());}
  if facts.objc_starts.contains(&start){sources.push("validated Objective-C IMP".into());}
  if facts.export_starts.contains(&start){sources.push("export trie".into());}
  if sources.is_empty(){sources.push("section-start fallback candidate".into());}
@@ -1585,11 +1639,12 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let external=super::signatures::external_prototype_database(digest)?;
  let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
  let mut call_prototypes=Vec::new();
- for (address,symbol_name) in &facts.symbols {
-  let signature=super::signatures::symbol(symbol_name)
-   .or_else(||external.get(symbol_name).cloned())
-   .or_else(||external.get(symbol_name.strip_prefix('_').unwrap_or(symbol_name)).cloned());
-  if let Some(signature)=signature { call_prototypes.push((*address,symbol_name.clone(),signature)); }
+ for (address,symbol_name) in &signature_symbols {
+  // Preserve SDK/catalog disagreements for the artifact's conflict gate;
+  // lookup precedence must not silently turn a contradiction into certainty.
+  for (name,signature) in super::signatures::source_candidates(*address,&[symbol_name.as_str()],"",&external) {
+   call_prototypes.push((*address,name,signature));
+  }
  }
  call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
  call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
@@ -1788,6 +1843,38 @@ mod tests {
   data[58..60].copy_from_slice(&1u16.to_le_bytes());
   data[64..68].copy_from_slice(&0x0100_0020u32.to_le_bytes());
   assert_eq!(unwind_info_starts_from_bytes(&data,0x1000,0x1000,0x1300),vec![0x1100,0x1120]);
+ }
+
+ #[test]
+ fn typed_dyld_bind_facts_require_completed_stream_and_segment_bounds() {
+  let segments=vec![super::DyldSegment{name:"__DATA".into(),vmaddr:0x1000,vmsize:0x20}];
+  let mut stream=vec![0x11,0x40];stream.extend_from_slice(b"_OBJC_CLASS_$_NSObject\0");
+  let suffix=stream.len();stream.extend_from_slice(&[0x70,8,0x90,0]);
+  let (_,facts)=super::decode_dyld_bind_stream(&stream,&segments,"bind",false);
+  assert_eq!(facts.len(),1);assert_eq!(facts[0].address,0x1008);
+  assert_eq!(facts[0].symbol,"_OBJC_CLASS_$_NSObject");assert_eq!(facts[0].library,1);
+  let mut outside=stream.clone();outside[suffix+1]=0x20;
+  assert!(super::decode_dyld_bind_stream(&outside,&segments,"bind",false).1.is_empty());
+  let mut missing_segment=stream.clone();missing_segment[suffix]=0x7f;
+  assert!(super::decode_dyld_bind_stream(&missing_segment,&segments,"bind",false).1.is_empty());
+  assert!(super::decode_dyld_bind_stream(&stream[..stream.len()-1],&segments,"bind",false).1.is_empty());
+  let mut operand_zero=stream[..stream.len()-1].to_vec();operand_zero.extend_from_slice(&[0x20,0]);
+  assert!(super::decode_dyld_bind_stream(&operand_zero,&segments,"bind",false).1.is_empty());
+  let mut unsupported=stream.clone();unsupported.insert(stream.len()-1,0xd0);
+  assert!(super::decode_dyld_bind_stream(&unsupported,&segments,"bind",false).1.is_empty());
+  let overflow=vec![super::DyldSegment{name:"__DATA".into(),vmaddr:u64::MAX-4,vmsize:0x20}];
+  assert!(super::decode_dyld_bind_stream(&stream,&overflow,"bind",false).1.is_empty());
+ }
+
+ #[test]
+ fn reconstruction_names_include_exports_and_call_stubs_not_pointer_slots() {
+  let symbols=vec![(0x1000,"_local".into())];
+  let exports=std::collections::BTreeMap::from([(0x1000,"_local".into()),(0x1100,"_exported".into())]);
+  let indirect=vec![("_malloc".into(),"stub".into(),0x2000),("_free".into(),"pointer".into(),0x3000)];
+  let joined=super::reconstruction_symbols(&symbols,&exports,&indirect);
+  assert_eq!(joined,vec![(0x1000,"_local".into()),(0x1100,"_exported".into()),(0x2000,"_malloc".into())]);
+  let imported=joined.iter().find(|(address,_)|*address==0x2000).unwrap();
+  assert!(crate::signatures::symbol(&imported.1).is_some(),"import-stub names must reach SDK signature lookup");
  }
 
  #[test]

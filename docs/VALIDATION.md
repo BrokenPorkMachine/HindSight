@@ -1,11 +1,11 @@
-# Validation — HindSight 0.5.12
+# Validation — HindSight 0.5.13
 
-Portable validation covers source topology, release identity, local dependency closure, Python/native contracts, plist/JSON/TOML parsing, shell syntax, deterministic Xcode project topology, Swift syntax parsing where available, Cargo lockfile structure, Rust 1.90 source admission, and compile checks of both the Apple-Silicon Hypervisor implementation and Intel fallback path. 0.5.12 validates Objective-C/C parameter and argument recovery, shared semantic lifting, scalar floating-point argument tracking, cache invalidation, and the 75-field analysis contract alongside existing scalability and continuity checks. Full Xcode/Rust linking still requires the native macOS release host.
+Portable validation covers source topology, release identity, local dependency closure, Python/native contracts, plist/JSON/TOML parsing, shell syntax, deterministic Xcode project topology, Swift syntax parsing where available, Cargo lockfile structure, Rust 1.90 source admission, and compile checks of both the Apple-Silicon Hypervisor implementation and Intel fallback path. 0.5.13 validates Objective-C/C parameter and argument recovery, shared semantic lifting, scalar floating-point argument tracking, cache invalidation, and the 75-field analysis contract alongside existing scalability and continuity checks. Full Xcode/Rust linking still requires the native macOS release host.
 
 
-## Universal macOS / Intel compatibility
+## Official Apple-Silicon macOS / experimental Intel compatibility
 
-Hotfix 5 adds regression coverage for `arm64 x86_64` Xcode settings, dual Rust targets, universal lipo packaging, x86_64 Swift type-checks, Intel native-debug stubs, service-side host gates, and the preserved cross-host ARM64 analysis/VectorEmu path. `scripts/test-beta-macos.sh` also verifies that the app executable, Coordinator service, `reworker`, and `vg-emu-server` each contain both architecture slices.
+The official release targets `arm64` macOS. Intel support remains an opt-in experimental path (`HINDSIGHT_EXPERIMENTAL_INTEL=1`) with dual Rust targets, x86_64 Swift type-checks, Intel native-debug stubs, service-side host gates, and the preserved cross-host ARM64 analysis/VectorEmu path. Official release checks require the arm64 slice; they do not require Intel slices.
 
 ## Generated-target type-check coverage
 
@@ -36,9 +36,9 @@ These checks complement the project-root/database symlink rejection and the nati
 
 ## Analysis/runtime invariants retained
 
-- Product/service/worker identity is `0.5.12`, release channel `stable`, bundle build `5912`, protocol ABI 1.
+- Product/service/worker identity is `0.5.13`, release channel `stable`, bundle build `5913`, protocol ABI 1.
 - Swift/Rust agree on the exact 75-field `AnalysisReport`.
-- Cache envelopes bind source SHA-256 and `arm64-analysis-v83-schema122`; only explicitly validated legacy cache paths are admitted.
+- Cache envelopes bind source SHA-256 and `arm64-analysis-v103-schema129`; only explicitly validated legacy cache paths are admitted.
 - Staged worker progress remains bounded, monotonic pipeline telemetry and is filtered from ordinary diagnostics.
 - Large-CFG dominators remain per-function/budgeted; Function Intelligence distinguishes internal/external calls; tail-call candidates remain exact-entry candidates.
 - Continuity schema 5 remains bounded to 1 MiB and preserves pins, recent pivots, collections, review baselines/journal, and follow-ups without reclassifying workflow state as evidence.
@@ -46,7 +46,7 @@ These checks complement the project-root/database symlink rejection and the nati
 
 ## Native macOS gates
 
-On either supported macOS architecture, `./scripts/test-macos.sh` runs the topology-derived dual-architecture Swift type-checks, portable suite, universal Rust bridge/worker build, native bridge contracts, full Debug app build, embedded XPC/worker/VectorEmu checks, universal-slice checks, and signing verification. `./scripts/test-beta-macos.sh` strengthens this with Release packaging. `./scripts/test-release-macos.sh` is the stable distribution gate and requires Developer ID signing, notarization, stapling, and stable bundle identity.
+On the official Apple-Silicon host, `./scripts/test-macos.sh` runs the topology-derived Swift type-checks, portable suite, arm64 Rust bridge/worker build, native bridge contracts, full Debug app build, embedded XPC/worker/VectorEmu checks, arm64-slice checks, and signing verification. `./scripts/test-beta-macos.sh` strengthens this with Release packaging. `./scripts/test-release-macos.sh` is the stable distribution gate and requires Developer ID signing, notarization, stapling, and stable bundle identity.
 
 Manual release-host checks remain documented in [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md) and [`RELEASE_READINESS.md`](RELEASE_READINESS.md), including real firmware analysis, Function Neighborhoods responsiveness, filesystem symlink-boundary substitution tests, dynamic debugger/Hypervisor/VectorEmu execution, 8 GiB memory pressure, and multi-size UI qualification.
 
@@ -57,3 +57,12 @@ Validate that `App/AnalysisEvidenceCore.swift` is in the generated app target, t
 ## Evidence Core 0.5.0
 
 Validate `App/AnalysisEvidenceCore.swift` is in the generated app target, the wire transport remains exactly 66 fields, indexing uses a utility-priority detached task, and Triage/Search/Related Evidence consume `currentEvidenceIndex`. Large reports must show explicit indexing state rather than a false empty result.
+
+## Real-image analysis section bounds
+
+Run `python3 scripts/test-analysis-section-bounds.py rust/target/debug/reworker /path/to/image`
+on macOS to analyze an image and validate every report section plus the native
+Swift identity/bounds contract. The test retains its report only in a temporary
+directory and does not execute the imported image. An `itunescloudd` regression
+reproduced an 88,112-byte prototype-conflict report; the bounded formatter emits
+59,641 bytes with a truncation notice, within the unchanged 65,535-byte limit.

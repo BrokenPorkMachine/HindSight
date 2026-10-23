@@ -30,7 +30,7 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.12)
+## Current baseline (0.5.13)
 
 ## 0.5.12 — Evidence graph navigation and cache control
 
@@ -80,11 +80,11 @@ HindSight began as a product split from two research lines: REWorkbench contribu
 
 
 
-## 0.4.9 Hotfix 5 — Universal macOS / Intel support
+## Official macOS support — Apple Silicon; Intel experimental
 
-HindSight now builds as a universal macOS application with **arm64 + x86_64** slices. Static ARM64/ARM64e analysis remains available on Intel because target decoding is cross-host; projects, evidence/review workflows, scripting/plugins, dyld/IPSW tooling, and the software **VectorEmu** backend remain enabled.
+HindSight officially targets macOS on **Apple Silicon (`arm64`)**. Static ARM64/ARM64e analysis is target-byte analysis and remains available in experimental Intel (`x86_64`) builds; projects, evidence/review workflows, scripting/plugins, dyld/IPSW tooling, and software **VectorEmu** remain available where they function. Intel builds are opt-in and are not part of the supported release matrix.
 
-Only implementations that are genuinely tied to the Apple-Silicon AArch64 host are closed out when the running process is x86_64: the current **Hypervisor RE / SoC Virtualization execution backend** and the current **Native ARM64 Debugger**. Those checks exist in both the UI and Coordinator/native layer. Rust bridge/worker and VectorEmu packaging now produce universal artifacts, and macOS type-check/release scripts explicitly cover both architectures. See [`docs/INTEL_MAC_COMPATIBILITY.md`](docs/INTEL_MAC_COMPATIBILITY.md).
+Only implementations that are genuinely tied to the Apple-Silicon AArch64 host are closed out when the running process is x86_64: the current **Hypervisor RE / SoC Virtualization execution backend** and the current **Native ARM64 Debugger**. Those checks exist in both the UI and Coordinator/native layer. Experimental Intel builds retain the cross-host Rust/VectorEmu paths when requested; official release packaging and qualification require only `arm64`. See [`docs/INTEL_MAC_COMPATIBILITY.md`](docs/INTEL_MAC_COMPATIBILITY.md).
 
 ## 0.4.9 hotfix hardening and audit closure
 
@@ -337,7 +337,7 @@ HindSight is intended for software, firmware, devices, and environments you own 
 
 ## Status
 
-`0.4.4` is the current stable-line source identity. Stable workbench paths have explicit failure/recovery behavior and the source validator rejects production crash primitives. Experimental machine profiles remain labelled Experimental. Distribution qualification requires the Apple Silicon real-target, memory-pressure, Release signing, and notarization matrix in [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md).
+`0.4.4` is the current stable-line source identity. Stable workbench paths have explicit failure/recovery behavior and the source validator rejects production crash primitives. Experimental machine profiles remain labelled Experimental. Credentialed distribution and manual Apple-Silicon release qualification are intentionally deferred; the retained procedures are documented in [`docs/RELEASE_READINESS.md`](docs/RELEASE_READINESS.md).
 
 Read next: [`docs/PRODUCT_VISION.md`](docs/PRODUCT_VISION.md), [`docs/TARGET_MODEL.md`](docs/TARGET_MODEL.md), [`docs/ARCHITECTURE_HINDSIGHT.md`](docs/ARCHITECTURE_HINDSIGHT.md), [`docs/ROADMAP.md`](docs/ROADMAP.md), and [`docs/COMMERCIAL_MODEL.md`](docs/COMMERCIAL_MODEL.md).
 

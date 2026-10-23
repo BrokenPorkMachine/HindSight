@@ -21,5 +21,5 @@ This checklist covers setting up Developer ID signing and notarization for stabl
 ## Notes
 - Candidate builds (`--candidate`) work without notarization credentials.
 - Stable builds (`--stable`) require all three env vars.
-- Notarization artifacts are created as `build/HindSight-0.5.12-notarization.zip` during the process.
+- Notarization artifacts are created as `build/HindSight-0.5.13-notarization.zip` during the process.
 - Credentials must never be committed to git.

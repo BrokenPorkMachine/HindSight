@@ -1,6 +1,6 @@
-# Intel Mac compatibility — 0.4.9 Hotfix 5
+# Intel Mac compatibility — experimental
 
-HindSight is built as a universal macOS application with `arm64` and `x86_64` slices. The host architecture controls only features whose implementation actually depends on Apple-Silicon AArch64 execution state.
+HindSight officially supports macOS on Apple Silicon (`arm64`). Intel (`x86_64`) support is experimental, provided for research and development only, and is not a release or support commitment. The host architecture controls features whose implementation depends on Apple-Silicon AArch64 execution state.
 
 ## Available on both Apple Silicon and Intel
 
@@ -27,7 +27,7 @@ The workspaces remain represented in the product so project/navigation state rem
 
 An `x86_64` HindSight process running under Rosetta is treated like Intel for these features. This is deliberate: feature availability follows the executing process slice, not merely the physical CPU underneath it.
 
-## Universal build prerequisites
+## Experimental Intel build
 
 Both Rust standard-library targets must be installed on the build host:
 
@@ -35,8 +35,8 @@ Both Rust standard-library targets must be installed on the build host:
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 ```
 
-The checked-in Xcode project builds `arm64 x86_64`, and the Rust bridge, `reworker`, and `vg-emu-server` are lipo-combined into universal artifacts for Release builds.
+Official builds target `arm64` only. To produce an experimental Intel/universal development build, set `HINDSIGHT_EXPERIMENTAL_INTEL=1`; the required Intel Rust target must be installed as well.
 
 ## Qualification matrix
 
-Before distribution, run the macOS release gates on both an Intel Mac and an Apple-Silicon Mac. On Intel, verify that the Apple-Silicon-only workspaces are visibly unavailable while static analysis and VectorEmu remain functional. On Apple Silicon, additionally execute the Hypervisor and native ARM64-debugger smoke tests.
+Before distribution, run the release gates on an Apple-Silicon Mac only. Intel smoke tests may be run as experimental research checks, but Intel results do not qualify or block an official release.

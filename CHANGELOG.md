@@ -1,3 +1,13 @@
+# 0.5.13 — Reconstruction exports and graph scaling
+
+- Add discoverable scoped `.c`, `.m`, `.h` and `.n` reconstruction dumps, verified manifests, resumable batches and explicit failure counts.
+- Add Dump All with `c/`, `h/`, `m/` and `n/` folders. Emit explicit code-bearing review fallbacks when qualified source is unavailable.
+- Recover Objective-C class/member headers and supported scalar method adapters, retain validated superclass/protocol names and legacy bind providers, and expose public SDK declaration lookup. Synthetic packaging and unresolved dependencies remain labelled.
+- Expand qualified scalar/SDK pointer reconstruction and declaration-only FP, stack-argument and Apple SDK headers with language contracts.
+- Keep array declarator shape honest: unsupported pointer arrays, multidimensional arrays and VLA expressions no longer flatten into scalar-pointer declarations.
+- Open flow/evidence graphs at 80% zoom; use fixed-size, aspect-preserving whole-surface minimaps with correctly scaled nodes and viewport indicators.
+- Official binaries target macOS Apple Silicon. Intel remains experimental. Credentialed signing/notarization validation is intentionally deferred; distribution is a GitHub prerelease.
+
 # HindSight Research Tool — Project recreation
 
 - Rename the Xcode project, workspace, app target, scheme, app entry point, and bridge header to HindSight; keep the application bundle named HindSight.app.
