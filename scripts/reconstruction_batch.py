@@ -45,6 +45,21 @@ def read_bounded(path, limit):
         os.close(directory_fd)
 
 
+def safe_sdk_function_declaration(value, name):
+    if value is None:
+        return True
+    if (not isinstance(value, str) or not value or len(value.encode()) > 1024
+            or not value.endswith(";") or any(unicodedata.category(char) == "Cc" for char in value)
+            or any(char in value for char in "\\{}[]#=\"")):
+        return False
+    if value.count("(") != 1 or value.count(")") != 1:
+        return False
+    head, tail = value.split("(", 1)
+    if not head.split() or head.split()[-1] != name or not tail.endswith(");"):
+        return False
+    return "(" not in tail and ")" not in tail[:-2] and ";" not in value[:-1]
+
+
 def verified_outputs(directory, manifest):
     """Bind every exported byte to validated function/source evidence first."""
     sdk_catalog = manifest.get("sdk_catalog")
@@ -58,26 +73,62 @@ def verified_outputs(directory, manifest):
             missing = catalog.get("missing_functions")
             if (type(catalog.get("schema")) is not int or catalog["schema"] != 1
                     or not re.fullmatch(r"[0-9a-f]{64}", str(catalog.get("header_sha256", "")))
+                    or catalog.get("sdk") not in {"macosx", "iphoneos", "iphonesimulator"}
+                    or not isinstance(catalog.get("target"), str)
+                    or not re.fullmatch(r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+\.[0-9]+(-simulator)?",
+                                        catalog["target"])
+                    or not isinstance(catalog.get("sdk_path"), str)
+                    or not catalog["sdk_path"].startswith("/") or len(catalog["sdk_path"]) > 4096
+                    or any(unicodedata.category(char) == "Cc" for char in catalog["sdk_path"])
+                    or not isinstance(catalog.get("sdk_build"), str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", catalog["sdk_build"])
+                    or not isinstance(catalog.get("compiler"), str)
+                    or not catalog["compiler"] or len(catalog["compiler"].encode()) > 512
+                    or any(unicodedata.category(char) == "Cc" for char in catalog["compiler"])
                     or not isinstance(candidates, list) or not 1 <= len(candidates) <= 128
                     or not isinstance(functions, list) or len(functions) > 128
                     or not isinstance(missing, list) or len(missing) > 128):
                 raise ValueError("SDK catalog schema or declaration bounds are invalid")
+            target_match = re.fullmatch(
+                r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+\.[0-9]+(-simulator)?",
+                catalog["target"])
+            platform, simulator = target_match.group(2), target_match.group(3) is not None
+            sdk_leaf = catalog["sdk_path"].rsplit("/", 1)[-1]
+            if ((catalog["sdk"] == "macosx") != (platform == "macos")
+                    or (catalog["sdk"] == "iphoneos") != (platform == "ios" and not simulator)
+                    or (catalog["sdk"] == "iphonesimulator") != (platform == "ios" and simulator)
+                    or (platform == "ios" and not simulator and target_match.group(1) == "x86_64")
+                    or sdk_leaf != {"macosx": "MacOSX.sdk", "iphoneos": "iPhoneOS.sdk",
+                                    "iphonesimulator": "iPhoneSimulator.sdk"}[catalog["sdk"]]):
+                raise ValueError("SDK catalog target and SDK identity disagree")
             candidate_symbols = {}
             for candidate in candidates:
                 if (not isinstance(candidate, dict) or not all(isinstance(candidate.get(key), str) and candidate[key]
-                        for key in ("name", "symbol", "provider")) or candidate["name"] in candidate_symbols):
+                        for key in ("name", "symbol", "provider"))
+                        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", candidate["name"])
+                        or len(candidate["name"]) > 256 or len(candidate["symbol"]) > 1024
+                        or candidate["symbol"] != "_" + candidate["name"]
+                        or not (re.fullmatch(r"/usr/lib/(?:system/)?lib[A-Za-z0-9_.+-]+\.dylib", candidate["provider"])
+                                or re.fullmatch(r"/System/Library/Frameworks/([A-Za-z][A-Za-z0-9_]*)\.framework/(?:Versions/[A-Za-z0-9]+/)?\1", candidate["provider"]))
+                        or candidate["name"] in candidate_symbols):
                     raise ValueError("SDK catalog import candidates are invalid")
                 candidate_symbols[candidate["name"]] = candidate["symbol"]
             function_symbols = {}
             for function in functions:
                 if (not isinstance(function, dict) or not isinstance(function.get("name"), str)
-                        or not function["name"] or not isinstance(function.get("symbol"), str)
+                        or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", function["name"])
+                        or len(function["name"]) > 256
+                        or not isinstance(function.get("symbol"), str)
+                        or len(function["symbol"]) > 1024
                         or function["name"] in function_symbols or type(function.get("worker_eligible")) is not bool
-                        or (function.get("abi_declaration") is not None
-                            and not isinstance(function.get("abi_declaration"), str))):
+                        or not safe_sdk_function_declaration(function.get("declaration"), function["name"])
+                        or not safe_sdk_function_declaration(function.get("abi_declaration"), function["name"])
+                        or (function.get("worker_eligible") and not function.get("abi_declaration"))):
                     raise ValueError("SDK catalog function declarations are invalid")
                 function_symbols[function["name"]] = function.get("symbol")
-            if (any(not isinstance(name, str) for name in missing) or len(set(missing)) != len(missing)
+            if (any(not isinstance(name, str) or len(name) > 256
+                    or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", name)
+                    for name in missing) or len(set(missing)) != len(missing)
                     or set(function_symbols) & set(missing)
                     or set(candidate_symbols) != set(function_symbols) | set(missing)
                     or any(candidate_symbols[name] != symbol for name, symbol in function_symbols.items())):
@@ -163,6 +214,8 @@ def verified_outputs(directory, manifest):
             source = candidate["source"]
             if "hash-bound Apple SDK declaration catalog" not in source:
                 continue
+            if candidate["language"] != "C":
+                raise ValueError("SDK catalog provenance is only valid for C declarations")
             if not isinstance(sdk_catalog, dict):
                 raise ValueError("SDK-derived call declaration lacks its retained catalog")
             symbol, declaration = candidate.get("symbol"), candidate.get("declaration")

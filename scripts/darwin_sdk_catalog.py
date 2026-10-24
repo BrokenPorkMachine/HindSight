@@ -11,6 +11,7 @@ import subprocess
 import sys
 import uuid
 import tempfile
+import unicodedata
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -239,40 +240,98 @@ def collect_declarations(functions, header=DEFAULT_HEADER, sdk="macosx", target=
 def worker_prototypes(catalog, source_sha256):
     if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
         raise ValueError("invalid source SHA-256")
-    if catalog.get("producer") != "hindsight-apple-clang-declarations-v1":
+    if (not isinstance(catalog, dict) or catalog.get("producer") != "hindsight-apple-clang-declarations-v1"
+            or type(catalog.get("schema")) is not int or catalog["schema"] != 1):
         raise ValueError("worker prototypes require an Apple Clang SDK declaration catalog")
+    if catalog.get("source_sha256") is not None and catalog.get("source_sha256") != source_sha256:
+        raise ValueError("SDK catalog source digest differs from prototype binding")
     target = catalog.get("target")
     sdk_path = catalog.get("sdk_path")
     sdk_build = catalog.get("sdk_build", "unrecorded")
     compiler = catalog.get("compiler")
     header_sha256 = catalog.get("header_sha256")
+    target_match = (re.fullmatch(
+        r"(arm64|arm64e|x86_64)-apple-(macos|ios)([0-9]+\.[0-9]+(?:\.[0-9]+)?)(-simulator)?",
+        target) if isinstance(target, str) else None)
+    sdk = catalog.get("sdk")
+    sdk_leaf = Path(sdk_path).name if isinstance(sdk_path, str) else ""
+    expected_sdk = ({"macosx": ("macos", False, "MacOSX.sdk"),
+                    "iphoneos": ("ios", False, "iPhoneOS.sdk"),
+                    "iphonesimulator": ("ios", True, "iPhoneSimulator.sdk")}.get(sdk)
+                    if isinstance(sdk, str) else None)
     if (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", target)
             or not isinstance(sdk_path, str) or not sdk_path.startswith("/") or len(sdk_path) > 4096
-            or any(ord(char) < 32 for char in sdk_path)
+            or any(unicodedata.category(char) == "Cc" for char in sdk_path)
+            or target_match is None or expected_sdk is None
+            or (target_match.group(2), target_match.group(4) is not None, sdk_leaf)
+                != expected_sdk
+            or (target_match.group(2) == "ios" and target_match.group(1) == "x86_64"
+                and target_match.group(4) is None)
             or not isinstance(sdk_build, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sdk_build)
             or not isinstance(compiler, str) or not compiler or len(compiler) > 512
-            or any(ord(char) < 32 and char != " " for char in compiler)
+            or any(unicodedata.category(char) == "Cc" for char in compiler)
             or not isinstance(header_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", header_sha256)):
         raise ValueError("SDK catalog lacks valid target, SDK, compiler or header provenance")
-    if catalog.get("missing_functions"):
+    functions = catalog.get("functions")
+    missing = catalog.get("missing_functions")
+    if (not isinstance(functions, list) or not 1 <= len(functions) <= 128
+            or not isinstance(missing, list) or missing):
         raise ValueError("cannot publish incomplete requested prototype set")
     lines = [f"# source_sha256={source_sha256}", f"# producer={catalog['producer']}",
              f"# target={catalog['target']}", f"# compiler={catalog['compiler']}", f"# sdk={catalog['sdk_path']}",
              f"# sdk_build={catalog.get('sdk_build', 'unrecorded')}",
              f"# header_sha256={catalog['header_sha256']}",
              "# Scope: SDK declarations; runtime provider identity must be qualified separately."]
-    for record in catalog["functions"]:
-        declaration = record["abi_declaration"]
-        symbol = record["symbol"]
-        if not record["worker_eligible"] or not declaration:
-            raise ValueError(f"unsupported prototype declarator: {record['name']}")
-        if len(declaration) > 1024 or len(symbol) > 1024 or any(ch in declaration + symbol for ch in "\n\r\t\\{}#=\""):
-            raise ValueError(f"prototype exceeds worker declaration contract: {record['name']}")
+    names, symbols = set(), set()
+    for record in functions:
+        if not isinstance(record, dict):
+            raise ValueError("SDK prototype function record is invalid")
+        name, symbol, declaration = record.get("name"), record.get("symbol"), record.get("abi_declaration")
+        if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,255}", name)
+                or name in names or not isinstance(symbol, str) or symbol != "_" + name
+                or symbol in symbols or type(record.get("worker_eligible")) is not bool
+                or not record["worker_eligible"] or not isinstance(declaration, str)
+                or not _safe_function_declaration(declaration, name)):
+            raise ValueError("SDK prototype function record is unsupported or inconsistent")
+        names.add(name)
+        symbols.add(symbol)
         lines.append(f"{symbol}\t{declaration}")
+    if "import_candidates" in catalog:
+        candidates = catalog["import_candidates"]
+        candidate_names, candidate_symbols = set(), set()
+        if not isinstance(candidates, list) or not 1 <= len(candidates) <= 128:
+            raise ValueError("SDK import candidate set is invalid")
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                raise ValueError("SDK import candidate is invalid")
+            name, symbol, provider = (candidate.get("name"), candidate.get("symbol"), candidate.get("provider"))
+            public_provider = (isinstance(provider, str) and
+                (re.fullmatch(r"/usr/lib/(?:system/)?lib[A-Za-z0-9_.+-]+\.dylib", provider)
+                 or re.fullmatch(r"/System/Library/Frameworks/([A-Za-z][A-Za-z0-9_]*)\.framework/(?:Versions/[A-Za-z0-9]+/)?\1", provider)))
+            if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,255}", name)
+                    or symbol != "_" + name or not public_provider
+                    or name in candidate_names or symbol in candidate_symbols):
+                raise ValueError("SDK import candidate identity or provider is invalid")
+            candidate_names.add(name)
+            candidate_symbols.add(symbol)
+        if candidate_names != names or candidate_symbols != symbols:
+            raise ValueError("SDK import candidates do not match resolved prototypes")
     output = "\n".join(lines) + "\n"
     if len(output.encode()) > 4 * 1024 * 1024:
         raise ValueError("prototype catalog exceeds worker byte budget")
     return output
+
+
+def _safe_function_declaration(value, name):
+    if (not value or len(value.encode()) > 1024 or not value.endswith(";")
+            or any(unicodedata.category(char) == "Cc" for char in value)
+            or any(char in value for char in "\\{}[]#=\"")):
+        return False
+    if value.count("(") != 1 or value.count(")") != 1:
+        return False
+    head, tail = value.split("(", 1)
+    return (bool(head.split()) and head.split()[-1] == name and tail.endswith(");")
+            and "(" not in tail and ")" not in tail[:-2] and ";" not in value[:-1])
 
 
 def main():

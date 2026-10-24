@@ -26,7 +26,9 @@ identity once per lookup request and reuses it for each candidate symbol while
 checking the header before and after parsing. The coordinator may reuse a result
 for later functions only when source digest, candidate imports and the full
 target/SDK/compiler/header identity match; the in-process cache holds at most
-four entries and clears on project switch, analysis-cache clearing, or disconnect. Each function attempt
+four entries and clears on project switch, analysis-cache clearing, or disconnect.
+The coordinator refuses cache clearing while SDK collection is in flight, so
+pending work cannot recreate cleared catalog evidence. Each function attempt
 and its exported manifest entry also name
 the catalog hash used for that request, and checkpoint validation rejects a
 missing catalog association, including when an artifact contains an SDK-derived
@@ -47,22 +49,33 @@ parent-directory descriptor without following symlinks. File identity,
 modification time and change time are checked across the read.
 Checkpoint and retained batch artifact reads use the same bounded no-follow
 descriptor validation.
+Native catalog encoding also checks import/declaration pairing and consistent
+target, SDK, compiler, and header identities across every collected row, plus
+the architecture/platform triple with a full three-part deployment version and captured
+import-name/symbol pairing, and uses the live selector's same predicate to
+revalidate the provider's public system path and leading-letter import name.
 The app rejects a reply that labels a declaration as Apple SDK catalog evidence
 but omits the matching source-bound catalog reference; package verification
 applies the same rule.
 
 Worker prototype parsing preserves the distinction between analyst-supplied
 prototypes and Apple Clang SDK declarations. SDK origin is accepted only when
-the source digest and bounded target, SDK, compiler, and header-hash metadata are
-present in the catalog preamble; the origin is retained in signature evidence.
-The Python worker-prototype exporter validates the same required metadata
-before emitting a prototype file.
+the source digest and bounded target, SDK path, compiler, SDK build, and
+header-hash metadata are present in the catalog preamble. For Apple SDK
+prototypes, the worker checks that the target platform and simulator suffix
+match the SDK path's directory name; the CLI applies the same check before
+emitting prototypes. Before emission, the CLI also checks source binding,
+resolved coverage, unique import names/symbols, declaration shape, and provider
+eligibility. The origin is retained in signature evidence.
 Binary Workspace displays the retained catalog filename and hash beside the
 function artifact, or states that no catalog was retained for that request.
 Its call declaration disclosure shows up to 128 symbol, target, declaration and
 origin records, makes target addresses navigable, reports the displayed and
 total counts, and states that declarations do not supply function
-implementations. The app rejects a reply that labels a declaration as Apple SDK
+implementations. SDK-derived rows also show the recorded provider from the
+verified catalog, with a reminder that linkage metadata does not prove runtime
+resolution. The catalog panel also displays the target triple, SDK build,
+SDK path, compiler and header hash. The app rejects a reply that labels a declaration as Apple SDK
 catalog evidence but omits the matching source-bound catalog reference; package
 verification applies the same rule.
 
@@ -128,5 +141,9 @@ checkpoints and exported format sidecars. Both app and CLI batch verification
 match every SDK-attributed call candidate's symbol and ABI declaration to the
 retained catalog. CLI batch reads also use bounded no-follow descriptors and
 verify metadata across each read. The CLI checks Apple Clang catalog schema,
-declaration bounds and the import/function/missing-name association, plus the
-bounded call-candidate field contract. App batch qualification remains open.
+1 KiB declaration bounds, target/SDK agreement, public provider paths and the
+import/function/missing-name association, plus the
+bounded call-candidate field contract and the SDK C-language attribution rule.
+Worker-eligible catalog entries require a nonempty ABI declaration.
+Retained declaration text must match the collector's bounded C function form.
+App batch qualification remains open.

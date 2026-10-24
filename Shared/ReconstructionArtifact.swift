@@ -178,7 +178,11 @@ struct ReconstructionCallSignatureCandidate: Sendable, Identifiable {
     let language: String
     let declaration: String
     let source: String
-    var id: String { "\(String(target, radix: 16))-\(symbol)-\(declaration)" }
+    var id: String {
+        [String(target, radix: 16), symbol, language, declaration, source]
+            .map { "\($0.utf8.count):\($0)" }
+            .joined(separator: "|")
+    }
     var requiresSDKCatalog: Bool { source.contains("hash-bound Apple SDK declaration catalog") }
 }
 struct ReconstructionSemanticCoverage: Sendable {

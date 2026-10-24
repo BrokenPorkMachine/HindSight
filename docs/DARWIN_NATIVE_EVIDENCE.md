@@ -1,6 +1,6 @@
 # Darwin native evidence for reconstruction
 
-The native reconstruction tools collect libobjc/dyld observations and import C function declarations with Apple Clang. The worker now joins structured, target-local property/ivar layouts to AArch64 pseudocode, qualified against those native observations. These support C00N in the [Chimera completion roadmap](CHIMERA_COMPLETION_ROADMAP.md). General runtime object/type inference, arbitrary aggregate ingestion and native-catalog import UI remain open.
+The native reconstruction tools collect libobjc/dyld observations and import C function declarations with Apple Clang. The worker now joins structured, target-local property/ivar layouts to AArch64 pseudocode, qualified against those native observations. These support C00N in the [Chimera completion roadmap](CHIMERA_COMPLETION_ROADMAP.md). General runtime object/type inference and arbitrary aggregate ingestion remain open.
 
 ## Native runtime catalog
 
@@ -40,6 +40,14 @@ python3 scripts/collect-darwin-sdk.py --sdk iphoneos --target arm64-apple-ios16.
 ```
 
 An SDK/target mismatch is rejected. Filtered AST output is spooled and bounded to 4 MiB per requested function; at most 128 distinct functions are admitted. Unsupported callback/array/function-pointer declarators retain their structured type evidence and are not reduced to fabricated scalar prototypes. Complete record/bitfield layout ingestion and calling-convention attribute handling remain part of the project type-library work.
+
+## Analyst project type catalog
+
+The workspace's Project Type Catalog stores bounded analyst declarations (`typedef`, `struct`, `union` or `enum`) alongside a target label and the SHA-256 identity of a source already captured in that project. The coordinator checks that the declared architecture matches the captured source's inspected architecture, validates the declaration shape, and groups conflicting declarations for review. Catalog records are project-local and persist with the project database.
+
+These candidates are reviewable evidence only. They are not yet sent to the reconstruction worker, used to infer layouts, or treated as SDK/runtime facts. Feeding conflict-free declarations into reconstruction with provenance attached remains open; adding SDK producer/image/version provenance and complete arbitrary aggregate layouts remains part of the broader type-library work.
+
+Use **Export JSON** in the Project Type Catalog workspace to write a bounded, validated catalog for review or handoff. The export preserves the candidate rows, analyst source label, target and captured-source SHA-256. Its SHA-256 is reported in the workspace after writing. It is an evidence interchange file; importing it into another project's trusted catalog and feeding declarations to reconstruction are not implemented.
 
 ## Feed declarations to AArch64 pseudocode
 

@@ -79,6 +79,30 @@ private func readSDKCatalogFile(_ url: URL, maximumBytes: Int = 4 * 1024 * 1024)
     return data
 }
 
+private func readSDKCatalogEvidence(projectPath: String, digest: String,
+                                   reference: DarwinSDKDeclarationCatalogReference?)
+    -> (providers: [String: String], identity: String)? {
+    guard let reference, reference.validated(for: digest) else { return nil }
+    let directory = URL(fileURLWithPath: projectPath, isDirectory: true)
+        .appendingPathComponent("analysis-cache", isDirectory: true)
+    let url = directory.appendingPathComponent(reference.fileName)
+    guard let data = try? readSDKCatalogFile(url),
+          SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == reference.catalogSHA256,
+          let catalog = try? JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: data),
+          catalog.validated(for: digest), (try? catalog.encoded()) == data,
+          let collection = catalog.declarations.first else { return nil }
+    var providers: [String: String] = [:]
+    for candidate in catalog.candidates { providers[candidate.symbol] = candidate.provider }
+    let identity = [
+        "target=\(collection.context.triple)",
+        "sdk=\(collection.context.sdk) sdk_build=\(collection.sdkBuild)",
+        "sdk_path=\(collection.sdkPath)",
+        "compiler=\(collection.compiler)",
+        "header_sha256=\(collection.headerSHA256)"
+    ].joined(separator: "\n")
+    return (providers, identity)
+}
+
 struct VGRecentProject: Codable, Hashable, Identifiable {
     let path: String
     let lastOpened: Date
@@ -117,6 +141,11 @@ final class WorkbenchModel: ObservableObject {
     @Published var analysisReport: AnalysisReport?
     @Published private(set) var reconstructionArtifact: ReconstructionArtifact?
     @Published private(set) var reconstructionSDKCatalog: DarwinSDKDeclarationCatalogReference?
+    @Published private(set) var reconstructionSDKProviders: [String: String] = [:]
+    @Published private(set) var reconstructionSDKIdentity: String?
+    @Published private(set) var projectTypeCatalog = ProjectTypeCatalog(candidates: [])
+    @Published private(set) var projectTypeCatalogStatus = "Project type catalog unavailable."
+    private var projectTypeCatalogGeneration: UInt64 = 0
     @Published private(set) var reconstructionStatus = "Select a function and request reconstruction."
     private var reconstructionContext: ReconstructionReviewContext?
     private var reconstructionRequestID: String?
@@ -749,13 +778,19 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 service.reconstructFunction(record.id, startAddress: String(functionStart), endAddress: String(functionEnd),
                                             requestID: reconstructionID, withReply: done)
             }
-            let artifact = try decodeReconstructionReply(reconstructionText, requestID: reconstructionID,
-                digest: digest, start: functionStart, end: functionEnd).artifact
+            let reconstruction = try decodeReconstructionReply(reconstructionText, requestID: reconstructionID,
+                digest: digest, start: functionStart, end: functionEnd)
+            let artifact = reconstruction.artifact
             try artifact.writeReviewExport(to: URL(fileURLWithPath: reconstructionOutput))
             selectedID = record.id
             analysisRecordID = record.id
             analysisReport = analysis
             reconstructionArtifact = artifact
+            reconstructionSDKCatalog = reconstruction.sdkCatalogReference
+            let sdkEvidence = readSDKCatalogEvidence(projectPath: importedProject.path,
+                digest: digest, reference: reconstruction.sdkCatalogReference)
+            reconstructionSDKProviders = sdkEvidence?.providers ?? [:]
+            reconstructionSDKIdentity = sdkEvidence?.identity
             reconstructionContext = ReconstructionReviewContext(project: importedProject.path, record: record.id,
                                                                  analysis: analysisID, digest: digest)
             guard currentReconstruction?.start == functionStart && currentReconstruction?.end == functionEnd else {
@@ -1710,7 +1745,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard !busy, projectServiceReady, let record = selected, let digest = record.result.source_sha256,
               let projectPath = project?.path, let analysis = currentAnalysis else { return }
         let id = UUID().uuidString, generation = navigationGeneration
-        activeRequest = id; reconstructionRequestID = id; busy = true; reconstructionSDKCatalog = nil
+        activeRequest = id; reconstructionRequestID = id; busy = true
         reconstructionStatus = "Reconstructing the selected function…"
         startAnalysisMonitor(requestID: id)
         client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
@@ -1721,9 +1756,15 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             do { text = try result.get() }
             catch { self.busy = false; self.activeRequest = nil; self.reconstructionRequestID = nil; self.reconstructionStatus = error.localizedDescription; return }
             Task { [weak self] in
-                let decoded = await Task.detached(priority: .userInitiated) { () -> Result<(artifact: ReconstructionArtifact, message: String, sdkCatalogReference: DarwinSDKDeclarationCatalogReference?), Error> in
-                    Result { try decodeReconstructionReply(text, requestID: id, digest: digest,
-                                                           start: function.start, end: function.end) }
+                let decoded = await Task.detached(priority: .userInitiated) { () -> Result<(artifact: ReconstructionArtifact, message: String, sdkCatalogReference: DarwinSDKDeclarationCatalogReference?, sdkProviders: [String: String], sdkIdentity: String?), Error> in
+                    Result {
+                        let reconstruction = try decodeReconstructionReply(text, requestID: id, digest: digest,
+                            start: function.start, end: function.end)
+                        let sdkEvidence = readSDKCatalogEvidence(projectPath: projectPath, digest: digest,
+                                                                 reference: reconstruction.sdkCatalogReference)
+                        return (reconstruction.artifact, reconstruction.message,
+                                reconstruction.sdkCatalogReference, sdkEvidence?.providers ?? [:], sdkEvidence?.identity)
+                    }
                 }.value
                 guard let self, self.activeRequest == id else { return }
                 self.busy = false; self.activeRequest = nil; self.reconstructionRequestID = nil
@@ -1734,6 +1775,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     let artifact = reconstruction.artifact
                     self.reconstructionArtifact = artifact
                     self.reconstructionSDKCatalog = reconstruction.sdkCatalogReference
+                    self.reconstructionSDKProviders = reconstruction.sdkProviders
+                    self.reconstructionSDKIdentity = reconstruction.sdkIdentity
                     self.reconstructionContext = ReconstructionReviewContext(project: projectPath, record: record.id,
                                                                              analysis: analysis.request_id, digest: digest)
                     self.reconstructionStatus = reconstruction.message.contains("Full SDK lookup evidence retained")
@@ -2006,17 +2049,30 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     functions = restored
                     entries = previous
                     bytes = saved["output_bytes"] as? Int ?? 0
-                    sdkCatalogs = (saved["sdk_catalogs"] as? [[String: Any]] ?? []).compactMap { item in
+                    let savedCatalogItems: [[String: Any]]
+                    if let rawCatalogs = saved["sdk_catalogs"] {
+                        guard let rows = rawCatalogs as? [[String: Any]] else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint SDK catalog list is malformed.")
+                        }
+                        savedCatalogItems = rows
+                    } else {
+                        savedCatalogItems = []
+                    }
+                    sdkCatalogs.removeAll(keepingCapacity: true)
+                    for item in savedCatalogItems {
                         guard let fileName = item["file_name"] as? String,
                               let sourceSHA256 = item["source_sha256"] as? String,
-                              let catalogSHA256 = item["catalog_sha256"] as? String else { return nil }
-                        return DarwinSDKDeclarationCatalogReference(fileName: fileName, sourceSHA256: sourceSHA256,
-                                                                    catalogSHA256: catalogSHA256)
-                    }
-                    for item in saved["sdk_catalogs"] as? [[String: Any]] ?? [] {
-                        if let fileName = item["file_name"] as? String, let size = item["bytes"] as? Int {
-                            sdkCatalogByteCounts[fileName] = size
+                              let catalogSHA256 = item["catalog_sha256"] as? String,
+                              let size = item["bytes"] as? Int, size > 0, size <= 4 * 1024 * 1024 else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint SDK catalog metadata could not be restored.")
                         }
+                        let reference = DarwinSDKDeclarationCatalogReference(fileName: fileName,
+                            sourceSHA256: sourceSHA256, catalogSHA256: catalogSHA256)
+                        guard reference.validated(for: digest), sdkCatalogByteCounts[fileName] == nil else {
+                            throw ReconstructionArtifact.Invalid(message: "Checkpoint SDK catalog identity is invalid or duplicated.")
+                        }
+                        sdkCatalogs.append(reference)
+                        sdkCatalogByteCounts[fileName] = size
                     }
                 } catch { reconstructionStatus = error.localizedDescription; return nil }
             }
@@ -2373,6 +2429,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 self.evidenceIndexRecordID = nil
                 self.reconstructionArtifact = nil
                 self.reconstructionSDKCatalog = nil
+                self.reconstructionSDKProviders = [:]
+                self.reconstructionSDKIdentity = nil
                 self.reconstructionContext = nil
                 self.status = reply.message
             } catch {
@@ -3199,6 +3257,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             guard reply.ok, let snapshot = reply.project else { status = reply.message; return false }
             let projectChanged = project?.path != snapshot.path
             if projectChanged {
+                projectTypeCatalog = ProjectTypeCatalog(candidates: [])
+                projectTypeCatalogStatus = "Loading project type catalog…"
                 instructionPage = nil; analysisReport = nil; pageRecordID = nil; analysisRecordID = nil; navigationGeneration = UUID()
                 analysisReportsByRecordID.removeAll()
                 diffBaselineID = snapshot.records.first?.id ?? ""
@@ -3214,8 +3274,112 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             if !snapshot.records.contains(where: {$0.id == selectedID}) { selectedID = snapshot.records.first?.id }
             persistLaunchSessionIfPossible()
             status = reply.message.isEmpty ? "Project open." : reply.message
+            refreshProjectTypeCatalog()
             return true
         } catch { status = error.localizedDescription; return false }
+    }
+    func refreshProjectTypeCatalog() {
+        guard projectServiceReady, let requestedProjectPath = project?.path else { return }
+        projectTypeCatalogGeneration &+= 1
+        let generation = projectTypeCatalogGeneration
+        client.request(maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+            operation: { $0.projectTypeCatalog(withReply: $1) }) { [weak self] result in
+            guard let self, self.project?.path == requestedProjectPath,
+                  self.projectTypeCatalogGeneration == generation else { return }
+            do {
+                let payload = try result.get()
+                let reply = try JSONDecoder().decode(ProjectTypeCatalogReply.self, from: Data(payload.utf8))
+                guard reply.ok, let catalog = reply.catalog, catalog.validated() != nil else {
+                    self.projectTypeCatalogStatus = reply.message.isEmpty ? "Project type catalog failed validation." : reply.message
+                    return
+                }
+                self.projectTypeCatalog = catalog
+                self.projectTypeCatalogStatus = catalog.conflicts.isEmpty
+                    ? "\(catalog.candidates.count) project type evidence candidate(s)."
+                    : "\(catalog.conflicts.count) type name(s) have conflicting declarations and are withheld."
+            } catch { self.projectTypeCatalogStatus = error.localizedDescription }
+        }
+    }
+    func exportProjectTypeCatalog() {
+        guard let catalog = projectTypeCatalog.validated(), !catalog.candidates.isEmpty,
+              let projectPath = project?.path else {
+            projectTypeCatalogStatus = "There is no validated project type catalog to export."
+            return
+        }
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(catalog)
+            guard data.count <= 8 * 1024 * 1024 else {
+                throw WorkbenchError("Project type catalog exceeds its 8 MiB export limit.")
+            }
+            let projectName = URL(fileURLWithPath: projectPath, isDirectory: true).lastPathComponent
+            let panel = NSSavePanel()
+            panel.title = "Export Project Type Evidence"
+            panel.nameFieldStringValue = "\(projectName).hindsight-types.json"
+            panel.allowedContentTypes = [.json]
+            panel.message = "This export retains analyst provenance, target labels, and captured source SHA-256 identities."
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try data.write(to: url, options: .withoutOverwriting)
+            let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            projectTypeCatalogStatus = "Exported \(catalog.candidates.count) type evidence candidate(s) (SHA-256 \(digest))."
+        } catch { projectTypeCatalogStatus = error.localizedDescription }
+    }
+    func addProjectTypeCandidate(_ candidate: ProjectTypeCandidate) {
+        guard projectServiceReady, candidate.validated != nil,
+              let data = try? JSONEncoder().encode(candidate), data.count <= 40 * 1024 else {
+            projectTypeCatalogStatus = "Project type candidate is invalid or exceeds its byte limit."
+            return
+        }
+        let json = String(decoding: data, as: UTF8.self)
+        guard let requestedProjectPath = project?.path else { return }
+        projectTypeCatalogGeneration &+= 1
+        let generation = projectTypeCatalogGeneration
+        client.request(maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+            operation: { $0.addProjectTypeCandidate(json, withReply: $1) }) { [weak self] result in
+            guard let self, self.project?.path == requestedProjectPath,
+                  self.projectTypeCatalogGeneration == generation else { return }
+            do {
+                let payload = try result.get()
+                let reply = try JSONDecoder().decode(ProjectTypeCatalogReply.self, from: Data(payload.utf8))
+                guard reply.ok, let catalog = reply.catalog, catalog.validated() != nil else {
+                    self.projectTypeCatalogStatus = reply.message.isEmpty ? "Project type catalog update failed validation." : reply.message
+                    return
+                }
+                self.projectTypeCatalog = catalog
+                self.projectTypeCatalogStatus = catalog.conflicts(for: candidate.target).contains(candidate.name)
+                    ? "Conflicting declarations for \(candidate.name) are retained and withheld."
+                    : "Added type evidence for \(candidate.name)."
+            } catch { self.projectTypeCatalogStatus = error.localizedDescription }
+        }
+    }
+    func removeProjectTypeCandidate(_ candidate: ProjectTypeCandidate) {
+        guard projectServiceReady, candidate.validated != nil,
+              let data = try? JSONEncoder().encode(candidate), data.count <= 40 * 1024 else {
+            projectTypeCatalogStatus = "Project type evidence identity is invalid or oversized."
+            return
+        }
+        let json = String(decoding: data, as: UTF8.self)
+        guard let requestedProjectPath = project?.path else { return }
+        projectTypeCatalogGeneration &+= 1
+        let generation = projectTypeCatalogGeneration
+        client.request(maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+            operation: { $0.removeProjectTypeCandidate(json, withReply: $1) }) { [weak self] result in
+            guard let self, self.project?.path == requestedProjectPath,
+                  self.projectTypeCatalogGeneration == generation else { return }
+            do {
+                let payload = try result.get()
+                let reply = try JSONDecoder().decode(ProjectTypeCatalogReply.self, from: Data(payload.utf8))
+                guard reply.ok, let catalog = reply.catalog, catalog.validated() != nil else {
+                    self.projectTypeCatalogStatus = reply.message.isEmpty ? "Project type catalog update failed validation." : reply.message
+                    return
+                }
+                self.projectTypeCatalog = catalog
+                self.projectTypeCatalogStatus = catalog.conflicts(for: candidate.target).contains(candidate.name)
+                    ? "Conflicting declarations for \(candidate.name) remain withheld."
+                    : "Removed the selected declaration candidate for \(candidate.name)."
+            } catch { self.projectTypeCatalogStatus = error.localizedDescription }
+        }
     }
     private func ledgerContext() -> VGLedgerContext {
         VGLedgerContext(

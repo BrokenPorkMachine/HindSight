@@ -157,13 +157,14 @@ enum VGWorkspaceCatalog {
             ])
 
         add(.evidence,
-            ["Investigation Ledger", "Evidence Graph", "Notes"],
-            sidebar: ["Investigation Ledger", "Evidence Graph", "Notes"],
+            ["Investigation Ledger", "Evidence Graph", "Project Type Catalog", "Notes"],
+            sidebar: ["Investigation Ledger", "Evidence Graph", "Project Type Catalog", "Notes"],
             subtitle: "Connect machine evidence, correlations, and analyst context without collapsing provenance.",
             icon: "note.text",
             overrides: [
                 "Investigation Ledger": ("Investigation Ledger", "book.pages"),
                 "Evidence Graph": ("Evidence Graph", "point.3.connected.trianglepath.dotted"),
+                "Project Type Catalog": ("Project Type Catalog", "text.book.closed"),
                 "Notes": ("Notes", "note.text")
             ])
 

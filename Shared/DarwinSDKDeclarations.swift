@@ -10,6 +10,13 @@ struct DarwinSDKImportCandidate: Codable, Equatable, Sendable {
     let provider: String
 }
 
+private func isEligiblePublicSDKProvider(_ provider: String) -> Bool {
+    provider.range(of: #"^/usr/lib/(?:system/)?lib[A-Za-z0-9_.+-]+\.dylib$"#,
+                   options: .regularExpression) != nil
+        || provider.range(of: #"^/System/Library/Frameworks/([A-Za-z][A-Za-z0-9_]*)\.framework/(?:Versions/[A-Za-z0-9]+/)?\1$"#,
+                          options: .regularExpression) != nil
+}
+
 struct DarwinSDKFunctionDeclaration: Codable, Equatable, Sendable {
     let name: String
     let symbol: String
@@ -65,9 +72,86 @@ struct DarwinSDKDeclarationCatalog: Codable, Sendable {
         self.sourceSHA256 = sourceSHA256
         self.candidates = candidates
         self.declarations = declarations
+        guard validated(for: sourceSHA256) else {
+            throw DarwinSDKDeclarations.Invalid(message: "SDK declarations do not match their captured import candidates or collection identity.")
+        }
+    }
+
+    func validated(for expectedSourceSHA256: String) -> Bool {
+        guard schema == 1, sourceSHA256 == expectedSourceSHA256,
+              sourceSHA256.utf8.count == 64,
+              sourceSHA256.allSatisfy({ "0123456789abcdef".contains($0) }),
+              !candidates.isEmpty, candidates.count <= 128,
+              candidates.count == declarations.count else { return false }
+        func bounded(_ value: String, maximum: Int) -> Bool {
+            value.utf8.count <= maximum && !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+        }
+        func validFunctionDeclaration(_ value: String?, name: String) -> Bool {
+            guard let value else { return true }
+            guard !value.isEmpty, value.utf8.count <= 1024, value.hasSuffix(";"),
+                  value.rangeOfCharacter(from: CharacterSet(charactersIn: "\n\r\t\\{}[]#=\"")) == nil,
+                  value.filter({ $0 == "(" }).count == 1, value.filter({ $0 == ")" }).count == 1,
+                  let opening = value.firstIndex(of: "("), let closing = value.lastIndex(of: ")"),
+                  value.index(after: closing) == value.index(before: value.endIndex) else { return false }
+            let declaredName = value[..<opening].split(whereSeparator: \.isWhitespace).last
+            let arguments = value[value.index(after: opening)..<closing]
+            return declaredName.map(String.init) == name
+                && !arguments.contains("(") && !arguments.contains(")")
+                && value.dropLast().filter({ $0 == ";" }).isEmpty
+        }
+        guard let first = declarations.first,
+              ["arm64", "arm64e", "x86_64"].contains(first.context.architecture),
+              !first.context.sdk.isEmpty, bounded(first.context.sdk, maximum: 32),
+              !first.context.triple.isEmpty, bounded(first.context.triple, maximum: 128),
+              first.sdkPath.hasPrefix("/"), bounded(first.sdkPath, maximum: 4096),
+              first.sdkBuild.range(of: #"^[A-Za-z0-9_.-]{1,128}$"#, options: .regularExpression) != nil,
+              !first.compiler.isEmpty, bounded(first.compiler, maximum: 512),
+              first.headerSHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil else { return false }
+        let triplePrefix = "\(first.context.architecture)-apple-"
+        guard first.context.triple.hasPrefix(triplePrefix) else { return false }
+        let platform = String(first.context.triple.dropFirst(triplePrefix.count))
+        guard platform.range(of: #"^(?:macos|ios)[0-9]+\.[0-9]+\.[0-9]+(?:-simulator)?$"#,
+                             options: .regularExpression) != nil else { return false }
+        if platform.hasPrefix("ios"), !platform.hasSuffix("-simulator"),
+           first.context.architecture == "x86_64" { return false }
+        switch first.context.sdk {
+        case "macosx":
+            guard platform.hasPrefix("macos"), !platform.hasSuffix("-simulator"),
+                  URL(fileURLWithPath: first.sdkPath).lastPathComponent == "MacOSX.sdk" else { return false }
+        case "iphoneos":
+            guard platform.hasPrefix("ios"), !platform.hasSuffix("-simulator"),
+                  URL(fileURLWithPath: first.sdkPath).lastPathComponent == "iPhoneOS.sdk" else { return false }
+        case "iphonesimulator":
+            guard platform.hasPrefix("ios"), platform.hasSuffix("-simulator"),
+                  URL(fileURLWithPath: first.sdkPath).lastPathComponent == "iPhoneSimulator.sdk" else { return false }
+        default: return false
+        }
+        var importedSymbols = Set<String>()
+        for (candidate, declaration) in zip(candidates, declarations) {
+            guard !candidate.name.isEmpty, bounded(candidate.name, maximum: 256),
+                  candidate.name.range(of: #"^[A-Za-z][A-Za-z0-9_]*$"#, options: .regularExpression) != nil,
+                  !candidate.symbol.isEmpty, bounded(candidate.symbol, maximum: 1024),
+                  candidate.symbol == "_" + candidate.name, importedSymbols.insert(candidate.symbol).inserted,
+                  !candidate.provider.isEmpty, bounded(candidate.provider, maximum: 4096),
+                  isEligiblePublicSDKProvider(candidate.provider),
+                  declaration.context == first.context,
+                  declaration.sdkPath == first.sdkPath, declaration.sdkBuild == first.sdkBuild,
+                  declaration.compiler == first.compiler, declaration.headerSHA256 == first.headerSHA256 else { return false }
+            if let function = declaration.function {
+                guard function.name == candidate.name, function.symbol == candidate.symbol,
+                      bounded(function.name, maximum: 256), bounded(function.symbol, maximum: 1024),
+                      validFunctionDeclaration(function.declaration, name: function.name),
+                      validFunctionDeclaration(function.abiDeclaration, name: function.name),
+                      !function.workerEligible || function.abiDeclaration.map({ !$0.isEmpty }) == true else { return false }
+            }
+        }
+        return true
     }
 
     func encoded() throws -> Data {
+        guard validated(for: sourceSHA256) else {
+            throw DarwinSDKDeclarations.Invalid(message: "SDK declaration catalog failed its internal provenance checks.")
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = try encoder.encode(self)
@@ -505,11 +589,6 @@ enum DarwinSDKDeclarations {
             throw Invalid(message: "SDK linkage section exceeds byte budget.")
         }
         let row = try NSRegularExpression(pattern: #"^symbol=(_[A-Za-z][A-Za-z0-9_]*) import\[\d+\] dylib=(\S+) addend=(-?\d+) weak=(yes|no)(?:\s|$)"#)
-        let dylib = try NSRegularExpression(pattern: #"^/usr/lib/(?:system/)?lib[A-Za-z0-9_.+-]+\.dylib$"#)
-        let framework = try NSRegularExpression(pattern: #"^/System/Library/Frameworks/([A-Za-z][A-Za-z0-9_]*)\.framework/(?:Versions/[A-Za-z0-9]+/)?\1$"#)
-        func matches(_ expression: NSRegularExpression, _ value: String) -> Bool {
-            expression.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
-        }
         var claims: [String: Set<Claim>] = [:]
         for line in linkageRecords.split(separator: "\n") {
             let value = String(line)
@@ -519,7 +598,7 @@ enum DarwinSDKDeclarations {
                   let addendRange = Range(match.range(at: 3), in: value) else { continue }
             let symbol = String(value[symbolRange]), provider = String(value[providerRange])
             let claim = Claim(provider: provider, addend: String(value[addendRange]),
-                              publicSystem: matches(dylib, provider) || matches(framework, provider))
+                              publicSystem: isEligiblePublicSDKProvider(provider))
             claims[symbol, default: []].insert(claim)
         }
         var result: [DarwinSDKImportCandidate] = []

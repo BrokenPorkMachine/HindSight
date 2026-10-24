@@ -97,9 +97,11 @@ that environment for all imported symbols while checking the header around each
 parse. Coordinator also keeps up to four source/candidate-bound lookup results
 in process memory; a later function request reuses them only after hashing the
 capture and matching the complete SDK/compiler/header/target identity. Project
-Project switch, analysis-cache clearing, and coordinator disconnect clear the
+switch, analysis-cache clearing, and coordinator disconnect clear the
 in-process cache; successful cache clearing also drops the app's displayed
-reconstruction artifact and catalog. Binary Workspace now offers
+reconstruction artifact and catalog. The coordinator refuses cache clearing
+while SDK declaration collection is in flight, preventing pending evidence
+from being republished after a clear. Binary Workspace now offers
 “Export SDK catalog” for the current function; it verifies the cache file hash
 and source identity before writing the JSON catalog. Batch checkpoints now
 retain deduplicated catalog sidecars under `sdk-catalogs/`, count catalog bytes
@@ -126,6 +128,13 @@ declaration match as package verification.
 The shared checkpoint, retained artifact, and dump readers pin the checked
 parent directory and open each batch input relative to that descriptor, with
 no-follow and bounded-read checks.
+Native catalog encoding now checks that every declaration corresponds to its
+ordered captured import candidate and that all rows share one target, SDK,
+compiler, and header identity. It also validates the architecture/platform/SDK
+triple including a full three-part deployment version, import-name/symbol pairing, and
+public system dylib/framework provider paths through the same predicate used
+by live import selection. Retained import names also follow the selector's
+leading-letter C identifier rule.
 Worker signature evidence now distinguishes the source-bound Apple Clang SDK
 catalog from analyst prototypes, validating the catalog preamble before
 applying that origin label. The Python and app prototype producers both include
@@ -135,15 +144,57 @@ candidates with navigable targets, declaration and source labels, reporting how
 many were shown out of the total. The UI states that these declarations do not
 supply imported implementations. The decoder validates the full bounded
 candidate list and cross-checks every SDK-attributed candidate against its
-catalog across all metadata settings nodes, while limiting display to 128. App replies and evidence packages must include
+catalog across all metadata settings nodes, while limiting display to 128. SDK
+candidate rows show the recorded public import provider from the verified catalog;
+the catalog panel also shows target triple, SDK name/build/path, compiler and header hash.
+Missing provider or identity evidence is identified. App replies and evidence packages must include
 the matching source-bound catalog whenever a call candidate carries Apple SDK
 catalog provenance. Python validates the same metadata before emitting SDK
 worker prototypes and checks batch artifact candidates against the retained
 catalog before resume or dump. Its batch reader pins the parent directory and
 uses bounded no-follow descriptor reads with before/after metadata checks. For
 Apple Clang catalogs, it validates the schema and import/function/missing-name
-set before accepting the source hash. It validates candidate field shapes and
-bounds before checking SDK provenance.
+set, target/SDK agreement, and public provider paths before accepting the source hash. It validates candidate field shapes,
+bounds, and C language attribution before checking SDK provenance. Retained
+declarations use the collector's 1 KiB per-declaration limit.
+The validators also enforce the collector's single-function C declarator shape;
+worker-eligible entries require a nonempty ABI declaration. Native and Python
+catalog readers now agree that x86_64 iOS targets are simulator-only; an
+x86_64 device triple is rejected during catalog validation. The Python reader
+also enforces the native reader's 256-byte import-name and 1 KiB symbol bounds
+for imported, resolved, and missing-name entries; both require SDK build IDs to
+use the same bounded ASCII character set. App checkpoint resume now
+fails on malformed, duplicate, or source-mismatched catalog rows instead of
+silently dropping a sidecar reference. The Python prototype emitter and Rust
+worker now also bind Apple catalog targets to the SDK path family, including
+simulator status and the supported two- or three-part deployment version. The
+native app and batch readers also bind the SDK directory name to the catalog's
+SDK and target fields. Before emitting worker TSV, the CLI verifies source
+binding, complete function coverage, exact import name/symbol associations,
+unique candidates, bounded declaration shapes and eligible public providers.
+SDK-path and compiler metadata reject Unicode control characters consistently
+in the CLI and Rust worker.
+Project schema v2 now atomically migrates schema-v1 projects and retains bounded
+type-declaration candidates with captured source digest, target and provenance. Identical evidence is deduplicated;
+different declarations for one name remain visible as conflicts, and the
+catalog's resolver withholds conflicted names. Reads verify every stored
+candidate key against its content hash. Coordinator APIs and a Project
+Type Catalog workspace expose refresh, target filtering, insertion, candidate
+removal, conflict review and bounded JSON export. Export retains each analyst
+assertion's target and captured-source digest; its content hash is shown for
+handoff verification. A name conflicts only when its declarations differ
+for the same target; removing one conflicting assertion can restore a unique
+target-scoped declaration, and the UI labels unique candidates separately from
+withheld conflicts. Add/remove status uses the candidate's target scope, so a
+same-name conflict on another target does not produce a false warning. Catalog
+callbacks carry a request generation, preventing stale refresh or mutation
+replies from replacing newer state. The UI clears unsubmitted type drafts when the
+project or selected source changes, preventing stale declarations from being
+bound to a different capture. Type candidates accept only bounded ASCII,
+balanced typedef/struct/union/enum declarations, with directives, comments and
+quoted code rejected. Candidate provenance is fixed to `analyst` for this input
+path, so caller-supplied labels cannot impersonate trusted catalog sources.
+Feeding resolved project types into reconstruction remains open.
 
 This short queue is the live handoff; C00–C16 below retain the full acceptance
 criteria. `[~]` means implemented in part or under verification, never complete.
@@ -597,6 +648,7 @@ Current progress: a C17 artifact schema, offline content/reference/AST/eligibili
 Dependencies: captured image identity and the thin C00 evidence contract. This work begins before general SSA/type inference and supplies its initial names and types.
 
 - [x] Establish [isolated Darwin runtime collection and Apple Clang C prototype import](DARWIN_NATIVE_EVIDENCE.md): real helper-process image/selector/property/ivar/layout records, compiler-derived declarations, source/platform-bound worker prototype input, and `-O0/-O2` pseudocode integration. Rich native-record joins, full type-library ingestion and target-runtime collection remain in the open tasks below.
+- [x] Add a persistent project type-candidate catalog with bounded declaration validation, captured-source SHA-256 provenance, and target-architecture matching; expose analyst entry and conflict review in the workspace. Candidates remain evidence only and are not yet consumed by reconstruction.
 
 - [~] Build one version-aware Mach-O/dyld path for macOS/iOS: UUIDs, architecture/subtype, platform/build version, segments/sections, symbols/exports, dylib ordinals, reexports, stubs/GOT/authenticated pointers, chained fixups and shared-cache image identities. *(in progress — claimed)*
 - [~] Collect native loaded-image ownership and slide/symbol evidence through dyld, `dladdr` and applicable Mach APIs; join file/preferred/runtime addresses only through a validated mapping. Native introspection runs in its own helper or qualified target runtime. *(in progress — claimed)*

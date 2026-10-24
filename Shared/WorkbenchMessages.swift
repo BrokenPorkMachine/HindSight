@@ -48,6 +48,109 @@ struct ProjectRecord: Codable, Identifiable {
     var note: String
     var revision: Int
 }
+
+struct ProjectTypeCandidate: Codable, Equatable, Identifiable {
+    let name: String
+    let declaration: String
+    let target: String
+    let source: String
+    let sourceSHA256: String
+    var id: String {
+        [name, declaration, target, source, sourceSHA256].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+    }
+
+    var validated: ProjectTypeCandidate? {
+        let identifier = name.range(of: #"^[A-Za-z_][A-Za-z0-9_]{0,255}$"#, options: .regularExpression) != nil
+        let targetArchitecture = target.split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
+        let targetValid = target.range(of: #"^[A-Za-z0-9_.-]{1,128}$"#, options: .regularExpression) != nil
+            && ["arm64", "arm64e", "aarch64", "x86_64", "i386", "arm", "thumb"].contains(targetArchitecture)
+        let sourceValid = source == "analyst"
+        let digestValid = sourceSHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil
+        let declarationValid = !declaration.isEmpty && declaration.utf8.count <= 16 * 1024
+            && declaration.unicodeScalars.allSatisfy { $0.value < 128 }
+            && !declaration.unicodeScalars.contains(where: {
+                CharacterSet.controlCharacters.contains($0) && $0.value != 0x0a && $0.value != 0x09
+            }) && Self.isTypeDeclaration(declaration)
+        return identifier && targetValid && sourceValid && digestValid && declarationValid ? self : nil
+    }
+
+    private static func isTypeDeclaration(_ declaration: String) -> Bool {
+        let value = declaration.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ["typedef ", "struct ", "union ", "enum "].contains(where: value.hasPrefix),
+              value.hasSuffix(";"), !value.contains("//"), !value.contains("/*"), !value.contains("*/"),
+              !value.contains(where: { ["#", "\\", "\"", "'"].contains(String($0)) }) else { return false }
+        var delimiters: [Character] = []
+        for (index, character) in value.enumerated() {
+            switch character {
+            case "{", "(", "[": delimiters.append(character)
+            case "}", ")", "]":
+                let expected: Character = character == "}" ? "{" : character == ")" ? "(" : "["
+                guard delimiters.popLast() == expected else { return false }
+            case ";" where delimiters.isEmpty:
+                if index != value.count - 1 { return false }
+            default: break
+            }
+        }
+        return delimiters.isEmpty
+    }
+}
+
+struct ProjectTypeCatalog: Codable {
+    static let currentSchema = 1
+    let schema: Int
+    let candidates: [ProjectTypeCandidate]
+
+    init(candidates: [ProjectTypeCandidate], schema: Int = Self.currentSchema) {
+        self.schema = schema
+        self.candidates = candidates
+    }
+
+    var conflicts: Set<String> {
+        conflicts(for: nil)
+    }
+
+    func conflicts(for target: String?) -> Set<String> {
+        let matching = target.map { value in candidates.filter { $0.target == value } } ?? candidates
+        let declarations = Dictionary(grouping: matching, by: { "\($0.name)|\($0.target)" })
+        return Set(declarations.values.compactMap { rows -> String? in
+            guard Set(rows.map { $0.declaration }).count > 1 else { return nil }
+            return rows.first?.name
+        })
+    }
+
+    func declaration(for name: String, target: String) -> String? {
+        let matching = candidates.filter { $0.name == name && $0.target == target }
+        let declarations = Set(matching.map { $0.declaration })
+        guard declarations.count == 1 else { return nil }
+        return declarations.first
+    }
+
+    func validated() -> ProjectTypeCatalog? {
+        guard schema == Self.currentSchema, candidates.count <= 10_000,
+              candidates.allSatisfy({ $0.validated != nil }),
+              Set(candidates.map { $0.id }).count == candidates.count else { return nil }
+        let estimatedBytes = candidates.reduce(0) {
+            $0 + $1.name.utf8.count + $1.declaration.utf8.count + $1.target.utf8.count
+                + $1.source.utf8.count + $1.sourceSHA256.utf8.count + 256
+        }
+        guard estimatedBytes <= 4 * 1024 * 1024 else { return nil }
+        return self
+    }
+}
+
+struct ProjectTypeCatalogReply: Codable {
+    let ok: Bool
+    let message: String
+    let catalog: ProjectTypeCatalog?
+    static func success(_ catalog: ProjectTypeCatalog) -> Self { Self(ok: true, message: "", catalog: catalog) }
+    static func failure(_ message: String) -> Self { Self(ok: false, message: message, catalog: nil) }
+    var encoded: String {
+        guard let data = try? JSONEncoder().encode(self), let text = String(data: data, encoding: .utf8) else {
+            return #"{"ok":false,"message":"Type catalog reply encoding failed","catalog":null}"#
+        }
+        return text
+    }
+}
 /// Versioned project boundary shared by the app, Coordinator and remote API.
 ///
 /// Older coordinators emitted only `path` and `records`; decoding those

@@ -475,10 +475,47 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             do {
                 guard let current = store else { throw WorkbenchError("Create or open a project first.") }
                 guard !supervisor.isBusy else { throw WorkbenchError("Cancel the active inspection before clearing the analysis cache.") }
+                guard sdkLookups.isEmpty else {
+                    throw WorkbenchError("Wait for or cancel the active SDK declaration lookup before clearing the analysis cache.")
+                }
                 let removed = try current.clearAnalysisCache()
                 sdkLookupCache.removeAll(keepingCapacity: true)
                 reply(ServiceReply.success("Cleared \(removed) cached analysis result\(removed == 1 ? "" : "s")."))
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
+        }
+    }
+    func projectTypeCatalog(withReply reply: @escaping (String) -> Void) {
+        queue.async { [self] in
+            do {
+                guard let store else { throw WorkbenchError("Create or open a project first.") }
+                reply(ProjectTypeCatalogReply.success(try store.projectTypeCatalog()).encoded)
+            } catch { reply(ProjectTypeCatalogReply.failure(error.localizedDescription).encoded) }
+        }
+    }
+    func addProjectTypeCandidate(_ candidateJSON: String, withReply reply: @escaping (String) -> Void) {
+        guard candidateJSON.utf8.count <= 40 * 1024 else {
+            reply(ProjectTypeCatalogReply.failure("Project type candidate exceeds its byte limit.").encoded); return
+        }
+        guard let candidate = try? JSONDecoder().decode(ProjectTypeCandidate.self, from: Data(candidateJSON.utf8)) else {
+            reply(ProjectTypeCatalogReply.failure("Project type candidate is malformed.").encoded); return
+        }
+        queue.async { [self] in
+            do {
+                guard let store else { throw WorkbenchError("Create or open a project first.") }
+                reply(ProjectTypeCatalogReply.success(try store.addProjectTypeCandidate(candidate)).encoded)
+            } catch { reply(ProjectTypeCatalogReply.failure(error.localizedDescription).encoded) }
+        }
+    }
+    func removeProjectTypeCandidate(_ candidateJSON: String, withReply reply: @escaping (String) -> Void) {
+        guard candidateJSON.utf8.count <= 40 * 1024,
+              let candidate = try? JSONDecoder().decode(ProjectTypeCandidate.self, from: Data(candidateJSON.utf8)) else {
+            reply(ProjectTypeCatalogReply.failure("Project type evidence identity is malformed or oversized.").encoded); return
+        }
+        queue.async { [self] in
+            do {
+                guard let store else { throw WorkbenchError("Create or open a project first.") }
+                reply(ProjectTypeCatalogReply.success(try store.removeProjectTypeCandidate(candidate)).encoded)
+            } catch { reply(ProjectTypeCatalogReply.failure(error.localizedDescription).encoded) }
         }
     }
     func debugAttach(_ pid: Int32, withReply reply: @escaping (String) -> Void) {

@@ -43,6 +43,8 @@ struct VGBinaryWorkspace: View {
     let onUndoFunctionOverride: (UInt64) -> Void
     let reconstruction: ReconstructionArtifact?
     let reconstructionSDKCatalog: DarwinSDKDeclarationCatalogReference?
+    let reconstructionSDKProviders: [String: String]
+    let reconstructionSDKIdentity: String?
     let reconstructionStatus: String
     let reconstructionBusy: Bool
     let onReconstruct: (VGFunctionRecord) -> Void
@@ -507,6 +509,17 @@ struct VGBinaryWorkspace: View {
                             Text(catalog.fileName).font(.caption.monospaced()).textSelection(.enabled)
                             Text("Catalog SHA-256 \(catalog.catalogSHA256)")
                                 .font(.caption.monospaced()).textSelection(.enabled)
+                            if let reconstructionSDKIdentity {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Verified SDK environment")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    Text(reconstructionSDKIdentity)
+                                        .font(.caption.monospaced()).textSelection(.enabled)
+                                }
+                            } else if !artifact.sdkCatalogCandidates.isEmpty {
+                                Text("SDK/compiler/header identity unavailable from the retained catalog.")
+                                    .font(.caption).foregroundStyle(.orange)
+                            }
                         }
                     } else {
                         Text("SDK declaration catalog does not match this reconstruction source.")
@@ -532,11 +545,20 @@ struct VGBinaryWorkspace: View {
                                         .font(.caption.monospaced()).textSelection(.enabled)
                                     Text("Origin: \(candidate.source)")
                                         .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                    if let provider = reconstructionSDKProviders[candidate.symbol] {
+                                        Text("Recorded import provider: \(provider)")
+                                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                    } else if candidate.requiresSDKCatalog {
+                                        Text("Recorded import provider unavailable in the retained catalog.")
+                                            .font(.caption).foregroundStyle(.orange)
+                                    }
                                 }
                                 .padding(.vertical, 3)
                             }
                         }
                         Text("A declaration supplies call type evidence; it does not provide or prove the imported function implementation.")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("Recorded providers come from captured linkage metadata and do not prove runtime resolution.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }

@@ -137,6 +137,10 @@ private struct VGBoundedEvidenceList: View {
 @MainActor
 struct ContentView: View {
     @ObservedObject var model: WorkbenchModel
+    @State private var projectTypeName = ""
+    @State private var projectTypeDeclaration = ""
+    @State private var projectTypeTarget = ""
+    @State private var projectTypeTargetFilter = ""
     @State private var commandPalettePresented = false
     @State private var sidebarQuery = ""
     @State private var showInspector = true
@@ -1085,6 +1089,8 @@ struct ContentView: View {
                         },
                         reconstruction: model.currentReconstruction,
                         reconstructionSDKCatalog: model.reconstructionSDKCatalog,
+                        reconstructionSDKProviders: model.reconstructionSDKProviders,
+                        reconstructionSDKIdentity: model.reconstructionSDKIdentity,
                         reconstructionStatus: model.reconstructionStatus,
                         reconstructionBusy: model.busy,
                         onReconstruct: model.reconstructFunction,
@@ -2002,6 +2008,98 @@ struct ContentView: View {
             case "SoC Virtualization":
                 if VGHostPlatform.supportsAppleSiliconHypervisor { virtualizationWorkspace() }
                 else { hostUnavailableWorkspace("SoC Virtualization", feature: "Apple-Silicon Hypervisor RE") }
+            case "Project Type Catalog":
+                let targetFilter = projectTypeTargetFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+                let visibleTypeCandidates = model.projectTypeCatalog.candidates.filter {
+                    targetFilter.isEmpty || $0.target.localizedCaseInsensitiveContains(targetFilter)
+                }
+                VStack(alignment: .leading, spacing: 14) {
+                    GroupBox("Project type evidence") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Declarations are retained with source digest and target provenance. Identical declarations can corroborate one another; conflicting declarations remain visible and are withheld from type selection.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            HStack {
+                                Text(model.projectTypeCatalogStatus).font(.caption)
+                                Spacer()
+                                Button("Export JSON", action: model.exportProjectTypeCatalog)
+                                    .disabled(!model.projectServiceReady || model.projectTypeCatalog.candidates.isEmpty)
+                                Button("Refresh", action: model.refreshProjectTypeCatalog)
+                                    .disabled(!model.projectServiceReady)
+                            }
+                            TextField("Filter target (for example arm64-apple-macos)", text: $projectTypeTargetFilter)
+                            if model.projectTypeCatalog.candidates.isEmpty {
+                                VStack(spacing: 6) {
+                                    Image(systemName: "text.book.closed").font(.title2).foregroundStyle(.secondary)
+                                    Text("No type evidence").font(.headline)
+                                    Text("Add a declaration candidate below to seed this project catalog.")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }.frame(maxWidth: .infinity, minHeight: 120)
+                            } else if visibleTypeCandidates.isEmpty {
+                                Text("No candidates match this target filter.").font(.caption).foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity, minHeight: 80)
+                            } else {
+                                ScrollView {
+                                    LazyVStack(alignment: .leading, spacing: 8) {
+                                        ForEach(visibleTypeCandidates) { candidate in
+                                            VStack(alignment: .leading, spacing: 4) {
+                                                HStack {
+                                                    Text(candidate.name).font(.system(.body, design: .monospaced).weight(.semibold))
+                                                    if model.projectTypeCatalog.conflicts(for: candidate.target).contains(candidate.name) {
+                                                        Label("Conflict · withheld", systemImage: "exclamationmark.triangle.fill")
+                                                            .font(.caption).foregroundStyle(.orange)
+                                                    } else if model.projectTypeCatalog.declaration(for: candidate.name,
+                                                        target: candidate.target) != nil {
+                                                        Label("Unique for target", systemImage: "checkmark.seal")
+                                                            .font(.caption).foregroundStyle(.secondary)
+                                                    }
+                                                    Spacer()
+                                                    Button(role: .destructive) {
+                                                        model.removeProjectTypeCandidate(candidate)
+                                                    } label: {
+                                                        Image(systemName: "trash")
+                                                    }
+                                                    .buttonStyle(.borderless)
+                                                    .disabled(!model.projectServiceReady)
+                                                    .help("Remove this evidence candidate")
+                                                }
+                                                Text(candidate.declaration).font(.system(.caption, design: .monospaced))
+                                                    .textSelection(.enabled)
+                                                Text("\(candidate.target) • \(candidate.source) • source \(candidate.sourceSHA256.prefix(12))…")
+                                                    .font(.caption2).foregroundStyle(.secondary)
+                                            }
+                                            .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6))
+                                        }
+                                    }
+                                }.frame(maxHeight: 320)
+                            }
+                        }.padding(8)
+                    }
+                    GroupBox("Add analyst declaration") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Enter one bounded typedef, struct, union, or enum declaration. Function bodies, directives, comments, and conflicted definitions are rejected or withheld.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            TextField("Type name", text: $projectTypeName)
+                            TextField("Target triple or ABI", text: $projectTypeTarget)
+                            TextEditor(text: $projectTypeDeclaration)
+                                .font(.system(.body, design: .monospaced)).frame(minHeight: 100)
+                                .overlay(RoundedRectangle(cornerRadius: 5).stroke(.secondary.opacity(0.25)))
+                            HStack {
+                                Text("Bound to selected source: \(record.result.source_sha256.map { String($0.prefix(12)) } ?? "unavailable")…")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Add candidate") {
+                                    guard let digest = record.result.source_sha256 else { return }
+                                    model.addProjectTypeCandidate(ProjectTypeCandidate(name: projectTypeName,
+                                        declaration: projectTypeDeclaration, target: projectTypeTarget,
+                                        source: "analyst", sourceSHA256: digest))
+                                }
+                                .disabled(!model.projectServiceReady || record.result.source_sha256 == nil
+                                    || projectTypeName.isEmpty || projectTypeDeclaration.isEmpty || projectTypeTarget.isEmpty)
+                            }
+                        }.padding(8)
+                    }
+                }
             case "Notes":
                 GroupBox("Project note") {
                     VStack(alignment: .leading) {
@@ -3628,5 +3726,16 @@ struct ContentView: View {
             model.scheduleColdStart()
         }
         .onChange(of: model.workspace) { _, newValue in rememberWorkspace(newValue) }
+        .onChange(of: model.project?.path) { _, _ in
+            projectTypeName = ""
+            projectTypeDeclaration = ""
+            projectTypeTarget = ""
+            projectTypeTargetFilter = ""
+        }
+        .onChange(of: model.selectedID) { _, _ in
+            projectTypeName = ""
+            projectTypeDeclaration = ""
+            projectTypeTarget = ""
+        }
     }
 }

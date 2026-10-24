@@ -69,8 +69,31 @@ final class ProjectStore {
             guard sqlite3_open_v2(databaseURL.path, &db, flags, nil) == SQLITE_OK else { throw WorkbenchError("Cannot open project database.") }
             sqlite3_busy_timeout(db, 1000)
             if !create {
-                guard try scalar("PRAGMA user_version") == 1,
-                      try scalar("SELECT schema_version FROM project_meta WHERE singleton=1") == 1 else {
+                let version = try scalar("PRAGMA user_version")
+                let metadataVersion = try scalar("SELECT schema_version FROM project_meta WHERE singleton=1")
+                if version == 1 && metadataVersion == 1 {
+                    try execute("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE project_type_candidates (
+                     id TEXT PRIMARY KEY CHECK(length(id)=64),
+                     name TEXT NOT NULL,
+                     declaration TEXT NOT NULL,
+                     target TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64)
+                    );
+                    CREATE INDEX project_type_candidates_by_name ON project_type_candidates(name);
+                    ALTER TABLE project_meta RENAME TO project_meta_v1;
+                    CREATE TABLE project_meta (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                     schema_version INTEGER NOT NULL CHECK(schema_version=2)
+                    );
+                    INSERT INTO project_meta VALUES (1,2);
+                    DROP TABLE project_meta_v1;
+                    PRAGMA user_version=2;
+                    COMMIT;
+                    """)
+                } else if version != 2 || metadataVersion != 2 {
                     throw WorkbenchError("Unsupported project schema. No migration performed.")
                 }
             }
@@ -163,6 +186,103 @@ final class ProjectStore {
             throw WorkbenchError("Project reply budget exceeded. Reduce record or note size.")
         }
         return snapshot
+    }
+    func projectTypeCatalog() throws -> ProjectTypeCatalog {
+        let statement = try prepare("SELECT id,name,declaration,target,source,source_sha256 FROM project_type_candidates ORDER BY name,id LIMIT 10001")
+        defer { sqlite3_finalize(statement) }
+        var candidates: [ProjectTypeCandidate] = []
+        var estimatedBytes = 0
+        while true {
+            let step = sqlite3_step(statement)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW, candidates.count < 10_000 else {
+                throw WorkbenchError("Project type catalog exceeds its 10,000-candidate limit or could not be read.")
+            }
+            let storedID = try text(statement, 0)
+            let candidate = ProjectTypeCandidate(name: try text(statement, 1), declaration: try text(statement, 2),
+                target: try text(statement, 3), source: try text(statement, 4), sourceSHA256: try text(statement, 5))
+            let expectedID = SHA256.hash(data: Data(candidate.id.utf8)).map { String(format: "%02x", $0) }.joined()
+            guard candidate.validated != nil, storedID == expectedID else {
+                throw WorkbenchError("Project type catalog contains invalid or altered evidence.")
+            }
+            estimatedBytes += candidate.name.utf8.count + candidate.declaration.utf8.count
+                + candidate.target.utf8.count + candidate.source.utf8.count + candidate.sourceSHA256.utf8.count + 256
+            guard estimatedBytes <= 4 * 1024 * 1024 else { throw WorkbenchError("Project type catalog exceeds its 8 MiB reply budget.") }
+            candidates.append(candidate)
+        }
+        let catalog = ProjectTypeCatalog(candidates: candidates)
+        guard catalog.validated() != nil,
+              try JSONEncoder().encode(catalog).count <= 8 * 1024 * 1024 else {
+            throw WorkbenchError("Project type catalog exceeds its encoding budget.")
+        }
+        return catalog
+    }
+    func addProjectTypeCandidate(_ candidate: ProjectTypeCandidate) throws -> ProjectTypeCatalog {
+        guard candidate.validated != nil else { throw WorkbenchError("Invalid project type evidence candidate.") }
+        let records = try prepare("SELECT header_json FROM records")
+        defer { sqlite3_finalize(records) }
+        var sourceIsCaptured = false
+        var sourceArchitecture: String?
+        while true {
+            let step = sqlite3_step(records)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { throw WorkbenchError("Cannot verify project type source identity.") }
+            let header = try JSONDecoder().decode(HeaderResult.self, from: Data(try text(records, 0).utf8))
+            if header.captured, header.source_sha256 == candidate.sourceSHA256 {
+                sourceIsCaptured = true
+                sourceArchitecture = header.architecture
+                break
+            }
+        }
+        guard sourceIsCaptured else { throw WorkbenchError("Type evidence must reference a captured source in this project.") }
+        let candidateArchitecture = candidate.target.split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
+        let architectureMatches: Bool
+        switch sourceArchitecture?.lowercased() {
+        case "arm64", "arm64e", "aarch64": architectureMatches = ["arm64", "arm64e", "aarch64"].contains(candidateArchitecture)
+        case "x86-64", "x86_64", "intel x86_64": architectureMatches = candidateArchitecture == "x86_64"
+        case "i386", "intel i386": architectureMatches = candidateArchitecture == "i386"
+        case "arm32": architectureMatches = ["arm", "thumb"].contains(candidateArchitecture)
+        default: architectureMatches = false
+        }
+        guard architectureMatches else {
+            throw WorkbenchError("Type evidence target architecture does not match the captured source.")
+        }
+        let id = SHA256.hash(data: Data(candidate.id.utf8)).map { String(format: "%02x", $0) }.joined()
+        let exists = try prepare("SELECT 1 FROM project_type_candidates WHERE id=?")
+        defer { sqlite3_finalize(exists) }
+        guard sqlite3_bind_text(exists, 1, id, -1, transient) == SQLITE_OK else {
+            throw WorkbenchError("Cannot bind project type evidence identity.")
+        }
+        let existence = sqlite3_step(exists)
+        if existence == SQLITE_DONE {
+            guard try scalar("SELECT count(*) FROM project_type_candidates") < 10_000 else {
+                throw WorkbenchError("Project type catalog reached its 10,000-candidate limit.")
+            }
+            let insert = try prepare("INSERT INTO project_type_candidates(id,name,declaration,target,source,source_sha256) VALUES(?,?,?,?,?,?)")
+            defer { sqlite3_finalize(insert) }
+            guard sqlite3_bind_text(insert, 1, id, -1, transient) == SQLITE_OK else { throw WorkbenchError("Cannot bind project type evidence identity.") }
+            try bind(candidate.name, 2, insert)
+            try bind(candidate.declaration, 3, insert)
+            try bind(candidate.target, 4, insert)
+            try bind(candidate.source, 5, insert)
+            try bind(candidate.sourceSHA256, 6, insert)
+            guard sqlite3_step(insert) == SQLITE_DONE else { throw WorkbenchError(String(cString: sqlite3_errmsg(db))) }
+        } else if existence != SQLITE_ROW {
+            throw WorkbenchError(String(cString: sqlite3_errmsg(db)))
+        }
+        return try projectTypeCatalog()
+    }
+    func removeProjectTypeCandidate(_ candidate: ProjectTypeCandidate) throws -> ProjectTypeCatalog {
+        guard candidate.validated != nil else { throw WorkbenchError("Invalid project type evidence identity.") }
+        let id = SHA256.hash(data: Data(candidate.id.utf8)).map { String(format: "%02x", $0) }.joined()
+        let statement = try prepare("DELETE FROM project_type_candidates WHERE id=?")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_bind_text(statement, 1, id, -1, transient) == SQLITE_OK else {
+            throw WorkbenchError("Cannot bind project type evidence identity.")
+        }
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw WorkbenchError(String(cString: sqlite3_errmsg(db))) }
+        guard sqlite3_changes(db) == 1 else { throw WorkbenchError("Project type evidence changed; refresh the catalog and retry.") }
+        return try projectTypeCatalog()
     }
     private func transaction(_ operation: () throws -> ProjectSnapshot) throws -> ProjectSnapshot {
         try execute("BEGIN IMMEDIATE")

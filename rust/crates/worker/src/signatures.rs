@@ -176,13 +176,43 @@ fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTree
         let compiler=metadata.get("compiler").copied().unwrap_or("");
         let header=metadata.get("header_sha256").copied().unwrap_or("");
         let token=|value:&str|!value.is_empty()&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'.'|b'_'|b'-'));
-        if !token(target)||!sdk.starts_with('/')||sdk.len()>4096||sdk.bytes().any(|byte|byte.is_ascii_control())
-            ||!token(sdk_build)||compiler.is_empty()||compiler.len()>512||compiler.bytes().any(|byte|!byte.is_ascii_graphic()&&byte!=b' ')
+        if !valid_apple_sdk_target(target, sdk)||sdk.len()>4096||sdk.chars().any(char::is_control)
+            ||!token(sdk_build)||compiler.is_empty()||compiler.len()>512||compiler.chars().any(char::is_control)
             ||header.len()!=64||!header.bytes().all(|byte|byte.is_ascii_hexdigit()) {
             return Err("Apple SDK prototype catalog lacks valid target/toolchain provenance")
         }
     }
     Ok(result)
+}
+
+fn valid_apple_sdk_target(target: &str, sdk_path: &str) -> bool {
+    let Some((architecture, platform)) = target.split_once("-apple-") else { return false };
+    if !matches!(architecture, "arm64" | "arm64e" | "x86_64") || platform.contains("-apple-") {
+        return false;
+    }
+    let (platform, simulator) = platform.strip_suffix("-simulator")
+        .map_or((platform, false), |value| (value, true));
+    let (family, version) = if let Some(version) = platform.strip_prefix("macos") {
+        if simulator { return false; }
+        ("macos", version)
+    } else if let Some(version) = platform.strip_prefix("ios") {
+        if !simulator && architecture == "x86_64" { return false; }
+        ("ios", version)
+    } else {
+        return false;
+    };
+    let parts: Vec<&str> = version.split('.').collect();
+    if !(2..=3).contains(&parts.len())
+        || parts.iter().any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())) {
+        return false;
+    }
+    let expected_sdk = match (family, simulator) {
+        ("macos", false) => "MacOSX.sdk",
+        ("ios", false) => "iPhoneOS.sdk",
+        ("ios", true) => "iPhoneSimulator.sdk",
+        _ => return false,
+    };
+    sdk_path.starts_with('/') && sdk_path.rsplit('/').next() == Some(expected_sdk)
 }
 
 pub fn external_prototype_database(source_sha256:&str)->io::Result<BTreeMap<String,Signature>>{
