@@ -232,8 +232,13 @@ class ReconstructionDumpTests(unittest.TestCase):
         worker = self.root / "sdk-worker"
         worker.write_bytes(b"SDK worker identity")
         digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-        catalog = {"source_sha256": digest, "producer": "test SDK", "target": "arm64-apple-macos14.0",
-                   "compiler": "test Clang", "sdk_path": "/test/SDK", "sdk_build": "A1", "missing_functions": ["missing"],
+        catalog = {"schema": 1, "source_sha256": digest, "producer": "hindsight-apple-clang-declarations-v1",
+                   "sdk": "macosx", "target": "arm64-apple-macos14.0", "compiler": "test Clang",
+                   "sdk_path": "/test/MacOSX.sdk", "sdk_build": "A1", "header_sha256": "a" * 64,
+                   "missing_functions": [],
+                   "import_candidates": [{"name": name, "symbol": "_" + name,
+                                          "provider": "/usr/lib/libSystem.B.dylib"}
+                                         for name in ("known", "callback")],
                    "functions": [{"name": "known", "symbol": "_known", "abi_declaration": "int known(int value);", "worker_eligible": True},
                                  {"name": "callback", "symbol": "_callback", "abi_declaration": None, "worker_eligible": False}]}
         args = types.SimpleNamespace(binary=binary, worker=worker, output=self.root / "sdk-batch", sdk_imports=True,

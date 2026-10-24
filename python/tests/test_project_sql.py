@@ -12,7 +12,7 @@ class ProjectSQLTests(unittest.TestCase):
         self.db.execute(INSERT,('r1','/tmp/test','test',json.dumps({'captured':False})));self.db.commit()
     def tearDown(self):self.db.close();self.tmp.cleanup()
     def test_schema(self):
-        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],1)
+        self.assertEqual(self.db.execute('PRAGMA user_version').fetchone()[0],2)
         self.assertEqual(self.db.execute('PRAGMA integrity_check').fetchone()[0],'ok')
     def test_reopen_note(self):
         self.db.execute(UPDATE,('Saved café 🎵','r1',0));self.db.commit();self.db.close();self.db=sqlite3.connect(self.path)

@@ -30,7 +30,7 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.13)
+## Current baseline (0.5.14)
 
 ## 0.5.12 — Evidence graph navigation and cache control
 

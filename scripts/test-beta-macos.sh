@@ -40,11 +40,11 @@ for executable in "$app/Contents/MacOS/HindSight" "$service_exe" "$worker" "$emu
     /usr/bin/codesign --verify --strict --verbose=2 "$executable"
 done
 "$ROOT/scripts/test-embedded-worker.py" "$worker"
-"$emu" --version | /usr/bin/grep -F "0.5.13"
+"$emu" --version | /usr/bin/grep -F "0.5.14"
 
 # A notarization profile is optional for candidate qualification; stable distribution uses test-release-macos.sh and requires it.
 if [[ -n "${VECTORGLASS_NOTARIZE_PROFILE:-}" ]]; then
-    artifact="$ROOT/build/HindSight-0.5.13-notarization.zip"
+    artifact="$ROOT/build/HindSight-0.5.14-notarization.zip"
     rm -f "$artifact"
     identity=$(/usr/bin/codesign -dv --verbose=4 "$app" 2>&1 | /usr/bin/sed -n 's/^Authority=//p' | /usr/bin/head -n 1)
     [[ -n "$identity" && "$identity" != "-" ]] || { echo "error: notarization requested but Release app is not Developer-ID signed" >&2; exit 1; }

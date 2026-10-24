@@ -75,7 +75,7 @@ def verified_outputs(directory, manifest):
                     or not re.fullmatch(r"[0-9a-f]{64}", str(catalog.get("header_sha256", "")))
                     or catalog.get("sdk") not in {"macosx", "iphoneos", "iphonesimulator"}
                     or not isinstance(catalog.get("target"), str)
-                    or not re.fullmatch(r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+\.[0-9]+(-simulator)?",
+                    or not re.fullmatch(r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+(?:\.[0-9]+)?(-simulator)?",
                                         catalog["target"])
                     or not isinstance(catalog.get("sdk_path"), str)
                     or not catalog["sdk_path"].startswith("/") or len(catalog["sdk_path"]) > 4096
@@ -90,7 +90,7 @@ def verified_outputs(directory, manifest):
                     or not isinstance(missing, list) or len(missing) > 128):
                 raise ValueError("SDK catalog schema or declaration bounds are invalid")
             target_match = re.fullmatch(
-                r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+\.[0-9]+(-simulator)?",
+                r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+(?:\.[0-9]+)?(-simulator)?",
                 catalog["target"])
             platform, simulator = target_match.group(2), target_match.group(3) is not None
             sdk_leaf = catalog["sdk_path"].rsplit("/", 1)[-1]
@@ -98,8 +98,9 @@ def verified_outputs(directory, manifest):
                     or (catalog["sdk"] == "iphoneos") != (platform == "ios" and not simulator)
                     or (catalog["sdk"] == "iphonesimulator") != (platform == "ios" and simulator)
                     or (platform == "ios" and not simulator and target_match.group(1) == "x86_64")
-                    or sdk_leaf != {"macosx": "MacOSX.sdk", "iphoneos": "iPhoneOS.sdk",
-                                    "iphonesimulator": "iPhoneSimulator.sdk"}[catalog["sdk"]]):
+                    or re.fullmatch({"macosx": r"MacOSX(?:[0-9]+(?:\.[0-9]+)*)?\.sdk",
+                                     "iphoneos": r"iPhoneOS(?:[0-9]+(?:\.[0-9]+)*)?\.sdk",
+                                     "iphonesimulator": r"iPhoneSimulator(?:[0-9]+(?:\.[0-9]+)*)?\.sdk"}[catalog["sdk"]], sdk_leaf) is None):
                 raise ValueError("SDK catalog target and SDK identity disagree")
             candidate_symbols = {}
             for candidate in candidates:

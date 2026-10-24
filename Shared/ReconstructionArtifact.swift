@@ -753,7 +753,8 @@ struct ReconstructionArtifact: Sendable {
         var offset = 0
         while offset < count {
             let readCount = bytes.withUnsafeMutableBytes { buffer in
-                Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), count - offset)
+                guard let baseAddress = buffer.baseAddress else { return -1 }
+                return Darwin.read(descriptor, baseAddress.advanced(by: offset), count - offset)
             }
             try require(readCount > 0, "Batch input ended during reading.")
             offset += readCount
@@ -893,7 +894,10 @@ struct ReconstructionArtifact: Sendable {
             catalogs.append(VerifiedBatchCatalog(reference: reference, data: bytes, decoded: catalog))
         }
         let availableCatalogHashes = Set(catalogs.map { $0.reference.catalogSHA256 })
-        try require(entryCatalogHashes.allSatisfy { $0 == nil || availableCatalogHashes.contains($0!) },
+        try require(entryCatalogHashes.allSatisfy { hash in
+            guard let hash else { return true }
+            return availableCatalogHashes.contains(hash)
+        },
                     "Function references an SDK catalog absent from the checkpoint.")
         try require(availableCatalogHashes == Set(entryCatalogHashes.compactMap { $0 }),
                     "Checkpoint retains an SDK catalog with no function association.")

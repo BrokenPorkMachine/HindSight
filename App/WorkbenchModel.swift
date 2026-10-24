@@ -63,16 +63,18 @@ private func readSDKCatalogFile(_ url: URL, maximumBytes: Int = 4 * 1024 * 1024)
     var offset = 0
     while offset < byteCount {
         let count = data.withUnsafeMutableBytes { buffer in
-            Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), byteCount - offset)
+            guard let baseAddress = buffer.baseAddress else { return -1 }
+            return Darwin.read(descriptor, baseAddress.advanced(by: offset), byteCount - offset)
         }
         guard count > 0 else { throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog changed or ended during reading.") }
         offset += count
     }
     var after = stat()
     guard fstat(descriptor, &after) == 0, after.st_dev == info.st_dev, after.st_ino == info.st_ino,
-          after.st_size == info.st_size, after.st_mtime == info.st_mtime,
+          after.st_size == info.st_size,
+          after.st_mtimespec.tv_sec == info.st_mtimespec.tv_sec,
           after.st_mtimespec.tv_nsec == info.st_mtimespec.tv_nsec,
-          after.st_ctime == info.st_ctime,
+          after.st_ctimespec.tv_sec == info.st_ctimespec.tv_sec,
           after.st_ctimespec.tv_nsec == info.st_ctimespec.tv_nsec else {
         throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog changed during reading.")
     }
@@ -3311,7 +3313,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(catalog)
             guard data.count <= 8 * 1024 * 1024 else {
-                throw WorkbenchError("Project type catalog exceeds its 8 MiB export limit.")
+                throw ReconstructionArtifact.Invalid(message: "Project type catalog exceeds its 8 MiB export limit.")
             }
             let projectName = URL(fileURLWithPath: projectPath, isDirectory: true).lastPathComponent
             let panel = NSSavePanel()

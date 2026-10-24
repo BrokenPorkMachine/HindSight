@@ -351,7 +351,7 @@ assert (R/'docs/ANALYSIS_QUALITY_BETA14.md').is_file()
 
 # v0.4.2 staged-analysis execution and patch-compatible analysis-cache contract.
 target_model=(R/'Shared/TargetModel.swift').read_text()
-assert 'static let version = "0.5.13"' in target_model
+assert 'static let version = "0.5.14"' in target_model
 assert 'static let releaseChannel = "stable"' in target_model
 assert 'static let isPrerelease = false' in target_model
 assert r'\"release_channel\":\"stable\"' in bridge_caps
@@ -362,7 +362,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v104-schema130"', 'analysisCacheProducerVersion = "0.5.13"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v104-schema130"', 'analysisCacheProducerVersion = "0.5.14"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -721,9 +721,9 @@ for capability in ['modern_macho_metadata_admission','encrypted_metadata_analysi
 assert (R/'docs/ANALYSIS_ADMISSION_BETA7.md').is_file()
 
 # Release metadata must agree across every shipped component.
-release = "0.5.13"
-bundle_release = "0.5.13"
-bundle_build = "5913"
+release = "0.5.14"
+bundle_release = "0.5.14"
+bundle_build = "5914"
 app_info = plistlib.loads((R/'Config/App-Info.plist').read_bytes())
 coordinator_info = plistlib.loads((R/'Config/Coordinator-Info.plist').read_bytes())
 assert app_info['CFBundleShortVersionString'] == bundle_release
@@ -951,8 +951,8 @@ status_doc=(R/'docs/STATUS.md').read_text()
 validation_doc=(R/'docs/VALIDATION.md').read_text()
 macos_doc=(R/'docs/MACOS_VALIDATION.md').read_text()
 readiness_doc=(R/'docs/RELEASE_READINESS.md').read_text()
-assert status_doc.startswith('# HindSight 0.5.13 Status')
-assert validation_doc.startswith('# Validation — HindSight 0.5.13')
+assert status_doc.startswith('# HindSight 0.5.14 Status')
+assert validation_doc.startswith('# Validation — HindSight 0.5.14')
 for token in ['Hotfix 3', 'Function Neighborhoods', 'topology-derived']:
     assert token in status_doc or token in validation_doc, token
 for token in ['Function Neighborhoods', 'AnalysisNavigation.swift', 'AnalysisContinuity.swift', 'objects', 'analysis-cache', 'staging']:

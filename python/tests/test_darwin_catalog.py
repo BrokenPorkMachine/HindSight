@@ -239,7 +239,7 @@ class DarwinCatalogTests(unittest.TestCase):
         record = self.declarations["functions"][1]
         self.assertFalse(record["worker_eligible"])
         self.assertIn("(*)(int)", record["parameters"][0]["type"]["qualType"])
-        with self.assertRaisesRegex(ValueError, "unsupported prototype"):
+        with self.assertRaisesRegex(ValueError, "unsupported or inconsistent"):
             SDK.worker_prototypes(self.declarations, "1" * 64)
 
     def test_request_bounds_and_target_sdk_mismatches_are_rejected(self):

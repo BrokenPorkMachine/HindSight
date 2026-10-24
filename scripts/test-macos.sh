@@ -39,5 +39,5 @@ for executable in "$app/Contents/MacOS/HindSight" "$service/Contents/MacOS/Coord
   /usr/bin/codesign --verify --strict --verbose=2 "$executable"
 done
 "$ROOT/scripts/test-embedded-worker.py" "$service/Contents/MacOS/reworker"
-"$service/Contents/MacOS/vg-emu-server" --version | /usr/bin/grep -F "0.5.13"
+"$service/Contents/MacOS/vg-emu-server" --version | /usr/bin/grep -F "0.5.14"
 printf '%s\n' "Official arm64 macOS build/signature/bundle gates completed on $(uname -m). Intel support is experimental."

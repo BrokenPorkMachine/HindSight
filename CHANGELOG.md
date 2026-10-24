@@ -1,3 +1,11 @@
+# 0.5.14 — macOS build fix
+
+- Include the shared Darwin SDK declaration catalog in the app target as well as the Coordinator target.
+- Use Darwin `stat` timespec fields when verifying a retained SDK catalog and use the app's existing reconstruction error type for export limits.
+- Accept versioned Apple SDK directory names when binding compiler declarations, and keep only eligible import candidates in worker prototype input.
+- Refresh source validation fixtures for SDK provenance and project database schema 2.
+- Align app, service, worker, VectorEmu, release checks, and bundle metadata on version 0.5.14 (build 5914).
+
 # 0.5.13 — Reconstruction exports and graph scaling
 
 - Add discoverable scoped `.c`, `.m`, `.h` and `.n` reconstruction dumps, verified manifests, resumable batches and explicit failure counts.

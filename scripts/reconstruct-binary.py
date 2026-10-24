@@ -72,7 +72,12 @@ def run(args):
         prepared.prototypes = None
         if eligible:
             prepared.prototypes = Path(temporary) / "prototypes.tsv"
-            prepared.prototypes.write_text(worker_prototypes({**catalog, "functions": eligible, "missing_functions": []}, digest))
+            eligible_names = {record["name"] for record in eligible}
+            prototype_catalog = {**catalog, "functions": eligible, "missing_functions": []}
+            if "import_candidates" in catalog:
+                prototype_catalog["import_candidates"] = [candidate for candidate in catalog["import_candidates"]
+                                                          if candidate["name"] in eligible_names]
+            prepared.prototypes.write_text(worker_prototypes(prototype_catalog, digest))
         return run_batch(prepared, report=report, sdk_catalog=catalog)
 
 

@@ -1,10 +1,10 @@
-# HindSight 0.5.13 — Release readiness
+# HindSight 0.5.14 — Release readiness
 
-HindSight 0.5.13 officially supports macOS on Apple Silicon (`arm64`). Intel (`x86_64`) remains experimental and is not part of the official release gate. Credentialed distribution and manual host qualification are intentionally deferred until further notice; this document retains the future release procedure.
+HindSight 0.5.14 officially supports macOS on Apple Silicon (`arm64`). Intel (`x86_64`) remains experimental and is not part of the official release gate. Credentialed distribution and manual host qualification are intentionally deferred until further notice; this document retains the future release procedure.
 
 ## Source invariants already enforced
 
-- Product/service/worker identity is exactly `0.5.13`; release channel is `stable`; bundle build is `5913`.
+- Product/service/worker identity is exactly `0.5.14`; release channel is `stable`; bundle build is `5914`.
 - App and Coordinator require the same version, release channel, ABI, and required capabilities before project actions are enabled.
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
@@ -84,7 +84,7 @@ contract are supplied.
 
 ## Manual distribution matrix
 
-Before distributing 0.5.13, complete the official matrix on an Apple-Silicon Mac using the 8 GiB baseline:
+Before distributing 0.5.14, complete the official matrix on an Apple-Silicon Mac using the 8 GiB baseline:
 
 1. Re-run the large firmware image that exposed the beta.12 pressure failure; record peak RSS and confirm bounded dominator behavior.
 2. Analyze several real arm64 Mach-O inputs: stripped, symbol-rich, data-in-code, and encrypted-metadata cases.

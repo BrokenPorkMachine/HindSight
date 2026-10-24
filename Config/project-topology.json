@@ -106,6 +106,7 @@
       "Shared/TargetModel.swift",
       "Shared/HostPlatform.swift",
       "Shared/ReconstructionArtifact.swift",
+      "Shared/DarwinSDKDeclarations.swift",
       "App/RemoteGateway.swift",
       "App/RemoteUser.swift",
       "App/RemoteAnalysisTransactions.swift"
@@ -139,5 +140,5 @@
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "8762cad095767da25bcc9e69bfc2ea4b27ac43e8812cba7aaab29180910aa834"
+  "project_sha256": "ead3cd1eabefbacec6ee08491b8d30b0bb7a0e1d5d37a87b3daed47e9c08ff4a"
 }

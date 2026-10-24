@@ -255,16 +255,17 @@ def worker_prototypes(catalog, source_sha256):
         target) if isinstance(target, str) else None)
     sdk = catalog.get("sdk")
     sdk_leaf = Path(sdk_path).name if isinstance(sdk_path, str) else ""
-    expected_sdk = ({"macosx": ("macos", False, "MacOSX.sdk"),
-                    "iphoneos": ("ios", False, "iPhoneOS.sdk"),
-                    "iphonesimulator": ("ios", True, "iPhoneSimulator.sdk")}.get(sdk)
+    expected_sdk = ({"macosx": ("macos", False, "MacOSX"),
+                    "iphoneos": ("ios", False, "iPhoneOS"),
+                    "iphonesimulator": ("ios", True, "iPhoneSimulator")}.get(sdk)
                     if isinstance(sdk, str) else None)
     if (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", target)
             or not isinstance(sdk_path, str) or not sdk_path.startswith("/") or len(sdk_path) > 4096
             or any(unicodedata.category(char) == "Cc" for char in sdk_path)
             or target_match is None or expected_sdk is None
-            or (target_match.group(2), target_match.group(4) is not None, sdk_leaf)
-                != expected_sdk
+            or (target_match.group(2), target_match.group(4) is not None)
+                != expected_sdk[:2]
+            or re.fullmatch(re.escape(expected_sdk[2]) + r"(?:[0-9]+(?:\.[0-9]+)*)?\.sdk", sdk_leaf) is None
             or (target_match.group(2) == "ios" and target_match.group(1) == "x86_64"
                 and target_match.group(4) is None)
             or not isinstance(sdk_build, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sdk_build)
