@@ -17,9 +17,9 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "crc32fast"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
 dependencies = [
  "cfg-if",
 ]
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "reworkbench-bridge"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "reworkbench-model",
  "reworkbench-scheduler",
@@ -81,22 +81,22 @@ dependencies = [
 
 [[package]]
 name = "reworkbench-model"
-version = "0.5.13"
+version = "0.5.14"
 
 [[package]]
 name = "reworkbench-protocol"
-version = "0.5.13"
+version = "0.5.14"
 
 [[package]]
 name = "reworkbench-scheduler"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "reworkbench-model",
 ]
 
 [[package]]
 name = "reworkbench-worker"
-version = "0.5.13"
+version = "0.5.14"
 dependencies = [
  "flate2",
  "lzvn",
@@ -111,9 +111,9 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "syn"
-version = "3.0.8"
+version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01016da373cd8f7ef12624f796309f5c31ba8d646dd08856c02cd741d823c622"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -142,6 +142,6 @@ dependencies = [
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.26"
+version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"

@@ -761,9 +761,9 @@ struct ReconstructionArtifact: Sendable {
         var after = stat()
         try require(fstat(descriptor, &after) == 0 && after.st_dev == before.st_dev
                     && after.st_ino == before.st_ino && after.st_size == before.st_size
-                    && after.st_mtime == before.st_mtime
+                    && after.st_mtimespec.tv_sec == before.st_mtimespec.tv_sec
                     && after.st_mtimespec.tv_nsec == before.st_mtimespec.tv_nsec
-                    && after.st_ctime == before.st_ctime
+                    && after.st_ctimespec.tv_sec == before.st_ctimespec.tv_sec
                     && after.st_ctimespec.tv_nsec == before.st_ctimespec.tv_nsec,
                     "Batch input changed during reading.")
         return bytes
