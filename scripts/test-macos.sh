@@ -29,7 +29,9 @@ xcrun clang -arch "$host_arch" -mmacosx-version-min=14.0 -I "$ROOT/Bridge" "$ROO
 xcrun swiftc "$ROOT/Shared/WorkbenchMessages.swift" "$ROOT/Tests/page_contract.swift" -o "$ROOT/build/page-contract-smoke"; "$ROOT/build/page-contract-smoke"
 xcrun swiftc -import-objc-header "$ROOT/Bridge/HindSightBridge.h" "$ROOT/Shared/WorkbenchMessages.swift" "$ROOT/PlatformServices/CoordinatorService/VerifiedPageCache.swift" "$ROOT/Tests/cache_contract.swift" "$ROOT/build/bridge/Debug/libreworkbench_bridge.a" -o "$ROOT/build/cache-contract-smoke" -framework Security -framework CoreFoundation -liconv; "$ROOT/build/cache-contract-smoke"
 "$ROOT/scripts/build-app.sh"
-app="$ROOT/build/DerivedData/Build/Products/Debug/HindSight.app"; "$ROOT/scripts/verify-app-signing.sh" "$app"
+app="$ROOT/build/DerivedData/Build/Products/Debug/HindSight.app"
+"$ROOT/scripts/test-sdk-xpc-integration.sh"
+"$ROOT/scripts/verify-app-signing.sh" "$app"
 service="$app/Contents/XPCServices/CoordinatorService.xpc"; [[ -d "$service" ]] || { echo "missing service" >&2; exit 1; }
 for executable in "$app/Contents/MacOS/HindSight" "$service/Contents/MacOS/CoordinatorService" "$service/Contents/MacOS/reworker" "$service/Contents/MacOS/vg-emu-server"; do
   [[ -x "$executable" ]] || { echo "missing executable: $executable" >&2; exit 1; }

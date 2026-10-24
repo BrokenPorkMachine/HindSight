@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import SQLite3
 import Darwin
 struct WorkbenchError: LocalizedError {
@@ -319,6 +320,45 @@ final class ProjectStore {
             try? FileManager.default.removeItem(at: url)
             throw WorkbenchError("Analysis cache publication could not be verified.")
         }
+    }
+
+    /// Retain the complete public SDK lookup, including missing and unsupported
+    /// declarations, under the project cache with content-addressed identity.
+    func storeSDKDeclarationCatalog(_ data: Data, sourceSHA256: String) throws -> (fileName: String, catalogSHA256: String) {
+        guard data.count <= 4 * 1024 * 1024,
+              sourceSHA256.utf8.count == 64,
+              sourceSHA256.allSatisfy({ "0123456789abcdef".contains($0) }),
+              let catalog = try? JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: data),
+              catalog.schema == 1, catalog.sourceSHA256 == sourceSHA256,
+              (try? catalog.encoded()) == data else {
+            throw WorkbenchError("SDK declaration catalog failed source, schema or canonical encoding checks.")
+        }
+        let catalogSHA256 = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        let fileName = "sdk-declarations-\(sourceSHA256)-\(catalogSHA256).json"
+        let directory = try objectDirectory("analysis-cache")
+        let url = directory.appendingPathComponent(fileName)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) || (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            let existing = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard existing.isRegularFile == true, existing.isSymbolicLink != true,
+                  existing.fileSize == data.count else {
+                throw WorkbenchError("SDK declaration catalog destination is unsafe or has an unexpected size.")
+            }
+            let retained = try Data(contentsOf: url)
+            guard retained == data,
+                  SHA256.hash(data: retained).map({ String(format: "%02x", $0) }).joined() == catalogSHA256 else {
+                throw WorkbenchError("Content-addressed SDK catalog path contains changed evidence; the existing file was preserved.")
+            }
+            return (fileName, catalogSHA256)
+        }
+        try data.write(to: url, options: [.atomic])
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true, values.fileSize == data.count,
+              let stored = try? Data(contentsOf: url), SHA256.hash(data: stored).map({ String(format: "%02x", $0) }).joined() == catalogSHA256 else {
+            try? fm.removeItem(at: url)
+            throw WorkbenchError("SDK declaration catalog publication could not be verified.")
+        }
+        return (fileName, catalogSHA256)
     }
 
     func clearAnalysisCache() throws -> Int {

@@ -2,6 +2,8 @@
 
 `darwin_catalog_sample.h/.m` is a CC0 native metadata/declaration qualification fixture. Its C function, custom aggregate, class/instance methods, properties with custom accessors and backing ivars exercise the Darwin collector and Apple Clang-to-worker prototype path. Run `python3 scripts/test-darwin-catalog.py /absolute/path/to/reworker` on macOS; this complements the main source-fidelity corpus.
 
+`sdk_import_xpc.c` is a CC0 chained-fixup Mach-O fixture for the macOS app/XPC gate. It imports public `fwrite` and provides a stable function boundary so `scripts/test-sdk-xpc-integration.sh` can verify that the app's SDK declaration reaches a reconstruction artifact.
+
 The C, Objective-C, C++, and Objective-C++ sources in this directory were
 written for HindSight's decompiler corpus and are released into the public
 domain. They contain control flow, calls, dynamic dispatch, and integer data

@@ -315,6 +315,22 @@ pub(super) struct Program {
     start: u64,
     body: Vec<Tree>,
 }
+
+/// Repair-oriented C retains independently supported instructions, but stops
+/// before every unsupported effect and on leaving the captured prefix. It is
+/// deliberately separate from Program::new and cannot certify strict coverage.
+pub(super) fn review_source(start:u64,body:&[Tree],blocked:&std::collections::BTreeSet<u64>,truncated:bool)->String{
+    let mut source=format!("/* BEST-EFFORT MACHINE-STATE C RECONSTRUCTION.\n * Not an original prototype or a complete implementation.\n * Status 4 stops BEFORE unresolved effects or outside captured code.\n * Captured instruction tree truncated: {truncated}.\n * Flat 4096-byte private memory model; no host memory or external calls.\n */\n{}\n{}",include_str!("bitvector_runtime.h"),include_str!("machine_runtime.h"));
+    writeln!(source,"\nstatic int hs_review_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;(void)hs_add_carry;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(start)).unwrap();
+    for (index,tree) in body.iter().enumerate(){
+        let pc=start+index as u64*4;
+        let statement=if blocked.contains(&pc){"return 4;".to_owned()}else{stmt(tree).unwrap_or_else(|_|"return 4;".to_owned())};
+        writeln!(source,"case {}:{{/* loc_{pc:x}: instruction */s->steps++;{statement}s->pc={};break;}}",literal(pc),literal(pc+4)).unwrap();
+    }
+    source.push_str("default:return 4;}}}\n");
+    writeln!(source,"typedef struct hs_review_context {{ hs_state state; uint64_t limit; int status; }} hs_review_context;\nvoid hs_review_{start:x}(hs_review_context *context){{if(context)context->status=hs_review_run(&context->state,context->limit);}}").unwrap();
+    source
+}
 impl Program {
     pub(super) fn new(start: u64, body: Vec<Tree>) -> Result<Self, String> {
         if body.is_empty() || body.len() > 128 {

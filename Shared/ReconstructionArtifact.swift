@@ -1,6 +1,7 @@
 import Foundation
 import CoreFoundation
 import CryptoKit
+import Darwin
 
 struct ReconstructionRange: Sendable, Hashable {
     let start: UInt64
@@ -171,6 +172,15 @@ struct ReconstructionEvidence: Sendable, Identifiable {
     let description: String
     let ranges: [ReconstructionRange]
 }
+struct ReconstructionCallSignatureCandidate: Sendable, Identifiable {
+    let target: UInt64
+    let symbol: String
+    let language: String
+    let declaration: String
+    let source: String
+    var id: String { "\(String(target, radix: 16))-\(symbol)-\(declaration)" }
+    var requiresSDKCatalog: Bool { source.contains("hash-bound Apple SDK declaration catalog") }
+}
 struct ReconstructionSemanticCoverage: Sendable {
     let instructions: Int
     let sharedIR: Int
@@ -183,10 +193,26 @@ struct ReconstructionReply: Codable, Sendable {
     let requestID: String
     let message: String
     let artifactJSON: String?
-    static func encode(id: String, artifact: String? = nil, message: String) -> String {
-        let value = Self(requestID: id, message: String(message.prefix(4096)), artifactJSON: artifact)
+    let sdkCatalogReference: DarwinSDKDeclarationCatalogReference?
+    static func encode(id: String, artifact: String? = nil, message: String,
+                       sdkCatalogReference: DarwinSDKDeclarationCatalogReference? = nil) -> String {
+        let value = Self(requestID: id, message: String(message.prefix(4096)), artifactJSON: artifact,
+                         sdkCatalogReference: sdkCatalogReference)
         if let data = try? JSONEncoder().encode(value), data.count <= 12 * 1024 * 1024 { return String(decoding: data, as: UTF8.self) }
         return "{\"requestID\":\"\(id)\",\"message\":\"Reconstruction reply exceeds its transport budget.\"}"
+    }
+}
+
+struct DarwinSDKDeclarationCatalogReference: Codable, Equatable, Sendable {
+    let fileName: String
+    let sourceSHA256: String
+    let catalogSHA256: String
+
+    func validated(for sourceSHA256: String) -> Bool {
+        self.sourceSHA256 == sourceSHA256 &&
+        self.sourceSHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil &&
+        catalogSHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil &&
+        fileName == "sdk-declarations-\(self.sourceSHA256)-\(catalogSHA256).json"
     }
 }
 
@@ -194,7 +220,7 @@ struct ReconstructionReply: Codable, Sendable {
 /// identities and graph integrity; it does not certify arbitrary C semantics,
 /// execute generated source, or promote compilation to equivalence.
 struct ReconstructionArtifact: Sendable {
-    static let passVersion = "arm64-reconstruction-62"
+    static let passVersion = "arm64-reconstruction-63"
     static let maxBytes = 4 * 1024 * 1024
     let json: String
     let digest: String
@@ -206,6 +232,9 @@ struct ReconstructionArtifact: Sendable {
     let blockers: [String]
     let review: String
     let sources: [ReconstructionSource]
+    let callSignatureCandidates: [ReconstructionCallSignatureCandidate]
+    let sdkCatalogCandidates: [ReconstructionCallSignatureCandidate]
+    let callSignatureCandidateCount: Int
     let expressions: [ReconstructionExpression]
     let evidence: [String: ReconstructionEvidence]
     let semanticCoverage: ReconstructionSemanticCoverage
@@ -275,7 +304,7 @@ struct ReconstructionArtifact: Sendable {
               let budgets = document["budgets"] as? [String: Any], let limits = budgets["limits"] as? [String: Int], let consumed = budgets["consumed"] as? [String: Int], let exhausted = budgets["exhausted"] as? [String],
               let validation = document["validation"] as? [[String: Any]], let alternatives = document["alternatives"] as? [[String: Any]] else { throw Invalid(message: "Reconstruction identity, schema or bounds mismatch.") }
         try require(Set(document.keys) == ["schema","producer","source_sha256","analysis_engine","scope","function","eligibility","nodes","edges","ast","alternatives","budgets","validation","truncated"], "Unexpected reconstruction fields.")
-        try require(document["analysis_engine"] as? String == "arm64-analysis-v103-schema129" && pass == passVersion, "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
+        try require(document["analysis_engine"] as? String == "arm64-analysis-v104-schema130" && pass == passVersion, "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
         try require(nodes.count <= 100_000 && edges.count <= 400_000 && astNodes.count <= 100_000 && reasons.count <= 128 && validation.count <= 128 && alternatives.count <= 1024, "Reconstruction record budget exceeded.")
         let scopeKey: [Any] = [pass, settings]
         var identities = Set<String>()
@@ -400,7 +429,47 @@ struct ReconstructionArtifact: Sendable {
             _ = try check("validation", run, function: functionID)
             try require(run["artifact_sha256"] as? String == candidateDigest && (run["status"] as? String != "passed" || (run["mismatches"] as? [Any])?.isEmpty == true), "Validation belongs to a different reconstruction or contradicts its status.")
         }
-        return Self(json: json, digest: digest, start: start, end: end, pass: pass, settings: settings, eligibility: state, blockers: Array(Set(blockers)).sorted(), review: review, sources: sources, expressions: expressions, evidence: evidence, semanticCoverage: semanticCoverage, incoming: incoming)
+        let settingsPayloads = nodes.compactMap { node -> [String: Any]? in
+            guard (node["kind"] as? String) == "metadata",
+                  let payload = node["payload"] as? [String: Any] else { return nil }
+            return payload["analysis_settings"] as? [String: Any]
+        }
+        var rawCallCandidates: [[String: Any]] = []
+        for settingsPayload in settingsPayloads {
+            guard let raw = settingsPayload["call_signature_candidates"] else { continue }
+            guard let decoded = raw as? [[String: Any]], decoded.count <= 100_000,
+                  rawCallCandidates.count <= 100_000 - decoded.count else {
+                throw Invalid(message: "Invalid call signature candidate collection.")
+            }
+            rawCallCandidates.append(contentsOf: decoded)
+        }
+        var callCandidates: [ReconstructionCallSignatureCandidate] = []
+        var sdkCatalogCandidates: [ReconstructionCallSignatureCandidate] = []
+        var callCandidateIDs = Set<String>()
+        for candidate in rawCallCandidates {
+            guard Set(candidate.keys) == ["target", "symbol", "language", "declaration", "source"],
+                  let targetText = candidate["target"] as? String, let target = hex(targetText),
+                  let symbol = candidate["symbol"] as? String, !symbol.isEmpty, symbol.utf8.count <= 1024,
+                  !symbol.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                  let language = candidate["language"] as? String, !language.isEmpty, language.utf8.count <= 64,
+                  let declaration = candidate["declaration"] as? String, !declaration.isEmpty, declaration.utf8.count <= 2048,
+                  let source = candidate["source"] as? String, !source.isEmpty, source.utf8.count <= 512,
+                  !declaration.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                  !source.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+                throw Invalid(message: "Invalid call signature provenance evidence.")
+            }
+            let decoded = ReconstructionCallSignatureCandidate(target: target, symbol: symbol, language: language,
+                                                                 declaration: declaration, source: source)
+            try require(callCandidateIDs.insert(decoded.id).inserted, "Duplicate call signature provenance evidence.")
+            if decoded.requiresSDKCatalog { sdkCatalogCandidates.append(decoded) }
+            if callCandidates.count < 128 { callCandidates.append(decoded) }
+        }
+        return Self(json: json, digest: digest, start: start, end: end, pass: pass, settings: settings,
+                    eligibility: state, blockers: Array(Set(blockers)).sorted(), review: review,
+                    sources: sources, callSignatureCandidates: callCandidates,
+                    sdkCatalogCandidates: sdkCatalogCandidates,
+                    callSignatureCandidateCount: rawCallCandidates.count, expressions: expressions,
+                    evidence: evidence, semanticCoverage: semanticCoverage, incoming: incoming)
     }
 
     func why(_ ids: [String], limit: Int = 512) -> [ReconstructionEvidence] {
@@ -423,6 +492,172 @@ struct ReconstructionArtifact: Sendable {
             text = source.text
         } else { text = json }
         try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Write a portable evidence package with an optional source-bound SDK
+    /// declaration catalog. The package contains evidence only; it never runs
+    /// generated source or claims behavioral equivalence.
+    func writeEvidencePackage(to directory: URL,
+                              sdkCatalog: (reference: DarwinSDKDeclarationCatalogReference, data: Data)? = nil) throws {
+        var files: [(String, Data)] = [("function-\(String(format: "%016llx", start)).reconstruction.json", Data(json.utf8))]
+        let prefix = String(format: "function-%016llx", start)
+        for source in sources {
+            let suffix: String
+            switch source.kind {
+            case "recovered-source", "best-effort-source": suffix = ".c"
+            case "recovered-objective-c": suffix = ".m"
+            case "recovered-header", "best-effort-header": suffix = ".h"
+            case "machine-state-c": suffix = ".machine.c"
+            default: throw Invalid(message: "Unsupported generated output kind in evidence package.")
+            }
+            files.append((prefix + suffix, Data(source.text.utf8)))
+        }
+        var catalogRecord: [String: Any]?
+        let sdkCandidates = sdkCatalogCandidates
+        try Self.require(sdkCandidates.isEmpty || sdkCatalog != nil,
+                         "SDK-derived call declarations require their retained source catalog in the evidence package.")
+        if let sdkCatalog {
+            try Self.require(sdkCatalog.reference.validated(for: digest), "SDK catalog reference does not match this reconstruction.")
+            let catalog = try JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: sdkCatalog.data)
+            try Self.require(sdkCatalog.data.count <= 4 * 1024 * 1024
+                             && Self.hash(sdkCatalog.data) == sdkCatalog.reference.catalogSHA256
+                             && catalog.schema == 1 && catalog.sourceSHA256 == digest
+                             && (try? catalog.encoded()) == sdkCatalog.data,
+                             "SDK catalog failed its package content or source identity check.")
+            for candidate in sdkCandidates {
+                try Self.require(Self.sdkCatalog(catalog, supports: candidate),
+                                 "SDK catalog does not support an attributed call declaration.")
+            }
+            files.append((sdkCatalog.reference.fileName, sdkCatalog.data))
+            catalogRecord = ["path": sdkCatalog.reference.fileName, "bytes": sdkCatalog.data.count,
+                             "sha256": sdkCatalog.reference.catalogSHA256,
+                             "source_sha256": sdkCatalog.reference.sourceSHA256]
+        }
+        let outputs = files.map { ["path": $0.0, "bytes": $0.1.count, "sha256": Self.hash($0.1)] as [String: Any] }
+        var packageManifest: [String: Any] = [
+            "schema": 1, "kind": "reconstruction-evidence-package", "source_sha256": digest,
+            "start": String(format: "0x%016llx", start), "end": String(format: "0x%016llx", end),
+            "validation": "evidence package only; compilation, execution and behavior unqualified",
+            "files": outputs
+        ]
+        if let catalogRecord { packageManifest["sdk_catalog"] = catalogRecord }
+        else { packageManifest["sdk_catalog"] = NSNull() }
+        let manifest = try JSONSerialization.data(withJSONObject: packageManifest, options: [.prettyPrinted, .sortedKeys])
+        try Self.require(Set(files.map(\.0)).count == files.count, "Evidence package contains competing output paths.")
+        let total = files.reduce(manifest.count) { $0 + $1.1.count }
+        try Self.require(total <= 16 * 1024 * 1024, "Evidence package exceeds its byte budget.")
+        let parentValues = try directory.deletingLastPathComponent().resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        try Self.require(parentValues.isDirectory == true && parentValues.isSymbolicLink != true,
+                         "Evidence package parent must be a real directory.")
+        try Self.require(!FileManager.default.fileExists(atPath: directory.path)
+                         && (try? directory.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
+                         "Choose a new evidence package directory; existing output is preserved.")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        for (name, bytes) in files {
+            try bytes.write(to: directory.appendingPathComponent(name), options: .withoutOverwriting)
+        }
+        try manifest.write(to: directory.appendingPathComponent("manifest.json"), options: .withoutOverwriting)
+    }
+
+    /// Verify a portable evidence package before review or archival.
+    static func verifyEvidencePackage(at directory: URL) throws -> (artifact: ReconstructionArtifact,
+                                                                     sdkCatalogReference: DarwinSDKDeclarationCatalogReference?) {
+        let directoryValues = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        try require(directoryValues.isDirectory == true && directoryValues.isSymbolicLink != true,
+                    "Evidence package must be a real directory.")
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        let metadata = try manifestURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        try require(metadata.isRegularFile == true && metadata.isSymbolicLink != true
+                    && (metadata.fileSize ?? Int.max) <= 1024 * 1024, "Unsafe evidence package manifest.")
+        let manifestData = try readBatchBytes(at: manifestURL, maximum: 1024 * 1024)
+        guard let manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+              manifest["schema"] as? Int == 1, manifest["kind"] as? String == "reconstruction-evidence-package",
+              let digest = manifest["source_sha256"] as? String,
+              digest.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil,
+              let startText = manifest["start"] as? String, let start = hex(startText),
+              let endText = manifest["end"] as? String, let end = hex(endText), start < end,
+              let records = manifest["files"] as? [[String: Any]], (1...6).contains(records.count) else {
+            throw Invalid(message: "Invalid evidence package manifest identity.")
+        }
+        let prefix = String(format: "function-%016llx", start)
+        var files: [String: Data] = [:], total = manifestData.count
+        for record in records {
+            guard let name = record["path"] as? String,
+                  name.range(of: #"^sdk-declarations-\#(digest)-[0-9a-f]{64}\.json$"#, options: .regularExpression) != nil
+                    || name == prefix + ".reconstruction.json"
+                    || [".c", ".h", ".m", ".machine.c"].contains(where: { name == prefix + $0 }),
+                  let size = record["bytes"] as? Int, size >= 0, size <= 4 * 1024 * 1024,
+                  let expectedHash = record["sha256"] as? String,
+                  expectedHash.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil,
+                  files[name] == nil else {
+                throw Invalid(message: "Invalid evidence package file record.")
+            }
+            let url = directory.appendingPathComponent(name)
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            try require(values.isRegularFile == true && values.isSymbolicLink != true && values.fileSize == size,
+                        "Evidence package file is missing or unsafe.")
+            let bytes = try readBatchBytes(at: url, maximum: size)
+            try require(bytes.count == size && hash(bytes) == expectedHash,
+                        "Evidence package file hash mismatch.")
+            files[name] = bytes
+            total += size
+            try require(total <= 16 * 1024 * 1024, "Evidence package byte budget exceeded.")
+        }
+        guard let artifactBytes = files[prefix + ".reconstruction.json"] else {
+            throw Invalid(message: "Evidence package reconstruction artifact is missing.")
+        }
+        let artifact = try decode(String(decoding: artifactBytes, as: UTF8.self), digest: digest, start: start, end: end)
+        let artifactRequiresCatalog = !artifact.sdkCatalogCandidates.isEmpty
+        var expectedSourceNames = Set<String>()
+        for source in artifact.sources {
+            let suffix: String
+            switch source.kind {
+            case "recovered-source", "best-effort-source": suffix = ".c"
+            case "recovered-objective-c": suffix = ".m"
+            case "recovered-header", "best-effort-header": suffix = ".h"
+            case "machine-state-c": suffix = ".machine.c"
+            default: throw Invalid(message: "Unsupported source kind in evidence package artifact.")
+            }
+            let name = prefix + suffix
+            try require(expectedSourceNames.insert(name).inserted && files[name] == Data(source.text.utf8),
+                        "Evidence package source differs from its validated artifact.")
+        }
+        let actualSourceNames = Set(files.keys.filter { $0 != prefix + ".reconstruction.json" && !$0.hasPrefix("sdk-declarations-") })
+        try require(actualSourceNames == expectedSourceNames, "Evidence package has missing or unrelated source files.")
+        var catalogReference: DarwinSDKDeclarationCatalogReference?
+        if let catalogObject = manifest["sdk_catalog"] as? [String: Any] {
+            guard let name = catalogObject["path"] as? String,
+                  let size = catalogObject["bytes"] as? Int,
+                  let catalogHash = catalogObject["sha256"] as? String,
+                  let catalogSource = catalogObject["source_sha256"] as? String,
+                  let catalogBytes = files[name] else {
+                throw Invalid(message: "Evidence package SDK catalog record is incomplete.")
+            }
+            let reference = DarwinSDKDeclarationCatalogReference(fileName: name, sourceSHA256: catalogSource,
+                                                                  catalogSHA256: catalogHash)
+            try require(reference.validated(for: digest) && catalogBytes.count == size
+                        && hash(catalogBytes) == catalogHash,
+                        "Evidence package SDK catalog identity mismatch.")
+            let catalog = try JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: catalogBytes)
+            try require(catalog.schema == 1 && catalog.sourceSHA256 == digest
+                        && (try? catalog.encoded()) == catalogBytes,
+                        "Evidence package SDK catalog is not canonical or source-bound.")
+            for candidate in artifact.sdkCatalogCandidates {
+                try require(Self.sdkCatalog(catalog, supports: candidate),
+                            "Evidence package SDK catalog does not support an attributed call declaration.")
+            }
+            catalogReference = reference
+        } else {
+            try require(manifest["sdk_catalog"] is NSNull
+                        && !files.keys.contains(where: { $0.hasPrefix("sdk-declarations-") }),
+                        "Evidence package has an unreferenced SDK catalog.")
+        }
+        let actualCatalogNames = Set(files.keys.filter { $0.hasPrefix("sdk-declarations-") })
+        try require(catalogReference.map { actualCatalogNames == Set([$0.fileName]) } ?? actualCatalogNames.isEmpty,
+                    "Evidence package catalog file set does not match its manifest.")
+        try require(!artifactRequiresCatalog || catalogReference != nil,
+                    "Evidence package has SDK-derived declarations without their source catalog.")
+        return (artifact, catalogReference)
     }
 
     /// Export exactly this validated function. Preflight the entire output set
@@ -467,7 +702,23 @@ struct ReconstructionArtifact: Sendable {
         let start: UInt64
         let end: UInt64
         let state: String
+        let sdkCatalogSHA256: String?
         let artifact: ReconstructionArtifact?
+    }
+    private struct VerifiedBatchCatalog {
+        let reference: DarwinSDKDeclarationCatalogReference
+        let data: Data
+        let decoded: DarwinSDKDeclarationCatalog
+    }
+
+    private static func sdkCatalog(_ catalog: DarwinSDKDeclarationCatalog,
+                                   supports candidate: ReconstructionCallSignatureCandidate) -> Bool {
+        guard candidate.language == "C" else { return false }
+        return catalog.declarations.contains { item in
+            guard let function = item.function else { return false }
+            return function.workerEligible && function.symbol == candidate.symbol
+                && function.abiDeclaration == candidate.declaration
+        }
     }
 
     static func verifiedBatchCheckpoint(at directory: URL, digest: String, worker: String,
@@ -476,15 +727,46 @@ struct ReconstructionArtifact: Sendable {
     }
 
     private static func readBatchBytes(at url: URL, maximum: Int) throws -> Data {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let bytes = try handle.read(upToCount: maximum + 1) ?? Data()
-        try require(bytes.count <= maximum, "Batch input grew beyond its byte budget.")
+        try require(maximum >= 0, "Invalid batch input byte limit.")
+        let directoryDescriptor = Darwin.open(url.deletingLastPathComponent().path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        try require(directoryDescriptor >= 0, "Batch input directory could not be opened safely.")
+        defer { Darwin.close(directoryDescriptor) }
+        var directoryInfo = stat()
+        try require(fstat(directoryDescriptor, &directoryInfo) == 0
+                    && (directoryInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+                    "Batch input parent is not a real directory.")
+        let descriptor = Darwin.openat(directoryDescriptor, url.lastPathComponent,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        try require(descriptor >= 0, "Batch input could not be opened safely.")
+        defer { Darwin.close(descriptor) }
+        var before = stat()
+        try require(fstat(descriptor, &before) == 0 && (before.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG)
+                    && before.st_size >= 0 && before.st_size <= Int64(maximum),
+                    "Batch input is not a bounded regular file.")
+        let count = Int(before.st_size)
+        var bytes = Data(count: count)
+        var offset = 0
+        while offset < count {
+            let readCount = bytes.withUnsafeMutableBytes { buffer in
+                Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), count - offset)
+            }
+            try require(readCount > 0, "Batch input ended during reading.")
+            offset += readCount
+        }
+        var after = stat()
+        try require(fstat(descriptor, &after) == 0 && after.st_dev == before.st_dev
+                    && after.st_ino == before.st_ino && after.st_size == before.st_size
+                    && after.st_mtime == before.st_mtime
+                    && after.st_mtimespec.tv_nsec == before.st_mtimespec.tv_nsec
+                    && after.st_ctime == before.st_ctime
+                    && after.st_ctimespec.tv_nsec == before.st_ctimespec.tv_nsec,
+                    "Batch input changed during reading.")
         return bytes
     }
 
     private static func verifiedBatch(at directory: URL, digest: String, worker: String,
-                                      revision: String) throws -> (data: Data, entries: [VerifiedBatchEntry]) {
+                                      revision: String) throws -> (data: Data, entries: [VerifiedBatchEntry], catalogs: [VerifiedBatchCatalog]) {
         let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         try require(values.isDirectory == true && values.isSymbolicLink != true, "Unsafe batch directory.")
         let path = directory.appendingPathComponent("checkpoint.json")
@@ -513,9 +795,16 @@ struct ReconstructionArtifact: Sendable {
             }
         }
         var verified: [VerifiedBatchEntry] = []
+        var entryCatalogHashes: [String?] = []
         for entry in entries {
             try require(["recovered", "review-only", "failed"].contains(entry["state"] as? String ?? ""),
                         "Invalid checkpoint state.")
+            let catalogHash = entry["sdk_catalog_sha256"] as? String
+            if entry["sdk_catalog_sha256"] != nil {
+                try require(catalogHash?.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil,
+                            "Invalid function SDK catalog reference.")
+            }
+            entryCatalogHashes.append(catalogHash)
             guard let startText = entry["start"] as? String, let start = hex(startText),
                   let endText = entry["end"] as? String, let end = hex(endText), start < end else {
                 throw Invalid(message: "Invalid checkpoint function bounds.")
@@ -554,9 +843,65 @@ struct ReconstructionArtifact: Sendable {
                 }
                 try require((entry["state"] as? String == "recovered") == artifact.sources.contains(where: { $0.kind == "recovered-source" }),
                             "Checkpoint recovery state disagrees with its artifact.")
+                try require(artifact.sdkCatalogCandidates.isEmpty || catalogHash != nil,
+                            "SDK-derived call declarations lack their checkpoint catalog reference.")
                 decoded = artifact
             }
-            verified.append(VerifiedBatchEntry(start: start, end: end, state: entry["state"] as? String ?? "failed", artifact: decoded))
+            verified.append(VerifiedBatchEntry(start: start, end: end, state: entry["state"] as? String ?? "failed",
+                                               sdkCatalogSHA256: catalogHash, artifact: decoded))
+        }
+        let catalogDocuments: [[String: Any]]
+        if let rawCatalogs = document["sdk_catalogs"] {
+            guard let decodedCatalogs = rawCatalogs as? [[String: Any]] else {
+                throw Invalid(message: "Invalid retained SDK catalog list.")
+            }
+            catalogDocuments = decodedCatalogs
+        } else {
+            catalogDocuments = [] // schema-1 checkpoints created before SDK sidecars
+        }
+        try require(catalogDocuments.count <= 4096, "Checkpoint SDK catalog count exceeded.")
+        var catalogs: [VerifiedBatchCatalog] = [], catalogNames = Set<String>()
+        for item in catalogDocuments {
+            guard let fileName = item["file_name"] as? String,
+                  let sourceSHA256 = item["source_sha256"] as? String,
+                  let catalogSHA256 = item["catalog_sha256"] as? String,
+                  let size = item["bytes"] as? Int, size > 0, size <= 4 * 1024 * 1024 else {
+                throw Invalid(message: "Invalid retained SDK catalog identity.")
+            }
+            let reference = DarwinSDKDeclarationCatalogReference(fileName: fileName, sourceSHA256: sourceSHA256, catalogSHA256: catalogSHA256)
+            try require(reference.validated(for: digest) && catalogNames.insert(fileName).inserted,
+                        "Invalid or duplicate retained SDK catalog identity.")
+            let catalogDirectory = directory.appendingPathComponent("sdk-catalogs", isDirectory: true)
+            let directoryValues = try catalogDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            try require(directoryValues.isDirectory == true && directoryValues.isSymbolicLink != true,
+                        "Unsafe retained SDK catalog directory.")
+            let url = catalogDirectory.appendingPathComponent(fileName)
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            try require(values.isRegularFile == true && values.isSymbolicLink != true && values.fileSize == size,
+                        "Retained SDK catalog changed.")
+            let bytes = try readBatchBytes(at: url, maximum: size)
+            let catalog = try JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: bytes)
+            try require(bytes.count == size && hash(bytes) == catalogSHA256 && catalog.schema == 1
+                        && catalog.sourceSHA256 == digest && (try? catalog.encoded()) == bytes,
+                        "Retained SDK catalog failed its content or source identity check.")
+            total += size
+            try require(total <= 256 * 1024 * 1024, "Checkpoint byte budget exceeded.")
+            catalogs.append(VerifiedBatchCatalog(reference: reference, data: bytes, decoded: catalog))
+        }
+        let availableCatalogHashes = Set(catalogs.map { $0.reference.catalogSHA256 })
+        try require(entryCatalogHashes.allSatisfy { $0 == nil || availableCatalogHashes.contains($0!) },
+                    "Function references an SDK catalog absent from the checkpoint.")
+        try require(availableCatalogHashes == Set(entryCatalogHashes.compactMap { $0 }),
+                    "Checkpoint retains an SDK catalog with no function association.")
+        let catalogsByHash = Dictionary(uniqueKeysWithValues: catalogs.map { ($0.reference.catalogSHA256, $0.decoded) })
+        for entry in verified {
+            guard let artifact = entry.artifact,
+                  let catalogHash = entry.sdkCatalogSHA256,
+                  let catalog = catalogsByHash[catalogHash] else { continue }
+            for candidate in artifact.sdkCatalogCandidates {
+                try require(sdkCatalog(catalog, supports: candidate),
+                            "Checkpoint catalog does not support an attributed call declaration.")
+            }
         }
         try require(document["output_bytes"] as? Int == total, "Checkpoint byte accounting mismatch.")
         let outcomeKeys = ["batch_status", "recovered_functions", "review_only_functions", "failed_functions"]
@@ -571,7 +916,7 @@ struct ReconstructionArtifact: Sendable {
                         document["failed_functions"] as? Int == outcome.failed,
                         "Checkpoint outcome counters disagree with retained attempts.")
         }
-        return (data, verified)
+        return (data, verified, catalogs)
     }
 
     /// Produce an exact representation dump from verified in-memory artifacts,
@@ -600,7 +945,7 @@ struct ReconstructionArtifact: Sendable {
             try require(total <= maximumBytes, "Dump-all byte budget exhausted; partial output retained.")
             formats.append(["folder": format.fileExtension, "format": format.rawValue,
                             "available": manifest["available"] ?? 0, "unavailable": manifest["unavailable"] ?? 0,
-                            "manifest_sha256": hash(data)])
+                            "manifest_sha256": hash(data), "sdk_catalogs": manifest["sdk_catalogs"] ?? []])
         }
         let manifest = try JSONSerialization.data(withJSONObject: [
             "schema": 1, "kind": "reconstruction-all-formats-export", "source_sha256": digest,
@@ -620,6 +965,15 @@ struct ReconstructionArtifact: Sendable {
         var outputs: [(String, Data)] = []
         var entries: [[String: Any]] = []
         var total = 0, available = 0
+        var catalogManifest: [[String: Any]] = []
+        for catalog in batch.catalogs {
+            let name = "sdk-catalogs/\(catalog.reference.fileName)"
+            total += catalog.data.count
+            try require(maximumBytes >= 0 && total <= maximumBytes, "Dump byte budget exhausted before publication.")
+            outputs.append((name, catalog.data))
+            catalogManifest.append(["path": name, "bytes": catalog.data.count, "sha256": catalog.reference.catalogSHA256,
+                                    "source_sha256": catalog.reference.sourceSHA256])
+        }
         for entry in batch.entries {
             let prefix = String(format: "function-%016llx", entry.start)
             var files: [[String: Any]] = []
@@ -638,18 +992,21 @@ struct ReconstructionArtifact: Sendable {
                 outputs.append((name, bytes))
                 files.append(["path": name, "bytes": bytes.count, "sha256": hash(bytes)])
             }
-            entries.append(["start": String(format: "0x%016llx", entry.start),
-                            "end": String(format: "0x%016llx", entry.end), "state": entry.state,
-                            "available": source != nil, "files": files,
-                            "representation": source?.kind ?? "unavailable",
-                            "languages": source?.languages ?? [],
-                            "blockers": entry.artifact?.blockers ?? ["Function reconstruction failed."]])
+            var manifestEntry: [String: Any] = ["start": String(format: "0x%016llx", entry.start),
+                "end": String(format: "0x%016llx", entry.end), "state": entry.state,
+                "available": source != nil, "files": files,
+                "representation": source?.kind ?? "unavailable",
+                "languages": source?.languages ?? [],
+                "blockers": entry.artifact?.blockers ?? ["Function reconstruction failed."]]
+            if let catalogHash = entry.sdkCatalogSHA256 { manifestEntry["sdk_catalog_sha256"] = catalogHash }
+            entries.append(manifestEntry)
         }
         let manifest = try JSONSerialization.data(withJSONObject: [
             "schema": 1, "kind": "reconstruction-format-export", "format": format.rawValue,
             "artifact_kind": format.sourceKind, "source_sha256": digest, "worker": worker,
             "pass": passVersion, "revision": revision, "source_checkpoint_sha256": hash(batch.data),
             "available": available, "unavailable": entries.count - available, "output_bytes": total,
+            "sdk_catalogs": catalogManifest,
             "failed_functions": batch.entries.filter { $0.state == "failed" }.count,
             "best_effort": entries.filter { ($0["representation"] as? String)?.hasPrefix("best-effort-") == true }.count,
             "coverage": "validated retained batch only; undiscovered functions remain unknown",
@@ -660,7 +1017,11 @@ struct ReconstructionArtifact: Sendable {
                     && (try? output.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
                     "Choose a new dump directory; existing output is preserved.")
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
-        for (name, bytes) in outputs { try bytes.write(to: output.appendingPathComponent(name), options: .withoutOverwriting) }
+        for (name, bytes) in outputs {
+            let target = output.appendingPathComponent(name)
+            if name.contains("/") { try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true) }
+            try bytes.write(to: target, options: .withoutOverwriting)
+        }
         try manifest.write(to: output.appendingPathComponent("export-manifest.json"), options: .withoutOverwriting)
         return manifest
     }

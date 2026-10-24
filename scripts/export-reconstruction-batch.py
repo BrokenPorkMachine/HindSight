@@ -85,6 +85,7 @@ def run(batch, output, format_name, start=None, end=None, address=None, maximum_
               "source_bytes": manifest.get("source_bytes"),
               "batch_scope": manifest.get("scope"),
               "source_batch_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+              **({"sdk_catalog_sha256": manifest["sdk_catalog_sha256"]} if "sdk_catalog_sha256" in manifest else {}),
               "scope": "address" if address is not None else "range" if start is not None else "retained-batch",
               "requested_start": start, "requested_end": end, "requested_address": address,
               "coverage": "validated retained batch only; undiscovered and omitted functions remain unknown",

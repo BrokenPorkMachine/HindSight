@@ -126,8 +126,16 @@ final class BoundedServiceLane {
     }
 }
 final class CoordinatorService: NSObject, CoordinatorProtocol {
+    private struct SDKLookupCacheEntry: Sendable {
+        let environment: DarwinSDKCollectionEnvironment
+        let catalogData: Data
+        let prototypes: Data?
+        let eligibleDeclarations: Int
+    }
     private let queue = DispatchQueue(label: "ca.zensoftware.VectorGlass.coordinator")
     private var store: ProjectStore?
+    private var sdkLookups: [String: DarwinSDKLookupCancellation] = [:]
+    private var sdkLookupCache: [String: SDKLookupCacheEntry] = [:]
     private let pageCache = VerifiedPageCache()
     private lazy var supervisor = WorkerSupervisor(queue: queue)
     private let debugServer = DebugServer()
@@ -139,7 +147,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     private let firmwareLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.firmware", qos: .utility, maxConcurrent: 1, maxPending: 16, reservationBytes: 192 * 1_048_576)
     private let scriptingLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.scripting", qos: .utility, maxConcurrent: 4, maxPending: 64, reservationBytes: 64 * 1_048_576)
     private let reaLane = BoundedServiceLane(name: "ca.zensoftware.VectorGlass.rea", qos: .utility, maxConcurrent: 1, maxPending: 4, reservationBytes: 128 * 1_048_576)
-    private let analysisCacheEngineVersion = "arm64-analysis-v103-schema129"
+    private let analysisCacheEngineVersion = "arm64-analysis-v104-schema130"
     private let analysisCacheProducerVersion = "0.5.13"
     private let compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]
     func capabilities(withReply reply: @escaping (String) -> Void) {
@@ -149,7 +157,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
     func openProject(_ path: String, create: Bool, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in
             do {
-                guard !supervisor.isBusy else { throw WorkbenchError("Cancel the active inspection before switching projects.") }
+                guard !supervisor.isBusy, sdkLookups.isEmpty else { throw WorkbenchError("Cancel the active inspection before switching projects.") }
                 guard path.hasPrefix("/"), path.utf8.count <= 16384, !path.contains("\0") else { throw WorkbenchError("Invalid project path.") }
                 pageCache.clear()
                 let canonical = URL(fileURLWithPath: path).standardizedFileURL.path
@@ -157,6 +165,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                 let next = try ProjectStore(path: path, create: create)
                 let snapshot = try next.snapshot()
                 store = next
+                sdkLookupCache.removeAll(keepingCapacity: true)
                 reply(ServiceReply.success(snapshot))
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
@@ -307,18 +316,148 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     throw WorkbenchError("Reconstruction currently requires an unmapped thin AArch64 Mach-O; custom mappings and other formats remain unsupported.")
                 }
                 let before = try VerifiedPageCache.stamp(source.path)
-                supervisor.reconstruct(path: source.path, digest: source.digest, size: source.size, start: start, end: end, id: requestID) { [self] result in
+                func launch(_ prototypes: Data?, _ sdkNote: String,
+                            _ sdkCatalogReference: DarwinSDKDeclarationCatalogReference? = nil) {
                     do {
-                        guard store === current, try VerifiedPageCache.stamp(source.path) == before else { throw WorkbenchError("Project or captured source changed during reconstruction.") }
-                        let artifact = try result.get()
-                        reply(ReconstructionReply.encode(id: requestID, artifact: artifact, message: "Function reconstructed with captured-source verification. Generated text was not compiled or executed."))
+                        guard store === current, try VerifiedPageCache.stamp(source.path) == before else {
+                            throw WorkbenchError("Project or captured source changed before reconstruction.")
+                        }
+                        supervisor.reconstruct(path: source.path, digest: source.digest, size: source.size,
+                                               start: start, end: end, id: requestID, prototypes: prototypes) { [self] result in
+                            do {
+                                guard store === current, try VerifiedPageCache.stamp(source.path) == before else {
+                                    throw WorkbenchError("Project or captured source changed during reconstruction.")
+                                }
+                                let artifact = try result.get()
+                                let message = "Function reconstructed with captured-source verification. Generated text was not compiled or executed." + sdkNote
+                                reply(ReconstructionReply.encode(id: requestID, artifact: artifact, message: message,
+                                                                 sdkCatalogReference: sdkCatalogReference))
+                            } catch { reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription)) }
+                        }
                     } catch { reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription)) }
+                }
+                let engineIdentity = source.options.map { "multiarch-v1:" + SHA256.hash(data: Data($0.cacheIdentity.utf8)).map { String(format: "%02x", $0) }.joined().prefix(48) } ?? (analysisCacheEngineVersion + "-patterns1-" + BinaryImportOptions.analysisRevision)
+                guard let cached = try? current.cachedAnalysis(digest: source.digest, requestID: requestID,
+                                                               engineVersion: engineIdentity, compatibleLegacyProductVersions: []) else {
+                    launch(nil, " SDK lookup needs a current analysis; no declaration catalog was supplied.")
+                    return
+                }
+                let candidates = try DarwinSDKDeclarations.importCandidates(linkageRecords: cached.report.linkage_records)
+                guard !candidates.isEmpty else { launch(nil, " No eligible public SDK imports were found."); return }
+                guard let header = Bundle.main.url(forResource: "sdk_declarations", withExtension: "h") else {
+                    launch(nil, " Bundled SDK declaration header is unavailable.")
+                    return
+                }
+                let candidateBytes = try JSONEncoder().encode(candidates)
+                let cacheKey = source.digest + ":" + SHA256.hash(data: candidateBytes).map { String(format: "%02x", $0) }.joined()
+                let cachedLookup = sdkLookupCache[cacheKey]
+                guard sdkLookups[requestID] == nil else { throw WorkbenchError("Duplicate SDK lookup request ID.") }
+                let cancellation = DarwinSDKLookupCancellation()
+                sdkLookups[requestID] = cancellation
+                supervisor.recordStatus(id: requestID, operation: "reconstruction", phase: .running,
+                    detail: "Verifying the capture and collecting bounded SDK declarations.",
+                    progressPercent: 0, progressStage: "sdk-lookup")
+                DispatchQueue.global(qos: .utility).async { [self] in
+                    let prototypes: Data?
+                    let catalogData: Data?
+                    let note: String
+                    var cacheEntry: SDKLookupCacheEntry?
+                    do {
+                        let deadline = DispatchTime.now().uptimeNanoseconds + 120_000_000_000
+                        let context = try DarwinSDKDeclarations.verifiedTargetContext(path: source.path,
+                            expectedSHA256: source.digest, expectedSize: source.size, cancellation: cancellation)
+                        let environment = try DarwinSDKDeclarations.collectionEnvironment(context: context,
+                            headerPath: header.path, cancellation: cancellation)
+                        guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                            throw DarwinSDKDeclarations.Invalid(message: "SDK declaration collection exceeded its total deadline.")
+                        }
+                        if let cachedLookup, cachedLookup.environment == environment {
+                            catalogData = cachedLookup.catalogData
+                            prototypes = cachedLookup.prototypes
+                            cacheEntry = cachedLookup
+                            note = " SDK lookup reused \(candidates.count) source-bound public import declarations for the same verified SDK/compiler/header identity; \(cachedLookup.eligibleDeclarations) were supported."
+                        } else {
+                            var collected: [DarwinSDKCollectedDeclaration] = []
+                            for candidate in candidates {
+                                try cancellation.check()
+                                guard DispatchTime.now().uptimeNanoseconds < deadline else {
+                                    throw DarwinSDKDeclarations.Invalid(message: "SDK declaration collection exceeded its total deadline.")
+                                }
+                                collected.append(try DarwinSDKDeclarations.collect(name: candidate.name,
+                                    environment: environment, headerPath: header.path, cancellation: cancellation))
+                            }
+                            try cancellation.check()
+                            let catalog = try DarwinSDKDeclarationCatalog(sourceSHA256: source.digest,
+                                candidates: candidates, declarations: collected)
+                            let encodedCatalog = try catalog.encoded()
+                            let workerCatalog = try DarwinSDKDeclarations.workerPrototypes(candidates: candidates,
+                                results: collected, sourceSHA256: source.digest)
+                            let eligible = collected.filter { $0.function?.workerEligible == true }.count
+                            catalogData = encodedCatalog
+                            prototypes = workerCatalog
+                            cacheEntry = SDKLookupCacheEntry(environment: environment, catalogData: encodedCatalog,
+                                                              prototypes: workerCatalog, eligibleDeclarations: eligible)
+                            note = " SDK lookup checked \(candidates.count) public imports; \(eligible) supported declarations were supplied to the worker."
+                        }
+                    } catch {
+                        prototypes = nil
+                        catalogData = nil
+                        cacheEntry = nil
+                        note = " SDK declarations were unavailable (\(error.localizedDescription)); reconstruction continued without them."
+                    }
+                    queue.async { [self] in
+                        guard sdkLookups[requestID] === cancellation else { return }
+                        sdkLookups.removeValue(forKey: requestID)
+                        if cancellation.isCancelled {
+                            supervisor.recordStatus(id: requestID, operation: "reconstruction", phase: .cancelled,
+                                detail: "SDK declaration lookup cancelled before worker launch.",
+                                progressPercent: 0, progressStage: "cancelled")
+                            reply(ReconstructionReply.encode(id: requestID, message: "SDK declaration lookup cancelled before worker launch."))
+                            return
+                        }
+                        do {
+                            guard store === current, try VerifiedPageCache.stamp(source.path) == before else {
+                                throw WorkbenchError("Project or captured source changed during SDK catalog collection.")
+                            }
+                            var workerCatalog = prototypes
+                            var completionNote = note
+                            if let catalogData {
+                                do {
+                                    let receipt = try current.storeSDKDeclarationCatalog(catalogData, sourceSHA256: source.digest)
+                                    let reference = DarwinSDKDeclarationCatalogReference(fileName: receipt.fileName,
+                                        sourceSHA256: source.digest, catalogSHA256: receipt.catalogSHA256)
+                                    if let cacheEntry {
+                                        sdkLookupCache[cacheKey] = cacheEntry
+                                        if sdkLookupCache.count > 4, let oldestKey = sdkLookupCache.keys.sorted().first {
+                                            sdkLookupCache.removeValue(forKey: oldestKey)
+                                        }
+                                    }
+                                    completionNote += " Full SDK lookup evidence retained as analysis-cache/\(receipt.fileName) (SHA-256 \(receipt.catalogSHA256))."
+                                    launch(workerCatalog, completionNote, reference)
+                                    return
+                                } catch {
+                                    workerCatalog = nil
+                                    completionNote += " The SDK catalog could not be retained; declarations were withheld from reconstruction (\(error.localizedDescription))."
+                                }
+                            }
+                            launch(workerCatalog, completionNote)
+                        } catch {
+                            reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription))
+                        }
+                    }
                 }
             } catch { reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription)) }
         }
     }
     func cancelInspection(_ requestID: String, withReply reply: @escaping (Bool) -> Void) {
-        queue.async { [self] in reply(supervisor.stop(id: requestID)) }
+        queue.async { [self] in
+            if let lookup = sdkLookups[requestID] {
+                lookup.cancel()
+                supervisor.recordStatus(id: requestID, operation: "reconstruction", phase: .cancelling,
+                    detail: "Stopping SDK declaration lookup.", progressPercent: 0, progressStage: "cancel")
+                reply(true)
+            } else { reply(supervisor.stop(id: requestID)) }
+        }
     }
     func inspectionStatus(_ requestID: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in
@@ -337,6 +476,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                 guard let current = store else { throw WorkbenchError("Create or open a project first.") }
                 guard !supervisor.isBusy else { throw WorkbenchError("Cancel the active inspection before clearing the analysis cache.") }
                 let removed = try current.clearAnalysisCache()
+                sdkLookupCache.removeAll(keepingCapacity: true)
                 reply(ServiceReply.success("Cleared \(removed) cached analysis result\(removed == 1 ? "" : "s")."))
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
@@ -450,7 +590,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
     }
-    func disconnect() { queue.async { [self] in supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); reaLane.cancelQueued(); debugServer.shutdown(); terminalHost.stop(); pageCache.clear(); store = nil } }
+    func disconnect() { queue.async { [self] in sdkLookups.values.forEach { $0.cancel() }; sdkLookupCache.removeAll(); supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); reaLane.cancelQueued(); debugServer.shutdown(); terminalHost.stop(); pageCache.clear(); store = nil } }
 
     func terminalStart(_ workingDirectory: String, withReply reply: @escaping (String) -> Void) {
         reply(terminalHost.start(workingDirectory: workingDirectory))

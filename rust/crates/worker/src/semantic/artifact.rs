@@ -1253,6 +1253,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     let mut statement_mirrors = Vec::new();
     let mut trees = Vec::new();
     let mut strict_blocked = truncated || exhausted;
+    let mut review_blocked_pcs = std::collections::BTreeSet::new();
     let mut source_blocked = truncated || exhausted;
     let mut shared_ir_count = 0u64;
     let mut modeled_tree_count = 0u64;
@@ -1402,6 +1403,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         if has_unmodeled_fp_status_effect(portable) {
             reasons.push("FPCR/FPSR effects are not modeled");
         }
+        if !reasons.is_empty(){review_blocked_pcs.insert(pc);}
         strict_blocked |= !reasons.is_empty();
         source_blocked |= !reasons.is_empty() && !source_supported_call;
         unsupported_reason_count += reasons.len() as u64;
@@ -2062,22 +2064,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // strict source/ABI proofs fail. This is code for analyst repair, never a
     // substitute proof of compilability or an invented original prototype.
     if !has_recovered_source {
-        let mut available = String::new();
-        for line in rendering.lines() {
-            if available.len() + line.len() + 5 > 1_000_000 {
-                available.push_str("    /* TRUNCATED: review source byte budget exhausted. */\n    hs_unresolved_reconstruction_budget();\n");
-                break;
-            }
-            available.push_str("    ");
-            available.push_str(line);
-            available.push('\n');
-        }
-        let text = format!("/* BEST-EFFORT C-LIKE RECONSTRUCTION: not compilable or ABI-qualified.\n * Symbolic registers/intrinsics and unresolved effects require analyst repair.\n * This review wrapper is NOT the original function prototype.\n * Captured instruction tree truncated: {truncated}.\n */\n#include <stdint.h>\ntypedef struct hs_review_context hs_review_context;\nvoid hs_review_{start:x}(hs_review_context *context) {{\n    (void)context;\n{available}}}\n");
+        let text=executable::review_source(start,&trees,&review_blocked_pcs,truncated);
         {
             let review = builder.record("metadata", "derived", object([
                 ("artifact_kind", "best-effort-source".into()), ("source", text.into()),
                 ("status", "review-only-uncompiled".into()), ("ast_root", root.clone().into()),
-                ("contract", "instruction-derived C-like code; unresolved symbolic registers/intrinsics; no original ABI, compilation or equivalence claim".into()),
+                ("contract", "repair-oriented machine-state C; status 4 stops before unsupported effects or outside captured code; bounded flat memory; no original ABI, complete implementation or equivalence claim".into()),
             ]), array([]))?;
             builder.edge(&root_mirror, &review, "renders-as")?;
         }

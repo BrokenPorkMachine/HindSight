@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 import UniformTypeIdentifiers
@@ -20,12 +21,62 @@ private struct VGAnalysisDecodeResult: Sendable {
 }
 
 private func decodeReconstructionReply(_ text: String, requestID: String, digest: String,
-                                      start: UInt64, end: UInt64) throws -> ReconstructionArtifact {
+                                      start: UInt64, end: UInt64) throws -> (artifact: ReconstructionArtifact, message: String, sdkCatalogReference: DarwinSDKDeclarationCatalogReference?) {
     let reply = try JSONDecoder().decode(ReconstructionReply.self, from: Data(text.utf8))
     guard reply.requestID == requestID, let artifact = reply.artifactJSON else {
         throw ReconstructionArtifact.Invalid(message: reply.message)
     }
-    return try ReconstructionArtifact.decode(artifact, digest: digest, start: start, end: end)
+    let catalog = reply.sdkCatalogReference
+    guard catalog == nil || catalog?.validated(for: digest) == true else {
+        throw ReconstructionArtifact.Invalid(message: "SDK catalog reference does not match the captured source.")
+    }
+    let decodedArtifact = try ReconstructionArtifact.decode(artifact, digest: digest, start: start, end: end)
+    guard decodedArtifact.sdkCatalogCandidates.isEmpty || catalog != nil else {
+        throw ReconstructionArtifact.Invalid(message: "SDK-derived call declarations arrived without their retained source catalog.")
+    }
+    return (decodedArtifact, reply.message, catalog)
+}
+
+private func readSDKCatalogFile(_ url: URL, maximumBytes: Int = 4 * 1024 * 1024) throws -> Data {
+    let directoryDescriptor = Darwin.open(url.deletingLastPathComponent().path,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard directoryDescriptor >= 0 else {
+        throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog directory could not be opened safely.")
+    }
+    defer { Darwin.close(directoryDescriptor) }
+    var directoryInfo = stat()
+    guard fstat(directoryDescriptor, &directoryInfo) == 0,
+          (directoryInfo.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR) else {
+        throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog parent is not a real directory.")
+    }
+    let descriptor = Darwin.openat(directoryDescriptor, url.lastPathComponent,
+        O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog could not be opened safely.") }
+    defer { Darwin.close(descriptor) }
+    var info = stat()
+    guard fstat(descriptor, &info) == 0, (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+          info.st_size > 0, info.st_size <= Int64(maximumBytes) else {
+        throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog is not a bounded regular file.")
+    }
+    var data = Data(count: Int(info.st_size))
+    let byteCount = data.count
+    var offset = 0
+    while offset < byteCount {
+        let count = data.withUnsafeMutableBytes { buffer in
+            Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), byteCount - offset)
+        }
+        guard count > 0 else { throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog changed or ended during reading.") }
+        offset += count
+    }
+    var after = stat()
+    guard fstat(descriptor, &after) == 0, after.st_dev == info.st_dev, after.st_ino == info.st_ino,
+          after.st_size == info.st_size, after.st_mtime == info.st_mtime,
+          after.st_mtimespec.tv_nsec == info.st_mtimespec.tv_nsec,
+          after.st_ctime == info.st_ctime,
+          after.st_ctimespec.tv_nsec == info.st_ctimespec.tv_nsec else {
+        throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog changed during reading.")
+    }
+    return data
 }
 
 struct VGRecentProject: Codable, Hashable, Identifiable {
@@ -65,6 +116,7 @@ final class WorkbenchModel: ObservableObject {
     @Published var instructionPage: InstructionPage?
     @Published var analysisReport: AnalysisReport?
     @Published private(set) var reconstructionArtifact: ReconstructionArtifact?
+    @Published private(set) var reconstructionSDKCatalog: DarwinSDKDeclarationCatalogReference?
     @Published private(set) var reconstructionStatus = "Select a function and request reconstruction."
     private var reconstructionContext: ReconstructionReviewContext?
     private var reconstructionRequestID: String?
@@ -698,7 +750,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                                             requestID: reconstructionID, withReply: done)
             }
             let artifact = try decodeReconstructionReply(reconstructionText, requestID: reconstructionID,
-                                                         digest: digest, start: functionStart, end: functionEnd)
+                digest: digest, start: functionStart, end: functionEnd).artifact
             try artifact.writeReviewExport(to: URL(fileURLWithPath: reconstructionOutput))
             selectedID = record.id
             analysisRecordID = record.id
@@ -1658,7 +1710,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard !busy, projectServiceReady, let record = selected, let digest = record.result.source_sha256,
               let projectPath = project?.path, let analysis = currentAnalysis else { return }
         let id = UUID().uuidString, generation = navigationGeneration
-        activeRequest = id; reconstructionRequestID = id; busy = true; reconstructionStatus = "Reconstructing the selected function…"
+        activeRequest = id; reconstructionRequestID = id; busy = true; reconstructionSDKCatalog = nil
+        reconstructionStatus = "Reconstructing the selected function…"
         startAnalysisMonitor(requestID: id)
         client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
                        operation: { $0.reconstructFunction(record.id, startAddress: String(function.start), endAddress: String(function.end), requestID: id, withReply: $1) }) { [weak self] result in
@@ -1668,7 +1721,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             do { text = try result.get() }
             catch { self.busy = false; self.activeRequest = nil; self.reconstructionRequestID = nil; self.reconstructionStatus = error.localizedDescription; return }
             Task { [weak self] in
-                let decoded = await Task.detached(priority: .userInitiated) { () -> Result<ReconstructionArtifact, Error> in
+                let decoded = await Task.detached(priority: .userInitiated) { () -> Result<(artifact: ReconstructionArtifact, message: String, sdkCatalogReference: DarwinSDKDeclarationCatalogReference?), Error> in
                     Result { try decodeReconstructionReply(text, requestID: id, digest: digest,
                                                            start: function.start, end: function.end) }
                 }.value
@@ -1677,11 +1730,15 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 guard self.navigationGeneration == generation, self.selectedID == record.id, self.project?.path == projectPath,
                       self.currentAnalysis?.request_id == analysis.request_id else { self.reconstructionStatus = "Discarded reconstruction for an earlier project, artifact or analysis revision."; return }
                 switch decoded {
-                case .success(let artifact):
+                case .success(let reconstruction):
+                    let artifact = reconstruction.artifact
                     self.reconstructionArtifact = artifact
+                    self.reconstructionSDKCatalog = reconstruction.sdkCatalogReference
                     self.reconstructionContext = ReconstructionReviewContext(project: projectPath, record: record.id,
                                                                              analysis: analysis.request_id, digest: digest)
-                    self.reconstructionStatus = "\(artifact.eligibility) · \(artifact.pass). Generated source has not been compiled or executed by the app."
+                    self.reconstructionStatus = reconstruction.message.contains("Full SDK lookup evidence retained")
+                        ? reconstruction.message
+                        : "\(artifact.eligibility) · \(artifact.pass). Generated source has not been compiled or executed by the app."
                 case .failure(let error): self.reconstructionStatus = error.localizedDescription
                 }
             }
@@ -1769,7 +1826,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         let panel = NSSavePanel()
         panel.title = dumpAll ? "Dump all formats (.c .h .m .n)" : format.map { "Dump reconstruction (.\($0.fileExtension))" } ?? "Export Reconstruction Batch"
         panel.nameFieldStringValue = "binary-reconstruction" + (format.map { "-\($0.fileExtension)" } ?? "")
-        panel.message = "Choose a new directory. Per-function evidence is retained; requested format dumps are placed in a dump subfolder. Unavailable output is reported, not fabricated."
+        panel.message = "Choose a new directory. Per-function evidence and any retained SDK declaration catalogs are preserved; requested format dumps are placed in a dump subfolder. Unavailable output is reported, not fabricated."
         guard panel.runModal() == .OK, let directory = panel.url else { return }
         do {
             guard !FileManager.default.fileExists(atPath: directory.path) else {
@@ -1823,7 +1880,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         let destination = NSSavePanel()
         destination.title = format.map { "Dump validated batch (.\($0.fileExtension))" } ?? "Dump all formats (.c .h .m .n)"
         destination.nameFieldStringValue = "dump-" + (format?.fileExtension ?? "all")
-        destination.message = "Choose a new directory for this format and its retained evidence. Existing files are never overwritten."
+        destination.message = "Choose a new directory for this format, its retained function evidence, and any SDK catalog sidecars. Existing files are never overwritten."
         guard destination.runModal() == .OK, let output = destination.url else { return }
         Task {
             if let format { await self.dumpReconstructionBatch(from: directory, to: output, format: format, digest: digest) }
@@ -1839,12 +1896,15 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         let generation = navigationGeneration
         reconstructionStatus = "Writing verified c/, h/, m/ and n/ dumps…"
         do {
-            _ = try await Task.detached(priority: .utility) {
+            let data = try await Task.detached(priority: .utility) {
                 try ReconstructionArtifact.writeBatchAllFormatExport(from: directory, to: output,
                     digest: digest, worker: worker, revision: BinaryImportOptions.analysisRevision)
             }.value
             guard navigationGeneration == generation else { return }
-            reconstructionStatus = "Dumped all formats to \(output.path) in c/, h/, m/ and n/. Each manifest reports unavailable or failed functions. No code was executed."
+            let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let formats = manifest?["formats"] as? [[String: Any]] ?? []
+            let catalogs = (formats.first?["sdk_catalogs"] as? [[String: Any]])?.count ?? 0
+            reconstructionStatus = "Dumped all formats to \(output.path) in c/, h/, m/ and n/ with \(catalogs) SDK catalog sidecar(s). Each manifest reports unavailable or failed functions. No code was executed."
         } catch { if navigationGeneration == generation { reconstructionStatus = error.localizedDescription } }
         status = reconstructionStatus
     }
@@ -1864,7 +1924,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             }.value
             guard navigationGeneration == generation else { return }
             let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            reconstructionStatus = "Dumped \(manifest?["available"] as? Int ?? 0) .\(format.fileExtension) files to \(output.path); \(manifest?["unavailable"] as? Int ?? 0) unavailable, \(manifest?["failed_functions"] as? Int ?? 0) functions failed. No code was executed."
+            let catalogs = (manifest?["sdk_catalogs"] as? [[String: Any]])?.count ?? 0
+            reconstructionStatus = "Dumped \(manifest?["available"] as? Int ?? 0) .\(format.fileExtension) files to \(output.path) with \(catalogs) SDK catalog sidecar(s); \(manifest?["unavailable"] as? Int ?? 0) unavailable, \(manifest?["failed_functions"] as? Int ?? 0) functions failed. No code was executed."
         } catch { if navigationGeneration == generation { reconstructionStatus = error.localizedDescription } }
         status = reconstructionStatus
     }
@@ -1881,6 +1942,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             var requestedDumpAll = dumpAll
             var requestedScope = scope
             var entries: [[String: Any]] = []
+            var sdkCatalogs: [DarwinSDKDeclarationCatalogReference] = []
+            var sdkCatalogByteCounts: [String: Int] = [:]
             var bytes = 0
             var lastRequestID: String?
             defer {
@@ -1943,6 +2006,18 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     functions = restored
                     entries = previous
                     bytes = saved["output_bytes"] as? Int ?? 0
+                    sdkCatalogs = (saved["sdk_catalogs"] as? [[String: Any]] ?? []).compactMap { item in
+                        guard let fileName = item["file_name"] as? String,
+                              let sourceSHA256 = item["source_sha256"] as? String,
+                              let catalogSHA256 = item["catalog_sha256"] as? String else { return nil }
+                        return DarwinSDKDeclarationCatalogReference(fileName: fileName, sourceSHA256: sourceSHA256,
+                                                                    catalogSHA256: catalogSHA256)
+                    }
+                    for item in saved["sdk_catalogs"] as? [[String: Any]] ?? [] {
+                        if let fileName = item["file_name"] as? String, let size = item["bytes"] as? Int {
+                            sdkCatalogByteCounts[fileName] = size
+                        }
+                    }
                 } catch { reconstructionStatus = error.localizedDescription; return nil }
             }
             let retainedCount = entries.count
@@ -1956,6 +2031,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     "revision": BinaryImportOptions.analysisRevision,
                     "planned": functions.map { ["start": $0.startText, "end": String(format: "0x%016llx", $0.end)] },
                     "discovered": functions.count, "attempted": entries.count, "output_bytes": bytes,
+                    "sdk_catalogs": sdkCatalogs.map { ["file_name": $0.fileName, "source_sha256": $0.sourceSHA256,
+                                                        "catalog_sha256": $0.catalogSHA256,
+                                                        "bytes": sdkCatalogByteCounts[$0.fileName] ?? 0] },
                     "retained": retainedCount,
                     "cancelled": self.reconstructionBatchCancelled, "functions": entries,
                     "complete_discovery": false, "validation": "generated; compilation and behavior unqualified"
@@ -1986,12 +2064,60 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                             continuation.resume(with: $0)
                         }
                     }
-                    let artifact = try await Task.detached(priority: .userInitiated) {
+                    let decodedReply = try await Task.detached(priority: .userInitiated) {
                         try decodeReconstructionReply(text, requestID: id, digest: digest,
                                                       start: function.start, end: function.end)
                     }.value
+                    let artifact = decodedReply.artifact
                     guard self.navigationGeneration == generation, self.project?.path == projectPath,
                           self.selectedID == record.id, self.currentAnalysis?.request_id == analysis.request_id else { break }
+                    if let reference = decodedReply.sdkCatalogReference, !sdkCatalogs.contains(where: { $0.fileName == reference.fileName }) {
+                        guard reference.validated(for: digest) else {
+                            throw ReconstructionArtifact.Invalid(message: "SDK catalog reference does not match the batch source.")
+                        }
+                        let cacheDirectory = URL(fileURLWithPath: projectPath, isDirectory: true)
+                            .appendingPathComponent("analysis-cache", isDirectory: true)
+                        let catalogURL = cacheDirectory.appendingPathComponent(reference.fileName)
+                        let cacheValues = try cacheDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                        let fileValues = try catalogURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+                        guard cacheValues.isDirectory == true, cacheValues.isSymbolicLink != true,
+                              fileValues.isRegularFile == true, fileValues.isSymbolicLink != true,
+                              let size = fileValues.fileSize, size > 0, size <= 4 * 1024 * 1024 else {
+                            throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog is missing or unsafe.")
+                        }
+                        let catalogData = try readSDKCatalogFile(catalogURL)
+                        let catalogHash = SHA256.hash(data: catalogData).map { String(format: "%02x", $0) }.joined()
+                        guard catalogData.count == size, catalogHash == reference.catalogSHA256,
+                              let catalog = try? JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: catalogData),
+                              catalog.schema == 1, catalog.sourceSHA256 == digest,
+                              (try? catalog.encoded()) == catalogData else {
+                            throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog failed its content or source identity check.")
+                        }
+                        let catalogDirectory = directory.appendingPathComponent("sdk-catalogs", isDirectory: true)
+                        if !FileManager.default.fileExists(atPath: catalogDirectory.path) {
+                            try FileManager.default.createDirectory(at: catalogDirectory, withIntermediateDirectories: false)
+                        }
+                        let catalogDirectoryValues = try catalogDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                        guard catalogDirectoryValues.isDirectory == true, catalogDirectoryValues.isSymbolicLink != true else {
+                            throw ReconstructionArtifact.Invalid(message: "SDK catalog batch directory is unsafe.")
+                        }
+                        let retainedCatalog = catalogDirectory.appendingPathComponent(reference.fileName)
+                        if FileManager.default.fileExists(atPath: retainedCatalog.path) {
+                            let attrs = try FileManager.default.attributesOfItem(atPath: retainedCatalog.path)
+                            guard (attrs[.type] as? FileAttributeType) == .typeRegular,
+                                  try readSDKCatalogFile(retainedCatalog) == catalogData else {
+                                throw ReconstructionArtifact.Invalid(message: "An uncheckpointed SDK catalog path contains different data.")
+                            }
+                        } else {
+                            try catalogData.write(to: retainedCatalog, options: .withoutOverwriting)
+                        }
+                        sdkCatalogs.append(reference)
+                        sdkCatalogByteCounts[reference.fileName] = catalogData.count
+                        bytes += catalogData.count
+                    }
+                    if let reference = decodedReply.sdkCatalogReference {
+                        entry["sdk_catalog_sha256"] = reference.catalogSHA256
+                    }
                     let remaining = 256 * 1024 * 1024 - bytes
                     let files = try await Task.detached(priority: .utility) {
                         try artifact.writeBatchExport(to: directory, maximumBytes: remaining)
@@ -2032,6 +2158,106 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { try artifact.writeReviewExport(sourceID: source?.id, to: url); reconstructionStatus = "Exported \(url.lastPathComponent). No generated code was executed." }
         catch { reconstructionStatus = error.localizedDescription }
+    }
+
+    func exportReconstructionEvidencePackage(_ function: VGFunctionRecord) {
+        guard let artifact = currentReconstruction, artifact.start == function.start, artifact.end == function.end else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose an Evidence Package Location"
+        panel.message = "Choose a parent folder. HindSight will create a new folder containing the reconstruction artifact and any retained SDK declaration catalog."
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let parent = panel.url else { return }
+        let package = parent.appendingPathComponent("function-\(String(format: "%016llx", function.start))-evidence", isDirectory: true)
+        do {
+            var catalog: (reference: DarwinSDKDeclarationCatalogReference, data: Data)?
+            if let reference = reconstructionSDKCatalog {
+                guard let projectPath = project?.path, let digest = selected?.result.source_sha256 else {
+                    throw ReconstructionArtifact.Invalid(message: "The current SDK catalog has no active project source identity.")
+                }
+                catalog = (reference, try retainedSDKCatalogData(reference: reference, digest: digest, projectPath: projectPath))
+            }
+            try artifact.writeEvidencePackage(to: package, sdkCatalog: catalog)
+            reconstructionStatus = "Exported reconstruction evidence package to \(package.path). Generated code was not executed."
+        } catch { reconstructionStatus = error.localizedDescription }
+        status = reconstructionStatus
+    }
+
+    func verifyReconstructionEvidencePackage() {
+        guard !busy else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Verify Reconstruction Evidence Package"
+        panel.message = "Select a package folder to verify its manifest, file hashes, source artifacts, and optional SDK catalog."
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        let generation = navigationGeneration
+        busy = true
+        reconstructionStatus = "Verifying reconstruction evidence package…"
+        Task { [weak self] in
+            let result = await Task.detached(priority: .utility) {
+                try ReconstructionArtifact.verifyEvidencePackage(at: directory)
+            }.result
+            guard let self else { return }
+            guard self.navigationGeneration == generation else { self.busy = false; return }
+            self.busy = false
+            switch result {
+            case .success(let package):
+                let catalogNote = package.sdkCatalogReference == nil ? "no SDK catalog" : "SDK catalog verified"
+                self.reconstructionStatus = "Evidence package verified for 0x\(String(package.artifact.start, radix: 16))–0x\(String(package.artifact.end, radix: 16)) (\(catalogNote)); source SHA-256 \(package.artifact.digest)."
+            case .failure(let error):
+                self.reconstructionStatus = error.localizedDescription
+            }
+            self.status = self.reconstructionStatus
+        }
+    }
+
+    private func retainedSDKCatalogData(reference: DarwinSDKDeclarationCatalogReference,
+                                         digest: String, projectPath: String) throws -> Data {
+        guard reference.validated(for: digest) else {
+            throw ReconstructionArtifact.Invalid(message: "SDK catalog reference does not match the captured source.")
+        }
+        let cacheDirectory = URL(fileURLWithPath: projectPath, isDirectory: true)
+            .appendingPathComponent("analysis-cache", isDirectory: true)
+        let catalogURL = cacheDirectory.appendingPathComponent(reference.fileName)
+        let directoryValues = try cacheDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        let fileValues = try catalogURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard directoryValues.isDirectory == true, directoryValues.isSymbolicLink != true,
+              fileValues.isRegularFile == true, fileValues.isSymbolicLink != true,
+              let size = fileValues.fileSize, size > 0, size <= 4 * 1024 * 1024 else {
+            throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog is missing or unsafe.")
+        }
+        let data = try readSDKCatalogFile(catalogURL)
+        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard data.count == size, hash == reference.catalogSHA256,
+              let catalog = try? JSONDecoder().decode(DarwinSDKDeclarationCatalog.self, from: data),
+              catalog.schema == 1, catalog.sourceSHA256 == digest, (try? catalog.encoded()) == data else {
+            throw ReconstructionArtifact.Invalid(message: "Retained SDK catalog failed its content or source identity check.")
+        }
+        return data
+    }
+
+    func exportReconstructionSDKCatalog() {
+        guard currentReconstruction != nil, let reference = reconstructionSDKCatalog,
+              let projectPath = project?.path, let digest = selected?.result.source_sha256,
+              reference.validated(for: digest) else {
+            reconstructionStatus = "No current reconstruction has a retained SDK declaration catalog."
+            return
+        }
+        do {
+            let data = try retainedSDKCatalogData(reference: reference, digest: digest, projectPath: projectPath)
+            let panel = NSSavePanel()
+            panel.title = "Export SDK Declaration Evidence"
+            panel.nameFieldStringValue = reference.fileName
+            panel.allowedContentTypes = [.json]
+            panel.message = "This catalog records public SDK declarations and lookup limits. It does not contain imported function implementations."
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try data.write(to: url, options: .withoutOverwriting)
+            reconstructionStatus = "Exported SDK declaration catalog \(url.lastPathComponent) (SHA-256 \(reference.catalogSHA256))."
+        } catch { reconstructionStatus = error.localizedDescription }
     }
 
     /// Export a bounded, evidence-labelled reconstruction package for the
@@ -2145,6 +2371,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 self.analysisRecordID = nil
                 self.analysisEvidenceIndex = nil
                 self.evidenceIndexRecordID = nil
+                self.reconstructionArtifact = nil
+                self.reconstructionSDKCatalog = nil
+                self.reconstructionContext = nil
                 self.status = reply.message
             } catch {
                 self.status = error.localizedDescription

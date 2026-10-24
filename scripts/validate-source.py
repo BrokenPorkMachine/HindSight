@@ -362,7 +362,7 @@ for token in ['LegacyAnalysisCacheEnvelope', 'AnalysisCacheEnvelope', 'analysisC
               'Data(contentsOf: url, options: [.mappedIfSafe])', 'Set(rawReport.keys) == AnalysisReport.jsonFields',
               'data.write(to: url, options: [.atomic])', 'isSymbolicLinkKey']:
     assert token in project_store_cache, token
-for token in ['analysisCacheEngineVersion = "arm64-analysis-v103-schema129"', 'analysisCacheProducerVersion = "0.5.13"',
+for token in ['analysisCacheEngineVersion = "arm64-analysis-v104-schema130"', 'analysisCacheProducerVersion = "0.5.13"',
               'compatibleLegacyAnalysisCacheVersions: Set<String> = ["0.4.1"]', '.checkingCache',
               'Compatible 0.4.1 analysis cache reused and migrated', 'storeAnalysisCache(report']:
     assert token in coordinator_main, token
@@ -515,7 +515,7 @@ assert (R/'docs/ANALYSIS_NAVIGATION_0.4.3.md').is_file()
 analysis_continuity=(R/'App/AnalysisContinuity.swift').read_text()
 for token in ['struct VGAnalysisPin', 'struct VGAnalysisVisit', 'struct VGAnalysisSnapshot', 'struct VGAnalysisDelta',
               'maximumBytes = 1 * 1024 * 1024', 'maximumPins = 128', 'maximumRecent = 96',
-              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v103-schema129']:
+              'analysis-continuity-v1.json', 'options: .atomic', 'isSymbolicLinkKey', 'isRegularFileKey', 'decoder.dateDecodingStrategy = .iso8601', 'arm64-analysis-v104-schema130']:
     assert token in analysis_continuity, token
 for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'Text("Changes").tag("Changes")',
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:
@@ -1002,6 +1002,10 @@ if swiftc:
     with tempfile.TemporaryDirectory(prefix='vectorglass-target-model-') as tmp:
         exe=pathlib.Path(tmp)/'target-model-contract'
         subprocess.run([swiftc,str(R/'Shared/TargetModel.swift'),str(R/'Tests/target_model_contract.swift'),'-o',str(exe)],check=True)
+        subprocess.run([str(exe)],check=True)
+    with tempfile.TemporaryDirectory(prefix='hindsight-sdk-declarations-') as tmp:
+        exe=pathlib.Path(tmp)/'sdk-declarations-contract'
+        subprocess.run([swiftc,str(R/'Shared/DarwinSDKDeclarations.swift'),str(R/'Tests/darwin_sdk_declarations_contract.swift'),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
     with tempfile.TemporaryDirectory(prefix='vectorglass-analysis-protocol-') as tmp:
         exe=pathlib.Path(tmp)/'analysis-protocol-contract'

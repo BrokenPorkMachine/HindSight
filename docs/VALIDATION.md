@@ -38,7 +38,7 @@ These checks complement the project-root/database symlink rejection and the nati
 
 - Product/service/worker identity is `0.5.13`, release channel `stable`, bundle build `5913`, protocol ABI 1.
 - Swift/Rust agree on the exact 75-field `AnalysisReport`.
-- Cache envelopes bind source SHA-256 and `arm64-analysis-v103-schema129`; only explicitly validated legacy cache paths are admitted.
+- Cache envelopes bind source SHA-256 and `arm64-analysis-v104-schema130`; only explicitly validated legacy cache paths are admitted.
 - Staged worker progress remains bounded, monotonic pipeline telemetry and is filtered from ordinary diagnostics.
 - Large-CFG dominators remain per-function/budgeted; Function Intelligence distinguishes internal/external calls; tail-call candidates remain exact-entry candidates.
 - Continuity schema 5 remains bounded to 1 MiB and preserves pins, recent pivots, collections, review baselines/journal, and follow-ups without reclassifying workflow state as evidence.
@@ -46,7 +46,7 @@ These checks complement the project-root/database symlink rejection and the nati
 
 ## Native macOS gates
 
-On the official Apple-Silicon host, `./scripts/test-macos.sh` runs the topology-derived Swift type-checks, portable suite, arm64 Rust bridge/worker build, native bridge contracts, full Debug app build, embedded XPC/worker/VectorEmu checks, arm64-slice checks, and signing verification. `./scripts/test-beta-macos.sh` strengthens this with Release packaging. `./scripts/test-release-macos.sh` is the stable distribution gate and requires Developer ID signing, notarization, stapling, and stable bundle identity.
+On the official Apple-Silicon host, `./scripts/test-macos.sh` runs the topology-derived Swift type-checks, portable suite, arm64 Rust bridge/worker build, native bridge contracts, full Debug app build, a captured Mach-O → SDK declaration → CoordinatorService XPC → reconstruction artifact check, embedded XPC/worker/VectorEmu checks, arm64-slice checks, and signing verification. `./scripts/test-beta-macos.sh` strengthens this with Release packaging. `./scripts/test-release-macos.sh` is the stable distribution gate and requires Developer ID signing, notarization, stapling, and stable bundle identity.
 
 Manual release-host checks remain documented in [`MACOS_VALIDATION.md`](MACOS_VALIDATION.md) and [`RELEASE_READINESS.md`](RELEASE_READINESS.md), including real firmware analysis, Function Neighborhoods responsiveness, filesystem symlink-boundary substitution tests, dynamic debugger/Hypervisor/VectorEmu execution, 8 GiB memory pressure, and multi-size UI qualification.
 

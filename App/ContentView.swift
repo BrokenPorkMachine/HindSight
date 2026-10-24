@@ -1084,12 +1084,16 @@ struct ContentView: View {
                             model.undoDecompilerFunctionOverride(recordID: record.id, address: address)
                         },
                         reconstruction: model.currentReconstruction,
+                        reconstructionSDKCatalog: model.reconstructionSDKCatalog,
                         reconstructionStatus: model.reconstructionStatus,
                         reconstructionBusy: model.busy,
                         onReconstruct: model.reconstructFunction,
                         onReconstructScope: { scope, address in model.reconstructScope(scope, address: address) },
                         onCancelReconstruction: model.cancelReconstruction,
                         onExportReconstruction: { function, source in model.exportReconstruction(function, source: source) },
+                        onExportReconstructionEvidencePackage: { function in model.exportReconstructionEvidencePackage(function) },
+                        onVerifyReconstructionEvidencePackage: model.verifyReconstructionEvidencePackage,
+                        onExportSDKCatalog: model.exportReconstructionSDKCatalog,
                         onExportReconstructionScope: { scope, language, address in
                             model.exportReconstructionScope(scope: scope, language: language, address: address)
                         }

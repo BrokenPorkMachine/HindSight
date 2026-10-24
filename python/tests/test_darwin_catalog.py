@@ -7,6 +7,7 @@ import struct
 import json
 import subprocess
 import io
+import os
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 import tempfile
@@ -28,6 +29,12 @@ SDK = module("darwin_sdk_catalog", "darwin_sdk_catalog.py")
 
 
 class SDKImportSelectionTests(unittest.TestCase):
+    def test_structured_returns_and_unprototyped_or_incomplete_functions_are_not_flattened(self):
+        for spelling in ["int (*(void))(int)", "int ()", "int (int)"]:
+            node = {"name": "sample", "type": {"qualType": spelling}, "inner": []}
+            self.assertIsNone(SDK._declaration(node, False), spelling)
+        self.assertEqual(SDK._declaration({"name": "sample", "type": {"qualType": "int (void)"}}, False), "int sample(void);")
+
     def test_redeclaration_comparison_ignores_only_top_level_restrict(self):
         self.assertEqual(SDK._parameter_abi_key({"qualType": "const void *restrict"}), "const void *")
         self.assertNotEqual(SDK._parameter_abi_key({"qualType": "const void *restrict"}), "void *")
@@ -89,6 +96,28 @@ class DarwinCatalogTests(unittest.TestCase):
         cls.catalog = NATIVE.collect(cls.helper, ["HSNativeCatalogFixture", "HSNativeMissingClass"], ["malloc", "HSNativeMissingSymbol"])
         cls.header = ROOT / "Tests/Fixtures/Decompilation/darwin_catalog_sample.h"
         cls.declarations = SDK.collect_declarations(["HSNativeCatalogCount", "HSNativeCatalogCallback"], cls.header)
+        cls.swift_contract = Path(cls.directory.name) / "native-sdk-declarations-contract"
+        swift_environment = dict(os.environ, CLANG_MODULE_CACHE_PATH=str(Path(cls.directory.name) / "swift-module-cache"))
+        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/DarwinSDKDeclarations.swift"),
+                        str(ROOT / "Tests/darwin_sdk_declarations_contract.swift"), "-o", str(cls.swift_contract)],
+                       env=swift_environment, check=True, capture_output=True, timeout=120)
+
+    def test_native_parser_matches_real_sdk_redeclarations(self):
+        expected = SDK.collect_declarations(["fwrite"])
+        result = subprocess.run(["xcrun", "--sdk", "macosx", "clang", "-target", expected["target"],
+                                 "-isysroot", expected["sdk_path"], "-x", "objective-c", "-std=c17", "-fblocks", "-fno-modules",
+                                 "-fsyntax-only", "-Xclang", "-ast-dump=json", "-Xclang", "-ast-dump-filter", "-Xclang", "fwrite",
+                                 str(SDK.DEFAULT_HEADER)], check=True, capture_output=True, timeout=60)
+        ast = Path(self.directory.name) / "fwrite-ast.json"
+        ast.write_bytes(result.stdout)
+        parsed = subprocess.run([str(self.swift_contract), str(ast), "fwrite"], capture_output=True, timeout=30)
+        self.assertEqual(parsed.returncode, 0, parsed.stderr.decode(errors="replace"))
+        self.assertEqual(parsed.stdout.decode().splitlines()[0], expected["functions"][0]["abi_declaration"])
+
+    def test_native_target_context_matches_captured_macho(self):
+        result = subprocess.run([str(self.swift_contract), "--macho", str(self.helper), "macosx"], capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        self.assertEqual(result.stdout.decode().splitlines()[0], self.catalog["architecture"] + "-apple-macos14.0.0")
 
     def test_loaded_image_identity_and_symbol_ownership(self):
         record = self.catalog["symbols"][0]
@@ -188,6 +217,23 @@ class DarwinCatalogTests(unittest.TestCase):
         names = {item["name"] for item in catalog["import_candidates"]}
         self.assertTrue(all(record["name"] in names and record["captured_provider"] for record in catalog["functions"]))
         self.assertEqual(catalog["source_sha256"], SDK.verify_macho_target(self.helper, "arm64-apple-macos14.0"))
+        batch = Path(self.directory.name) / "automatic-sdk-batch"
+        reconstruction = [sys.executable, str(ROOT / "scripts/reconstruct-binary.py"), str(self.helper), str(batch),
+                          "--worker", str(worker), "--sdk-imports", "--max-functions", "1"]
+        for resume in [False, True]:
+            result = subprocess.run([*reconstruction, *(["--resume"] if resume else [])], capture_output=True, timeout=180)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            manifest = json.loads((batch / "manifest.json").read_bytes())
+            self.assertEqual(manifest["sdk_catalog"]["source_sha256"], catalog["source_sha256"])
+            self.assertRegex(manifest["sdk_catalog_sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(manifest["prototypes_sha256"])
+            self.assertEqual(manifest["attempted"], 1)
+        dumped = Path(self.directory.name) / "automatic-sdk-dump"
+        result = subprocess.run([sys.executable, str(ROOT / "scripts/export-reconstruction-batch.py"), str(batch), str(dumped),
+                                 "--format", "c"], capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        exported = json.loads((dumped / "export-manifest.json").read_bytes())
+        self.assertEqual(exported["sdk_catalog_sha256"], manifest["sdk_catalog_sha256"])
 
     def test_callback_declarators_remain_evidence_without_false_scalar_prototype(self):
         record = self.declarations["functions"][1]

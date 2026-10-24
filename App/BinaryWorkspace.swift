@@ -42,12 +42,16 @@ struct VGBinaryWorkspace: View {
     let onSaveFunctionOverride: (UInt64, String, String, String, VGAnalysisConfidence) -> Void
     let onUndoFunctionOverride: (UInt64) -> Void
     let reconstruction: ReconstructionArtifact?
+    let reconstructionSDKCatalog: DarwinSDKDeclarationCatalogReference?
     let reconstructionStatus: String
     let reconstructionBusy: Bool
     let onReconstruct: (VGFunctionRecord) -> Void
     let onReconstructScope: (String, UInt64?) -> Void
     let onCancelReconstruction: () -> Void
     let onExportReconstruction: (VGFunctionRecord, ReconstructionSource?) -> Void
+    let onExportReconstructionEvidencePackage: (VGFunctionRecord) -> Void
+    let onVerifyReconstructionEvidencePackage: () -> Void
+    let onExportSDKCatalog: () -> Void
     let onExportReconstructionScope: (String, String, UInt64?) -> Void
 
     @State private var functionQuery = ""
@@ -467,10 +471,14 @@ struct VGBinaryWorkspace: View {
                     Button("Function at address…") { onReconstructScope("address", activeAddress) }
                     Button("Resume batch…") { onReconstructScope("resume", activeAddress) }
                 }.disabled(reconstructionBusy)
+                Button("Verify package…", action: onVerifyReconstructionEvidencePackage)
+                    .disabled(reconstructionBusy)
                 if reconstructionBusy { Button("Cancel", action: onCancelReconstruction) }
                 if let function = selectedFunction, matchingReconstruction != nil {
                     Button("Export evidence…") { onExportReconstruction(function, nil) }
+                    Button("Export evidence package…") { onExportReconstructionEvidencePackage(function) }
                     if let source = chosenSource { Button("Export source…") { onExportReconstruction(function, source) } }
+                    if reconstructionSDKCatalog != nil { Button("Export SDK catalog…", action: onExportSDKCatalog) }
                 }
                 Menu("Dump reconstruction…") {
                     ForEach([("Whole binary", "whole"), ("Current section", "section"), ("Jump-to address", "address")], id: \.1) { scope in
@@ -491,6 +499,47 @@ struct VGBinaryWorkspace: View {
             Text(reconstructionStatus).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             if let artifact = matchingReconstruction {
                 Text("\(artifact.eligibility) · source \(artifact.digest.prefix(16)) · \(artifact.pass)").font(.caption.monospaced())
+                if let catalog = reconstructionSDKCatalog {
+                    if catalog.validated(for: artifact.digest) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("SDK declaration evidence · source-bound catalog")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text(catalog.fileName).font(.caption.monospaced()).textSelection(.enabled)
+                            Text("Catalog SHA-256 \(catalog.catalogSHA256)")
+                                .font(.caption.monospaced()).textSelection(.enabled)
+                        }
+                    } else {
+                        Text("SDK declaration catalog does not match this reconstruction source.")
+                            .font(.caption).foregroundStyle(.orange)
+                    }
+                } else {
+                    Text("No SDK declaration catalog was retained for this reconstruction request.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if artifact.callSignatureCandidateCount > 0 {
+                    DisclosureGroup("Call declaration evidence (showing \(artifact.callSignatureCandidates.count) of \(artifact.callSignatureCandidateCount))") {
+                        LazyVStack(alignment: .leading, spacing: 5) {
+                            ForEach(artifact.callSignatureCandidates) { candidate in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 5) {
+                                        Button(String(format: "0x%016llx", candidate.target)) {
+                                            selectAddress(candidate.target)
+                                        }
+                                        .buttonStyle(.link)
+                                        Text(candidate.symbol).font(.caption.monospaced()).textSelection(.enabled)
+                                    }
+                                    Text("\(candidate.language): \(candidate.declaration)")
+                                        .font(.caption.monospaced()).textSelection(.enabled)
+                                    Text("Origin: \(candidate.source)")
+                                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                }
+                                .padding(.vertical, 3)
+                            }
+                        }
+                        Text("A declaration supplies call type evidence; it does not provide or prove the imported function implementation.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
                 let coverage = artifact.semanticCoverage
                 Text("Semantic coverage evidence: \(coverage.modeledTrees)/\(coverage.instructions) modeled trees · \(coverage.sharedIR)/\(coverage.instructions) shared IR · \(coverage.dataInCode) data-in-code · \(coverage.unsupportedReasons) blocker reasons")
                     .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -498,7 +547,7 @@ struct VGBinaryWorkspace: View {
                     .font(.caption).foregroundStyle(coverage.strictMachineStateBlocked ? .orange : .secondary)
                 Picker("Output", selection: $sourceSelection) {
                     Text("Review tree").tag("review")
-                    ForEach(artifact.sources) { source in Text(source.kind == "recovered-source" ? "Recovered scalar source" : source.kind == "recovered-objective-c" ? "Recovered IMP + Objective-C method adapter (.m)" : source.kind == "recovered-header" ? "Recovered header (.h)" : source.kind == "best-effort-source" ? "Best-effort C-like code" : source.kind == "best-effort-header" ? "Review header (ABI unresolved)" : "Machine-state C").tag(source.id) }
+                    ForEach(artifact.sources) { source in Text(source.kind == "recovered-source" ? "Recovered scalar source" : source.kind == "recovered-objective-c" ? "Recovered IMP + Objective-C method adapter (.m)" : source.kind == "recovered-header" ? "Recovered header (.h)" : source.kind == "best-effort-source" ? "Best-effort machine-state C" : source.kind == "best-effort-header" ? "Review header (ABI unresolved)" : "Machine-state C").tag(source.id) }
                 }.pickerStyle(.menu)
                 Text(chosenSource?.status ?? "Review only; not compilable source").font(.caption).foregroundStyle(.orange)
                 if let source = chosenSource { Text(source.contract).font(.caption.monospaced()).textSelection(.enabled) }

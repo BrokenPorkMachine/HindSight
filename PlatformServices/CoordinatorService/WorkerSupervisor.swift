@@ -222,11 +222,36 @@ final class WorkerSupervisor {
             }
         }
     }
-    func reconstruct(path: String, digest: String, size: String, start: UInt64, end: UInt64, id: String,
+    func reconstruct(path: String, digest: String, size: String, start: UInt64, end: UInt64, id: String, prototypes: Data? = nil,
                      completion: @escaping (Result<String, Error>) -> Void) {
+        var prototypePath: String?
+        var prototypeDirectory: URL?
+        if let prototypes {
+            do {
+                guard prototypes.count <= 4 * 1024 * 1024,
+                      String(data: prototypes, encoding: .utf8)?.hasPrefix("# source_sha256=\(digest)\n") == true else {
+                    throw WorkbenchError("Reconstruction prototype catalog is not bound to the captured source.")
+                }
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("hindsight-prototypes-\(UUID().uuidString)")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                        attributes: [.posixPermissions: 0o700])
+                prototypeDirectory = directory
+                let file = directory.appendingPathComponent("prototypes.tsv")
+                guard FileManager.default.createFile(atPath: file.path, contents: prototypes,
+                                                     attributes: [.posixPermissions: 0o600]) else {
+                    throw WorkbenchError("Cannot create request-scoped prototype catalog.")
+                }
+                prototypePath = file.path
+            } catch {
+                if let prototypeDirectory { try? FileManager.default.removeItem(at: prototypeDirectory) }
+                completion(.failure(error))
+                return
+            }
+        }
         run(path: path, arguments: ["--reconstruct", path, digest, size, String(format: "0x%llx", start), String(format: "0x%llx", end), id],
             id: id, operation: "reconstruction", maxFrameBytes: ReconstructionArtifact.maxBytes,
-            deadlineSeconds: 120, admissionBytes: 256 * 1_048_576) { result in
+            deadlineSeconds: 120, admissionBytes: 256 * 1_048_576, prototypeDBPath: prototypePath) { result in
+            if let prototypeDirectory { try? FileManager.default.removeItem(at: prototypeDirectory) }
             completion(result.flatMap { data in Result {
                 guard let json = String(data: data, encoding: .utf8) else { throw WorkbenchError("Reconstruction is not UTF-8.") }
                 _ = try ReconstructionArtifact.decode(json, digest: digest, start: start, end: end)
@@ -274,10 +299,12 @@ final class WorkerSupervisor {
                      bypassQueue: Bool = false,
                      admissionAttempt: Int = 0,
                      submittedDate: Date? = nil,
+                     prototypeDBPath: String? = nil,
                      evidenceSink: ((WorkerEvidenceBundle?) -> Void)? = nil,
                      completion: @escaping (Result<Data, Error>) -> Void) {
         guard UUID(uuidString: id) != nil, path.utf8.count <= 16384, path.hasPrefix("/"), !path.contains("\0"),
-              maxFrameBytes > 0, maxFrameBytes <= WorkbenchProtocolLimits.analysisWorkerFrameBytes else {
+              maxFrameBytes > 0, maxFrameBytes <= WorkbenchProtocolLimits.analysisWorkerFrameBytes,
+              prototypeDBPath.map({ $0.hasPrefix("/") && $0.utf8.count <= 16_384 }) ?? true else {
             completion(.failure(WorkbenchError("Invalid inspection request."))); return
         }
         guard let governor else {
@@ -297,6 +324,7 @@ final class WorkerSupervisor {
                           maxFrameBytes: maxFrameBytes, deadlineSeconds: deadlineSeconds,
                           admissionBytes: admissionBytes, bypassQueue: true, admissionAttempt: attempts,
                           submittedDate: submittedDate,
+                          prototypeDBPath: prototypeDBPath,
                           evidenceSink: evidenceSink, completion: completion)
             }, cancel: { completion(.failure(WorkbenchError("Queued worker request cancelled."))) })
             if !enqueued { completion(.failure(WorkbenchError("Worker task queue is full (\(self.queuedTasks.count)/\(self.maxQueuedTasks)). Retry after active work completes."))) }
@@ -313,7 +341,8 @@ final class WorkerSupervisor {
             retryAdmission(path: path, arguments: arguments, id: id, operation: operation,
                            maxFrameBytes: maxFrameBytes, deadlineSeconds: deadlineSeconds,
                            admissionBytes: admissionBytes, attempt: admissionAttempt,
-                           submittedDate: submittedDate, evidenceSink: evidenceSink, completion: completion,
+                           submittedDate: submittedDate, prototypeDBPath: prototypeDBPath,
+                           evidenceSink: evidenceSink, completion: completion,
                            error: WorkbenchError("Analysis deferred: memory or thermal pressure is elevated (\(resource.description)). Close other heavy workloads or retry later."))
             return
         }
@@ -323,7 +352,8 @@ final class WorkerSupervisor {
                 retryAdmission(path: path, arguments: arguments, id: id, operation: operation,
                                maxFrameBytes: maxFrameBytes, deadlineSeconds: deadlineSeconds,
                                admissionBytes: admissionBytes, attempt: admissionAttempt,
-                               submittedDate: submittedDate, evidenceSink: evidenceSink, completion: completion,
+                               submittedDate: submittedDate, prototypeDBPath: prototypeDBPath,
+                               evidenceSink: evidenceSink, completion: completion,
                                error: WorkbenchError("Worker resource budget is busy; retry after active work completes."))
                 return
             }
@@ -337,7 +367,8 @@ final class WorkerSupervisor {
                 retryAdmission(path: path, arguments: arguments, id: id, operation: operation,
                                maxFrameBytes: maxFrameBytes, deadlineSeconds: deadlineSeconds,
                                admissionBytes: admissionBytes, attempt: admissionAttempt,
-                               submittedDate: submittedDate, evidenceSink: evidenceSink, completion: completion,
+                               submittedDate: submittedDate, prototypeDBPath: prototypeDBPath,
+                               evidenceSink: evidenceSink, completion: completion,
                                error: error)
             } else { completion(.failure(error)) }
             return
@@ -349,7 +380,8 @@ final class WorkerSupervisor {
             retryAdmission(path: path, arguments: arguments, id: id, operation: operation,
                            maxFrameBytes: maxFrameBytes, deadlineSeconds: deadlineSeconds,
                            admissionBytes: admissionBytes, attempt: admissionAttempt,
-                           submittedDate: submittedDate, evidenceSink: evidenceSink, completion: completion,
+                           submittedDate: submittedDate, prototypeDBPath: prototypeDBPath,
+                           evidenceSink: evidenceSink, completion: completion,
                            error: WorkbenchError("Worker reservation denied."))
             return
         }
@@ -362,7 +394,9 @@ final class WorkerSupervisor {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = output
         process.standardError = diagnostics
-        process.environment = ["LANG": "en_US.UTF-8"]
+        var environment = ["LANG": "en_US.UTF-8"]
+        if let prototypeDBPath { environment["HINDSIGHT_PROTOTYPE_DB"] = prototypeDBPath }
+        process.environment = environment
 
         let active = Job(id: id, operation: operation, process: process, lease: lease, globalLockFD: globalLockFD, resourceAdmission: resourceAdmission, startedAt: submittedDate ?? Date(), completion: completion)
         let lifecycle = DispatchGroup()
@@ -591,7 +625,8 @@ final class WorkerSupervisor {
 
     private func retryAdmission(path: String, arguments: [String], id: String, operation: String,
                                 maxFrameBytes: Int, deadlineSeconds: TimeInterval, admissionBytes: UInt64,
-                                attempt: Int, submittedDate: Date?, evidenceSink: ((WorkerEvidenceBundle?) -> Void)?,
+                                attempt: Int, submittedDate: Date?, prototypeDBPath: String?,
+                                evidenceSink: ((WorkerEvidenceBundle?) -> Void)?,
                                 completion: @escaping (Result<Data, Error>) -> Void, error: Error) {
         guard attempt < 20 else { completion(.failure(error)); return }
         let priority = Self.priority(for: operation)
@@ -603,6 +638,7 @@ final class WorkerSupervisor {
                       maxFrameBytes: maxFrameBytes, deadlineSeconds: deadlineSeconds,
                       admissionBytes: admissionBytes, bypassQueue: true,
                       admissionAttempt: attempt, submittedDate: submittedDate ?? date,
+                      prototypeDBPath: prototypeDBPath,
                       evidenceSink: evidenceSink, completion: completion)
         }, cancel: { completion(.failure(WorkbenchError("Queued worker request cancelled."))) })
         guard accepted else { completion(.failure(WorkbenchError("Worker task queue is full while waiting for resources."))); return }

@@ -116,7 +116,13 @@ pub fn source_candidates(start:u64,names:&[&str],objc_records:&str,external:&BTr
     candidates.dedup_by(|a,b|{
         let same=a.0==b.0&&a.1.language==b.1.language&&a.1.declaration==b.1.declaration;
         if same&&a.1.source!=b.1.source{
-            b.1.source="exact SDK ABI catalog corroborated by hash-bound analyst C prototype catalog";
+            let sdk="hash-bound Apple SDK declaration catalog";
+            let analyst="hash-bound analyst C prototype catalog";
+            b.1.source=if (a.1.source==sdk&&b.1.source==analyst)||(b.1.source==sdk&&a.1.source==analyst){
+                "hash-bound Apple SDK declaration catalog corroborated by hash-bound analyst C prototype catalog"
+            }else if a.1.source==sdk||b.1.source==sdk{
+                "hash-bound Apple SDK declaration catalog corroborated by another exact declaration source"
+            }else{"exact SDK ABI catalog corroborated by hash-bound analyst C prototype catalog"};
         }
         same
     });candidates
@@ -134,12 +140,22 @@ fn objc_signature_candidates(records:&str)->Vec<(u64,(String,Signature))>{
 
 fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTreeMap<String,Signature>, &'static str> {
     if contents.len()>4*1024*1024||contents.lines().count()>20_000{return Err("External prototype catalog exceeds byte/record budget")}
-    let mut bound=false;let mut result=BTreeMap::new();
+    let mut bound=false;let mut saw_declaration=false;let mut metadata=BTreeMap::<&str,&str>::new();let mut result=BTreeMap::new();
     for line in contents.lines() {
-        if let Some(expected)=line.strip_prefix("# source_sha256="){if expected.len()!=64||!expected.bytes().all(|byte|byte.is_ascii_hexdigit())||!expected.eq_ignore_ascii_case(source_sha256){return Err("External prototype catalog source SHA-256 mismatch")}bound=true;continue}
+        if let Some(expected)=line.strip_prefix("# source_sha256="){
+            if saw_declaration||bound||expected.len()!=64||!expected.bytes().all(|byte|byte.is_ascii_hexdigit())||!expected.eq_ignore_ascii_case(source_sha256){return Err("External prototype catalog source SHA-256 mismatch")}
+            bound=true;continue
+        }
+        if let Some((key,value))=line.strip_prefix("# ").and_then(|value|value.split_once('=')) {
+            if matches!(key,"producer"|"target"|"sdk"|"sdk_build"|"compiler"|"header_sha256") {
+                if saw_declaration||value.is_empty()||value.len()>4096||metadata.insert(key,value).is_some(){return Err("External prototype catalog metadata is invalid, misplaced or duplicated")}
+            }
+            continue
+        }
         let line=line.trim();if line.is_empty()||line.starts_with('#'){continue}
         if line.len()>2048{return Err("External prototype catalog record exceeds length budget")}
         let Some((symbol,declaration))=line.split_once('\t')else{return Err("External prototype records require a tab between symbol and declaration")};
+        saw_declaration=true;
         let symbol=symbol.trim();let declaration=declaration.trim();
         if !clean(symbol)||!declaration.ends_with(';')||declaration.len()>1024||declaration.chars().any(|ch|ch.is_control()||matches!(ch,'\\'|'{'|'}'|'#'|'='|'"')){return Err("External prototype catalog contains an unsafe declaration")}
         let Some((head,arguments))=declaration[..declaration.len()-1].split_once('(')else{return Err("External prototype declaration is malformed")};
@@ -147,9 +163,26 @@ fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTree
         let declared=head.split_whitespace().last().map(|name|name.trim_start_matches('*')).unwrap_or("");
         if declared.is_empty()||!declared.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_')||symbol.trim_start_matches('_')!=declared{return Err("External prototype symbol and declaration name differ")}
         if result.get(symbol).is_some_and(|old:&Signature|old.declaration!=declaration){return Err("External prototype catalog contains conflicting declarations for one symbol")}
-        result.insert(symbol.to_owned(),Signature{language:"C",declaration:declaration.to_owned(),source:"hash-bound analyst C prototype catalog"});
+        let source=if metadata.get("producer")==Some(&"hindsight-apple-clang-declarations-v1") {
+            "hash-bound Apple SDK declaration catalog"
+        }else{"hash-bound analyst C prototype catalog"};
+        result.insert(symbol.to_owned(),Signature{language:"C",declaration:declaration.to_owned(),source});
     }
-    if !bound{return Err("External prototype catalog requires source_sha256 binding")}Ok(result)
+    if !bound{return Err("External prototype catalog requires source_sha256 binding")}
+    if metadata.get("producer")==Some(&"hindsight-apple-clang-declarations-v1") {
+        let target=metadata.get("target").copied().unwrap_or("");
+        let sdk=metadata.get("sdk").copied().unwrap_or("");
+        let sdk_build=metadata.get("sdk_build").copied().unwrap_or("");
+        let compiler=metadata.get("compiler").copied().unwrap_or("");
+        let header=metadata.get("header_sha256").copied().unwrap_or("");
+        let token=|value:&str|!value.is_empty()&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'.'|b'_'|b'-'));
+        if !token(target)||!sdk.starts_with('/')||sdk.len()>4096||sdk.bytes().any(|byte|byte.is_ascii_control())
+            ||!token(sdk_build)||compiler.is_empty()||compiler.len()>512||compiler.bytes().any(|byte|!byte.is_ascii_graphic()&&byte!=b' ')
+            ||header.len()!=64||!header.bytes().all(|byte|byte.is_ascii_hexdigit()) {
+            return Err("Apple SDK prototype catalog lacks valid target/toolchain provenance")
+        }
+    }
+    Ok(result)
 }
 
 pub fn external_prototype_database(source_sha256:&str)->io::Result<BTreeMap<String,Signature>>{

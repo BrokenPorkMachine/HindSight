@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Export independent worker reconstructions and a binary/range coverage manifest."""
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -50,13 +51,40 @@ def request(worker, binary, digest, size, command, arguments, prototypes):
 
 
 def run(args):
+    if not getattr(args, "sdk_imports", False):
+        return run_batch(args)
+    if args.prototypes:
+        raise ValueError("--sdk-imports cannot be combined with --prototypes")
+    if args.output.is_symlink() or (not args.resume and args.output.exists()):
+        raise ValueError("choose a new regular output directory; existing output is preserved")
+    from darwin_sdk_catalog import collect_import_declarations, worker_prototypes
+    binary, worker = args.binary.resolve(), args.worker.resolve()
+    if args.binary.is_symlink() or not binary.is_file():
+        raise ValueError("input must be a regular non-symlink file")
+    digest = file_hash(binary)
+    report = request(worker, binary, digest, binary.stat().st_size, "--analyze", [], None)
+    catalog = collect_import_declarations(binary, report, sdk=args.sdk, target=args.sdk_target)
+    eligible = [record for record in catalog["functions"] if record["worker_eligible"] and record["abi_declaration"]]
+    # Missing or structured declarations stay in the evidence catalog. Only
+    # eligible declarations enter the worker's bounded scalar TSV interface.
+    with tempfile.TemporaryDirectory(prefix="hindsight-sdk-prototypes-") as temporary:
+        prepared = copy.copy(args)
+        prepared.prototypes = None
+        if eligible:
+            prepared.prototypes = Path(temporary) / "prototypes.tsv"
+            prepared.prototypes.write_text(worker_prototypes({**catalog, "functions": eligible, "missing_functions": []}, digest))
+        return run_batch(prepared, report=report, sdk_catalog=catalog)
+
+
+def run_batch(args, report=None, sdk_catalog=None):
     binary, worker = args.binary.resolve(), args.worker.resolve()
     if not binary.is_file() or args.binary.is_symlink():
         raise ValueError("input must be a regular non-symlink file")
     with binary.open("rb") as captured:
         digest = hashlib.file_digest(captured, "sha256").hexdigest()
     size = binary.stat().st_size
-    report = request(worker, binary, digest, size, "--analyze", [], args.prototypes)
+    if report is None:
+        report = request(worker, binary, digest, size, "--analyze", [], args.prototypes)
     if report.get("source_sha256") != digest or not isinstance(report.get("functions"), str):
         raise ValueError("analysis does not match captured source")
     all_functions = []
@@ -82,6 +110,13 @@ def run(args):
                 "include_callees": args.include_callees,
                 "closure_function_limit": args.max_functions if args.include_callees else None,
                 "scope": {"start": args.start, "end": args.end}}
+    if sdk_catalog is not None:
+        if sdk_catalog.get("source_sha256") != digest:
+            raise ValueError("SDK declarations do not match captured source")
+        catalog_bytes = json.dumps(sdk_catalog, sort_keys=True, separators=(",", ":")).encode()
+        if len(catalog_bytes) > 4 * 1024 * 1024:
+            raise ValueError("SDK evidence catalog exceeds byte budget")
+        identity["sdk_catalog_sha256"] = hashlib.sha256(catalog_bytes).hexdigest()
     if args.output.is_symlink():
         raise ValueError("output directory must not be a symlink")
     if not args.resume:
@@ -92,7 +127,8 @@ def run(args):
         if checkpoint.is_symlink() or not checkpoint.is_file() or checkpoint.stat().st_size > 16 * 1024 * 1024:
             raise ValueError("missing or unsafe resume checkpoint")
         retained = json.loads(read_bounded(checkpoint, 16 * 1024 * 1024))
-        if retained.get("schema") != 1 or any(retained.get(key) != value for key, value in identity.items()):
+        if (retained.get("schema") != 1 or any(retained.get(key) != value for key, value in identity.items())
+                or retained.get("sdk_catalog_sha256") != identity.get("sdk_catalog_sha256")):
             raise ValueError("resume source, worker, prototype catalog or scope identity mismatch")
         if args.include_callees:
             scheduled = [tuple(value) for value in retained["scheduled"]]
@@ -116,7 +152,7 @@ def run(args):
             raise ValueError("resume outputs exceed requested byte budget")
 
     def state():
-        return {"schema": 1, **identity, "discovered_in_scope": len(functions),
+        return {"schema": 1, **identity, **({"sdk_catalog": sdk_catalog} if sdk_catalog is not None else {}), "discovered_in_scope": len(functions),
                 "recovered_functions": sum(entry["state"] == "recovered" for entry in entries),
                 "review_only_functions": sum(entry["state"] == "review-only" for entry in entries),
                 "failed_functions": sum(entry["state"] == "failed" for entry in entries),
@@ -231,6 +267,9 @@ if __name__ == "__main__":
     parser.add_argument("--include-callees", action="store_true",
                         help="include direct callees discovered elsewhere in the captured image")
     parser.add_argument("--prototypes", type=lambda value: Path(value).resolve())
+    parser.add_argument("--sdk-imports", action="store_true", help="collect applicable public SDK import declarations and retain lookup evidence")
+    parser.add_argument("--sdk", choices=["macosx", "iphoneos", "iphonesimulator"], default="macosx")
+    parser.add_argument("--sdk-target", default="arm64-apple-macos14.0")
     parser.add_argument("--start", type=lambda value: int(value, 0))
     parser.add_argument("--end", type=lambda value: int(value, 0))
     parser.add_argument("--max-functions", type=int, default=4096)

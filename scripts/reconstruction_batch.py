@@ -1,21 +1,90 @@
 """Bounded reconstruction-batch evidence and export validation."""
 import hashlib
 import json
+import os
 import re
+import stat
+import unicodedata
 
 from reconstruction_artifact import ReconstructionArtifact
 
 
 def read_bounded(path, limit):
-    with path.open("rb") as source:
-        raw = source.read(limit + 1)
-    if len(raw) > limit:
-        raise ValueError("batch input exceeds byte budget")
-    return raw
+    if type(limit) is not int or limit < 0:
+        raise ValueError("invalid batch input byte limit")
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("platform lacks safe no-follow batch input support")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    directory_fd = os.open(path.parent, directory_flags)
+    try:
+        directory_info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_info.st_mode):
+            raise ValueError("batch input parent is not a directory")
+        descriptor = os.open(path.name, file_flags, dir_fd=directory_fd)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_size < 0 or before.st_size > limit:
+                raise ValueError("batch input is not a bounded regular file")
+            remaining = before.st_size
+            chunks = []
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise ValueError("batch input ended during reading")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) !=
+                    (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)):
+                raise ValueError("batch input changed during reading")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_fd)
 
 
 def verified_outputs(directory, manifest):
     """Bind every exported byte to validated function/source evidence first."""
+    sdk_catalog = manifest.get("sdk_catalog")
+    if "sdk_catalog_sha256" in manifest or "sdk_catalog" in manifest:
+        catalog = sdk_catalog
+        if not isinstance(catalog, dict) or catalog.get("source_sha256") != manifest.get("source_sha256"):
+            raise ValueError("SDK catalog source binding differs from batch")
+        if catalog.get("producer") == "hindsight-apple-clang-declarations-v1":
+            candidates = catalog.get("import_candidates")
+            functions = catalog.get("functions")
+            missing = catalog.get("missing_functions")
+            if (type(catalog.get("schema")) is not int or catalog["schema"] != 1
+                    or not re.fullmatch(r"[0-9a-f]{64}", str(catalog.get("header_sha256", "")))
+                    or not isinstance(candidates, list) or not 1 <= len(candidates) <= 128
+                    or not isinstance(functions, list) or len(functions) > 128
+                    or not isinstance(missing, list) or len(missing) > 128):
+                raise ValueError("SDK catalog schema or declaration bounds are invalid")
+            candidate_symbols = {}
+            for candidate in candidates:
+                if (not isinstance(candidate, dict) or not all(isinstance(candidate.get(key), str) and candidate[key]
+                        for key in ("name", "symbol", "provider")) or candidate["name"] in candidate_symbols):
+                    raise ValueError("SDK catalog import candidates are invalid")
+                candidate_symbols[candidate["name"]] = candidate["symbol"]
+            function_symbols = {}
+            for function in functions:
+                if (not isinstance(function, dict) or not isinstance(function.get("name"), str)
+                        or not function["name"] or not isinstance(function.get("symbol"), str)
+                        or function["name"] in function_symbols or type(function.get("worker_eligible")) is not bool
+                        or (function.get("abi_declaration") is not None
+                            and not isinstance(function.get("abi_declaration"), str))):
+                    raise ValueError("SDK catalog function declarations are invalid")
+                function_symbols[function["name"]] = function.get("symbol")
+            if (any(not isinstance(name, str) for name in missing) or len(set(missing)) != len(missing)
+                    or set(function_symbols) & set(missing)
+                    or set(candidate_symbols) != set(function_symbols) | set(missing)
+                    or any(candidate_symbols[name] != symbol for name, symbol in function_symbols.items())):
+                raise ValueError("SDK catalog declarations do not match their import candidates")
+        raw = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()
+        if len(raw) > 4 * 1024 * 1024 or hashlib.sha256(raw).hexdigest() != manifest.get("sdk_catalog_sha256"):
+            raise ValueError("SDK evidence catalog hash or budget mismatch")
     seen = set()
     starts = set()
     total = 0
@@ -63,6 +132,48 @@ def verified_outputs(directory, manifest):
                 int(artifact["function"]["start"], 16) != start or
                 int(artifact["function"]["end"], 16) != int(entry["end"], 16)):
             raise ValueError("function reconstruction identity mismatch")
+        settings_payloads = [node["payload"]["analysis_settings"]
+                             for node in artifact.get("nodes", [])
+                             if isinstance(node, dict) and isinstance(node.get("payload"), dict)
+                             and isinstance(node["payload"].get("analysis_settings"), dict)]
+        call_candidates = []
+        for settings in settings_payloads:
+            raw_candidates = settings.get("call_signature_candidates", [])
+            if (not isinstance(raw_candidates, list) or len(raw_candidates) > 100_000
+                    or len(call_candidates) > 100_000 - len(raw_candidates)):
+                raise ValueError("invalid call signature candidate collection")
+            call_candidates.extend(raw_candidates)
+        for candidate in call_candidates:
+            if (not isinstance(candidate, dict)
+                    or set(candidate) != {"target", "symbol", "language", "declaration", "source"}
+                    or not isinstance(candidate.get("target"), str)
+                    or not re.fullmatch(r"0x[0-9a-fA-F]{1,16}", candidate["target"])
+                    or not isinstance(candidate.get("symbol"), str) or not candidate["symbol"]
+                    or len(candidate["symbol"].encode()) > 1024
+                    or any(unicodedata.category(char) == "Cc" for char in candidate["symbol"])
+                    or not isinstance(candidate.get("language"), str) or not candidate["language"]
+                    or len(candidate["language"].encode()) > 64
+                    or not isinstance(candidate.get("declaration"), str) or not candidate["declaration"]
+                    or len(candidate["declaration"].encode()) > 2048
+                    or any(unicodedata.category(char) == "Cc" for char in candidate["declaration"])
+                    or not isinstance(candidate.get("source"), str) or not candidate["source"]
+                    or len(candidate["source"].encode()) > 512
+                    or any(unicodedata.category(char) == "Cc" for char in candidate["source"])):
+                raise ValueError("invalid call signature candidate")
+            source = candidate["source"]
+            if "hash-bound Apple SDK declaration catalog" not in source:
+                continue
+            if not isinstance(sdk_catalog, dict):
+                raise ValueError("SDK-derived call declaration lacks its retained catalog")
+            symbol, declaration = candidate.get("symbol"), candidate.get("declaration")
+            functions = sdk_catalog.get("functions")
+            if (not isinstance(symbol, str) or not isinstance(declaration, str)
+                    or not isinstance(functions, list) or len(functions) > 128
+                    or not any(isinstance(function, dict) and function.get("worker_eligible") is True
+                               and function.get("symbol") == symbol
+                               and function.get("abi_declaration") == declaration
+                               for function in functions)):
+                raise ValueError("SDK catalog does not support an attributed call declaration")
         expected = {artifact_name: files[artifact_name]}
         kinds = {"recovered-source": ".c", "recovered-objective-c": ".m", "best-effort-source": ".c", "recovered-header": ".h", "best-effort-header": ".h", "machine-state-c": ".machine.c"}
         has_recovered_source = False

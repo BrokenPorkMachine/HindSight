@@ -148,13 +148,22 @@ def _parameter_abi_key(types):
 
 def _declaration(node, canonical):
     function_type = node["type"]["qualType"]
-    if "(" not in function_type or "__attribute__" in function_type:
+    if function_type.count("(") != 1 or function_type.count(")") != 1 or not function_type.endswith(")") or "__attribute__" in function_type:
         return None
     return_type = function_type.split("(", 1)[0].strip()
     if any(character in return_type for character in ";{}[]\n\r\t"):
         return None
     parameters = []
-    for index, parameter in enumerate(child for child in node.get("inner", []) if child.get("kind") == "ParmVarDecl"):
+    parameter_nodes = [child for child in node.get("inner", []) if child.get("kind") == "ParmVarDecl"]
+    argument_text = function_type.split("(", 1)[1][:-1].strip()
+    if not argument_text:
+        return None  # A C no-prototype type does not prove a (void) signature.
+    argument_types = [value.strip() for value in argument_text.split(",")]
+    variadic = bool(node.get("variadic"))
+    fixed_count = 0 if argument_text == "void" else len(argument_types) - int(variadic)
+    if fixed_count != len(parameter_nodes) or variadic != (argument_types[-1] == "..."):
+        return None
+    for index, parameter in enumerate(parameter_nodes):
         rendered = _parameter(parameter, index, canonical)
         if rendered is None:
             return None
@@ -230,10 +239,27 @@ def collect_declarations(functions, header=DEFAULT_HEADER, sdk="macosx", target=
 def worker_prototypes(catalog, source_sha256):
     if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
         raise ValueError("invalid source SHA-256")
+    if catalog.get("producer") != "hindsight-apple-clang-declarations-v1":
+        raise ValueError("worker prototypes require an Apple Clang SDK declaration catalog")
+    target = catalog.get("target")
+    sdk_path = catalog.get("sdk_path")
+    sdk_build = catalog.get("sdk_build", "unrecorded")
+    compiler = catalog.get("compiler")
+    header_sha256 = catalog.get("header_sha256")
+    if (not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", target)
+            or not isinstance(sdk_path, str) or not sdk_path.startswith("/") or len(sdk_path) > 4096
+            or any(ord(char) < 32 for char in sdk_path)
+            or not isinstance(sdk_build, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", sdk_build)
+            or not isinstance(compiler, str) or not compiler or len(compiler) > 512
+            or any(ord(char) < 32 and char != " " for char in compiler)
+            or not isinstance(header_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", header_sha256)):
+        raise ValueError("SDK catalog lacks valid target, SDK, compiler or header provenance")
     if catalog.get("missing_functions"):
         raise ValueError("cannot publish incomplete requested prototype set")
     lines = [f"# source_sha256={source_sha256}", f"# producer={catalog['producer']}",
              f"# target={catalog['target']}", f"# compiler={catalog['compiler']}", f"# sdk={catalog['sdk_path']}",
+             f"# sdk_build={catalog.get('sdk_build', 'unrecorded')}",
+             f"# header_sha256={catalog['header_sha256']}",
              "# Scope: SDK declarations; runtime provider identity must be qualified separately."]
     for record in catalog["functions"]:
         declaration = record["abi_declaration"]

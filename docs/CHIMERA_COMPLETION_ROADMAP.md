@@ -4,7 +4,146 @@ This is the implementation order for the remaining work in [ROADMAP.md](ROADMAP.
 
 Inputs: the two existing roadmaps, the independent [reconstruction-first draft](RECONSTRUCTION_FIRST_ROADMAP.md), the [Apple Silicon application specification](Apple_Silicon_Reverse_Engineering_App_Spec_v1.md), and the current implementation. No separate replacement roadmap from the other model was available when this synthesis was written. The user directed work to proceed with these inputs.
 
-## Current actionable queue (2026-10-22)
+## Current actionable queue (2026-10-23)
+
+Published baseline: [v0.5.13-rc.1](https://github.com/BrokenPorkMachine/HindSight/releases/tag/v0.5.13-rc.1),
+commit `4da4600`, reconstruction pass 62. The changes below marked unreleased
+are development work and are not present in that published package.
+
+Unreleased pass 63: best-effort fallback code now uses the bounded machine-state
+C runtime instead of undefined symbolic registers/intrinsics. Supported
+instructions are retained; status 4 stops before unqualified effects and outside
+the captured prefix. This remains a repair-oriented fragment, not an original
+ABI, complete function or equivalence claim. Source/cache identities advance to
+`arm64-analysis-v104-schema130` and `prototype-abi-v20`. Initial worker/Clippy and
+opaque-operation stop/budget tests pass. Every fallback in the 16-fixture worker
+gate syntax-checks with C17 and warnings-as-errors; opaque execution preserves
+registers/flags before the unresolved operation and honors the step budget.
+Both app typechecks and portable validation (237 Python tests, six optional
+skips) pass. The published release remains unchanged.
+Additional pass-63 runtime checks at `-O0`/`-O2` with UBSan verify supported
+register updates and flat-memory writes before an unresolved operation, preserved
+later registers and flags, guarded memory-fault exits, and stopping exactly at
+the 128-instruction captured-prefix boundary. A lower step budget stops earlier
+without executing the next instruction. The 16-fixture gate passes; none of
+these fragment checks upgrades full-function recovery or equivalence eligibility.
+
+Unreleased automatic SDK CLI integration: `reconstruct-binary.py --sdk-imports`
+reuses worker discovery, collects applicable public import declarations, supplies
+supported prototypes to reconstruction, and retains the complete missing/unsupported
+lookup evidence with a source-bound catalog hash. SDK build identity enters the
+prototype hash; resume rejects changed evidence or removed lookup intent. Dumps
+retain the catalog identity and reject tampered catalog evidence before creating
+output. The actual Mach-O → SDK → reconstruction → resume → dump path passes,
+alongside focused identity/tamper tests. The later app integration below adds
+automatic request-time lookup and project catalog persistence.
+Native app groundwork now includes a Foundation-only public-import selector in
+CoordinatorService's generated target. It preserves provider conflicts, excludes
+private/special/nonzero-addend candidates, and rejects byte/symbol/name budget
+overruns without truncation. Its standalone executable contract and both full
+coordinator typechecks pass (21 topology sources). Native collection and request
+binding are described below.
+The native declaration parser now handles bounded, concatenated Clang AST JSON,
+retains source/canonical spellings, and rejects conflicting redeclarations while
+ignoring only top-level parameter `restrict`. Real `fwrite` SDK redeclarations
+produce the same ABI declaration as the Python collector. Both collectors now
+withhold function-pointer returns, C no-prototype signatures and incomplete
+parameter lists rather than flattening them. Native framing/size/depth/conflict
+contracts, 16 catalog tests and both coordinator typechecks pass. Compiler-process
+supervision and source/SDK-bound app request integration followed this parser work.
+Native SDK target context now derives architecture/subtype, explicit platform and
+minimum OS version from bounded thin Mach-O load commands, without host-platform
+fallback. It supports the current macOS/iOS/simulator declaration scope and
+rejects conflicting/missing evidence, unknown AArch64 subtypes, malformed build
+records and ambiguous legacy iOS commands. Legacy macOS minimum-version records
+remain supported. Real captured-header and synthetic target tests pass alongside
+the 17 catalog tests and both coordinator typechecks.
+The native target reader now opens a regular captured file without following its
+final symlink, streams a whole-file SHA-256 check against the project identity,
+and compares file/path metadata before using bounded Mach-O header bytes. Its
+contract rejects changed content, wrong size/hash and symlink substitution;
+both coordinator architecture typechecks pass.
+Native Apple Clang collection is now available as a bounded one-declaration
+operation. It resolves the installed SDK/compiler, records SDK build, compiler
+and header identities, enforces process deadlines and output budgets, and
+rechecks the header after parsing. The real SDK fixture produces the same
+`HSNativeCatalogCount` ABI declaration as the Python collector; both coordinator
+architecture typechecks and the standalone contract pass.
+Coordinator reconstruction now consults a current analysis cache for public
+import candidates, verifies the captured source, collects supported native SDK
+declarations on a utility queue and passes a source-bound, request-scoped TSV to
+the worker. The temporary catalog is removed at request completion/cancellation;
+missing SDK/compiler evidence is reported and reconstruction continues. The SDK
+header is bundled with CoordinatorService. Both coordinator typechecks and a
+full arm64 app build pass. The real app/XPC gate now captures a chained-fixup
+Mach-O with a public `fwrite` import, analyzes it, and confirms the SDK ABI
+declaration reaches the worker's reconstruction artifact; a no-catalog worker
+control has no call-signature candidate. The gate runs before signing verification
+in `test-macos.sh`. Coordinator tracks request-scoped cancellation through capture
+hashing and Clang subprocesses. The XPC gate cancels during lookup, verifies no
+worker artifact is published and cancelled status is retained, then succeeds on
+a fresh request. SDK-backed source-header qualification remains a separate
+evidence gate. The app now stores the complete
+SDK lookup catalog as canonical JSON in `analysis-cache/`, with filenames bound
+to both the captured source digest and catalog digest. Missing and unsupported
+declarations remain in the stored catalog. Persistence is verified before any
+prototype is supplied to reconstruction; a failed publication withholds those
+prototypes. The content-addressed store reuses matching catalog bytes and
+refuses to overwrite changed evidence at an existing hash path. The
+reconstruction status names the retained catalog file and hash,
+and project analysis-cache clearing removes it. Each SDK lookup request now
+resolves SDK path/build, compiler and bundled-header identity once, then reuses
+that environment for all imported symbols while checking the header around each
+parse. Coordinator also keeps up to four source/candidate-bound lookup results
+in process memory; a later function request reuses them only after hashing the
+capture and matching the complete SDK/compiler/header/target identity. Project
+Project switch, analysis-cache clearing, and coordinator disconnect clear the
+in-process cache; successful cache clearing also drops the app's displayed
+reconstruction artifact and catalog. Binary Workspace now offers
+“Export SDK catalog” for the current function; it verifies the cache file hash
+and source identity before writing the JSON catalog. Batch checkpoints now
+retain deduplicated catalog sidecars under `sdk-catalogs/`, count catalog bytes
+against the 256 MiB cap, and validate canonical bytes plus source/catalog hashes
+on resume. Per-format and all-format dumps include catalog sidecars and hash
+entries in each format manifest; the aggregate manifest reports the sidecar set
+per format folder. Real app/XPC qualification of catalog-bearing batch resume
+and dump behavior remains open. App export prompts and completion status now
+identify whether SDK sidecars were included and report their count. Each
+function attempt and exported function entry now names its catalog hash, and
+checkpoint validation rejects dangling catalog references and SDK-derived
+artifact candidates without a per-function catalog association, and rejects
+unreferenced catalog sidecars. It also matches each SDK-attributed candidate's
+symbol and ABI declaration against the associated catalog entry. Binary Workspace
+also exports one function as a new evidence package containing its artifact,
+generated source representations, optional SDK catalog, and file hash manifest.
+The app can re-open such a package and validate its file hashes, artifact bounds,
+generated source bytes, and optional canonical SDK catalog. App catalog reads
+now open the file without following symlinks, bound the opened regular file to
+4 MiB, and verify descriptor identity plus modification/change metadata across
+the read.
+Evidence package creation enforces the same per-candidate SDK symbol and ABI
+declaration match as package verification.
+The shared checkpoint, retained artifact, and dump readers pin the checked
+parent directory and open each batch input relative to that descriptor, with
+no-follow and bounded-read checks.
+Worker signature evidence now distinguishes the source-bound Apple Clang SDK
+catalog from analyst prototypes, validating the catalog preamble before
+applying that origin label. The Python and app prototype producers both include
+the required header hash. Binary Workspace displays the catalog filename and
+hash beside the function artifact and exposes up to 128 call declaration
+candidates with navigable targets, declaration and source labels, reporting how
+many were shown out of the total. The UI states that these declarations do not
+supply imported implementations. The decoder validates the full bounded
+candidate list and cross-checks every SDK-attributed candidate against its
+catalog across all metadata settings nodes, while limiting display to 128. App replies and evidence packages must include
+the matching source-bound catalog whenever a call candidate carries Apple SDK
+catalog provenance. Python validates the same metadata before emitting SDK
+worker prototypes and checks batch artifact candidates against the retained
+catalog before resume or dump. Its batch reader pins the parent directory and
+uses bounded no-follow descriptor reads with before/after metadata checks. For
+Apple Clang catalogs, it validates the schema and import/function/missing-name
+set before accepting the source hash. It validates candidate field shapes and
+bounds before checking SDK provenance.
 
 This short queue is the live handoff; C00–C16 below retain the full acceptance
 criteria. `[~]` means implemented in part or under verification, never complete.
@@ -79,9 +218,9 @@ instead of being hidden by lookup precedence. All 369 worker tests pass.
 The native Darwin catalog gate now verifies that a source-bound Apple Clang
 declaration reaches an actual reconstructed header at both `-O0` and `-O2`,
 in addition to existing pseudocode, layout and source-identity checks. Automatic
-SDK discovery in the app, provider-qualified matching, complete class/interface
-exports and general implementation recovery remain open. Review-only fallback
-code is not qualified recovered source. The earlier candidate build predates
+app discovery follows in the current queue; provider-qualified matching,
+complete class/interface exports and general implementation recovery remain
+open. Review-only fallback code is not qualified recovered source. The earlier candidate build predates
 these changes; rebuild/requalification and GitHub publication remain pending.
 
 Public SDK lookup now has a source-bound command-line path documented in
@@ -872,7 +1011,7 @@ An original checkbox closes only when all mapped work and its stated gate are pr
 
 ## Next executable work
 
-Execute the [current actionable queue](#current-actionable-queue-2026-10-18) in order.
+Execute the [current actionable queue](#current-actionable-queue-2026-10-23) in order.
 Its early steps deliver a function end to end; the remote gateway and conditional
 GitHub push retain the explicit acceptance checks in
 [HINDSIGHT_REMOTE.md](HINDSIGHT_REMOTE.md).

@@ -62,6 +62,23 @@ class ReconstructionDumpTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in output.iterdir()),
                          sorted([self.name, "export-manifest.json"]))
 
+    def test_sdk_catalog_identity_survives_dump_and_tampering_is_refused(self):
+        catalog = {"source_sha256": self.manifest["source_sha256"], "sdk_build": "A1"}
+        self.manifest["sdk_catalog"] = catalog
+        self.manifest["sdk_catalog_sha256"] = hashlib.sha256(json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.publish()
+        output = self.root / "sdk-dump"
+        result = self.dump(output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((output / "export-manifest.json").read_bytes())["sdk_catalog_sha256"], self.manifest["sdk_catalog_sha256"])
+        catalog["sdk_build"] = "forged"
+        self.publish()
+        refused = self.root / "sdk-forged-dump"
+        result = self.dump(refused)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"SDK evidence catalog hash", result.stderr)
+        self.assertFalse(refused.exists())
+
     def test_failed_function_is_unavailable_not_an_empty_source(self):
         self.manifest["functions"][0].update(state="failed", files=[])
         self.publish()
@@ -203,6 +220,51 @@ class ReconstructionDumpTests(unittest.TestCase):
                 self.assertEqual(requests.call_count, 1, "retained failures must not be silently retried")
                 self.assertEqual(resumed["functions"], manifest["functions"])
                 self.assertEqual(resumed["failed_functions"], 1)
+
+    def test_sdk_imports_are_automatic_retained_and_resume_bound(self):
+        spec = importlib.util.spec_from_file_location("batch_sdk_test", ROOT / "scripts/reconstruct-binary.py")
+        batch = importlib.util.module_from_spec(spec)
+        with patch.object(sys, "path", [str(ROOT / "scripts"), *sys.path]):
+            spec.loader.exec_module(batch)
+            import darwin_sdk_catalog as sdk
+        binary = self.root / "sdk-input"
+        binary.write_bytes(b"SDK-bound capture")
+        worker = self.root / "sdk-worker"
+        worker.write_bytes(b"SDK worker identity")
+        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+        catalog = {"source_sha256": digest, "producer": "test SDK", "target": "arm64-apple-macos14.0",
+                   "compiler": "test Clang", "sdk_path": "/test/SDK", "sdk_build": "A1", "missing_functions": ["missing"],
+                   "functions": [{"name": "known", "symbol": "_known", "abi_declaration": "int known(int value);", "worker_eligible": True},
+                                 {"name": "callback", "symbol": "_callback", "abi_declaration": None, "worker_eligible": False}]}
+        args = types.SimpleNamespace(binary=binary, worker=worker, output=self.root / "sdk-batch", sdk_imports=True,
+                                     sdk="macosx", sdk_target="arm64-apple-macos14.0", prototypes=None,
+                                     resume=False, start=None, end=None, include_callees=False, max_functions=1, max_bytes=1024*1024)
+        def request(worker, binary, source, size, command, arguments, prototypes):
+            if command == "--analyze":
+                self.assertIsNone(prototypes)
+                return {"source_sha256": digest, "functions": "0x1000 0x1008 8 bytes identity"}
+            self.assertIn("_known\tint known(int value);", prototypes.read_text())
+            self.assertNotIn("_callback", prototypes.read_text())
+            self.assertIn("# sdk_build=A1", prototypes.read_text())
+            return fixture(source=digest)
+        with patch.object(batch, "request", side_effect=request) as requests, patch.object(sdk, "collect_import_declarations", return_value=catalog), contextlib.redirect_stdout(io.StringIO()):
+            manifest = batch.run(args)
+            self.assertEqual(requests.call_count, 2, "discovery should be reused, not analyzed twice")
+            self.assertEqual(manifest["sdk_catalog"], catalog)
+            args.resume = True
+            resumed = batch.run(args)
+            self.assertEqual(resumed["functions"], manifest["functions"])
+            catalog["sdk_build"] = "A2"
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                batch.run(args)
+            catalog["sdk_build"] = "A1"
+            args.sdk_imports = False
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                batch.run(args)
+        saved = json.loads((args.output / "checkpoint.json").read_bytes())
+        saved["sdk_catalog"]["compiler"] = "tampered"
+        with self.assertRaisesRegex(ValueError, "SDK evidence catalog hash"):
+            batch.verified_outputs(args.output, saved)
 
 
 if __name__ == "__main__":

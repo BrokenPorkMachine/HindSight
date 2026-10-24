@@ -46,6 +46,7 @@
     "README.md",
     "Resources/schema.sql",
     "Shared/CoordinatorProtocol.swift",
+    "Shared/DarwinSDKDeclarations.swift",
     "Shared/DebugMessages.swift",
     "Shared/FirmwareRuntimeMessages.swift",
     "Shared/HostPlatform.swift",
@@ -60,6 +61,7 @@
     "native/debug/debug_server.h",
     "native/macho/decode.c",
     "native/macho/decode.h",
+    "native/reconstruction/sdk_declarations.h",
     "native/terminal/terminal_pty.c",
     "native/terminal/terminal_pty.h",
     "native/virtualization/hv_vm.c",
@@ -132,9 +134,10 @@
       "native/macho/decode.c",
       "native/virtualization/hv_vm.c",
       "native/terminal/terminal_pty.c",
-      "Shared/ReconstructionArtifact.swift"
+      "Shared/ReconstructionArtifact.swift",
+      "Shared/DarwinSDKDeclarations.swift"
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "ec8502b950803575438a0dab34c5ab18a20c36e3f821e11088f9b0815fec5ff7"
+  "project_sha256": "8762cad095767da25bcc9e69bfc2ea4b27ac43e8812cba7aaab29180910aa834"
 }

@@ -102,7 +102,7 @@ _hs_ast_opaque:
 .globl _hs_ast_large
 _hs_ast_large:
     .rept 130
-    nop
+    add x0, x0, #1
     .endr
     ret
 .globl _hs_ast_barriers
@@ -423,11 +423,72 @@ _hs_ast_opaque_memory:
             assert any(node["kind"] == "unsupported-effect" for node in artifacts[name]["nodes"])
             review = [node["payload"] for node in artifacts[name]["nodes"] if node["payload"].get("artifact_kind") == "best-effort-source"]
             assert len(review) == 1 and "loc_" in review[0]["source"] and "BEST-EFFORT" in review[0]["source"]
+            assert "Status 4 stops BEFORE unresolved effects" in review[0]["source"]
+            source_file = root / (name + "-review.c")
+            source_file.write_text(review[0]["source"])
+            subprocess.run(["xcrun", "clang", "-std=c17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", str(source_file)],
+                           check=True, capture_output=True, timeout=60)
+            if name == "opaque":
+                entry = int(artifacts[name]["function"]["start"], 16)
+                source_file.write_text(review[0]["source"] +
+                    f'\nint main(void){{hs_review_context c={{0}};c.limit=32;c.state.x[0]=123;c.state.nzcv=5;hs_review_{entry:x}(&c);'
+                    f'if(c.status!=4||c.state.pc!=UINT64_C(0x{entry:x})||c.state.x[0]!=123||c.state.nzcv!=5)return 1;'
+                    f'c.limit=0;hs_review_{entry:x}(&c);return c.status==2?0:2;}}\n')
+                executable = root / "opaque-review-run"
+                subprocess.run(["xcrun", "clang", "-std=c17", str(source_file), "-o", str(executable)],
+                               check=True, capture_output=True, timeout=60)
+                subprocess.run([str(executable)], check=True, capture_output=True, timeout=30)
             assert review[0]["status"] == "review-only-uncompiled"
+        for feature, stop_offset, expected_steps in [("opaque_flow", 4, 2), ("opaque_memory", 8, 3)]:
+            entry = int(artifacts[feature]["function"]["start"], 16)
+            code = next(node["payload"]["source"] for node in artifacts[feature]["nodes"]
+                        if node["payload"].get("artifact_kind") == "best-effort-source")
+            checks = ("if(c.state.x[1]!=1)return 3;" if feature == "opaque_flow" else
+                      "if(c.state.sp!=HS_MEM_BASE+HS_MEM_SIZE-16)return 3;"
+                      "for(unsigned j=0;j<8;j++)if(c.state.memory[HS_MEM_SIZE-16+j]!=(uint8_t)(values[i]>>(8*j)))return 4;"
+                      "for(unsigned j=0;j<HS_MEM_SIZE;j++)if((j<HS_MEM_SIZE-16||j>=HS_MEM_SIZE-8)&&c.state.memory[j])return 5;")
+            fault_check = (f'hs_review_context bad={{0}};bad.limit=32;bad.state.sp=16;bad.state.x[0]=123;bad.state.memory[0]=0xaa;'
+                           f'hs_review_{entry:x}(&bad);if(bad.status!=3||bad.state.fault!=1||bad.state.steps!=2||'
+                           f'bad.state.pc!=UINT64_C(0x{entry+4:x})||bad.state.memory[0]!=0xaa)return 6;'
+                           if feature == "opaque_memory" else "")
+            harness = (f'\nint main(void){{uint64_t values[]={{0,1,UINT64_MAX,UINT64_C(0x7fffffffffffffff)}};'
+                       f'for(unsigned i=0;i<4;i++){{hs_review_context c={{0}};c.limit=32;c.state.sp=HS_MEM_BASE+HS_MEM_SIZE;'
+                       f'c.state.x[0]=values[i];c.state.x[1]=55;c.state.x[3]=777;c.state.nzcv=5;hs_review_{entry:x}(&c);'
+                       f'if(c.status!=4||c.state.pc!=UINT64_C(0x{entry+stop_offset:x})||c.state.steps!={expected_steps})return 1;'
+                       'if(c.state.x[0]!=values[i]||c.state.x[3]!=777||c.state.nzcv!=5)return 2;'
+                       + checks + '}' + fault_check + 'return 0;}\n')
+            source_file = root / (feature + "-review-run.c")
+            source_file.write_text(code + harness)
+            for optimization in ["-O0", "-O2"]:
+                executable = root / (feature + "-review-run" + optimization)
+                subprocess.run(["xcrun", "clang", "-std=c17", optimization, "-fsanitize=undefined", "-fno-sanitize-recover=all",
+                                str(source_file), "-o", str(executable)], check=True, capture_output=True, timeout=60)
+                subprocess.run([str(executable)], check=True, capture_output=True, timeout=30)
         assert artifacts["large"]["truncated"]
+        for feature, document in artifacts.items():
+            for node in document["nodes"]:
+                if node["payload"].get("artifact_kind") == "best-effort-source":
+                    source_file = root / (feature + "-review-syntax.c")
+                    source_file.write_text(node["payload"]["source"])
+                    subprocess.run(["xcrun", "clang", "-std=c17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", str(source_file)],
+                                   check=True, capture_output=True, timeout=60)
         assert any("truncated: true" in node["payload"].get("source", "") for node in artifacts["large"]["nodes"])
         assert artifacts["large"]["budgets"]["exhausted"] == ["instructions"]
         assert artifacts["large"]["eligibility"]["state"] == "blocked"
+        large_entry = int(artifacts["large"]["function"]["start"], 16)
+        large_code = next(node["payload"]["source"] for node in artifacts["large"]["nodes"]
+                          if node["payload"].get("artifact_kind") == "best-effort-source")
+        large_source = root / "large-review-bound.c"
+        large_source.write_text(large_code +
+            f'\nint main(void){{hs_review_context c={{0}};c.limit=512;c.state.x[0]=7;hs_review_{large_entry:x}(&c);'
+            f'if(c.status!=4||c.state.x[0]!=135||c.state.steps!=128||c.state.pc!=UINT64_C(0x{large_entry+512:x}))return 1;'
+            f'c.state.x[0]=7;c.limit=127;hs_review_{large_entry:x}(&c);'
+            f'return c.status==2&&c.state.x[0]==134&&c.state.steps==127?0:2;}}\n')
+        for optimization in ["-O0", "-O2"]:
+            large_executable = root / ("large-review-bound" + optimization)
+            subprocess.run(["xcrun", "clang", "-std=c17", optimization, "-fsanitize=undefined", "-fno-sanitize-recover=all",
+                            str(large_source), "-o", str(large_executable)], check=True, capture_output=True, timeout=60)
+            subprocess.run([str(large_executable)], check=True, capture_output=True, timeout=30)
 
         document = artifacts["identity"]
         mutated = copy.deepcopy(document)

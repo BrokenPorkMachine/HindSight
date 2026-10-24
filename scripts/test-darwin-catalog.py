@@ -62,6 +62,13 @@ def run(worker):
         subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/ReconstructionArtifact.swift"),
                         str(ROOT / "Tests/reconstruction_artifact_contract.swift"), "-o", str(contract)],
                        env=swift_environment, check=True, capture_output=True, timeout=120)
+        sdk_contract = Path(directory) / "darwin-sdk-declarations-contract"
+        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/DarwinSDKDeclarations.swift"),
+                        str(ROOT / "Tests/darwin_sdk_declarations_contract.swift"), "-o", str(sdk_contract)],
+                       env=swift_environment, check=True, capture_output=True, timeout=120)
+        native_declaration = subprocess.run([str(sdk_contract), "--collect", str(header), "HSNativeCatalogCount"],
+                                            check=True, capture_output=True, text=True, timeout=90).stdout.splitlines()[0]
+        assert native_declaration == declaration["functions"][0]["abi_declaration"], "native and Python SDK ABI declarations disagree"
         oracle=native.collect(helper,["HSNativeCatalogFixture"],[])["classes"][0]
         for optimization in ["-O0", "-O2"]:
             binary = Path(directory) / "sdk-sample"

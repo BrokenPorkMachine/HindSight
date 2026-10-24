@@ -9,7 +9,7 @@ HindSight 0.5.13 officially supports macOS on Apple Silicon (`arm64`). Intel (`x
 - Dense workspaces use adaptive wide/medium/compact topology rather than fixed horizontal packing; compact action groups wrap/restack and Targets no longer uses fixed metadata columns inside a collapsible pane.
 - Large-CFG dominator analysis is per-function and budgeted; worker termination is isolated and reported.
 - Analysis Quality distinguishes coverage from negative evidence; candidate control-flow remains labelled candidate evidence.
-- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v103-schema129` prevents reuse of results from earlier semantic lifts.
+- Project-local cached analysis is SHA-256- and analysis-engine-bound using envelope schema 3, bounded to the analysis transport ceiling, atomically published, symlink-rejected, and decoded through the same report limits before reuse. Schema-2 cache reads remain supported; engine identity `arm64-analysis-v104-schema130` prevents reuse of results from earlier semantic lifts.
 - Existing schema-v1 projects require no database migration for the cache feature.
 - Worker progress records must remain separate from framed stdout and real stderr diagnostics; final evidence publication remains atomic.
 - App and Coordinator macOS Swift type-check source sets are derived directly from `Config/project-topology.json`; `AnalysisNavigation.swift`, `AnalysisContinuity.swift`, and future generated-target Swift files cannot be omitted by stale hand-maintained shell lists.
@@ -116,7 +116,7 @@ Until that matrix is completed on both release hosts, treat the source archive a
 
 ## 0.4.3 analysis-navigation qualification
 
-On the release host, reuse a valid 0.4.2 schema-2 analysis cache and confirm 0.4.3 does not rerun the worker when source SHA-256 and `arm64-analysis-v103-schema129` still match. Exercise Analysis Triage and Navigator with address-bearing, symbol-bearing, and text-only rows; verify Source, Code, CFG, and Symbol routing never invents a destination when the required identity is absent. Select an address/symbol row and verify Related Evidence is bounded and source-labelled.
+On the release host, reuse a valid 0.4.2 schema-2 analysis cache and confirm 0.4.3 does not rerun the worker when source SHA-256 and `arm64-analysis-v104-schema130` still match. Exercise Analysis Triage and Navigator with address-bearing, symbol-bearing, and text-only rows; verify Source, Code, CFG, and Symbol routing never invents a destination when the required identity is absent. Select an address/symbol row and verify Related Evidence is bounded and source-labelled.
 
 ## 0.4.4 investigation-continuity qualification
 
