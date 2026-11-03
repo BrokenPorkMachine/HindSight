@@ -8,6 +8,12 @@ typedef struct HSNativeCatalogPair {
 } HSNativeCatalogPair;
 
 unsigned long HSNativeCatalogCount(unsigned long value);
+double HSNativeCatalogRatio(unsigned long value);
+double HSNativeCatalogStack(double a, double b, double c, double d, double e, double f, double g, double h, double ninth, double tenth);
+NSRange HSNativeCatalogRange(unsigned long value);
+CGRect HSNativeCatalogRect(unsigned long value);
+CGAffineTransform HSNativeCatalogTransform(unsigned long value);
+unsigned long _HSNativeUnderscored(unsigned long value);
 void HSNativeCatalogCallback(void (*callback)(int));
 
 @interface HSNativeCatalogFixture : NSObject

@@ -224,7 +224,7 @@ struct DarwinSDKDeclarationCatalogReference: Codable, Equatable, Sendable {
 /// identities and graph integrity; it does not certify arbitrary C semantics,
 /// execute generated source, or promote compilation to equivalence.
 struct ReconstructionArtifact: Sendable {
-    static let passVersion = "arm64-reconstruction-63"
+    static let passVersion = "arm64-reconstruction-84"
     static let maxBytes = 4 * 1024 * 1024
     let json: String
     let digest: String
@@ -308,7 +308,7 @@ struct ReconstructionArtifact: Sendable {
               let budgets = document["budgets"] as? [String: Any], let limits = budgets["limits"] as? [String: Int], let consumed = budgets["consumed"] as? [String: Int], let exhausted = budgets["exhausted"] as? [String],
               let validation = document["validation"] as? [[String: Any]], let alternatives = document["alternatives"] as? [[String: Any]] else { throw Invalid(message: "Reconstruction identity, schema or bounds mismatch.") }
         try require(Set(document.keys) == ["schema","producer","source_sha256","analysis_engine","scope","function","eligibility","nodes","edges","ast","alternatives","budgets","validation","truncated"], "Unexpected reconstruction fields.")
-        try require(document["analysis_engine"] as? String == "arm64-analysis-v104-schema130" && pass == passVersion, "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
+        try require(document["analysis_engine"] as? String == "arm64-analysis-v125-schema130" && pass == passVersion, "Unsupported reconstruction engine/pass; regenerate with the bundled worker.")
         try require(nodes.count <= 100_000 && edges.count <= 400_000 && astNodes.count <= 100_000 && reasons.count <= 128 && validation.count <= 128 && alternatives.count <= 1024, "Reconstruction record budget exceeded.")
         let scopeKey: [Any] = [pass, settings]
         var identities = Set<String>()

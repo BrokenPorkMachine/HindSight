@@ -722,6 +722,34 @@ mod tests {
     }
 
     #[test]
+    fn mixed_width_conversions_use_the_correct_register_banks() {
+        let to_integer = instruction(0x1e78_0020); // fcvtzs w0, d1
+        assert_eq!(instruction_vector_effects(&to_integer), VectorEffects {
+            reads: vec![VectorRange::float(1, IrFloatPrecision::Double)], writes: vec![],
+        });
+        let effects = to_integer.portable.gpr_effects();
+        assert_eq!((effects.uses, effects.definitions, effects.barrier), (0, 1, false));
+        assert_eq!(instruction_flag_effects(&to_integer), FlagEffects::default());
+        let to_float = instruction(0x9e22_0020); // scvtf s0, x1
+        assert_eq!(instruction_vector_effects(&to_float), VectorEffects {
+            reads: vec![], writes: vec![VectorRange::low(0, 16)],
+        });
+        let effects = to_float.portable.gpr_effects();
+        assert_eq!((effects.uses, effects.definitions, effects.barrier), (2, 0, false));
+        assert_eq!(instruction_flag_effects(&to_float), FlagEffects::default());
+        for (unscaled, fixed) in [(0x1e78_0020, 0x1e58_ec20), (0x9e22_0020, 0x9e02_ec20)] {
+            let a = instruction(unscaled);
+            let b = instruction(fixed);
+            assert_eq!(instruction_vector_effects(&a), instruction_vector_effects(&b));
+            let a = a.portable.gpr_effects();
+            let b = b.portable.gpr_effects();
+            assert_eq!((a.uses, a.definitions, a.barrier), (b.uses, b.definitions, b.barrier));
+        }
+        assert_eq!(instruction(0x1e62_03e0).portable.gpr_effects().uses, 0); // scvtf d0, wzr
+        assert_eq!(instruction(0x9e38_003f).portable.gpr_effects().definitions, 0); // fcvtzs xzr, s1
+    }
+
+    #[test]
     fn a_lane_extract_reads_only_the_selected_lane() {
         // umov x0, v1.d[0] = 0x4e083c20
         let effects = instruction_vector_effects(&instruction(0x4e08_3c20));

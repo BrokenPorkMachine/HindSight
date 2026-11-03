@@ -30,6 +30,16 @@ int re_arm64_decode(uint32_t w,uint64_t pc,char*out,size_t cap){
  if(!out||!cap)return -1;
  out[0]=0;if(pc%4)return -1;
  char a[8],b[8],c[8];unsigned rd=w&31,rn=(w>>5)&31;int wide=(w>>31)!=0;uint64_t dest;
+ /* Scalar integer/FP conversion: integer width and FP precision are independent. */
+ {
+  uint32_t plain=w&0x7fbffc00u,fixed=w&0x7fbf0000u;
+  const char *op=NULL;int to_float=0,is_fixed=0;
+  switch(plain){case 0x1e220000u:op="scvtf";to_float=1;break;case 0x1e230000u:op="ucvtf";to_float=1;break;case 0x1e380000u:op="fcvtzs";break;case 0x1e390000u:op="fcvtzu";break;default:break;}
+  if(!op){switch(fixed){case 0x1e020000u:op="scvtf";to_float=1;break;case 0x1e030000u:op="ucvtf";to_float=1;break;case 0x1e180000u:op="fcvtzs";break;case 0x1e190000u:op="fcvtzu";break;default:break;}is_fixed=op!=NULL;}
+  if(op){unsigned scale=64-((w>>10)&63);char fp[8];unsigned f=to_float?rd:rn;snprintf(fp,sizeof(fp),"%c%u",(w&(1u<<22))?'d':'s',f);
+   if(!is_fixed || wide || scale<=32){const char *g=reg(a,to_float?rn:rd,wide,0);if(is_fixed)return text(out,cap,1,"%s %s, %s, #%u",op,to_float?fp:g,to_float?g:fp,scale);return text(out,cap,1,"%s %s, %s",op,to_float?fp:g,to_float?g:fp);}
+  }
+ }
  if(w==0xd503201f)return text(out,cap,1,"nop");
  if((w&0xffe0001f)==0xd4200000)return text(out,cap,1,"brk #0x%x",(w>>5)&0xffff);
  if((w&0xffe0001f)==0xd4400000)return text(out,cap,1,"hlt #0x%x",(w>>5)&0xffff);

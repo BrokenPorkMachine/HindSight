@@ -135,6 +135,11 @@ _hs_ast_vector_fp:
     fadd v0.4s, v1.4s, v2.4s
     frecpe v3.2d, v4.2d
     ret
+.globl _hs_ast_mixed_conversion
+_hs_ast_mixed_conversion:
+    fcvtzs w0, d1
+    fcvtzs xzr, s1, #5
+    ret
 .globl _hs_ast_opaque_flow
 _hs_ast_opaque_flow:
     mov x1, #1
@@ -161,7 +166,7 @@ _hs_ast_opaque_memory:
         ranges = {match[3]: (match[1], match[2]) for line in report["functions"].splitlines()
                   if (match := re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+(\S+)", line))}
         artifacts = {}
-        for name in ["identity", "sum", "join", "flags", "system_flags", "addcarry", "call", "indirect", "opaque", "large", "barriers", "barrier_accesses", "barrier_join", "vector_fp", "opaque_flow", "opaque_memory"]:
+        for name in ["identity", "sum", "join", "flags", "system_flags", "addcarry", "call", "indirect", "opaque", "large", "barriers", "barrier_accesses", "barrier_join", "vector_fp", "mixed_conversion", "opaque_flow", "opaque_memory"]:
             start, end = ranges["_hs_ast_"+name]
             document = request(worker, binary, "--reconstruct", start, end)
             assert document.get("producer") == "hindsight-reconstruction-v1", document
@@ -174,6 +179,21 @@ _hs_ast_opaque_memory:
             decoded = [node["payload"] for node in document["nodes"] if node["kind"] == "decode"]
             operations = [node["payload"] for node in document["nodes"] if node["kind"] == "ir-operation"]
             blockers = [node for node in document["nodes"] if node["kind"] == "unsupported-effect"]
+            if name == "mixed_conversion":
+                conversion_pc = int(start, 16)
+                at_pc = [node for node in document["nodes"] if node["ranges"] and int(node["ranges"][0]["start"], 16) == conversion_pc]
+                assert any(node["kind"] == "unsupported-effect" and node["payload"].get("reason") == "FPCR/FPSR effects are not modeled" for node in at_pc), at_pc
+                assert any(node["kind"] == "decode" and node["payload"]["word"] == "0x1e780020" and node["payload"]["shared_ir_available"] for node in at_pc), at_pc
+                conversion = next(node["payload"]["tree"] for node in at_pc if node["kind"] == "ir-operation")
+                assert conversion["attributes"] == {"signed": True, "fractional_bits": None, "direction": "float-to-integer", "rounding": "toward-zero", "result_discarded": False, "fp_status": "unmodeled"}, conversion
+                assert [child["attributes"]["name"] for child in conversion["children"]] == ["w0", "d1"], conversion
+                assert any(node["kind"] == "ast-node" and node["payload"].get("kind") == "scalar-int-float-conversion" for node in at_pc), at_pc
+                discarded = next(node["payload"]["tree"] for node in document["nodes"] if node["kind"] == "ir-operation" and node["ranges"] and int(node["ranges"][0]["start"], 16) == conversion_pc + 4)
+                assert discarded["attributes"]["fractional_bits"] == 5 and discarded["attributes"]["result_discarded"] is True, discarded
+                assert [child["attributes"]["name"] for child in discarded["children"]] == ["xzr", "s1"], discarded
+                rendering = document["ast"]["rendering"]
+                assert f"loc_{conversion_pc:x}: w0 = fcvtzs(d1); /* FP status effects unresolved */" in rendering, rendering
+                assert f"loc_{conversion_pc + 4:x}: discard(fcvtzs(s1, fractional_bits=5)); /* FP status effects unresolved */" in rendering, rendering
             assert len(coverage) == 1, (name, coverage)
             summary = coverage[0]
             assert summary["instruction_count"] == len(decoded) == len(operations), (name, summary)
@@ -199,7 +219,7 @@ _hs_ast_opaque_memory:
             module_cache.mkdir()
             swift_environment = dict(os.environ, CLANG_MODULE_CACHE_PATH=str(module_cache))
             fixture.write_text(json.dumps(artifacts["identity"], separators=(",", ":")))
-            subprocess.run([swiftc, str(ROOT / "Shared/ReconstructionArtifact.swift"),
+            subprocess.run([swiftc, str(ROOT / "Shared/DarwinSDKDeclarations.swift"), str(ROOT / "Shared/ReconstructionArtifact.swift"),
                             str(ROOT / "Tests/reconstruction_artifact_contract.swift"), "-o", str(contract)],
                            check=True, capture_output=True, timeout=120, env=swift_environment)
             function = artifacts["identity"]["function"]
@@ -382,8 +402,12 @@ _hs_ast_opaque_memory:
         assert call_effects, artifacts["call"]["ast"]["nodes"]
         effect = call_effects[0]
         assert effect["abi"]["name"] == "apple-aapcs64", effect
-        assert effect["abi"]["caller_saved_gpr"] == "x0-x18", effect
-        assert effect["abi"]["callee_saved_gpr"] == "x19-x30", effect
+        assert effect["abi"]["caller_saved_gpr"] == "x0-x17,x30", effect
+        assert effect["abi"]["callee_saved_gpr"] == "x19-x29", effect
+        assert effect["abi"]["caller_saved_vector"] == "v0-v7,v16-v31,v8-v15[127:64]", effect
+        assert effect["abi"]["callee_saved_vector"] == "v8-v15[63:0]", effect
+        assert effect["abi"]["reserved_gpr"] == "x18", effect
+        assert effect["abi"]["preserved_special"] == "sp", effect
         assert effect["abi"]["flags_clobbered"] is True, effect
         assert effect["call_kind"] == "direct", effect
         assert isinstance(effect["target"], int), effect

@@ -66,6 +66,8 @@ def run(worker):
                     document=request(worker,binary,"--reconstruct",start,end,prototypes=prototypes)
                 except subprocess.CalledProcessError as error:
                     raise AssertionError((name,optimization,stripped,error.stderr.decode(errors="replace"))) from error
+                if document.get("kind") == "error":
+                    raise AssertionError((name, optimization, stripped, "worker error", document))
                 try: ReconstructionArtifact(document)
                 except Exception as error: raise AssertionError((name,optimization,str(error))) from error
                 class_layouts=[node["payload"] for node in document["nodes"]

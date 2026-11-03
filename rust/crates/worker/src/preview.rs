@@ -405,11 +405,23 @@ fn runtime_reference_graph(file:&mut File,window:&[u8],size:u64)->io::Result<Str
  }
  if edges==0{out.push_str("No validated Objective-C selector/class/super reference edges were recovered.\n");}Ok(out)
 }
-fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],base:u64,calls:&[(u64,u64,u64)],symbols:&[(u64,String)])->io::Result<std::collections::BTreeMap<u64,String>>{
+fn ordinary_objc_dispatch(name:&str)->bool { matches!(name, "objc_msgSend" | "_objc_msgSend") }
+fn objc_dispatch_entry(name:&str)->bool {
+ let bare=name.strip_prefix('_').unwrap_or(name);
+ matches!(bare, "objc_msgSend" | "objc_msgSendSuper" | "objc_msgSendSuper2" | "objc_msgSend_stret" | "objc_msgSendSuper_stret" | "objc_msgSendSuper2_stret" | "objc_msgSend_fpret" | "objc_msgSend_fp2ret")
+}
+fn proven_objc_dispatch_slot(address:u64,indirect_facts:&[(String,String,u64)],bind_facts:&[DyldBindFact])->bool {
+ let binds=bind_facts.iter().filter(|fact|fact.address==address).collect::<Vec<_>>();
+ if binds.iter().any(|fact|fact.kind!=1||fact.weak||fact.addend!=0){return false}
+ let names=indirect_facts.iter().filter(|(_,kind,slot)|*slot==address&&matches!(kind.as_str(),"lazy-pointer"|"nonlazy-pointer")).map(|(name,_,_)|name.as_str()).chain(binds.iter().map(|fact|fact.symbol.as_str())).collect::<std::collections::BTreeSet<_>>();
+ names.len()==1&&names.iter().next().is_some_and(|name|ordinary_objc_dispatch(name))
+}
+fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],base:u64,calls:&[(u64,u64,u64)],symbols:&[(u64,String)],indirect_facts:&[(String,String,u64)])->io::Result<std::collections::BTreeMap<u64,String>>{
  let mut result=std::collections::BTreeMap::new();
  let section_list=sections(window);
+ let bind_facts=ordinary_dyld_bind_facts(file,window,size)?;
  for &(_,site,target) in calls{
-  let direct_symbol=symbol_name_at(symbols,target).is_some_and(|name|name.contains("objc_msgSend"));
+  let direct_symbol=symbol_name_at(symbols,target).is_some_and(ordinary_objc_dispatch);
   let mut selector=None;
   if let Some(stub_section)=section_for_va(&section_list,target).filter(|section|section.sect=="__objc_stubs"){
    let relative=target-stub_section.addr;
@@ -417,10 +429,10 @@ fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],b
     if let Some(bytes)=read_va(file,&section_list,size,target,20)?{
      let first=le32(&bytes[0..4]);let second=le32(&bytes[4..8]);let third=le32(&bytes[8..12]);let fourth=le32(&bytes[12..16]);let fifth=le32(&bytes[16..20]);
      let load_fields=|word:u32|->Option<(u32,u32,u64)>{if word&0x3b00_0000!=0x3900_0000||(word>>22)&3!=1||word>>30!=3{return None}Some((word&31,(word>>5)&31,(((word>>10)&0xfff)as u64)*8))};
-     if let (Some((base_register,page)),Some((loaded,load_base,offset)),Some((dispatch_register,_dispatch_page)),Some((dispatch_loaded,dispatch_base,_)))=(
+     if let (Some((base_register,page)),Some((loaded,load_base,offset)),Some((dispatch_register,dispatch_page)),Some((dispatch_loaded,dispatch_base,dispatch_offset)))=(
       arm64_address_value(first,target),load_fields(second),arm64_address_value(third,target+8),load_fields(fourth)){
       let is_dispatch=fifth&0xffff_fc1f==0xd61f_0000&&(fifth>>5)&31==dispatch_register;
-      if base_register==1&&first>>31!=0&&loaded==1&&load_base==1&&dispatch_register==16&&third>>31!=0&&dispatch_loaded==16&&dispatch_base==16&&is_dispatch{
+      if base_register==1&&first>>31!=0&&loaded==1&&load_base==1&&dispatch_register==16&&third>>31!=0&&dispatch_loaded==16&&dispatch_base==16&&is_dispatch&&dispatch_page.checked_add(dispatch_offset).is_some_and(|slot|proven_objc_dispatch_slot(slot,indirect_facts,&bind_facts)){
        if let Some(reference)=page.checked_add(offset){selector=objc_selector_name(file,&section_list,size,reference)?;}
       }
      }
@@ -450,7 +462,7 @@ fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],b
 fn selector_call_xrefs(relocations:&[(u64,String,u32,bool,u32,Option<u64>)],calls:&[(u64,u64,u64)],symbols:&[(u64,String)])->String{
  let mut out=String::new();let mut count=0usize;
  for (site,name,_,_,_,target) in relocations.iter(){let lower=name.to_ascii_lowercase();if !(lower.contains("objc_msgsend")||lower.contains("objc_msgsend$super")||lower.contains("selref")||lower.contains("selector")){continue}out.push_str(&format!("{site:#018x}  relocation -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}out.push('\n');count+=1;if out.len()>60_000{return out}}
- for &(func,site,target) in calls.iter(){if let Some(name)=symbol_name_at(symbols,target){if name.contains("objc_msgSend"){out.push_str(&format!("{site:#018x}  function {func:#018x} direct call -> {name}\n"));count+=1;if out.len()>60_000{return out}}}}
+ for &(func,site,target) in calls.iter(){if let Some(name)=symbol_name_at(symbols,target){if objc_dispatch_entry(name){out.push_str(&format!("{site:#018x}  function {func:#018x} direct call -> {name}\n"));count+=1;if out.len()>60_000{return out}}}}
  if count==0{out.push_str("No selector/message-send xrefs were proven by symbols or Mach-O relocations in the bounded code pass.\n");}out
 }
 fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
@@ -1036,6 +1048,15 @@ fn arm64e_pointer_records(file:&mut File,window:&[u8],size:u64)->io::Result<Stri
 
 
 
+fn chained_import_name(data:&[u8],symbols_off:usize,name_off:usize)->Option<String>{
+ let start=symbols_off.checked_add(name_off)?;
+ let tail=data.get(start..)?;
+ let end=tail.iter().position(|&byte|byte==0)?;
+ if end==0||end>4096{return None}
+ let name=std::str::from_utf8(&tail[..end]).ok()?;
+ if name.chars().any(char::is_control){return None}
+ Some(name.into())
+}
 fn dyld_import_entries(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<(usize,String,i64,i32,bool)>>{
  let ncmd=if window.len()>=20{le32(&window[16..20])}else{0};let mut at=32usize;let mut dataoff=0u64;let mut datasize=0u64;
  for _ in 0..ncmd{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8]) as usize;if cs<8||at+cs>window.len(){break}if cmd==0x80000034&&cs>=16{dataoff=le32(&window[at+8..at+12]) as u64;datasize=le32(&window[at+12..at+16]) as u64;break}at+=cs;}
@@ -1049,7 +1070,7 @@ fn dyld_import_entries(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<(us
   2=>{let v=le32(&data[off..off+4]);let a=i32::from_le_bytes(data[off+4..off+8].try_into().unwrap()) as i64;(((v&0xff) as i8) as i32,((v>>8)&1)!=0,(v>>9) as usize,a)},
   3=>{let v=le64(&data[off..off+8]);let a=i64::from_le_bytes(data[off+8..off+16].try_into().unwrap());(((v&0xffff) as i16) as i32,((v>>16)&1)!=0,(v>>32) as usize,a)},
   _=>unreachable!()};
-  let no=symbols_off.saturating_add(name_off);if no>=data.len(){continue}let tail=&data[no..];let end=tail.iter().position(|&b|b==0).unwrap_or(tail.len()).min(4096);if end==0{continue}let name=String::from_utf8_lossy(&tail[..end]).into_owned();out.push((i,name,addend,lib,weak));
+  let Some(name)=chained_import_name(&data,symbols_off,name_off)else{continue};out.push((i,name,addend,lib,weak));
  }
  Ok(out)
 }
@@ -1176,6 +1197,13 @@ fn dyld_bind_stream(data:&[u8],segments:&[DyldSegment],label:&str,weak_stream:bo
 }
 #[derive(Clone,Debug,PartialEq,Eq)]
 struct DyldBindFact { address:u64, symbol:String, library:i32, kind:u8, weak:bool, addend:i64 }
+fn ordinary_dyld_bind_facts(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<DyldBindFact>> {
+ let Some(ranges)=dyld_info_ranges(window)else{return Ok(Vec::new())};
+ let (offset,length)=ranges[1];
+ if length==0||length>16*1024*1024||offset>size||length as u64>size-offset{return Ok(Vec::new())}
+ let bytes=read_exact_range(file,offset,length)?;
+ Ok(decode_dyld_bind_stream(&bytes,&dyld_segments(window),"bind",false).1)
+}
 fn decode_dyld_bind_stream(data:&[u8],segments:&[DyldSegment],label:&str,weak_stream:bool)->(String,Vec<DyldBindFact>){
  let mut facts=Vec::new();
  let mut completed=false;
@@ -1416,7 +1444,7 @@ fn function_neighborhood_report(starts:&[u64],calls:&[(u64,u64,u64)],tails:&[(u6
  if out.lines().count()<=2{out.push_str("No direct function neighborhood edges were recovered in the bounded code scan.\n");}out
 }
 
-fn typed_call_graph_report(calls:&[(u64,u64,u64)],tails:&[(u64,u64,u64)],symbols:&[(u64,String)],objc_names:&std::collections::BTreeMap<u64,String>,export_names:&std::collections::BTreeMap<u64,String>,stub_names:&std::collections::BTreeMap<u64,String>,starts:&[u64],scan_end:u64,indirect_facts:&[(String,String,u64)],thunks:&std::collections::BTreeSet<u64>)->String{
+fn typed_call_graph_report(calls:&[(u64,u64,u64)],tails:&[(u64,u64,u64)],symbols:&[(u64,String)],objc_names:&std::collections::BTreeMap<u64,String>,export_names:&std::collections::BTreeMap<u64,String>,stub_names:&std::collections::BTreeMap<u64,String>,starts:&[u64],_scan_end:u64,indirect_facts:&[(String,String,u64)],thunks:&std::collections::BTreeSet<u64>)->String{
  let mut out=String::from("Typed call graph\n=================\nEdge types: direct (BL to a discovered function start), import (BL to a proven import stub), dispatch (BL to a proven objc_msgSend entry point; receiver and target method unresolved), thunk (BL to a trampoline/stub; target is a stub address), indirect (BLR through register; candidate set from relocation/relocation+heuristic), unresolved (BL to an address that is neither a discovered function start nor a proven import stub nor a thunk), tail (cross-function B candidate). Confidence: high/medium/low. Indirect call sites are also reported by the separate indirect-call evidence.\n\n");
  let stubs:std::collections::BTreeSet<u64>=stub_names.keys().copied().collect();
  let admitted:std::collections::BTreeSet<u64>=starts.iter().copied().collect();
@@ -1427,11 +1455,8 @@ fn typed_call_graph_report(calls:&[(u64,u64,u64)],tails:&[(u64,u64,u64)],symbols
   let caller_name=resolved_function_name(func,symbols,objc_names,export_names,stub_names).unwrap_or("<discovered>");
   let callee_name=resolved_function_name(target,symbols,objc_names,export_names,stub_names).unwrap_or("<target>");
   // A message send is proven by the callee symbol, not by the callee address.
-  let is_dispatch=symbol_name_at(symbols,target).is_some_and(|name|name.contains("objc_msgSend"));
-  // A target outside the captured image is named by a relocation rather than
-  // resolved to an address, so the edge is external.
-  let outside_image=target<scan_end.saturating_sub(1)&&target>=scan_end;
-  let edge_type=if is_dispatch{"dispatch"}else if thunks.contains(&target){"thunk"}else if stubs.contains(&target){"import"}else if admitted.contains(&target){"direct"}else if outside_image{"unresolved"}else{"unresolved"};
+  let is_dispatch=symbol_name_at(symbols,target).is_some_and(objc_dispatch_entry);
+  let edge_type=if is_dispatch{"dispatch"}else if thunks.contains(&target){"thunk"}else if stubs.contains(&target){"import"}else if admitted.contains(&target){"direct"}else{"unresolved"};
   let confidence=match edge_type{"direct"=>0.9,"import"=>0.95,"dispatch"=>0.6,"thunk"=>0.7,"unresolved"=>0.3,_=>0.5};
   match edge_type{"direct"=>direct_count+=1,"import"=>import_count+=1,"dispatch"=>dispatch_count+=1,"thunk"=>thunk_count+=1,"unresolved"=>unresolved_count+=1,_=>{}}
   if out.len()<58000{out.push_str(&format!("edge={edge_type:<8} confidence={confidence:.2} caller={func:#018x} {caller_name}  site={site:#018x}  callee={target:#018x} {callee_name}\n"));}
@@ -1668,6 +1693,23 @@ fn append_bounded_call_effect_summary(output: &mut String, row: &str) -> bool {
     false
 }
 
+fn compose_semantic_preview(instructions:&str,pseudocode:&str)->String {
+ const MARKER:&str="\n\nReconstructed pseudocode\n========================\n";
+ const OMITTED:&str="/* Additional pseudocode omitted; use per-function reconstruction. */\n";
+ let mut pseudo=pseudocode.to_owned();
+ if pseudo.len()>58_500 {
+  let mut end=58_000;while !pseudo.is_char_boundary(end){end-=1;}
+  end=pseudo[..end].rfind("\n}\n").map(|n|n+3).unwrap_or(0);
+  pseudo.truncate(end);pseudo.push_str(OMITTED);
+ }
+ let note="/* Instruction preview shortened to retain reconstructed pseudocode. */\n";
+ let budget=60_000usize.saturating_sub(MARKER.len()+pseudo.len()+note.len());
+ let mut output=String::new();
+ for line in instructions.split_inclusive('\n') { if output.len()+line.len()>budget{break}output.push_str(line); }
+ if output.len()<instructions.len(){output.push_str(note);}
+ output.push_str(MARKER);output.push_str(&pseudo);output
+}
+
 pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(2,"verify","Validating analysis identity and opening the captured artifact.");
  if path.len()>16384||!std::path::Path::new(path).is_absolute()||digest.len()!=64||!digest.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||id.len()!=36||!id.bytes().all(|b|b.is_ascii_hexdigit()||b==b'-'){return Err(io::Error::new(io::ErrorKind::InvalidInput,"Invalid analysis identity"));}
@@ -1752,7 +1794,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let mut signature_symbols=symbols.clone();
  signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
- let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols)?;
+ let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols,&indirect_facts)?;
  let external_prototypes=super::signatures::external_prototype_database(digest)?;
  let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address);
  let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
@@ -1763,12 +1805,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
  for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
- let mut semantic_preview=super::semantic::render(&code,map.address,map.offset,&starts,&data_ranges);
- const PSEUDO_MARKER:&str="\n\nReconstructed pseudocode\n========================\n";
- if semantic_preview.len()>30_000 {semantic_preview=semantic_preview.chars().take(29_000).collect();semantic_preview.push_str("\n/* instruction preview truncated for pseudocode budget */\n");}
- semantic_preview.push_str(PSEUDO_MARKER);
- let mut pseudocode_budget=60_000usize.saturating_sub(semantic_preview.len()+1024);
- for ch in reconstructed_pseudocode.chars(){if ch.len_utf8()>pseudocode_budget{break}semantic_preview.push(ch);pseudocode_budget-=ch.len_utf8();}
+ let semantic_preview=compose_semantic_preview(&super::semantic::render(&code,map.address,map.offset,&starts,&data_ranges),&reconstructed_pseudocode);
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;
  for (source,workspace,kind,text,priority) in [
@@ -1817,6 +1854,96 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_decoder_displays_mixed_integer_float_conversions() {
+        for (word, expected) in [(0x1e78_0009, "fcvtzs w9, d0"), (0x9e02_ec20, "scvtf s0, x1, #5"),
+                                  (0x1e58_ec20, "fcvtzs w0, d1, #5")] {
+            let mut buffer = [0 as std::ffi::c_char; 128];
+            let result = unsafe { super::re_arm64_decode(word, 0x1000, buffer.as_mut_ptr(), buffer.len()) };
+            assert_eq!(result, 1);
+            assert_eq!(unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }.to_str().unwrap(), expected);
+        }
+        let mut buffer = [0 as std::ffi::c_char; 128];
+        assert_eq!(unsafe { super::re_arm64_decode(0x1e42_7c20, 0x1000, buffer.as_mut_ptr(), buffer.len()) }, 0);
+        for (opcode, name, to_float) in [(0x1e02_0000u32, "scvtf", true), (0x1e03_0000, "ucvtf", true),
+            (0x1e18_0000, "fcvtzs", false), (0x1e19_0000, "fcvtzu", false)] {
+            for wide in [false, true] { for double in [false, true] { for scale in 1..=64u32 {
+                let word = opcode | ((wide as u32) << 31) | ((double as u32) << 22) | ((64-scale) << 10) | (1 << 5);
+                let mut buffer = [0 as std::ffi::c_char; 128];
+                let result = unsafe { super::re_arm64_decode(word, 0x1000, buffer.as_mut_ptr(), buffer.len()) };
+                if !wide && scale > 32 { assert_eq!(result, 0, "{word:#010x}"); continue; }
+                let gp = if wide { "x" } else { "w" };
+                let fp = if double { "d" } else { "s" };
+                let expected = if to_float { format!("{name} {fp}0, {gp}1, #{scale}") }
+                               else { format!("{name} {gp}0, {fp}1, #{scale}") };
+                assert_eq!(result, 1, "{word:#010x}");
+                assert_eq!(unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }.to_str().unwrap(), expected);
+            } } }
+        }
+    }
+    #[test]
+    fn super_dispatch_is_not_an_ordinary_message_send() {
+        assert!(super::ordinary_objc_dispatch("_objc_msgSend"));
+        assert!(!super::ordinary_objc_dispatch("_objc_msgSendSuper"));
+        assert!(!super::ordinary_objc_dispatch("_objc_msgSendSuper2"));
+        assert!(!super::ordinary_objc_dispatch("_objc_msgSend_stret"));
+        assert!(!super::ordinary_objc_dispatch("__objc_msgSend"));
+    }
+    #[test]
+    fn semantic_preview_preserves_complete_pseudocode_within_byte_budget() {
+        let pseudo=format!("void sample() {{\n{}\n}}\n", "    /* é */\n".repeat(4000));
+        let output=super::compose_semantic_preview(&"instruction\n".repeat(4000),&pseudo);
+        assert!(output.ends_with(&pseudo));assert!(output.len()<=60_000);
+        assert!(output.contains("Instruction preview shortened"));
+        let oversized=format!("void first() {{\n}}\nvoid huge() {{\n{}", "é".repeat(40_000));
+        let output=super::compose_semantic_preview("",&oversized);
+        assert!(output.contains("void first()"));assert!(!output.contains("void huge()"));
+        assert!(output.contains("Additional pseudocode omitted"));assert!(output.len()<=60_000);
+    }
+    #[test]
+    fn dispatch_edges_require_exact_runtime_symbols() {
+        let symbols = vec![(0x2000,"_objc_msgSend".into()), (0x3000,"_objc_msgSendSuper2".into()), (0x4000,"_not_objc_msgSend_helper".into()), (0x5000,"__objc_msgSend".into())];
+        let calls = vec![(0x1000,0x1000,0x2000), (0x1000,0x1004,0x3000), (0x1000,0x1008,0x4000), (0x1000,0x100c,0x5000)];
+        let graph = super::typed_call_graph_report(&calls, &[], &symbols, &Default::default(), &Default::default(), &Default::default(), &[0x1000,0x4000,0x5000], 0x6000, &[], &Default::default());
+        assert!(graph.lines().any(|line| line.contains("edge=dispatch") && line.contains("callee=0x0000000000002000")), "{graph}");
+        assert!(graph.lines().any(|line| line.contains("edge=dispatch") && line.contains("callee=0x0000000000003000")), "{graph}");
+        for address in ["4000", "5000"] {
+            assert!(graph.lines().any(|line| line.contains("edge=direct") && line.contains(&format!("callee=0x{address:0>16}"))), "{graph}");
+        }
+        let xrefs = super::selector_call_xrefs(&[], &calls, &symbols);
+        assert!(xrefs.contains("_objc_msgSendSuper2"));
+        assert!(!xrefs.contains("_not_objc_msgSend_helper"));
+        assert!(!xrefs.contains("__objc_msgSend"));
+    }
+    #[test]
+    fn selector_stub_dispatch_requires_unambiguous_pointer_slot() {
+        let slot = 0x4000;
+        let fact = |name:&str,kind:&str,address| (name.to_string(),kind.to_string(),address);
+        assert!(super::proven_objc_dispatch_slot(slot, &[fact("_objc_msgSend","nonlazy-pointer",slot)], &[]));
+        assert!(super::proven_objc_dispatch_slot(slot, &[fact("_objc_msgSend","lazy-pointer",slot),fact("_objc_msgSend","lazy-pointer",slot)], &[]));
+        for facts in [vec![], vec![fact("_objc_msgSendSuper2","nonlazy-pointer",slot)], vec![fact("_objc_msgSend","stub",slot)], vec![fact("_objc_msgSend","nonlazy-pointer",slot+8)], vec![fact("_objc_msgSend","nonlazy-pointer",slot),fact("_other","lazy-pointer",slot)]] {
+            assert!(!super::proven_objc_dispatch_slot(slot, &facts, &[]));
+        }
+        let bind = super::DyldBindFact { address:slot, symbol:"_objc_msgSend".into(), library:1, kind:1, weak:false, addend:0 };
+        assert!(super::proven_objc_dispatch_slot(slot, &[], std::slice::from_ref(&bind)));
+        assert!(!super::proven_objc_dispatch_slot(slot, &[fact("_other","nonlazy-pointer",slot)], std::slice::from_ref(&bind)));
+        for invalid in [super::DyldBindFact { weak:true, ..bind.clone() }, super::DyldBindFact { addend:8, ..bind.clone() }, super::DyldBindFact { kind:2, ..bind.clone() }] {
+            assert!(!super::proven_objc_dispatch_slot(slot, &[fact("_objc_msgSend","nonlazy-pointer",slot)], &[invalid]));
+        }
+    }
+    #[test]
+    fn chained_import_names_require_bounded_terminated_valid_utf8() {
+        let pool = b"xx_objc_msgSend\0_other\0";
+        assert_eq!(super::chained_import_name(pool,2,0).as_deref(), Some("_objc_msgSend"));
+        assert_eq!(super::chained_import_name(pool,2,14).as_deref(), Some("_other"));
+        assert!(super::chained_import_name(b"_objc_msgSend",0,0).is_none());
+        assert!(super::chained_import_name(b"\xff\0",0,0).is_none());
+        assert!(super::chained_import_name(b"bad\nname\0",0,0).is_none());
+        assert!(super::chained_import_name(b"\0",0,0).is_none());
+        assert!(super::chained_import_name(pool,usize::MAX,1).is_none());
+        let mut long=vec![b'a';4097];long.push(0);
+        assert!(super::chained_import_name(&long,0,0).is_none());
+    }
  use super::{explicit_integer_cast,function_parameter_candidates,objc_imp_names,export_function_names,resolved_function_name,unified_symbol_records,unwind_info_starts_from_bytes};
 
  #[test]
@@ -1853,6 +1980,10 @@ mod tests {
   let (_,facts)=super::decode_dyld_bind_stream(&stream,&segments,"bind",false);
   assert_eq!(facts.len(),1);assert_eq!(facts[0].address,0x1008);
   assert_eq!(facts[0].symbol,"_OBJC_CLASS_$_NSObject");assert_eq!(facts[0].library,1);
+  let mut dispatch=vec![0x11,0x40];dispatch.extend_from_slice(b"_objc_msgSend\0");dispatch.extend_from_slice(&[0x70,8,0x90,0]);
+  let facts=super::decode_dyld_bind_stream(&dispatch,&segments,"bind",false).1;
+  assert!(super::proven_objc_dispatch_slot(0x1008,&[],&facts));
+  assert!(!super::proven_objc_dispatch_slot(0x1008,&[],&super::decode_dyld_bind_stream(&dispatch[..dispatch.len()-1],&segments,"bind",false).1));
   let mut outside=stream.clone();outside[suffix+1]=0x20;
   assert!(super::decode_dyld_bind_stream(&outside,&segments,"bind",false).1.is_empty());
   let mut missing_segment=stream.clone();missing_segment[suffix]=0x7f;

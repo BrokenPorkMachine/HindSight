@@ -110,6 +110,20 @@ enum DarwinSDKDeclarationsContract {
             sdkBuild: "test-build", compiler: "Apple clang test", headerSHA256: String(repeating: "a", count: 64),
             function: declaration)
         let candidate = DarwinSDKImportCandidate(name: "sample", symbol: "_sample", provider: system)
+        let versioned = DarwinSDKCollectedDeclaration(context: context, sdkPath: "/test/MacOSX27.0.sdk",
+            sdkBuild: bound.sdkBuild, compiler: bound.compiler, headerSHA256: bound.headerSHA256, function: declaration)
+        _ = try DarwinSDKDeclarationCatalog(sourceSHA256: String(repeating: "b", count: 64), candidates: [candidate], declarations: [versioned])
+        let malformed = DarwinSDKCollectedDeclaration(context: context, sdkPath: "/test/MacOSX27..0.sdk",
+            sdkBuild: bound.sdkBuild, compiler: bound.compiler, headerSHA256: bound.headerSHA256, function: declaration)
+        guard (try? DarwinSDKDeclarationCatalog(sourceSHA256: String(repeating: "b", count: 64), candidates: [candidate], declarations: [malformed])) == nil else {
+            throw DarwinSDKDeclarations.Invalid(message: "Malformed SDK version was accepted.")
+        }
+        for (platform, path) in [(2, "/test/iPhoneOS18.1.sdk"), (7, "/test/iPhoneSimulator18.1.sdk")] {
+            let ios = try DarwinSDKDeclarations.targetContext(machoCommands: image(platform: UInt32(platform)))
+            let item = DarwinSDKCollectedDeclaration(context: ios, sdkPath: path,
+                sdkBuild: bound.sdkBuild, compiler: bound.compiler, headerSHA256: bound.headerSHA256, function: declaration)
+            _ = try DarwinSDKDeclarationCatalog(sourceSHA256: String(repeating: "b", count: 64), candidates: [candidate], declarations: [item])
+        }
         let tsv = try DarwinSDKDeclarations.workerPrototypes(candidates: [candidate], results: [bound],
             sourceSHA256: String(repeating: "b", count: 64))
         guard let tsv, let text = String(data: tsv, encoding: .utf8),

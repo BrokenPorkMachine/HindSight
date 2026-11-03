@@ -1061,6 +1061,7 @@ struct ContentView: View {
             case "Binary Workspace":
                 if let analysis = model.currentAnalysis {
                     VGBinaryWorkspace(
+                        binaryPath: record.path,
                         functionsText: analysis.functions,
                         dyldImageIdentity: model.dyldAnalysisImageByRecordID[record.id],
                         symbolResolverText: analysis.symbol_resolver,

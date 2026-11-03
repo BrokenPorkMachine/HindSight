@@ -114,16 +114,24 @@ struct DarwinSDKDeclarationCatalog: Codable, Sendable {
                              options: .regularExpression) != nil else { return false }
         if platform.hasPrefix("ios"), !platform.hasSuffix("-simulator"),
            first.context.architecture == "x86_64" { return false }
+        func validSDKLeaf(_ prefix: String) -> Bool {
+            let leaf = URL(fileURLWithPath: first.sdkPath).lastPathComponent
+            guard leaf.hasPrefix(prefix), leaf.hasSuffix(".sdk") else { return false }
+            let version = leaf.dropFirst(prefix.count).dropLast(4)
+            return version.isEmpty || version.split(separator: ".", omittingEmptySubsequences: false).allSatisfy {
+                !$0.isEmpty && $0.utf8.allSatisfy { (48...57).contains($0) }
+            }
+        }
         switch first.context.sdk {
         case "macosx":
             guard platform.hasPrefix("macos"), !platform.hasSuffix("-simulator"),
-                  URL(fileURLWithPath: first.sdkPath).lastPathComponent == "MacOSX.sdk" else { return false }
+                  validSDKLeaf("MacOSX") else { return false }
         case "iphoneos":
             guard platform.hasPrefix("ios"), !platform.hasSuffix("-simulator"),
-                  URL(fileURLWithPath: first.sdkPath).lastPathComponent == "iPhoneOS.sdk" else { return false }
+                  validSDKLeaf("iPhoneOS") else { return false }
         case "iphonesimulator":
             guard platform.hasPrefix("ios"), platform.hasSuffix("-simulator"),
-                  URL(fileURLWithPath: first.sdkPath).lastPathComponent == "iPhoneSimulator.sdk" else { return false }
+                  validSDKLeaf("iPhoneSimulator") else { return false }
         default: return false
         }
         var importedSymbols = Set<String>()

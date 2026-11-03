@@ -1,5 +1,42 @@
 # Worker reconstruction artifacts: first transport slice
 
+The current identity is `arm64-analysis-v125-schema130`, reconstruction pass
+`arm64-reconstruction-84`. Tail-call candidates now use the same typed constant
+argument rendering and instruction provenance as ordinary calls. Outgoing scalar GPR/SIMD pair stores recover each
+known lane independently. Unknown pair lanes invalidate overlapping evidence;
+SIMD pair writeback invalidates stack-pointer copies and old stack slots.
+The previous pass recovered float/double stack argument literals from proven
+scalar SIMD and integer stores, including stores through intact 64-bit
+copies of SP with explicit copy provenance, with invalidation on overlapping writes,
+possible aliases, calls, and SP changes. Earlier call summaries describe Apple's reserved x18,
+the volatile link register, and the preserved low 64 bits of v8-v15 explicitly,
+following [Apple's ARM64 register rules](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms)
+and the [AAPCS64 register contract](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst).
+The preceding pass prioritizes complete reconstructed pseudocode
+over instruction previews within the report budget and reports omitted functions.
+The preceding pass exposed the hidden x8 result buffer in
+calls returning known indirect aggregates, without shifting ordinary arguments.
+The preceding pass assigned known register-returned aggregates
+and wide integers to explicit register tuples, preserving input/output identities.
+The preceding pass assigned scalar call results to registers established by
+recovered C/Objective-C signatures. Earlier work validated
+chained import names and accepted completed legacy dyld binds as
+evidence for Objective-C selector-stub dispatch pointers, alongside indirect symbols;
+conflicting, weak, or adjusted binds remain unresolved. Earlier work classified Objective-C dispatch edges using
+exact runtime entry-point names. The preceding pass rendered spilled SDK aggregates as direct
+stack values. Earlier work rendered unresolved scalar stack arguments as
+typed loads. Earlier work rendered indirect aggregate and wide stack
+tail-call arguments with the same value expressions as ordinary calls. Earlier work
+preserved receiver and variadic-argument uncertainty in tail-call candidates and
+rendered supported demangled C++ call names
+and marks possible implicit receivers as unresolved. Earlier passes recovered
+supported Itanium C++ operator, constructor and destructor
+names and retained member-function
+cv and reference qualifiers without inferring the hidden receiver's ABI location;
+the earlier pass added review-only scalar integer/FP
+conversion trees; FPCR/FPSR effects still block strict export. Previous cached
+analysis and reconstruction artifacts require regeneration for these semantics.
+
 The app now exposes **Reconstruction** in the main menu, with explicit
 **Dump C (.c)**, **Dump Objective-C (.m)**, **Dump headers (.h)** and **Dump native
 (.n)** actions for the whole discovered binary, verified current section or a

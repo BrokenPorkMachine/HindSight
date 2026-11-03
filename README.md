@@ -30,7 +30,12 @@ Import now supports thin/universal Mach-O 32/64 for Intel and AArch64, plus ARM3
 
 See [format coverage, importing SEPI and remaining analysis gaps](docs/BINARY_FORMATS_AND_ANALYSIS.md).
 
-## Current baseline (0.5.14)
+## Current baseline (0.5.15)
+
+The 0.5.15 candidate improves C/Objective-C call and tail-call pseudocode,
+stack argument recovery, aggregate results, C++ demangling, and staged binary
+patches. See [release notes](docs/releases/0.5.15-rc.1.md). Complete source
+reconstruction remains in development; unresolved evidence is retained in exports.
 
 ## 0.5.12 — Evidence graph navigation and cache control
 

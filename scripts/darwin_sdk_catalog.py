@@ -224,7 +224,7 @@ def collect_declarations(functions, header=DEFAULT_HEADER, sdk="macosx", target=
         declaration = _declaration(node, False)
         abi_declaration = _declaration(node, True)
         symbol = node.get("mangledName", "_" + name)
-        eligible = abi_declaration is not None and node.get("storageClass") != "static" and symbol.lstrip("_") == name
+        eligible = abi_declaration is not None and node.get("storageClass") != "static" and symbol == "_" + name
         records.append({"name": name, "symbol": symbol, "function_type": stable_type(node["type"]),
                         "parameters": parameters, "declaration": declaration, "abi_declaration": abi_declaration,
                         "variadic": bool(node.get("variadic")), "location": node.get("loc", {}),

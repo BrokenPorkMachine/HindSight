@@ -59,7 +59,7 @@ def analyze(worker: pathlib.Path, binary: pathlib.Path) -> dict:
     return report
 
 
-def score(source_type: str, report: dict) -> dict[str, int]:
+def score(source_type: str, report: dict, optimization: str) -> dict[str, int]:
     semantic = report.get("semantic_preview") or ""
     functions = report.get("functions") or ""
     cfg = report.get("cfg") or ""
@@ -148,8 +148,38 @@ def score(source_type: str, report: dict) -> dict[str, int]:
     metrics["normalized_boundary_sets"] = 1
     if source_type in {"objective-c", "objective-cpp"} and metrics["objc_method_records"] < 1:
         raise RuntimeError(f"{source_type} fixture produced no validated Objective-C method metadata: {metrics}")
+    if source_type == "cpp" and "scalar_types(wchar_t arg0, char16_t arg1, char32_t arg2, long double arg3, __int128 arg4)" not in (report.get("call_values") or ""):
+        raise RuntimeError("C++ scalar type names were not recovered from the compiled symbol")
+    if source_type == "cpp":
+        for declaration in ("QualifiedMethods::measure(int arg0) const;", "QualifiedMethods::read() volatile &;", "QualifiedMethods::consume() const &&;", "QualifiedMethods::QualifiedMethods(int arg0);", "QualifiedMethods::~QualifiedMethods();", "QualifiedMethods::operator+(int arg0) const;", "QualifiedMethods::operator[](int arg0);"):
+            if declaration not in (report.get("call_values") or ""):
+                raise RuntimeError(f"C++ member qualifiers were not recovered from the compiled symbol: {declaration}")
+        if "QualifiedMethods::operator+(/* possible implicit C++ receiver unresolved */" not in semantic:
+            raise RuntimeError("C++ operator call did not retain its demangled name and unresolved receiver")
+        if optimization == "-O2":
+            tail = semantic.split("/* tail_operator:", 1)
+            if len(tail) != 2 or "QualifiedMethods::operator+(/* possible implicit C++ receiver unresolved */" not in tail[1].split("\n}\n", 1)[0] or "tail-call candidate" not in tail[1].split("\n}\n", 1)[0]:
+                raise RuntimeError("optimized C++ tail call lost its demangled target or unresolved receiver")
+    if source_type == "cpp" and "arg4=wide_integer<__int128>(x3, x4)" not in semantic:
+        raise RuntimeError("C++ wide integer register binding was not preserved in pseudocode")
+    if source_type == "cpp" and "NaN and out-of-range results follow ARM64, not C cast semantics" not in semantic:
+        raise RuntimeError("C++ floating-point conversion lost its ARM64 semantics annotation")
+    if source_type == "cpp" and "fcvtzs" not in (report.get("annotated_disassembly") or ""):
+        raise RuntimeError("C++ floating-point conversion was not decoded in disassembly")
     if source_type in {"objective-c", "objective-cpp"} and metrics["objc_selector_calls"] < 1:
         raise RuntimeError(f"{source_type} fixture produced no validated selector message-send: {metrics}")
+    if source_type == "objective-c" and "combine:argument_0 /* ABI location unresolved */ :argument_1" not in semantic:
+        raise RuntimeError("Objective-C empty selector component was not preserved in message-send pseudocode")
+    if source_type == "objective-c":
+        super_body = semantic.split("parentDescription {", 1)
+        if len(super_body) != 2:
+            raise RuntimeError("Objective-C super-call fixture is missing from pseudocode")
+        super_body = super_body[1].split("\n}\n", 1)[0]
+        if "objc_msgSendSuper" not in super_body or "x0 points to objc_super" not in super_body or "objc_msgSend selector validated" in super_body or "0self" in super_body:
+            raise RuntimeError("Objective-C super dispatch or numeric offset was rendered incorrectly")
+        field_body = semantic.split("storedValue {", 1)
+        if len(field_body) != 2 or "self->x0" not in field_body[1].split("\n}\n", 1)[0]:
+            raise RuntimeError("Objective-C register-shaped ivar name was not preserved")
     if source_type in {"objective-c", "objective-cpp"} and ("self=x0" not in semantic or "_cmd=x1" not in semantic):
         raise RuntimeError(f"{source_type} fixture did not reconstruct the Objective-C hidden ABI parameters: {metrics}")
     if source_type in {"c", "objective-c"} and metrics["resolved_parameter_name_uses"] < 1:
@@ -187,7 +217,7 @@ def main() -> int:
                         shutil.copy2(original, binary)
                         subprocess.run(["/usr/bin/strip", "-S", "-x", str(binary)], check=True, capture_output=True, text=True)
                     report = analyze(worker, binary)
-                    metrics = score(source_type, report)
+                    metrics = score(source_type, report, optimization)
                     rows.append({"language": source_type, "optimization": optimization, "stripped": stripped, **metrics})
         totals = {
             metric: sum(row[metric] for row in rows)

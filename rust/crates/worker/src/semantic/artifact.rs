@@ -32,6 +32,29 @@ fn has_unmodeled_fp_status_effect(operation: IrOperation) -> bool {
         })
 }
 
+#[cfg(test)]
+mod fp_status_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_width_integer_float_conversions_block_strict_export() {
+        for word in [0x1e62_0020, 0x9e22_0020, 0x1e63_0020, 0x9e23_0020,
+                     0x1e78_0020, 0x9e38_0020, 0x1e79_0020, 0x9e39_0020,
+                     0x1e42_ec20, 0x9e02_ec20, 0x1e43_ec20, 0x9e03_ec20,
+                     0x1e58_ec20, 0x9e18_ec20, 0x1e59_ec20, 0x9e19_ec20,
+                     0x9e38_003f, 0x9e18_003f] { // discarded GPR results still affect FP status
+            let operation = decode(word, 0x1000);
+            let portable = lift_operation(operation, 0x1000);
+            assert!(matches!(portable, IrOperation::ScalarIntFloatConvert { .. }), "{word:#010x}");
+            assert!(has_unmodeled_fp_status_effect(portable), "{word:#010x}");
+        }
+        let plain = model(lift_operation(decode(0x1e78_0020, 0x1000), 0x1000)).unwrap();
+        assert_eq!(plain.render(), "w0 = fcvtzs(d1); /* FP status effects unresolved */");
+        let discarded = model(lift_operation(decode(0x9e18_ec3f, 0x1000), 0x1000)).unwrap();
+        assert_eq!(discarded.render(), "discard(fcvtzs(s1, fractional_bits=5)); /* FP status effects unresolved */");
+    }
+}
+
 pub(crate) use constraints::{Constraint, ConstraintKind, Solution as ConstraintSolution};
 
 pub(crate) use constraints::{report as constraint_report, solve as solve_constraints};
@@ -727,6 +750,22 @@ fn model(operation: IrOperation) -> Option<Tree> {
             ),
             update,
         ),
+        IrOperation::ScalarIntFloatConvert { destination, source, signed, fractional_bits } => {
+            let conversion_register = |value| match value {
+                IrConversionRegister::Integer { index, wide } => reg(Register { index: u32::from(index), wide, stack_pointer: false }.into()),
+                IrConversionRegister::Float { index, precision } => vector(IrSimdRegister { index, width: match precision {
+                    IrFloatPrecision::Half => IrSimdWidth::Half, IrFloatPrecision::Single => IrSimdWidth::Single, IrFloatPrecision::Double => IrSimdWidth::Double,
+                } }),
+            };
+            tree("scalar-int-float-conversion", None, object([
+                ("signed", signed.into()),
+                ("fractional_bits", fractional_bits.map(|bits| V::Int(i128::from(bits))).unwrap_or(V::Null)),
+                ("direction", if matches!(destination, IrConversionRegister::Float { .. }) { "integer-to-float" } else { "float-to-integer" }.into()),
+                ("rounding", if matches!(destination, IrConversionRegister::Float { .. }) { "fpcr" } else { "toward-zero" }.into()),
+                ("result_discarded", matches!(destination, IrConversionRegister::Integer { index: 31, .. }).into()),
+                ("fp_status", "unmodeled".into()),
+            ]), vec![conversion_register(destination), conversion_register(source)])
+        }
         IrOperation::VectorExtract {
             destination,
             source,
@@ -890,6 +929,17 @@ impl Tree {
         match self.kind {
             "register" => text_attribute(self, "name"),
             "constant" => text_attribute(self, "hex"),
+            "scalar-int-float-conversion" => {
+                let attributes = match &self.attributes { V::Object(fields) => fields, _ => unreachable!() };
+                let to_float = text_attribute(self, "direction") == "integer-to-float";
+                let signed = attributes.get("signed") == Some(&V::Bool(true));
+                let discarded = attributes.get("result_discarded") == Some(&V::Bool(true));
+                let mnemonic = match (to_float, signed) { (true, true) => "scvtf", (true, false) => "ucvtf", (false, true) => "fcvtzs", (false, false) => "fcvtzu" };
+                let scale = match attributes.get("fractional_bits") { Some(V::Int(bits)) => format!(", fractional_bits={bits}"), _ => String::new() };
+                let expression = format!("{mnemonic}({}{scale})", child(1));
+                let action = if discarded { format!("discard({expression})") } else { format!("{} = {expression}", child(0)) };
+                format!("{action}; /* FP status effects unresolved */")
+            }
             "binary" => format!(
                 "({} {} {})",
                 child(0),

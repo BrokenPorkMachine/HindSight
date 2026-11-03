@@ -3,6 +3,20 @@ import Foundation
 @main
 struct BinaryWorkspaceContract {
     static func main() {
+        let input = Data([0, 1, 2, 3])
+        precondition((try? VGBinaryPatch.bytes("01 aF")) == [1, 175])
+        precondition((try? VGBinaryPatch.bytes("0z")) == nil)
+        let first = VGBinaryPatch.Edit(offset: 0, expected: [0], replacement: [7])
+        let last = VGBinaryPatch.Edit(offset: 3, expected: [3], replacement: [6])
+        precondition((try? VGBinaryPatch.apply(input, edits: [last, first])) == Data([7, 1, 2, 6]))
+        precondition((try? VGBinaryPatch.apply(input, edits: [first, first])) == nil)
+        let stale = VGBinaryPatch.Edit(offset: 3, expected: [9], replacement: [6])
+        precondition((try? VGBinaryPatch.apply(input, edits: [first, stale])) == nil)
+        precondition(input == Data([0, 1, 2, 3]))
+        precondition((try? VGBinaryPatch.apply(input, offset: 1, expected: [1, 2], replacement: [9, 8])) == Data([0, 9, 8, 3]))
+        precondition((try? VGBinaryPatch.apply(input, offset: 1, expected: [0], replacement: [9])) == nil)
+        precondition((try? VGBinaryPatch.apply(input, offset: UInt64.max, expected: [1], replacement: [9])) == nil)
+        precondition((try? VGBinaryPatch.apply(input, offset: 0, expected: [0], replacement: [1, 2])) == nil)
         let functionsText = """
         0x0000000100001000  0x0000000100001010        16 bytes  _entry
         0x0000000100001010  0x0000000100001020        16 bytes  _helper

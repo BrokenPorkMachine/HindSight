@@ -13,21 +13,17 @@
 use crate::reconstruction::{array, object, Value as V};
 use std::collections::BTreeSet;
 
-/// AAPCS64 caller-saved general-purpose registers: x0-x18 are temporary or
-/// argument registers, and x18 is the platform register. The ABI lets a callee
-/// destroy all of them.
-pub const CALLER_SAVED_GPR: &str = "x0-x18";
-/// AAPCS64 callee-saved general-purpose registers: x19-x28, x29 (frame
-/// pointer) and x30 (link register) must be preserved by a compliant callee.
-pub const CALLEE_SAVED_GPR: &str = "x19-x30";
-/// AAPCS64 caller-saved floating-point/vector registers: v0-v7 hold arguments
-/// and results and are destroyed by a call.
-pub const CALLER_SAVED_VECTOR: &str = "v0-v7";
-/// AAPCS64 callee-saved floating-point/vector registers: v8-v15 must be
-/// preserved by a compliant callee.
-pub const CALLEE_SAVED_VECTOR: &str = "v8-v15";
-/// The stack pointer and the link register survive a call under AAPCS64.
-pub const PRESERVED_SPECIAL: &str = "sp,lr";
+/// Apple AAPCS64 volatile GPRs. BL/BLR also overwrite x30 (LR).
+/// Apple reserves x18; it is not an ordinary temporary register.
+pub const CALLER_SAVED_GPR: &str = "x0-x17,x30";
+/// General-purpose registers preserved across a returning call, including FP.
+pub const CALLEE_SAVED_GPR: &str = "x19-x29";
+/// Fully volatile vectors plus the volatile upper halves of v8-v15.
+pub const CALLER_SAVED_VECTOR: &str = "v0-v7,v16-v31,v8-v15[127:64]";
+/// Only the low 64 bits of v8-v15 (d8-d15) are preserved.
+pub const CALLEE_SAVED_VECTOR: &str = "v8-v15[63:0]";
+/// A returning call restores SP; LR is overwritten by the call instruction.
+pub const PRESERVED_SPECIAL: &str = "sp";
 
 /// How a call site reaches its callee.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +117,7 @@ impl CallSummary {
                 ("caller_saved_vector", CALLER_SAVED_VECTOR.into()),
                 ("callee_saved_vector", CALLEE_SAVED_VECTOR.into()),
                 ("preserved_special", PRESERVED_SPECIAL.into()),
+                ("reserved_gpr", "x18".into()),
                 ("flags_clobbered", true.into()),
             ]),
         );
@@ -751,10 +748,16 @@ mod tests {
 
     #[test]
     fn abi_contract_names_caller_and_callee_saved_registers() {
-        assert_eq!(CALLER_SAVED_GPR, "x0-x18");
-        assert_eq!(CALLEE_SAVED_GPR, "x19-x30");
-        assert_eq!(CALLER_SAVED_VECTOR, "v0-v7");
-        assert_eq!(CALLEE_SAVED_VECTOR, "v8-v15");
+        for summary in [CallSummary::direct(0x2000), CallSummary::indirect("x9".into())] {
+            let V::Object(fields) = summary.payload() else { panic!("call payload") };
+            let V::Object(abi) = &fields["abi"] else { panic!("ABI payload") };
+            assert_eq!(abi["caller_saved_gpr"], V::String("x0-x17,x30".into()));
+            assert_eq!(abi["callee_saved_gpr"], V::String("x19-x29".into()));
+            assert_eq!(abi["caller_saved_vector"], V::String("v0-v7,v16-v31,v8-v15[127:64]".into()));
+            assert_eq!(abi["callee_saved_vector"], V::String("v8-v15[63:0]".into()));
+            assert_eq!(abi["preserved_special"], V::String("sp".into()));
+            assert_eq!(abi["reserved_gpr"], V::String("x18".into()));
+        }
     }
 
     #[test]

@@ -1,3 +1,12 @@
+# 0.5.15 — C/Objective-C reconstruction and binary patching
+
+- Improve typed call and tail-call pseudocode, scalar/aggregate results, hidden result buffers, and proven integer/FP stack arguments, including paired stores and temporary SP copies.
+- Extend C++ demangling for constructors, destructors, operators, and member qualifiers while retaining unresolved receiver and variadic ABI details.
+- Strengthen Objective-C dispatch evidence, SDK declaration recovery, and source reconstruction contracts; preserve complete function pseudocode within preview budgets.
+- Correct Apple ARM64 call-effect metadata and invalidate stale reconstruction caches.
+- Add staged multi-edit binary patches with original-byte checks, overlap rejection, and atomic output.
+- Bump app, service, worker, VectorEmu, and bundle identities to 0.5.15 (build 5915).
+
 # 0.5.14 — macOS build fix
 
 - Include the shared Darwin SDK declaration catalog in the app target as well as the Coordinator target.

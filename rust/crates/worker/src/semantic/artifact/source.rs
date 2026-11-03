@@ -2580,7 +2580,7 @@ mod tests {
 
     #[test]
     fn explicit_signed_integer_spellings_keep_declared_width_and_signedness() {
-        for (spelling, bits) in [("signed short int", 16), ("signed long", 64),
+        for (spelling, bits) in [("signed int", 32), ("signed short int", 16), ("signed long", 64),
             ("signed long int", 64), ("signed long long", 64), ("signed long long int", 64)] {
             let pointer = SourceType { spelling: format!("const volatile {spelling} *"),
                 bits: 64, signed: false, pointer: true };
@@ -2591,6 +2591,10 @@ mod tests {
             assert!(!pointee.pointer);
             assert!(attempt(&[0xd65f03c0], &format!("{spelling} hs_test({spelling} value);")).is_ok());
         }
+        let loaded = attempt(&[0xb9400000, 0xd65f03c0], "signed int hs_test(const signed int *value);")
+            .expect("signed int pointer load is recoverable");
+        assert!(loaded.dag.nodes.iter().any(|node| node.source_type.as_ref().is_some_and(|ty|
+            ty.spelling == "signed int" && ty.bits == 32 && ty.signed && !ty.pointer)));
     }
     #[test]
     fn unsafe_and_unsupported_source_declarations_are_not_emitted() {

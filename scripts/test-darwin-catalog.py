@@ -51,7 +51,9 @@ def run(worker):
         print("Darwin SDK/worker integration requires macOS; skipped")
         return
     header = ROOT / "Tests/Fixtures/Decompilation/darwin_catalog_sample.h"
-    declaration = collect_declarations(["HSNativeCatalogCount"], header)
+    underscored = collect_declarations(["_HSNativeUnderscored"], header)["functions"][0]
+    assert underscored["symbol"] == "__HSNativeUnderscored" and underscored["worker_eligible"]
+    declaration = collect_declarations(["HSNativeCatalogCount", "HSNativeCatalogRatio", "HSNativeCatalogStack", "HSNativeCatalogRange", "HSNativeCatalogRect", "HSNativeCatalogTransform"], header)
     with tempfile.TemporaryDirectory(prefix="hindsight-darwin-worker-") as directory:
         spec=importlib.util.spec_from_file_location("collect_darwin_evidence",ROOT/"scripts/collect-darwin-evidence.py")
         native=importlib.util.module_from_spec(spec);spec.loader.exec_module(native)
@@ -59,7 +61,7 @@ def run(worker):
         native.compile_helper(helper,[header.with_suffix(".m")])
         contract = Path(directory) / "reconstruction-artifact-contract"
         swift_environment = dict(os.environ, CLANG_MODULE_CACHE_PATH=str(Path(directory) / "swift-module-cache"))
-        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/ReconstructionArtifact.swift"),
+        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/DarwinSDKDeclarations.swift"), str(ROOT / "Shared/ReconstructionArtifact.swift"),
                         str(ROOT / "Tests/reconstruction_artifact_contract.swift"), "-o", str(contract)],
                        env=swift_environment, check=True, capture_output=True, timeout=120)
         sdk_contract = Path(directory) / "darwin-sdk-declarations-contract"
@@ -87,7 +89,14 @@ def run(worker):
             assert "unsigned long HSNativeCatalogCount(unsigned long value);" not in baseline["call_values"]
             assert "value=x0" in recovered["call_values"] or "value=x0" in recovered["semantic_preview"]
             assert "// unsigned long HSNativeCatalogCount(unsigned long value) [" in recovered["semantic_preview"]
-            assert "HSNativeCatalogCount((unsigned long)0x2);" in recovered["semantic_preview"]
+            assert "x0 = HSNativeCatalogCount((unsigned long)0x2);" in recovered["semantic_preview"], "\n".join(line for line in recovered["semantic_preview"].splitlines() if "HSNativeCatalog" in line)
+            stack_calls = [line for line in recovered["semantic_preview"].splitlines() if "d0 = HSNativeCatalogStack(" in line]
+            assert len(stack_calls) == 1 and ", 1.0, -1.0);" in stack_calls[0], stack_calls
+            if optimization == "-O2":
+                assert "return HSNativeCatalogRatio((unsigned long)0x6);" in recovered["semantic_preview"], recovered["semantic_preview"]
+            for assignment in ["d0 = HSNativeCatalogRatio(", "(x0, x1) = HSNativeCatalogRange(", "(d0, d1, d2, d3) = HSNativeCatalogRect("]:
+                assert assignment in recovered["semantic_preview"], (optimization, assignment, recovered["semantic_preview"])
+            assert "/* hidden result buffer */ result_buffer<CGAffineTransform>(x8)" in recovered["semantic_preview"]
             # Exercise the actual dump producer, not only analysis pseudocode.
             boundary = next(re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+_HSNativeCatalogCount\s", line)
                             for line in recovered["functions"].splitlines()

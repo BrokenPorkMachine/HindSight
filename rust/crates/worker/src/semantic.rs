@@ -543,6 +543,7 @@ enum IrConversionRegister { Float { index: u8, precision: IrFloatPrecision }, In
 fn render_int_float_conversion(destination: IrConversionRegister, source: IrConversionRegister, signed: bool, fractional_bits: Option<u8>) -> String {
     let register = |value| match value {
         IrConversionRegister::Float { index, precision } => format!("{}{index}", match precision { IrFloatPrecision::Half => 'h', IrFloatPrecision::Single => 's', IrFloatPrecision::Double => 'd' }),
+        IrConversionRegister::Integer { index: 31, wide } => if wide { "xzr".into() } else { "wzr".into() },
         IrConversionRegister::Integer { index, wide } => format!("{}{index}", if wide { 'x' } else { 'w' }),
     };
     if let Some(bits) = fractional_bits {
@@ -557,7 +558,9 @@ fn render_int_float_conversion(destination: IrConversionRegister, source: IrConv
                 let mnemonic = if signed { "fcvtzs" } else { "fcvtzu" };
                 let width = if wide { 64 } else { 32 };
                 let precision_name = match precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "single", IrFloatPrecision::Double => "double" };
-                format!("{} = {mnemonic}_fixed{width}({}, fractional_bits={bits}); /* {precision_name}; truncates toward zero; out-of-range result is architecture-specific */", register(destination), register(source))
+                let expression = format!("{mnemonic}_fixed{width}({}, fractional_bits={bits})", register(source));
+                let action = if matches!(destination, IrConversionRegister::Integer { index: 31, .. }) { format!("discard({expression})") } else { format!("{} = {expression}", register(destination)) };
+                format!("{action}; /* {precision_name}; truncates toward zero; out-of-range result is architecture-specific */")
             }
             _ => format!("{} = fixed_conversion({});", register(destination), register(source)),
         };
@@ -566,11 +569,13 @@ fn render_int_float_conversion(destination: IrConversionRegister, source: IrConv
         (IrConversionRegister::Float { precision, .. }, IrConversionRegister::Integer { wide, .. }) => {
             let destination_type = match precision { IrFloatPrecision::Half => "half", IrFloatPrecision::Single => "float", IrFloatPrecision::Double => "double" };
             let source_type = format!("{}int{}_t", if signed { "" } else { "u" }, if wide { 64 } else { 32 });
-            format!("{} = ({destination_type})({source_type}){};", register(destination), register(source))
+            format!("{} = ({destination_type})({source_type}){}; /* FPCR rounding mode applies; FP status effects not modeled */", register(destination), register(source))
         }
         (IrConversionRegister::Integer { wide, .. }, IrConversionRegister::Float { .. }) => {
             let destination_type = format!("{}int{}_t", if signed { "" } else { "u" }, if wide { 64 } else { 32 });
-            format!("{} = ({destination_type}){};", register(destination), register(source))
+            let expression = format!("({destination_type}){}", register(source));
+            let action = if matches!(destination, IrConversionRegister::Integer { index: 31, .. }) { format!("discard({expression})") } else { format!("{} = {expression}", register(destination)) };
+            format!("{action}; /* truncates toward zero; NaN and out-of-range results follow ARM64, not C cast semantics; FP status effects not modeled */")
         }
         _ => format!("{} = conversion({});", register(destination), register(source)),
     }
@@ -5125,23 +5130,31 @@ fn decode(word: u32, pc: u64) -> Operation {
     // Scalar fixed-point integer/FP conversions. The encoded imm6 is 64-fbits;
     // 32-bit forms additionally require fbits <= 32. Keep rounding and overflow
     // behavior explicit in the rendered expression/comment.
-    let fixed_conversion = match word & 0xfff1_0000 {
-        0x1e00_0000 => Some((true, false, false)),
-        0x9e40_0000 => Some((true, false, true)),
-        0x1e01_0000 => Some((true, true, false)),
-        0x9e41_0000 => Some((true, true, true)),
-        0x1e10_0000 => Some((false, false, false)),
-        0x9e50_0000 => Some((false, false, true)),
-        0x1e11_0000 => Some((false, true, false)),
-        0x9e51_0000 => Some((false, true, true)),
+    let fixed_conversion = match word & 0xffff_0000 {
+        0x1e02_0000 => Some((true, false, false, false)),
+        0x1e42_0000 => Some((true, false, false, true)),
+        0x9e02_0000 => Some((true, false, true, false)),
+        0x9e42_0000 => Some((true, false, true, true)),
+        0x1e03_0000 => Some((true, true, false, false)),
+        0x1e43_0000 => Some((true, true, false, true)),
+        0x9e03_0000 => Some((true, true, true, false)),
+        0x9e43_0000 => Some((true, true, true, true)),
+        0x1e18_0000 => Some((false, false, false, false)),
+        0x1e58_0000 => Some((false, false, false, true)),
+        0x9e18_0000 => Some((false, false, true, false)),
+        0x9e58_0000 => Some((false, false, true, true)),
+        0x1e19_0000 => Some((false, true, false, false)),
+        0x1e59_0000 => Some((false, true, false, true)),
+        0x9e19_0000 => Some((false, true, true, false)),
+        0x9e59_0000 => Some((false, true, true, true)),
         _ => None,
     };
-    if let Some((to_float, unsigned, wide)) = fixed_conversion {
+    if let Some((to_float, unsigned, wide, double)) = fixed_conversion {
         let fractional_bits = 64 - ((word >> 10) & 0x3f);
         if fractional_bits == 0 || (!wide && fractional_bits > 32) { return Operation::Opaque; }
         let destination_index = (word & 31) as u8;
         let source_index = ((word >> 5) & 31) as u8;
-        let precision = if wide { IrFloatPrecision::Double } else { IrFloatPrecision::Single };
+        let precision = if double { IrFloatPrecision::Double } else { IrFloatPrecision::Single };
         let signed = !unsigned;
         let (destination, source) = if to_float {
             (IrConversionRegister::Float { index: destination_index, precision }, IrConversionRegister::Integer { index: source_index, wide })
@@ -5153,20 +5166,28 @@ fn decode(word: u32, pc: u64) -> Operation {
     // Integer-to-FP and FP-to-integer conversions without a fixed-point
     // fractional scale. Width, direction, and signedness come from the opcode.
     let integer_float_conversion = match word & 0xffff_fc00 {
-        0x9e62_0000 => Some((true, true, true)),   // SCVTF Dd, Xn
-        0x1e22_0000 => Some((true, false, true)),  // SCVTF Sd, Wn
-        0x9e63_0000 => Some((true, true, false)),  // UCVTF Dd, Xn
-        0x1e23_0000 => Some((true, false, false)), // UCVTF Sd, Wn
-        0x9e78_0000 => Some((false, true, true)),  // FCVTZS Xd, Dn
-        0x1e38_0000 => Some((false, false, true)), // FCVTZS Wd, Sn
-        0x9e79_0000 => Some((false, true, false)), // FCVTZU Xd, Dn
-        0x1e39_0000 => Some((false, false, false)),// FCVTZU Wd, Sn
+        0x9e62_0000 => Some((true, true, true, true)),
+        0x1e22_0000 => Some((true, false, true, false)),
+        0x1e62_0000 => Some((true, false, true, true)),
+        0x9e22_0000 => Some((true, true, true, false)),
+        0x9e63_0000 => Some((true, true, false, true)),
+        0x1e23_0000 => Some((true, false, false, false)),
+        0x1e63_0000 => Some((true, false, false, true)),
+        0x9e23_0000 => Some((true, true, false, false)),
+        0x9e78_0000 => Some((false, true, true, true)),
+        0x1e38_0000 => Some((false, false, true, false)),
+        0x1e78_0000 => Some((false, false, true, true)),
+        0x9e38_0000 => Some((false, true, true, false)),
+        0x9e79_0000 => Some((false, true, false, true)),
+        0x1e39_0000 => Some((false, false, false, false)),
+        0x1e79_0000 => Some((false, false, false, true)),
+        0x9e39_0000 => Some((false, true, false, false)),
         _ => None,
     };
-    if let Some((to_float, wide, signed)) = integer_float_conversion {
+    if let Some((to_float, wide, signed, double)) = integer_float_conversion {
         let destination_index = (word & 31) as u8;
         let source_index = ((word >> 5) & 31) as u8;
-        let precision = if wide { IrFloatPrecision::Double } else { IrFloatPrecision::Single };
+        let precision = if double { IrFloatPrecision::Double } else { IrFloatPrecision::Single };
         let (destination, source) = if to_float {
             (IrConversionRegister::Float { index: destination_index, precision }, IrConversionRegister::Integer { index: source_index, wide })
         } else {
@@ -8149,8 +8170,9 @@ pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: 
     (0..8u8).filter_map(|index| flow.read_v(index as u32).map(|value| (index, value.value, format!("proven_by=[{}]", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(",")) ))).collect()
 }
 
-/// Prove scalar outgoing stack values only from direct SP-relative stores in
-/// the same straight-line call window. Any possible alias, call, opaque
+/// Prove scalar outgoing stack values from SP-relative stores, including
+/// intact full-width copies of SP, in the same straight-line call window.
+/// Any possible alias, call, opaque
 /// operation, or SP update discards earlier stores. The caller supplies the
 /// formal width; a wider store proves its low bytes at the same offset.
 pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(usize, u8, u64, String)> {
@@ -8159,6 +8181,7 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
     let Some(function_index) = usize::try_from(function_start - base).ok().map(|offset| offset / 4) else { return Vec::new() };
     if call_index.saturating_mul(4) > code.len() { return Vec::new(); }
     let mut flow = Flow::new();
+    let mut stack_aliases = std::collections::BTreeMap::<u8, Vec<u64>>::new();
     let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
     for index in call_index.saturating_sub(64).max(function_index)..call_index {
         let Some(bytes) = code.get(index * 4..index * 4 + 4) else { return Vec::new() };
@@ -8166,7 +8189,7 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
         let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
         let portable = lift_operation(operation, pc);
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) { return Vec::new(); }
-        if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) { flow.clear(); stack.clear(); continue; }
+        if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) { flow.clear(); stack.clear(); stack_aliases.clear(); continue; }
         let sp_changed = matches!(operation,
             Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer)
             || matches!(portable,
@@ -8174,10 +8197,40 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
                 | IrOperation::Store { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
                 | IrOperation::LoadPair { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
                 | IrOperation::StorePair { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::SimdPairLoad { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
+                | IrOperation::SimdPairStore { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
                 | IrOperation::SimdLoad { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. }
                 | IrOperation::SimdStore { writeback: Some(IrWriteback { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, .. }), .. });
-        if sp_changed { stack.clear(); }
-        match portable {
+        if sp_changed { stack.clear(); stack_aliases.clear(); }
+        // Clang commonly addresses outgoing arguments through `mov xN, sp`.
+        // Only exact, full-width copies of the current SP qualify here.
+        let alias_definition = match portable {
+            IrOperation::Assign { destination, value: IrOperand::Register(source) }
+            | IrOperation::Binary { destination, operator: IrBinaryOp::Add, left: IrOperand::Register(source), right: IrOperand::Constant(0) }
+                if destination.class == IrRegisterClass::General && destination.bits == 64 && source.bits == 64 => {
+                    let origins = if source.class == IrRegisterClass::StackPointer { Some(vec![pc]) }
+                        else if source.class == IrRegisterClass::General { stack_aliases.get(&source.index).and_then(|origins| combine_origins(origins, &[], pc)) }
+                        else { None };
+                    origins.map(|origins| (destination.index, origins))
+                }
+            _ => None,
+        };
+        let mut base_evidence = String::new();
+        let mut normalize_address = |address| match address {
+            IrMemoryAddress::BaseOffset { base, offset } if base.class == IrRegisterClass::General && base.bits == 64 && stack_aliases.contains_key(&base.index) => {
+                base_evidence = format!("; stack_base=x{}; base_proven_by=[{}]", base.index, stack_aliases[&base.index].iter().map(|pc| format!("{pc:#x}")).collect::<Vec<_>>().join(","));
+                IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, index: 31, bits: 64 }, offset }
+            }
+            address => address,
+        };
+        let stack_operation = match portable {
+            IrOperation::Store { address, value, bytes, writeback } => IrOperation::Store { address: normalize_address(address), value, bytes, writeback },
+            IrOperation::SimdStore { source, address, writeback } => IrOperation::SimdStore { source, address: normalize_address(address), writeback },
+            IrOperation::StorePair { address, first, second, bytes, writeback } => IrOperation::StorePair { address: normalize_address(address), first, second, bytes, writeback },
+            IrOperation::SimdPairStore { address, first, second, bytes, writeback } => IrOperation::SimdPairStore { address: normalize_address(address), first, second, bytes, writeback },
+            _ => portable,
+        };
+        match stack_operation {
             IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, offset }, value, bytes, writeback: None }
                 if !sp_changed && (1..=8).contains(&bytes) && (0..=256).contains(&offset) => {
                     let offset = offset as usize;
@@ -8186,12 +8239,46 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
                         IrOperand::Constant(value) => Some((value, format!("proven_by=[{pc:#x}]"))),
                         IrOperand::Register(register) => flow.read(register.target()).map(|value| (value.value, format!("{}; stack_store={pc:#x}", proven_by(&value)))),
                     };
-                    if let Some((value, provenance)) = known { stack.insert(offset, (bytes, value, provenance)); }
+                    if let Some((value, provenance)) = known { stack.insert(offset, (bytes, value, format!("{provenance}{base_evidence}"))); }
                 }
-            IrOperation::Store { .. } | IrOperation::StorePair { .. } | IrOperation::SimdStore { .. } | IrOperation::AtomicStore { .. } => stack.clear(),
+            IrOperation::SimdStore { source, address: IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, offset }, writeback: None }
+                if !sp_changed && matches!(source.width, IrSimdWidth::Single | IrSimdWidth::Double) && (0..=256).contains(&offset) => {
+                    let offset = offset as usize;
+                    let bytes = source.width.bytes();
+                    stack.retain(|other, (width, _, _)| *other + usize::from(*width) <= offset || offset + usize::from(bytes) <= *other);
+                    if let Some(value) = flow.read_v(u32::from(source.index)) {
+                        let provenance = format!("proven_by=[{}]; stack_store={pc:#x}", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","));
+                        stack.insert(offset, (bytes, value.value as u64, format!("{provenance}{base_evidence}")));
+                    }
+                }
+            IrOperation::StorePair { address: IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, offset }, first, second, bytes, writeback: None }
+                if !sp_changed && matches!(bytes, 4 | 8) && (0..=256).contains(&offset) => {
+                    let offset = offset as usize;
+                    stack.retain(|other, (width, _, _)| *other + usize::from(*width) <= offset || offset + 2 * usize::from(bytes) <= *other);
+                    for (index, register) in [first, second].into_iter().enumerate() {
+                        if let Some(value) = flow.read(register.target()) {
+                            let provenance = format!("{}; stack_store={pc:#x}{base_evidence}", proven_by(&value));
+                            stack.insert(offset + index * usize::from(bytes), (bytes, value.value, provenance));
+                        }
+                    }
+                }
+            IrOperation::SimdPairStore { address: IrMemoryAddress::BaseOffset { base: IrRegister { class: IrRegisterClass::StackPointer, .. }, offset }, first, second, bytes, writeback: None }
+                if !sp_changed && matches!(bytes, 4 | 8) && (0..=256).contains(&offset) => {
+                    let offset = offset as usize;
+                    stack.retain(|other, (width, _, _)| *other + usize::from(*width) <= offset || offset + 2 * usize::from(bytes) <= *other);
+                    for (index, register) in [first, second].into_iter().enumerate() {
+                        if let Some(value) = flow.read_v(u32::from(register.index)) {
+                            let provenance = format!("proven_by=[{}]; stack_store={pc:#x}{base_evidence}", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(","));
+                            stack.insert(offset + index * usize::from(bytes), (bytes, value.value as u64, provenance));
+                        }
+                    }
+                }
+            IrOperation::Store { .. } | IrOperation::StorePair { .. } | IrOperation::SimdStore { .. } | IrOperation::SimdPairStore { .. } | IrOperation::AtomicStore { .. } => stack.clear(),
             _ => {}
         }
-        if portable == IrOperation::TargetSpecific || portable.render(&mut flow, pc).is_none() { flow.clear(); stack.clear(); }
+        for register in registers_in(portable.gpr_effects().definitions) { stack_aliases.remove(&register); }
+        if let Some((register, origins)) = alias_definition { stack_aliases.insert(register, origins); }
+        if portable == IrOperation::TargetSpecific || portable.render(&mut flow, pc).is_none() { flow.clear(); stack.clear(); stack_aliases.clear(); }
     }
     stack.into_iter().map(|(offset, (bytes, value, provenance))| (offset, bytes, value, provenance)).collect()
 }
@@ -8923,6 +9010,39 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outgoing_stack_pairs_recover_each_lane_and_invalidate_overlaps() {
+        let recover = |words: &[u32]| {
+            let code = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+            super::known_call_stack_argument_values(&code, 0x1000, 0x1000, 0x1000 + code.len() as u64)
+        };
+        // GPR pair constants; FP pairs use the same per-lane byte offsets.
+        for (first, second, pair, width, expected) in [
+            (0xd280_0029, 0xd280_004a, 0xa900_2be9, 8, [1u64, 2]),
+            (0x5280_0029, 0x5280_004a, 0x2900_2be9, 4, [1, 2]),
+            (0x1e2e_1008, 0x1e3e_1009, 0x2d00_27e8, 4, [0x3f80_0000, 0xbf80_0000]),
+            (0x1e6e_1008, 0x1e7e_1009, 0x6d00_27e8, 8, [0x3ff0_0000_0000_0000, 0xbff0_0000_0000_0000]),
+        ] {
+            let values = recover(&[first, second, pair]);
+            assert_eq!(values.iter().map(|(offset, bytes, value, _)| (*offset, *bytes, *value)).collect::<Vec<_>>(),
+                vec![(0, width, expected[0]), (width as usize, width, expected[1])]);
+            assert!(values.iter().all(|value| value.3.contains("stack_store=0x1008")));
+        }
+        // An unknown second lane overwrites the old second slot, without
+        // discarding the independently proven first lane.
+        let values = recover(&[0xd280_004a, 0xf900_07ea, 0x1e6e_1008, 0x6d00_27e8]);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].0, 0);
+        // Unknown SIMD pairs (including Q pairs), possible aliases, and
+        // pair writeback must never leave an earlier scalar store intact.
+        for barrier in [0x6d00_27e8, 0xad00_27e8, 0x6d00_2428, 0x6dbf_27e8, 0x6cc1_27e8] {
+            assert!(recover(&[0xd280_0029, 0xf900_03e9, barrier]).is_empty(), "{barrier:#x}");
+        }
+        // mov x8,sp; stp x9,x10,[x8] preserves address-copy evidence.
+        let values = recover(&[0x9100_03e8, 0xd280_0029, 0xd280_004a, 0xa900_2909]);
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().all(|value| value.3.contains("base_proven_by=[0x1000]")));
+    }
     use super::{decode, lift_operation, render, scalar_float_compare_flags, f16_to_f32_bits, Flow, IrFloatPrecision, KnownValue, Operation, Register};
 
     fn lift(word: u32, pc: u64) -> String {
@@ -9213,6 +9333,19 @@ mod tests {
             (0x9e43_0062, "d2 = ucvtf_fixed64(x3, fractional_bits=64); /* double; FPCR rounding mode applies */"),
             (0x1e18_80a4, "w4 = fcvtzs_fixed32(s5, fractional_bits=32); /* single; truncates toward zero; out-of-range result is architecture-specific */"),
             (0x9e59_fce6, "x6 = fcvtzu_fixed64(d7, fractional_bits=1); /* double; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x1e42_ec20, "d0 = scvtf_fixed32(w1, fractional_bits=5); /* double; FPCR rounding mode applies */"),
+            (0x9e02_ec20, "s0 = scvtf_fixed64(x1, fractional_bits=5); /* single; FPCR rounding mode applies */"),
+            (0x1e43_ec20, "d0 = ucvtf_fixed32(w1, fractional_bits=5); /* double; FPCR rounding mode applies */"),
+            (0x9e03_ec20, "s0 = ucvtf_fixed64(x1, fractional_bits=5); /* single; FPCR rounding mode applies */"),
+            (0x1e58_ec20, "w0 = fcvtzs_fixed32(d1, fractional_bits=5); /* double; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x9e18_ec20, "x0 = fcvtzs_fixed64(s1, fractional_bits=5); /* single; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x1e59_ec20, "w0 = fcvtzu_fixed32(d1, fractional_bits=5); /* double; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x9e19_ec20, "x0 = fcvtzu_fixed64(s1, fractional_bits=5); /* single; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x1e42_8020, "d0 = scvtf_fixed32(w1, fractional_bits=32); /* double; FPCR rounding mode applies */"),
+            (0x9e02_0020, "s0 = scvtf_fixed64(x1, fractional_bits=64); /* single; FPCR rounding mode applies */"),
+            (0x1e58_8020, "w0 = fcvtzs_fixed32(d1, fractional_bits=32); /* double; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x9e18_0020, "x0 = fcvtzs_fixed64(s1, fractional_bits=64); /* single; truncates toward zero; out-of-range result is architecture-specific */"),
+            (0x9e18_003f, "discard(fcvtzs_fixed64(s1, fractional_bits=64)); /* single; truncates toward zero; out-of-range result is architecture-specific */"),
         ];
         for (word, expected) in cases {
             assert_eq!(lift(word, 0x1000), expected);
@@ -9223,6 +9356,24 @@ mod tests {
         }
         // 32-bit fixed-point forms cannot encode more than 32 fractional bits.
         assert_eq!(lift(0x1e00_0020, 0x1000), "/* opaque instruction: semantics unavailable; value flow stops here */");
+        assert!(!matches!(decode(0x1e44_ec20, 0x1000), Operation::ScalarIntFloatConvert { .. }));
+        assert!(!matches!(decode(0x1e42_7c20, 0x1000), Operation::ScalarIntFloatConvert { .. }));
+        for opcode in [0x1e02_0000u32, 0x1e03_0000, 0x1e18_0000, 0x1e19_0000] {
+            for wide in [false, true] { for double in [false, true] { for scale in 1..=64u32 {
+                let word = opcode | ((wide as u32) << 31) | ((double as u32) << 22) | ((64-scale) << 10) | (1 << 5);
+                match decode(word, 0x1000) {
+                    Operation::ScalarIntFloatConvert { destination, source, fractional_bits: Some(bits), .. } => {
+                        assert!(wide || scale <= 32, "invalid scale accepted: {word:#010x}");
+                        assert_eq!(u32::from(bits), scale);
+                        let float = [destination, source].into_iter().find_map(|r| match r {
+                            super::IrConversionRegister::Float { precision, .. } => Some(precision), _ => None,
+                        }).unwrap();
+                        assert_eq!(float, if double { IrFloatPrecision::Double } else { IrFloatPrecision::Single });
+                    }
+                    _ => assert!(!wide && scale > 32, "valid conversion rejected: {word:#010x}"),
+                }
+            } } }
+        }
     }
 
     #[test]
@@ -9236,9 +9387,24 @@ mod tests {
             (0x1e38_016a, "w10 = (int32_t)s11;"),
             (0x9e79_01ac, "x12 = (uint64_t)d13;"),
             (0x1e39_0128, "w8 = (uint32_t)s9;"),
+            (0x1e78_0009, "w9 = (int32_t)d0;"),
+            (0x9e38_016a, "x10 = (int64_t)s11;"),
+            (0x1e62_0020, "d0 = (double)(int32_t)w1;"),
+            (0x9e23_00a4, "s4 = (float)(uint64_t)x5;"),
+            // Apple Clang-assembled mixed-width forms, both directions and signs.
+            (0x9e22_0020, "s0 = (float)(int64_t)x1;"),
+            (0x1e63_0020, "d0 = (double)(uint32_t)w1;"),
+            (0x9e23_0020, "s0 = (float)(uint64_t)x1;"),
+            (0x1e78_0020, "w0 = (int32_t)d1;"),
+            (0x9e38_0020, "x0 = (int64_t)s1;"),
+            (0x1e79_0020, "w0 = (uint32_t)d1;"),
+            (0x9e39_0020, "x0 = (uint64_t)s1;"),
+            (0x1e62_03e0, "d0 = (double)(int32_t)wzr;"),
+            (0x9e38_003f, "discard((int64_t)s1);"),
         ];
         for (word, expected) in cases {
-            assert_eq!(lift(word, 0x1000), expected);
+            assert!(lift(word, 0x1000).starts_with(expected), "{}", lift(word, 0x1000));
+            assert!(lift(word, 0x1000).contains("FP status effects not modeled"));
             let code = word.to_le_bytes();
             let report = render(&code, 0x1000, 0x100, &[0x1000], &[]);
             assert!(report.contains(expected), "{report}");

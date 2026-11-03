@@ -23,8 +23,9 @@ def run(worker):
         raise SystemExit("Header qualification requires the Apple SDK/toolchain.")
     declarations = ["double hs_double(double first, float second)",
                     "float hs_float(float value)", "long double hs_long_double(long double value)",
+                    "__int128 hs_wide(unsigned __int128 value)",
                     "uint64_t hs_stack(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h, uint64_t i)"]
-    names = ["hs_double", "hs_float", "hs_long_double", "hs_stack"]
+    names = ["hs_double", "hs_float", "hs_long_double", "hs_wide", "hs_stack"]
     aggregate_types = ["NSRange", "CFRange", "CGPoint", "CGSize", "CGRect", "CGAffineTransform"]
     declarations.extend(f"{ty} hs_sdk_{ty}({ty} value)" for ty in aggregate_types)
     names.extend("hs_sdk_" + ty for ty in aggregate_types)
@@ -32,7 +33,7 @@ def run(worker):
         root = Path(temporary)
         contract = root / "native-header-contract"
         environment = dict(os.environ, CLANG_MODULE_CACHE_PATH=str(root / "module-cache"))
-        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/ReconstructionArtifact.swift"),
+        subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/DarwinSDKDeclarations.swift"), str(ROOT / "Shared/ReconstructionArtifact.swift"),
                         str(ROOT / "Tests/reconstruction_artifact_contract.swift"), "-o", str(contract)],
                        check=True, capture_output=True, timeout=120, env=environment)
         fixture = root / "original.c"
@@ -98,7 +99,7 @@ def run(worker):
                             str(batch), "--headers-only"], check=True, timeout=120)
             qualification = json.loads((batch / "header-qualification/report.json").read_bytes())
             assert qualification["status"] == "passed" and len(qualification["headers"]) == len(names)
-            assert len(qualification["header_checks"]) == 38
+            assert len(qualification["header_checks"]) == len(names) * 4 - 2
             for entry in manifest["functions"]:
                 artifact_file = next(file for file in entry["files"] if file["path"].endswith(".json"))
                 artifact = json.loads((batch / artifact_file["path"]).read_bytes())

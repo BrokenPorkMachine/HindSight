@@ -1,5 +1,62 @@
 import Foundation
 
+enum VGBinaryPatch {
+    struct Edit: Identifiable {
+        let id = UUID()
+        let offset: UInt64
+        let expected: [UInt8]
+        let replacement: [UInt8]
+    }
+    static func apply(_ data: Data, edits: [Edit]) throws -> Data {
+        let sorted = edits.sorted { $0.offset < $1.offset }
+        var end: UInt64 = 0
+        for edit in sorted {
+            guard edit.offset >= end else { throw PatchError.overlap }
+            _ = try apply(data, offset: edit.offset, expected: edit.expected, replacement: edit.replacement)
+            end = edit.offset + UInt64(edit.expected.count)
+        }
+        var output = data
+        for edit in sorted {
+            output.replaceSubrange(Int(edit.offset)..<Int(edit.offset + UInt64(edit.expected.count)), with: edit.replacement)
+        }
+        return output
+    }
+    enum PatchError: Error, LocalizedError {
+        case invalidHex, lengthMismatch, outOfBounds, originalMismatch, overlap
+        var errorDescription: String? {
+            switch self {
+            case .overlap: return "Staged patches overlap. Remove the conflicting edit first."
+            case .invalidHex: return "Enter complete hexadecimal byte pairs."
+            case .lengthMismatch: return "Original and replacement bytes must have the same nonzero length."
+            case .outOfBounds: return "The patch extends beyond the file."
+            case .originalMismatch: return "The original bytes do not match the file at this offset."
+            }
+        }
+    }
+    static func bytes(_ text: String) throws -> [UInt8] {
+        let compact = text.filter { !$0.isWhitespace }
+        guard !compact.isEmpty, compact.count.isMultiple(of: 2), compact.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else { throw PatchError.invalidHex }
+        var result: [UInt8] = []
+        var index = compact.startIndex
+        while index < compact.endIndex {
+            let end = compact.index(index, offsetBy: 2)
+            guard let byte = UInt8(compact[index..<end], radix: 16) else { throw PatchError.invalidHex }
+            result.append(byte)
+            index = end
+        }
+        return result
+    }
+    static func apply(_ data: Data, offset: UInt64, expected: [UInt8], replacement: [UInt8]) throws -> Data {
+        guard !expected.isEmpty, expected.count == replacement.count else { throw PatchError.lengthMismatch }
+        guard offset <= UInt64(data.count), UInt64(expected.count) <= UInt64(data.count) - offset else { throw PatchError.outOfBounds }
+        let start = Int(offset)
+        guard Array(data[start..<(start + expected.count)]) == expected else { throw PatchError.originalMismatch }
+        var output = data
+        output.replaceSubrange(start..<(start + expected.count), with: replacement)
+        return output
+    }
+}
+
 struct VGBinaryReference: Identifiable, Hashable {
     let source: UInt64
     let target: UInt64

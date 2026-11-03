@@ -554,7 +554,7 @@ ret
                     module_cache = root / "swift-module-cache"
                     module_cache.mkdir()
                     swift_env = dict(os.environ, CLANG_MODULE_CACHE_PATH=str(module_cache))
-                    subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/ReconstructionArtifact.swift"),
+                    subprocess.run(["xcrun", "swiftc", str(ROOT / "Shared/DarwinSDKDeclarations.swift"), str(ROOT / "Shared/ReconstructionArtifact.swift"),
                                     str(ROOT / "Tests/reconstruction_artifact_contract.swift"),
                                     "-o", str(swift_contract)], check=True, env=swift_env, timeout=120)
                     artifact_file = root / "swift-artifact.json"

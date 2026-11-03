@@ -6,6 +6,18 @@ Inputs: the two existing roadmaps, the independent [reconstruction-first draft](
 
 ## Current actionable queue (2026-10-23)
 
+Unreleased pass 83 recovers independent scalar argument values from outgoing
+GPR and SIMD pair stores. Unknown lanes invalidate their overwritten slots;
+SIMD pair writeback clears old stack locations and SP-copy evidence.
+
+Unreleased pass 82 recovers float/double outgoing stack literals from proven
+stores, including Clang's temporary copies of SP. Register clobbers, stack
+changes, possible aliases, and overlapping stores invalidate the evidence.
+
+Unreleased pass 81 corrects the Apple ARM64 call-effect metadata used by
+reconstruction: x18 is reserved, LR is volatile, and only the low halves of
+v8-v15 are preserved. Cache identities invalidate earlier summaries.
+
 Published baseline: [v0.5.13-rc.1](https://github.com/BrokenPorkMachine/HindSight/releases/tag/v0.5.13-rc.1),
 commit `4da4600`, reconstruction pass 62. The changes below marked unreleased
 are development work and are not present in that published package.
@@ -15,7 +27,7 @@ C runtime instead of undefined symbolic registers/intrinsics. Supported
 instructions are retained; status 4 stops before unqualified effects and outside
 the captured prefix. This remains a repair-oriented fragment, not an original
 ABI, complete function or equivalence claim. Source/cache identities advance to
-`arm64-analysis-v104-schema130` and `prototype-abi-v20`. Initial worker/Clippy and
+`arm64-analysis-v125-schema130` and `prototype-abi-v37`. Initial worker/Clippy and
 opaque-operation stop/budget tests pass. Every fallback in the 16-fixture worker
 gate syntax-checks with C17 and warnings-as-errors; opaque execution preserves
 registers/flags before the unresolved operation and honors the step budget.

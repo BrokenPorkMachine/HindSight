@@ -17,7 +17,7 @@ spec = importlib.util.spec_from_file_location("pointee_requests", ROOT / "script
 requests = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(requests)
 TYPES = [("char", 8, True), ("signed char", 8, True), ("unsigned char", 8, False),
-         ("short", 16, True), ("unsigned short", 16, False), ("int", 32, True),
+         ("short", 16, True), ("unsigned short", 16, False), ("int", 32, True), ("signed int", 32, True),
          ("unsigned int", 32, False), ("long", 64, True), ("unsigned long", 64, False),
          ("long long", 64, True), ("unsigned long long", 64, False), ("size_t", 64, False),
          ("signed short int", 16, True), ("signed long", 64, True), ("signed long int", 64, True),

@@ -34,7 +34,7 @@ pub fn source_declaration(name: &str, signature: &Signature) -> Option<SourceDec
     if !c_identifier(&recovered_name) { return None; }
     // Reuse the body path's safe scalar spelling validation, not its argument
     // register eligibility. Plain FP declarations need no body/FP-mode proof.
-    let safe_type = |ty: &str| matches!(ty.trim(), "float" | "double" | "long double" |
+    let safe_type = |ty: &str| matches!(ty.trim(), "float" | "double" | "long double" | "__int128" | "unsigned __int128" |
         "NSRange" | "CFRange" | "CGPoint" | "CGSize" | "CGRect" | "CGAffineTransform") || {
         let probe = Signature { language: "C", declaration: format!("void hs_declaration_probe({ty} value);"), source: signature.source };
         source_signature("hs_declaration_probe", &probe).is_some()
@@ -81,7 +81,7 @@ pub fn source_signature(name:&str,signature:&Signature)->Option<SourceSignature>
         if !spelling.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b' '|b'*')){return None}
         let bare=spelling.split(|c:char|c.is_whitespace()||c=='*').filter(|s|!s.is_empty()&&!matches!(*s,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"|"__kindof")).collect::<Vec<_>>().join(" ");
         let native=["void","char","signed char","unsigned char","short","short int","signed short","unsigned short","unsigned short int","int","signed","signed int","unsigned","unsigned int","long","long int","unsigned long","unsigned long int","long long","long long int","unsigned long long","unsigned long long int","int8_t","uint8_t","int16_t","uint16_t","int32_t","uint32_t","int64_t","uint64_t","intptr_t","uintptr_t","size_t","ssize_t","ptrdiff_t","id","Class","SEL","NSInteger","NSUInteger","CFIndex","CFTypeID","CFOptionFlags","CFStringEncoding","CFNumberType","CFURLPathStyle","CFPropertyListFormat","dispatch_once_t","CFTypeRef","CFAllocatorRef","CFStringRef","CFArrayRef","CFDictionaryRef","CFBooleanRef","CFNumberRef","CFDataRef","CFBundleRef","CFURLRef","CFPropertyListRef","CFErrorRef","CFRunLoopRef"];
-        if !native.contains(&bare.as_str()) && !matches!(bare.as_str(),"bool"|"_Bool"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
+        if !native.contains(&bare.as_str()) && !matches!(bare.as_str(),"bool"|"_Bool"|"signed int"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
         let AbiType::Integer(bytes)=abi_type(&spelling)? else{return None};
         let kind=abi_integer_kind(&spelling)?;
         if kind==AbiIntegerKind::Boolean && !matches!(bare.as_str(),"bool"|"_Bool"){return None}
@@ -147,8 +147,9 @@ fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTree
             bound=true;continue
         }
         if let Some((key,value))=line.strip_prefix("# ").and_then(|value|value.split_once('=')) {
-            if matches!(key,"producer"|"target"|"sdk"|"sdk_build"|"compiler"|"header_sha256") {
-                if saw_declaration||value.is_empty()||value.len()>4096||metadata.insert(key,value).is_some(){return Err("External prototype catalog metadata is invalid, misplaced or duplicated")}
+            if matches!(key,"producer"|"target"|"sdk"|"sdk_build"|"compiler"|"header_sha256")
+                && (saw_declaration||value.is_empty()||value.len()>4096||metadata.insert(key,value).is_some()) {
+                return Err("External prototype catalog metadata is invalid, misplaced or duplicated")
             }
             continue
         }
@@ -161,7 +162,7 @@ fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTree
         let Some((head,arguments))=declaration[..declaration.len()-1].split_once('(')else{return Err("External prototype declaration is malformed")};
         if !arguments.ends_with(')')||arguments[..arguments.len()-1].contains(['(',')']){return Err("External prototype declaration has unsupported nesting")}
         let declared=head.split_whitespace().last().map(|name|name.trim_start_matches('*')).unwrap_or("");
-        if declared.is_empty()||!declared.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_')||symbol.trim_start_matches('_')!=declared{return Err("External prototype symbol and declaration name differ")}
+        if declared.is_empty()||!declared.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_')||!(symbol==declared||symbol.strip_prefix('_')==Some(declared)){return Err("External prototype symbol and declaration name differ")}
         if result.get(symbol).is_some_and(|old:&Signature|old.declaration!=declaration){return Err("External prototype catalog contains conflicting declarations for one symbol")}
         let source=if metadata.get("producer")==Some(&"hindsight-apple-clang-declarations-v1") {
             "hash-bound Apple SDK declaration catalog"
@@ -207,12 +208,13 @@ fn valid_apple_sdk_target(target: &str, sdk_path: &str) -> bool {
         return false;
     }
     let expected_sdk = match (family, simulator) {
-        ("macos", false) => "MacOSX.sdk",
-        ("ios", false) => "iPhoneOS.sdk",
-        ("ios", true) => "iPhoneSimulator.sdk",
+        ("macos", false) => "MacOSX",
+        ("ios", false) => "iPhoneOS",
+        ("ios", true) => "iPhoneSimulator",
         _ => return false,
     };
-    sdk_path.starts_with('/') && sdk_path.rsplit('/').next() == Some(expected_sdk)
+    let Some(version) = sdk_path.rsplit('/').next().and_then(|leaf| leaf.strip_prefix(expected_sdk)).and_then(|leaf| leaf.strip_suffix(".sdk")) else { return false };
+    sdk_path.starts_with('/') && (version.is_empty() || version.split('.').all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
 }
 
 pub fn external_prototype_database(source_sha256:&str)->io::Result<BTreeMap<String,Signature>>{
@@ -332,6 +334,15 @@ fn foundation_method(name: &str) -> Option<&'static str> {
     })
 }
 
+fn objc_selector_syntax(selector: &str) -> bool {
+    if selector.is_empty() { return false; }
+    let count = selector.bytes().filter(|b| *b == b':').count();
+    if count > 32 || (count > 0 && !selector.ends_with(':')) { return false; }
+    selector.split(':').all(|part| part.is_empty() ||
+        (part.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') &&
+         part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')))
+}
+
 pub fn objc_method(name: &str, encoding: &str) -> Option<Signature> {
     if !clean(name) || encoding.is_empty() || encoding.len() > 1024 || !encoding.is_ascii() || encoding.bytes().any(|b| b.is_ascii_control()) || !(name.starts_with("-[") || name.starts_with("+[")) || !name.ends_with(']') { return None }
     let bytes = encoding.as_bytes(); let mut at = 0;
@@ -340,6 +351,7 @@ pub fn objc_method(name: &str, encoding: &str) -> Option<Signature> {
     let selector_type = objc_type(bytes, &mut at, 0)?; skip_number(bytes, &mut at);
     if !matches!(self_type.as_str(), "id" | "Class") || selector_type != "SEL" { return None }
     let body = &name[2..name.len()-1]; let (_, selector) = body.split_once(' ')?;
+    if !objc_selector_syntax(selector) { return None }
     let count = selector.bytes().filter(|b| *b == b':').count();
     let mut args = Vec::new();
     for _ in 0..count { args.push(objc_type(bytes, &mut at, 0)?); skip_number(bytes, &mut at); }
@@ -673,13 +685,36 @@ fn cpp_type(bytes: &[u8], at: &mut usize, depth: usize) -> Option<String> {
         b'i' => "int".into(), b'j' => "unsigned int".into(),
         b'l' => "long".into(), b'm' => "unsigned long".into(),
         b'x' => "long long".into(), b'y' => "unsigned long long".into(),
-        b'f' => "float".into(), b'd' => "double".into(),
-        b'P' => format!("{} *", cpp_type(bytes, at, depth + 1)?),
-        b'R' => format!("{} &", cpp_type(bytes, at, depth + 1)?),
-        b'O' => format!("{} &&", cpp_type(bytes, at, depth + 1)?),
-        b'K' => format!("const {}", cpp_type(bytes, at, depth + 1)?),
-        b'V' => format!("volatile {}", cpp_type(bytes, at, depth + 1)?),
-        b'r' => format!("restrict {}", cpp_type(bytes, at, depth + 1)?),
+        b'f' => "float".into(), b'd' => "double".into(), b'e' => "long double".into(),
+        b'w' => "wchar_t".into(), b'n' => "__int128".into(), b'o' => "unsigned __int128".into(),
+        b'D' => { let suffix = *bytes.get(*at)?; *at += 1; match suffix {
+            b's' => "char16_t".into(), b'i' => "char32_t".into(), b'u' => "char8_t".into(),
+            _ => return None,
+        } },
+        b'P' => {
+            // A pointer to a reference is not a C++ type. In particular, do
+            // not turn malformed input into a plausible-looking declaration.
+            if matches!(bytes.get(*at), Some(b'R' | b'O')) { return None }
+            format!("{} *", cpp_type(bytes, at, depth + 1)?)
+        },
+        b'R' | b'O' => {
+            // C++ cannot form references to void or references. Reject these
+            // malformed encodings rather than reporting a fabricated type.
+            if matches!(bytes.get(*at), Some(b'v' | b'R' | b'O')) { return None }
+            let ty = cpp_type(bytes, at, depth + 1)?;
+            if ty.split_whitespace().last() == Some("void") { return None }
+            format!("{ty} {}", if code == b'R' { "&" } else { "&&" })
+        },
+        b'K' | b'V' | b'r' => {
+            let qualifier = match code { b'K' => "const", b'V' => "volatile", _ => "restrict" };
+            // Skip other qualifiers to identify the type they all apply to.
+            let mut underlying = *at;
+            while matches!(bytes.get(underlying), Some(b'K' | b'V' | b'r')) { underlying += 1; }
+            let kind = *bytes.get(underlying)?;
+            if matches!(kind, b'R' | b'O') { return None }
+            let ty = cpp_type(bytes, at, depth + 1)?;
+            if kind == b'P' { format!("{ty} {qualifier}") } else { format!("{qualifier} {ty}") }
+        },
         b'N' => {let mut names=Vec::new();while bytes.get(*at)!=Some(&b'E'){names.push(cpp_component(bytes,at)?);if names.len()>16{return None}}*at+=1;names.join("::")},
         digit if digit.is_ascii_digit() => {*at-=1;cpp_component(bytes,at)?},
         _ => return None,
@@ -697,23 +732,94 @@ fn cpp_component(bytes: &[u8], at: &mut usize) -> Option<String> {
     Some(value.into())
 }
 
+fn cpp_operator(bytes: &[u8], at: &mut usize) -> Option<&'static str> {
+    let spelling = match bytes.get(*at..*at + 2)? {
+        b"nw" => "operator new", b"na" => "operator new[]",
+        b"dl" => "operator delete", b"da" => "operator delete[]",
+        b"ps" | b"pl" => "operator+", b"ng" | b"mi" => "operator-",
+        b"ad" | b"an" => "operator&", b"de" | b"ml" => "operator*",
+        b"co" => "operator~", b"nt" => "operator!", b"dv" => "operator/",
+        b"rm" => "operator%", b"or" => "operator|", b"eo" => "operator^",
+        b"aS" => "operator=", b"pL" => "operator+=", b"mI" => "operator-=",
+        b"mL" => "operator*=", b"dV" => "operator/=", b"rM" => "operator%=",
+        b"aN" => "operator&=", b"oR" => "operator|=", b"eO" => "operator^=",
+        b"ls" => "operator<<", b"rs" => "operator>>", b"lS" => "operator<<=", b"rS" => "operator>>=",
+        b"eq" => "operator==", b"ne" => "operator!=", b"lt" => "operator<", b"gt" => "operator>",
+        b"le" => "operator<=", b"ge" => "operator>=", b"ss" => "operator<=>",
+        b"aa" => "operator&&", b"oo" => "operator||", b"pp" => "operator++", b"mm" => "operator--",
+        b"cm" => "operator,", b"pm" => "operator->*", b"pt" => "operator->", b"ix" => "operator[]",
+        _ => return None,
+    };
+    *at += 2;
+    Some(spelling)
+}
+
 pub fn symbol(name: &str) -> Option<Signature> {
     if !clean(name) { return None }
     if let Some((declaration, language)) = api(name) {
         return Some(Signature { language, declaration: declaration.into(), source: "exact SDK ABI catalog" });
     }
     let mangled = name.strip_prefix("__Z").or_else(|| name.strip_prefix("_Z"))?;
-    let bytes = mangled.as_bytes(); let mut at = 0; let mut names = Vec::new();
+    let bytes = mangled.as_bytes(); let mut at = 0; let mut names: Vec<String> = Vec::new();
+    let mut member_qualifiers = Vec::new();
+    let mut ref_qualifier = None;
+    let mut destructor = false;
     if bytes.first() == Some(&b'N') {
         at += 1;
-        while bytes.get(at) != Some(&b'E') { names.push(cpp_component(bytes, &mut at)?); if names.len() > 16 { return None } }
+        // Itanium encodes member-function cv-qualifiers in r, V, K order,
+        // followed by an optional ref-qualifier, before the nested name.
+        for (code, spelling) in [(b'r', "restrict"), (b'V', "volatile"), (b'K', "const")] {
+            if bytes.get(at) == Some(&code) { member_qualifiers.push(spelling); at += 1; }
+        }
+        if let Some(code @ (b'R' | b'O')) = bytes.get(at).copied() {
+            ref_qualifier = Some(if code == b'R' { "&" } else { "&&" });
+            at += 1;
+        }
+        while bytes.get(at) != Some(&b'E') {
+            if let Some(operator) = cpp_operator(bytes, &mut at) {
+                if names.is_empty() || bytes.get(at) != Some(&b'E') { return None }
+                names.push(operator.into());
+                break;
+            }
+            if matches!((bytes.get(at), bytes.get(at + 1)),
+                (Some(b'C'), Some(b'1' | b'2' | b'3')) | (Some(b'D'), Some(b'0' | b'1' | b'2'))) {
+                if names.is_empty() || !member_qualifiers.is_empty() || ref_qualifier.is_some() { return None }
+                destructor = bytes[at] == b'D';
+                let class = names.last()?.clone();
+                names.push(if destructor { format!("~{class}") } else { class });
+                at += 2;
+                // Constructor/destructor names are terminal components.
+                if bytes.get(at) != Some(&b'E') { return None }
+                break;
+            }
+            names.push(cpp_component(bytes, &mut at)?);
+            if names.len() > 16 { return None }
+        }
         at += 1;
-    } else { names.push(cpp_component(bytes, &mut at)?); }
+        if names.len() < 2 { return None }
+    } else if let Some(operator) = cpp_operator(bytes, &mut at) { names.push(operator.into()); }
+    else { names.push(cpp_component(bytes, &mut at)?); }
+    // A function encoding must contain a bare-function-type. A name alone
+    // can instead designate data and must not become a no-argument function.
+    if at == bytes.len() { return None }
+    if destructor && &bytes[at..] != b"v" { return None }
     let mut args = Vec::new();
     if bytes.get(at) == Some(&b'v') && at + 1 == bytes.len() { at += 1; }
-    else { while at < bytes.len() { args.push(cpp_type(bytes, &mut at, 0)?); if args.len() > 32 { return None } } }
+    else { while at < bytes.len() {
+        if bytes[at] == b'z' {
+            if at + 1 != bytes.len() { return None }
+            args.push("...".into()); at += 1; break;
+        }
+        let arg = cpp_type(bytes, &mut at, 0)?; if arg.split_whitespace().last() == Some("void") { return None } args.push(arg); if args.len() > 32 { return None }
+    } }
     if at != bytes.len() { return None }
-    let declaration = format!("/* return type unresolved */ {}({});", names.join("::"), args.iter().enumerate().map(|(i,t)| format!("{t} arg{i}")).collect::<Vec<_>>().join(", "));
+    let mut qualifiers = member_qualifiers.join(" ");
+    if let Some(reference) = ref_qualifier {
+        if !qualifiers.is_empty() { qualifiers.push(' '); }
+        qualifiers.push_str(reference);
+    }
+    if !qualifiers.is_empty() { qualifiers.insert(0, ' '); }
+    let declaration = format!("/* return type unresolved */ {}({}){};", names.join("::"), args.iter().enumerate().map(|(i,t)| if t == "..." { t.clone() } else { format!("{t} arg{i}") }).collect::<Vec<_>>().join(", "), qualifiers);
     Some(Signature { language: "C++ / Objective-C++", declaration, source: "Itanium mangled parameter types; return type absent" })
 }
 
@@ -783,6 +889,13 @@ fn callable_name(name: &str, signature: Option<&Signature>) -> String {
         return format!("objc_imp_{}", safe.trim_matches('_'));
     }
     if let Some(sig) = signature {
+        if sig.language == "C++ / Objective-C++" {
+            if let Some(head) = sig.declaration.strip_prefix("/* return type unresolved */ ").and_then(|decl| decl.split_once('(').map(|(head, _)| head)) {
+                if !head.is_empty() && head.bytes().all(|b| b.is_ascii_alphanumeric() || b"_ :~+-*/%&|^=!<>[],".contains(&b)) {
+                    return head.into();
+                }
+            }
+        }
         if let Some((head, _)) = sig.declaration.split_once('(') {
             let candidate = head.trim().trim_end_matches('*').split_whitespace().last().unwrap_or("");
             if !candidate.is_empty() && candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') {
@@ -790,8 +903,7 @@ fn callable_name(name: &str, signature: Option<&Signature>) -> String {
             }
         }
     }
-    let mut candidate = name.strip_prefix('_').unwrap_or(name);
-    if let Some(stripped) = candidate.strip_prefix('_') { candidate = stripped; }
+    let candidate = name.strip_prefix('_').unwrap_or(name);
     if candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') && !candidate.is_empty() {
         candidate.into()
     } else {
@@ -888,7 +1000,7 @@ fn objc_parameters(signature: &Signature) -> Vec<(String, String)> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AbiType { Integer(u8), Float(u8), IntegerAggregate(u8), FloatAggregate(u8), HiddenResultPointer(u8) }
+enum AbiType { Integer(u8), WideInteger, Float(u8), IntegerAggregate(u8), FloatAggregate(u8), HiddenResultPointer(u8) }
 
 /// Apple arm64 LP64 scalar ABI. Unknown typedefs/aggregates do not receive
 /// guessed locations: their layout can change both banks and the stack cursor.
@@ -896,9 +1008,14 @@ fn uncomment_type(ty: &str) -> Option<String> {
     let mut normalized = String::new();
     let mut rest = ty;
     while let Some((head, tail)) = rest.split_once("/*") {
+        if head.contains("*/") { return None; }
         normalized.push_str(head);
+        // In C a comment is replaced by whitespace during translation.
+        // Deleting it outright can join distinct tokens into a different type.
+        normalized.push(' ');
         rest = tail.split_once("*/")?.1;
     }
+    if rest.contains("*/") { return None; }
     normalized.push_str(rest);
     Some(normalized)
 }
@@ -917,10 +1034,11 @@ fn abi_type(ty: &str) -> Option<AbiType> {
         // Six doubles: 48 bytes, and not a homogeneous aggregate of at most
         // four members, so it is passed and returned indirectly.
         "CGAffineTransform" => AbiType::FloatAggregate(6),
+        "__int128" | "unsigned __int128" => AbiType::WideInteger,
         "float" => AbiType::Float(4), "double" | "long double" | "CGFloat" => AbiType::Float(8),
-        "bool" | "_Bool" | "BOOL" | "Boolean" | "char" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" | "Int8" | "UInt8" => AbiType::Integer(1),
-        "short" | "short int" | "signed short" | "signed short int" | "unsigned short" | "unsigned short int" | "int16_t" | "uint16_t" | "Int16" | "UInt16" | "unichar" => AbiType::Integer(2),
-        "int" | "signed" | "signed int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t" | "Int32" | "UInt32" | "CFStringEncoding" => AbiType::Integer(4),
+        "bool" | "_Bool" | "BOOL" | "Boolean" | "char" | "char8_t" | "signed char" | "unsigned char" | "int8_t" | "uint8_t" | "Int8" | "UInt8" => AbiType::Integer(1),
+        "short" | "short int" | "signed short" | "signed short int" | "unsigned short" | "unsigned short int" | "int16_t" | "uint16_t" | "Int16" | "UInt16" | "unichar" | "char16_t" => AbiType::Integer(2),
+        "int" | "signed" | "signed int" | "unsigned" | "unsigned int" | "int32_t" | "uint32_t" | "Int32" | "UInt32" | "CFStringEncoding" | "wchar_t" | "char32_t" => AbiType::Integer(4),
         "long" | "long int" | "signed long" | "signed long int" | "unsigned long" | "unsigned long int" | "long long" | "long long int" | "signed long long" | "signed long long int" | "unsigned long long" | "unsigned long long int" |
         "int64_t" | "uint64_t" | "Int64" | "UInt64" | "intptr_t" | "uintptr_t" | "size_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "NSUInteger" |
         "CFIndex" | "CFTypeID" | "CFOptionFlags" | "CFNumberType" | "CFURLPathStyle" | "CFPropertyListFormat" | "dispatch_once_t" => AbiType::Integer(8),
@@ -946,7 +1064,7 @@ fn abi_integer_kind(ty: &str) -> Option<AbiIntegerKind> {
         "CFBundleRef" | "CFURLRef" | "CFPropertyListRef" | "CFErrorRef" | "CFRunLoopRef");
     if pointer { return Some(AbiIntegerKind::Pointer); }
     if matches!(simple.as_str(), "bool" | "_Bool" | "BOOL") { return Some(AbiIntegerKind::Boolean); }
-    let signed = matches!(simple.as_str(), "char" | "signed char" | "short" | "short int" | "signed short" | "signed short int" |
+    let signed = matches!(simple.as_str(), "char" | "wchar_t" | "signed char" | "short" | "short int" | "signed short" | "signed short int" |
         "int" | "signed" | "signed int" | "long" | "long int" | "signed long" | "signed long int" | "long long" | "long long int" | "signed long long" | "signed long long int" |
         "int8_t" | "int16_t" | "int32_t" | "int64_t" | "Int8" | "Int16" | "Int32" | "Int64" |
         "intptr_t" | "ssize_t" | "ptrdiff_t" | "NSInteger" | "CFIndex" | "dispatch_once_t" |
@@ -959,6 +1077,7 @@ fn abi_types_agree(expected: &str, actual: &str) -> bool {
     let (Some(left), Some(right)) = (abi_type(expected), abi_type(actual)) else { return false; };
     if left != right { return false; }
     if matches!(left, AbiType::IntegerAggregate(_) | AbiType::FloatAggregate(_)) { return expected == actual; }
+    if matches!(left, AbiType::WideInteger) { return expected == actual; }
     if matches!(left, AbiType::Integer(_)) {
         // Recover the interpretation class independently of width. Pointer,
         // boolean, signed and unsigned encodings must not silently coerce.
@@ -1000,6 +1119,19 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
             continue;
         }
         let scalar = scalar.unwrap_or(AbiType::Integer(8));
+        if scalar == AbiType::WideInteger {
+            if gp <= 6 {
+                result.push(AbiParameter { name, register: format!("wide_integer<{ty}>(x{gp}, x{})", gp + 1), general_register: None, stack_scalar: None, source_type: Some(ty) });
+                gp += 2;
+            } else {
+                gp = 8;
+                stack_offset = (stack_offset + 15) & !15;
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, 16 bytes; Apple arm64 wide integer {ty})"), general_register: None, stack_scalar: Some((stack_offset, 16)), source_type: Some(ty) });
+                stack_offset += 16;
+                stack_slot += 1;
+            }
+            continue;
+        }
         if let AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words) = scalar {
             // A homogeneous floating-point aggregate of at most four members
             // travels in the floating-point registers, whatever its size. Every
@@ -1015,8 +1147,8 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
                     continue;
                 }
                 stack_offset = (stack_offset + 7) & !7;
-                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 composite {ty} passed by pointer)"), general_register: None, stack_scalar: None, source_type: Some(ty) });
-                stack_offset += bytes;
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, 8-byte pointer to {bytes}-byte Apple arm64 composite {ty})"), general_register: None, stack_scalar: Some((stack_offset, 8)), source_type: Some(ty) });
+                stack_offset += 8;
                 stack_slot += 1;
                 continue;
             }
@@ -1031,7 +1163,7 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
                 *bank = 8;
                 stack_offset = (stack_offset + 7) & !7;
                 let bytes = words as usize * 8;
-                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None, stack_scalar: None, source_type: Some(ty) });
+                result.push(AbiParameter { name, register: format!("stack argument (slot {stack_slot}, sp+0x{stack_offset:x}, {bytes} bytes; Apple arm64 SDK aggregate {ty})"), general_register: None, stack_scalar: Some((stack_offset, bytes as u8)), source_type: Some(ty) });
                 stack_offset += bytes;
                 stack_slot += 1;
             }
@@ -1056,6 +1188,38 @@ fn abi_parameters(signature: Option<&Signature>) -> Vec<AbiParameter> {
         stack_slot += 1;
     }
     result
+}
+
+// Render indirect composites as values loaded through the ABI pointer, and
+// wide stack values as two-word objects. A location description alone is not
+// the source-language argument value.
+fn render_abi_argument_location(argument: &AbiParameter) -> String {
+    if let (Some((offset, 16)), Some(ty)) = (argument.stack_scalar, argument.source_type.as_deref()) {
+        if abi_type(ty) == Some(AbiType::WideInteger) {
+            return format!("wide_integer_from_stack<{ty}>(sp + {offset:#x})");
+        }
+    }
+    if let (Some((offset, 8)), Some(ty)) = (argument.stack_scalar, argument.source_type.as_deref()) {
+        if matches!(abi_type(ty), Some(AbiType::IntegerAggregate(3..) | AbiType::FloatAggregate(5..))) {
+            return format!("aggregate_from_pointer<{ty}>(load64(sp + {offset:#x}))");
+        }
+    }
+    if let (Some((offset, width)), Some(ty)) = (argument.stack_scalar, argument.source_type.as_deref()) {
+        if matches!(abi_type(ty), Some(AbiType::IntegerAggregate(_) | AbiType::FloatAggregate(_))) {
+            return format!("aggregate_from_stack<{ty}>(sp + {offset:#x}, {width})");
+        }
+    }
+    if let (Some(register), Some(ty)) = (argument.general_register, argument.source_type.as_deref()) {
+        if matches!(abi_type(ty), Some(AbiType::IntegerAggregate(_) | AbiType::FloatAggregate(_))) {
+            return format!("aggregate_from_pointer<{ty}>(x{register})");
+        }
+    }
+    if let (Some((offset, width)), Some(ty)) = (argument.stack_scalar, argument.source_type.as_deref()) {
+        if matches!(abi_type(ty), Some(AbiType::Integer(_) | AbiType::Float(_))) {
+            return format!("load_stack_argument<{ty}>(sp + {offset:#x}, {width})");
+        }
+    }
+    argument.register.clone()
 }
 
 fn signature_return_type(signature: &Signature) -> Option<String> {
@@ -1103,13 +1267,41 @@ fn signature_returns_void(signature: Option<&Signature>) -> bool {
     signature.and_then(signature_return_type).as_deref() == Some("void")
 }
 
+fn scalar_call_result(signature: Option<&Signature>) -> Option<&'static str> {
+    let ty = signature.and_then(signature_return_type)?;
+    match abi_result_type(&ty)? {
+        AbiType::Integer(bytes) => Some(if bytes <= 4 { "w0" } else { "x0" }),
+        AbiType::Float(4) => Some("s0"),
+        AbiType::Float(8) => Some("d0"),
+        _ => None,
+    }
+}
+
+fn call_result_destination(signature: Option<&Signature>) -> Option<String> {
+    if let Some(register) = scalar_call_result(signature) { return Some(register.into()); }
+    let ty = signature.and_then(signature_return_type)?;
+    let (prefix, count) = match abi_result_type(&ty)? {
+        AbiType::WideInteger => ("x", 2),
+        AbiType::IntegerAggregate(words) => ("x", words),
+        AbiType::FloatAggregate(words) => ("d", words),
+        _ => return None,
+    };
+    Some(format!("({})", (0..count).map(|i|format!("{prefix}{i}")).collect::<Vec<_>>().join(", ")))
+}
+
+fn indirect_call_result_argument(signature: Option<&Signature>) -> Option<String> {
+    let ty = signature.and_then(signature_return_type)?;
+    matches!(abi_result_type(&ty), Some(AbiType::HiddenResultPointer(_)))
+        .then(||format!("/* hidden result buffer */ result_buffer<{ty}>(x8)"))
+}
+
 /// The Apple arm64 result ABI of a declared return type.
 ///
 /// A homogeneous floating-point aggregate of at most four members is returned
 /// in the floating-point registers, whatever its size: `CGRect` is 32 bytes
 /// and comes back in d0-d3. Every other composite larger than 16 bytes is
-/// returned indirectly: the caller passes the result location in x8 and the
-/// callee returns that pointer in x0. The result location is a dedicated
+/// returned indirectly: the caller passes the result location in x8. No
+/// pointer return in x0 is assumed. The result location is a dedicated
 /// register, so it never shifts the argument registers.
 fn abi_result_type(ty: &str) -> Option<AbiType> {
     match abi_type(ty) {
@@ -1127,6 +1319,7 @@ fn render_signature_return(signature: Option<&Signature>) -> String {
     let register = match abi_result_type(&ty) {
         Some(AbiType::Float(4)) => "s0", Some(AbiType::Float(_)) => "d0",
         Some(AbiType::Integer(bytes)) if bytes <= 4 => "w0", Some(AbiType::Integer(_)) => "x0",
+        Some(AbiType::WideInteger) => return format!("return wide_integer<{ty}>(x0, x1); /* Apple arm64 result */"),
         Some(AbiType::IntegerAggregate(words) | AbiType::FloatAggregate(words)) => {
             let prefix = if matches!(abi_type(&ty), Some(AbiType::FloatAggregate(_))) { "d" } else { "x" };
             let registers = (0..words).map(|index| format!("{prefix}{index}")).collect::<Vec<_>>().join(", ");
@@ -1190,6 +1383,9 @@ fn candidate_abi_parameters(report: &str, address: u64) -> Vec<AbiParameter> {
 /// so pre/post-writeback statements cannot reuse an old base name.
 fn replace_instruction_register_names(statement: &str, names: &BTreeMap<String, String>, outputs: Option<&BTreeMap<String, String>>) -> String {
     let bytes = statement.as_bytes();
+    let tuple_end = statement.strip_prefix('(').and_then(|body| body.split_once(") = "))
+        .filter(|(head, _)| head.split(", ").all(|register| register.strip_prefix('x').or_else(||register.strip_prefix('d')).and_then(|n|n.parse::<u8>().ok()).is_some_and(|n|n<32)))
+        .map(|(head, _)| head.len()+1);
     let mut names = names.clone();
     let mut written = Vec::<String>::new();
     let mut output = String::with_capacity(statement.len());
@@ -1223,14 +1419,24 @@ fn replace_instruction_register_names(statement: &str, names: &BTreeMap<String, 
                 else { cursor += 1; }
             }
             output.push_str(&statement[start..cursor]);
+        } else if bytes[cursor].is_ascii_digit() {
+            // Consume the entire numeric token, including the x in 0x0 and
+            // suffixes, before looking for register-shaped identifiers.
+            let start = cursor;
+            cursor += 1;
+            while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || matches!(bytes[cursor], b'_' | b'.')) { cursor += 1; }
+            output.push_str(&statement[start..cursor]);
         } else if bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' {
             let start = cursor;
             cursor += 1;
             while cursor < bytes.len() && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_') { cursor += 1; }
             let token = &statement[start..cursor];
             let tail = statement[cursor..].trim_start();
-            if tail.starts_with('(') { output.push_str(token); continue; }
-            let definition = outputs.is_some() && tail.starts_with('=') && !tail.starts_with("==");
+            let prefix = statement[..start].trim_end();
+            if tail.starts_with('(') || prefix.ends_with('.') || prefix.ends_with("->") {
+                output.push_str(token); continue;
+            }
+            let definition = outputs.is_some() && (tuple_end.is_some_and(|end|start<end) || tail.starts_with('=') && !tail.starts_with("=="));
             if definition { written.push(token.to_owned()); }
             let map = if definition { outputs.unwrap() } else { &names };
             output.push_str(map.get(token).map(String::as_str).unwrap_or(token));
@@ -1265,6 +1471,7 @@ fn replace_instruction_register_names(statement: &str, names: &BTreeMap<String, 
 fn parameter_name_seeds(signature: Option<&Signature>, report: &str, address: u64) -> Vec<super::semantic::ParameterNameSeed> {
     let parameters = if signature.is_some() { abi_parameters(signature) } else { candidate_abi_parameters(report, address) };
     parameters.into_iter().filter_map(|parameter| {
+        if matches!(parameter.source_type.as_deref().and_then(abi_type), Some(AbiType::IntegerAggregate(_) | AbiType::FloatAggregate(_))) { return None; }
         if let Some(register) = parameter.general_register {
             let bits = match parameter.source_type.as_deref().and_then(abi_type) {
                 Some(AbiType::Integer(bytes)) if bytes <= 4 => 32,
@@ -1341,6 +1548,56 @@ fn localize_stack_slot_accesses(statement:&str)->String{
     output
 }
 
+fn render_call_arguments(
+    args: &[AbiParameter],
+    known: &[(u8, u64, String)],
+    known_float: &[(u8, u128, String)],
+    known_stack: &[(usize, u8, u64, String)],
+) -> (Vec<String>, Vec<String>) {
+    let values=known.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
+    let float_values=known_float.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
+    let stack_values=known_stack.iter().map(|(offset,bytes,value,provenance)|(*offset,(*bytes,*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
+    let mut evidence=Vec::new();
+    let rendered=args.iter().map(|argument|{
+        if let Some(register)=argument.general_register.filter(|_| !matches!(argument.source_type.as_deref().and_then(abi_type), Some(AbiType::IntegerAggregate(_) | AbiType::FloatAggregate(_)))) {
+            if let Some((value,provenance))=values.get(&register){
+                let (rendered, cast) = typed_gp_argument(*value, argument.source_type.as_deref());
+                evidence.push(format!("{}({})={value:#x} {provenance}{}",argument.name,argument.register,
+                    cast.map(|cast| format!(" [{cast}]")).unwrap_or_default()));
+                return rendered;
+            }
+        }
+        if let (Some((offset, width)), Some(ty))=(argument.stack_scalar,argument.source_type.as_deref()) {
+            if let Some(AbiType::Float(bytes @ (4 | 8))) = abi_type(ty) {
+                if let Some((_, value, provenance)) = stack_values.get(&offset).filter(|(stored_width, _, _)| *stored_width >= width) {
+                    let rendered = render_fp_argument(if bytes == 4 { b's' } else { b'd' }, u128::from(*value));
+                    evidence.push(format!("{}(sp+0x{offset:x}, {width} bytes)={rendered} {provenance}", argument.name));
+                    return rendered;
+                }
+            }
+            if matches!(abi_type(ty),Some(AbiType::Integer(_))) {
+                if let Some((stored_width,value,provenance))=stack_values.get(&offset).filter(|(stored_width,_,_)|*stored_width>=width) {
+                    let (rendered,cast)=typed_gp_argument(*value,Some(ty));
+                    evidence.push(format!("{}(sp+0x{offset:x}, {width} bytes)={value:#x} {provenance}; store-width={stored_width}{}",
+                        argument.name,cast.map(|cast|format!(" [{cast}]")).unwrap_or_default()));
+                    return rendered;
+                }
+            }
+        }
+        if let Some((prefix, index)) = argument.register.as_bytes().split_first().and_then(|(prefix, rest)| std::str::from_utf8(rest).ok()?.parse::<u8>().ok().map(|index| (*prefix, index))) {
+            if matches!(prefix, b's' | b'd') {
+                if let Some((bits, provenance)) = float_values.get(&index) {
+                    let value = render_fp_argument(prefix, *bits);
+                    evidence.push(format!("{}({})={value} {provenance}", argument.name, argument.register));
+                    return value;
+                }
+            }
+        }
+        render_abi_argument_location(argument)
+    }).collect::<Vec<_>>();
+    (rendered, evidence)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_linear_statement(
     statement:&str,address:u64,start:u64,
@@ -1353,20 +1610,27 @@ fn render_linear_statement(
                 let indirect = statement.contains("indirect via");
                 let target_name=signatures.get(&target).map(|(name,_)|name.as_str())
                     .or_else(||(!indirect).then(||symbols.iter().find(|(candidate,_)|*candidate==target).map(|(_,name)|name.as_str())).flatten());
+                if let Some(name) = target_name {
+                    let dispatch = name.strip_prefix('_').unwrap_or(name);
+                    if matches!(dispatch, "objc_msgSendSuper" | "objc_msgSendSuper2") {
+                        let target_evidence = if indirect { statement.split_once("/*").and_then(|(_, tail)| tail.split_once("*/")).map(|(evidence, _)| format!(" /*{}*/", evidence)).unwrap_or_default() } else { String::new() };
+                        return format!("{dispatch}(x0, x1, /* message arguments unresolved */); /* {} {target:#x}; x0 points to objc_super; x1 is the selector; receiver, class, and argument types unresolved */{target_evidence}", if indirect { "indirect target resolved through a register" } else { "direct call target" });
+                    }
+                }
                 let known=super::semantic::known_call_argument_values(code,base,start,address);
                 let known_float=super::semantic::known_call_float_argument_values(code,base,start,address);
                 let known_stack=super::semantic::known_call_stack_argument_values(code,base,start,address);
                 if let Some(selector)=objc_selectors.get(&address){
                     let parts=selector.split(':').collect::<Vec<_>>();
                     let argument_count=parts.len().saturating_sub(1);
-                    if parts.iter().all(|part|part.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_'))
-                        &&(argument_count==0||selector.ends_with(':'))
-                        &&parts.iter().take(argument_count).all(|part|!part.is_empty())&&argument_count<=6{
+                    if objc_selector_syntax(selector) {
                         let values=known.iter().map(|(register,value,_)|(*register,*value)).collect::<BTreeMap<_,_>>();
                         let receiver=values.get(&0).map(|value|format!("{value:#x}")).unwrap_or_else(||"x0".into());
                         let mut message=format!("[{receiver}");
                         if argument_count==0{message.push(' ');message.push_str(selector);}
-                        else{for (index,part) in parts.iter().take(argument_count).enumerate(){let argument_register=index as u8+2;let argument=values.get(&argument_register).map(|value|format!("{value:#x}")).unwrap_or_else(||format!("x{argument_register}"));message.push(' ');message.push_str(part);message.push(':');message.push_str(&argument);}}
+                        // Selector arity does not establish argument types or ABI
+                        // register banks. An argument may be FP or an aggregate.
+                        else{for (index,part) in parts.iter().take(argument_count).enumerate(){message.push(' ');message.push_str(part);message.push(':');message.push_str(&format!("argument_{index} /* ABI location unresolved */"));}}
                         message.push(']');
                         return format!("{message}; /* objc_msgSend selector validated through __objc_selrefs at {address:#x}; receiver and argument types unresolved */");
                     }
@@ -1374,51 +1638,27 @@ fn render_linear_statement(
                 let known_values=known.iter().map(|(register,value,provenance)|format!("x{register}={value:#x} {provenance}")).collect::<Vec<_>>();
                 return if let Some(name)=target_name{
                     let target_signature=signatures.get(&target).map(|(_,signature)|signature);
-                    let values=known.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
-                    let float_values=known_float.iter().map(|(register,value,provenance)|(*register,(*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
-                    let stack_values=known_stack.iter().map(|(offset,bytes,value,provenance)|(*offset,(*bytes,*value,provenance.as_str()))).collect::<BTreeMap<_,_>>();
                     let args=target_signature.map(|signature|abi_parameters(Some(signature))).unwrap_or_else(||candidate_abi_parameters(parameter_evidence,target));
                     let bindings=args.iter().map(|argument|format!("{}={}",argument.name,argument.register)).collect::<Vec<_>>().join(", ");
-                    let mut evidence=Vec::new();
-                    let mut rendered=args.iter().map(|argument|{
-                        if let Some(register)=argument.general_register {
-                            if let Some((value,provenance))=values.get(&register){
-                                let (rendered, cast) = typed_gp_argument(*value, argument.source_type.as_deref());
-                                evidence.push(format!("{}({})={value:#x} {provenance}{}",argument.name,argument.register,
-                                    cast.map(|cast| format!(" [{cast}]")).unwrap_or_default()));
-                                return rendered;
-                            }
-                        }
-                        if let (Some((offset, width)), Some(ty))=(argument.stack_scalar,argument.source_type.as_deref()) {
-                            if matches!(abi_type(ty),Some(AbiType::Integer(_))) {
-                                if let Some((stored_width,value,provenance))=stack_values.get(&offset).filter(|(stored_width,_,_)|*stored_width>=width) {
-                                    let (rendered,cast)=typed_gp_argument(*value,Some(ty));
-                                    evidence.push(format!("{}(sp+0x{offset:x}, {width} bytes)={value:#x} {provenance}; store-width={stored_width}{}",
-                                        argument.name,cast.map(|cast|format!(" [{cast}]")).unwrap_or_default()));
-                                    return rendered;
-                                }
-                            }
-                        }
-                        if let Some((prefix, index)) = argument.register.as_bytes().split_first().and_then(|(prefix, rest)| std::str::from_utf8(rest).ok()?.parse::<u8>().ok().map(|index| (*prefix, index))) {
-                            if matches!(prefix, b's' | b'd') {
-                                if let Some((bits, provenance)) = float_values.get(&index) {
-                                    let value = render_fp_argument(prefix, *bits);
-                                    evidence.push(format!("{}({})={value} {provenance}", argument.name, argument.register));
-                                    return value;
-                                }
-                            }
-                        }
-                        argument.register.clone()
-                    }).collect::<Vec<_>>();
+                    let (mut rendered, evidence) = render_call_arguments(&args, &known, &known_float, &known_stack);
+                    if target_signature.is_some_and(|sig| sig.language == "C++ / Objective-C++" && sig.declaration.contains("::")) {
+                        rendered.insert(0, "/* possible implicit C++ receiver unresolved */".into());
+                    }
                     if target_signature.is_some_and(|sig| sig.declaration.contains("...")) {
                         rendered.push("/* variadic arguments unresolved; Apple arm64 stack ABI */".into());
                     }
+                    if let Some(buffer) = indirect_call_result_argument(target_signature) { rendered.push(buffer); }
                     let arguments=if args.is_empty()&&target_signature.is_none(){if known_values.is_empty(){"/* prototype and ABI arguments unresolved */".into()}else{format!("/* prototype unresolved; known ABI register values: {} */",known_values.join(", "))}}else{rendered.join(", ")};
                     let resolved=evidence.join(", ");
                     let binding_note=if bindings.is_empty(){"argument register bindings unresolved".into()}else if target_signature.is_some(){format!("argument bindings: {bindings}")}else{format!("candidate ABI argument bindings: {bindings}; callee types unresolved")};
                     let evidence_note=if resolved.is_empty(){"no argument constants proven in the straight-line call block".to_string()}else{format!("constant argument evidence: {resolved}")};
-                    format!("{}({}); /* {} {target:#x}; {}; {binding_note}; {evidence_note} */",callable_name(name,target_signature),arguments,if indirect{"indirect target resolved through a register"}else{"direct call target"},if target_signature.is_some(){"arguments follow recovered prototype arity"}else if args.is_empty(){"callee prototype and entry-use arity unavailable"}else{"arity candidate from callee entry-register uses"})
-                }else{format!("call(/* unresolved target {target:#x}; {}; {} */);",if indirect{"indirect target recovered from a register"}else{"direct BL"},if known_values.is_empty(){"arguments unresolved".to_string()}else{format!("known ABI register values: {}",known_values.join(", "))})};
+                    let target_evidence = if indirect { statement.split_once("/*").and_then(|(_, tail)| tail.split_once("*/")).map(|(evidence, _)| format!(" /*{}*/", evidence)).unwrap_or_default() } else { String::new() };
+                    let result = call_result_destination(target_signature).map(|register|format!("{register} = ")).unwrap_or_default();
+                    format!("{result}{}({}); /* {} {target:#x}; {}; {binding_note}; {evidence_note} */{target_evidence}",callable_name(name,target_signature),arguments,if indirect{"indirect target resolved through a register"}else{"direct call target"},if target_signature.is_some(){"arguments follow recovered prototype arity"}else if args.is_empty(){"callee prototype and entry-use arity unavailable"}else{"arity candidate from callee entry-register uses"})
+                }else{
+                    let target_evidence = if indirect { statement.split_once("/*").and_then(|(_, tail)| tail.split_once("*/")).map(|(evidence, _)| format!(" /*{}*/", evidence)).unwrap_or_default() } else { String::new() };
+                    format!("call(/* unnamed target {target:#x}; {}; {} */);{target_evidence}",if indirect{"indirect target recovered from a register"}else{"direct BL"},if known_values.is_empty(){"arguments unresolved".to_string()}else{format!("known ABI register values: {}",known_values.join(", "))})
+                };
             }
         }
     }
@@ -1676,12 +1916,28 @@ fn render_arm64_body(
                     if let Some(name) = target_name {
                         let target_signature = signatures.get(&target).map(|(_,signature)| signature);
                         let args = abi_parameters(target_signature);
-                        let arguments = if args.is_empty() && target_signature.is_none() { "/* AAPCS64 argument registers unresolved */".into() } else { args.iter().map(|argument|argument.register.as_str()).collect::<Vec<_>>().join(", ") };
+                        let known = super::semantic::known_call_argument_values(code, base, start, address);
+                        let known_float = super::semantic::known_call_float_argument_values(code, base, start, address);
+                        let known_stack = super::semantic::known_call_stack_argument_values(code, base, start, address);
+                        let (mut rendered, evidence) = render_call_arguments(&args, &known, &known_float, &known_stack);
+                        let evidence_note = if evidence.is_empty() { String::new() } else { format!("; constant argument evidence: {}", evidence.join(", ")) };
+                        let arguments = if args.is_empty() && target_signature.is_none() {
+                            "/* AAPCS64 argument registers unresolved */".into()
+                        } else {
+                            if target_signature.is_some_and(|sig| sig.language == "C++ / Objective-C++" && sig.declaration.contains("::")) {
+                                rendered.insert(0, "/* possible implicit C++ receiver unresolved */".into());
+                            }
+                            if target_signature.is_some_and(|sig| sig.declaration.contains("...")) {
+                                rendered.push("/* variadic arguments unresolved; Apple arm64 stack ABI */".into());
+                            }
+                            if let Some(buffer) = indirect_call_result_argument(target_signature) { rendered.push(buffer); }
+                            rendered.join(", ")
+                        };
                         let callee = callable_name(name,target_signature);
                         if signature_returns_void(target_signature) {
-                            format!("{callee}({arguments}); return; /* cross-function B tail-call candidate */")
+                            format!("{callee}({arguments}); return; /* cross-function B tail-call candidate{evidence_note} */")
                         } else {
-                            format!("return {callee}({arguments}); /* cross-function B tail-call candidate; return compatibility unresolved */")
+                            format!("return {callee}({arguments}); /* cross-function B tail-call candidate; return compatibility unresolved{evidence_note} */")
                         }
                     } else { format!("goto {target:#x}; /* tail-call candidate; target name unresolved */") }
                 }
@@ -1739,6 +1995,7 @@ fn recover_internal(
     if by_address.is_empty() && name_only.is_empty() { signatures.push_str("No source-level signatures were supported by available metadata or the exact API catalog.\n"); }
     let mut pseudo = String::from("// Bounded C-like reconstruction. Statements come from decoded AArch64 operations; declarations use validated runtime metadata or exact symbol prototypes. Unknown types, values, and effects stay marked.\n");
     pseudo.push_str(&declarations);
+    let mut emitted_functions = 0usize;
     for (i,&start) in starts.iter().take(200).enumerate() {
         let end = starts.get(i+1).copied().unwrap_or(scan_end);
         if pseudo.len() > 55_000 { break }
@@ -1752,6 +2009,7 @@ fn recover_internal(
                 if pseudo.len() + body.len() > 58_000 { break; }
                 pseudo.push_str(&body);
                 pseudo.push('\n');
+                emitted_functions += 1;
                 continue;
             }
         }
@@ -1769,6 +2027,10 @@ fn recover_internal(
             pseudo.push_str(&row);
         }
         pseudo.push_str("    /* remaining machine operations and return value unresolved */\n}\n\n");
+        emitted_functions += 1;
+    }
+    if emitted_functions < starts.len() {
+        pseudo.push_str(&format!("/* {} functions omitted from this bounded preview; use per-function reconstruction for their output. */\n", starts.len() - emitted_functions));
     }
     (signatures,pseudo)
 }
@@ -1793,8 +2055,22 @@ fn recover_internal(
     }
     #[test]
     fn declarations_are_independent_of_body_register_eligibility() {
+        let signed = Signature { language: "C", declaration: "signed int hs_test(signed int value);".into(), source: "analyst" };
+        let recovered = source_signature("_hs_test", &signed).expect("signed int is a supported scalar spelling");
+        assert_eq!(recovered.result_bits, 32);
+        assert!(recovered.result_signed && recovered.parameters[0].signed);
+        assert_eq!(recovered.parameters[0].register, 0);
+        for (spelling, bits) in [("signed char", 8), ("signed short", 16), ("signed short int", 16),
+            ("signed", 32), ("signed int", 32), ("signed long", 64), ("signed long int", 64),
+            ("signed long long", 64), ("signed long long int", 64)] {
+            let signature = Signature { language: "C", declaration: format!("{spelling} hs_test({spelling} value);"), source: "test" };
+            let recovered = source_signature("_hs_test", &signature).expect(spelling);
+            assert_eq!((recovered.result_bits, recovered.parameters[0].bits), (bits, bits), "{spelling}");
+            assert!(recovered.result_signed && recovered.parameters[0].signed, "{spelling}");
+        }
         for declaration in ["double hs_test(double first, float second);",
             "long double hs_test(long double value);",
+            "__int128 hs_test(unsigned __int128 value);",
             "NSRange hs_test(NSRange value);", "CFRange hs_test(CFRange value);",
             "CGPoint hs_test(CGPoint value);", "CGSize hs_test(CGSize value);",
             "CGRect hs_test(CGRect value);", "CGAffineTransform hs_test(CGAffineTransform value);",
@@ -1870,6 +2146,11 @@ fn recover_internal(
         assert!(!is_linear_statement("if (x0 == 0) goto 0x1000;"));
     }
     #[test] fn objc_encoding() {
+        let empty_keyword = objc_method("-[Widget combine::]", "q32@0:8q16q24").unwrap();
+        assert_eq!(empty_keyword.declaration, "- (long long)combine:(long long)arg0 :(long long)arg1;");
+        assert_eq!(abi_parameters(Some(&empty_keyword)).iter().map(|arg| arg.register.as_str()).collect::<Vec<_>>(), vec!["x0", "x1", "x2", "x3"]);
+        assert!(objc_method("-[Widget 1bad:]", "v24@0:8i16").is_none());
+        assert!(objc_method("-[Widget bad:tail]", "v24@0:8i16").is_none());
         let s=objc_method("-[NSString substringFromIndex:]", "@\"NSString\"24@0:8Q16").unwrap();
         assert_eq!(s.declaration,"- (NSString *)substringFromIndex:(NSUInteger)from;");
         assert!(objc_method("-[A x:]", "v24@0:8").is_none());
@@ -1912,6 +2193,29 @@ fn recover_internal(
         assert_eq!(symbol("__ZN3Foo3barEi").unwrap().declaration,"/* return type unresolved */ Foo::bar(int arg0);");
         assert_eq!(symbol("__Z7consumeP6Widget").unwrap().declaration,"/* return type unresolved */ consume(Widget * arg0);");
         assert_eq!(symbol("__Z7consumeRN3API6WidgetE").unwrap().declaration,"/* return type unresolved */ consume(API::Widget & arg0);");
+        assert!(symbol("__Z3foo").is_none());
+        assert!(symbol("__Z3foovi").is_none());
+        assert_eq!(symbol("__Z3fooKPi").unwrap().declaration,"/* return type unresolved */ foo(int * const arg0);");
+        assert_eq!(symbol("__Z3fooPKi").unwrap().declaration,"/* return type unresolved */ foo(const int * arg0);");
+        assert_eq!(symbol("__Z3fooPKPi").unwrap().declaration,"/* return type unresolved */ foo(int * const * arg0);");
+        assert_eq!(symbol("__Z3fooKVPi").unwrap().declaration,"/* return type unresolved */ foo(int * volatile const arg0);");
+        assert!(symbol("__Z3fooKRi").is_none());
+        assert!(symbol("__Z3fooRv").is_none());
+        assert!(symbol("__Z3fooRKv").is_none());
+        assert!(symbol("__Z3fooRRi").is_none());
+        assert!(symbol("__Z3fooPRi").is_none());
+        assert_eq!(symbol("__Z3fooPv").unwrap().declaration,"/* return type unresolved */ foo(void * arg0);");
+        assert_eq!(symbol("__Z3fooPKv").unwrap().declaration,"/* return type unresolved */ foo(const void * arg0);");
+        assert!(symbol("__Z3fooKv").is_none());
+        assert_eq!(symbol("__Z3fooiz").unwrap().declaration,"/* return type unresolved */ foo(int arg0, ...);");
+        assert_eq!(symbol("__Z1fwDsDien").unwrap().declaration,"/* return type unresolved */ f(wchar_t arg0, char16_t arg1, char32_t arg2, long double arg3, __int128 arg4);");
+        let typed = symbol("__Z1fwDsDien").unwrap();
+        let args = abi_parameters(Some(&typed));
+        assert_eq!(args.iter().take(4).map(|arg| arg.register.as_str()).collect::<Vec<_>>(), vec!["x0", "x1", "x2", "d0"]);
+        assert_eq!(args[4].register, "wide_integer<__int128>(x3, x4)");
+        assert!(symbol("__Z1fD").is_none());
+        assert_eq!(symbol("__Z3fooz").unwrap().declaration,"/* return type unresolved */ foo(...);");
+        assert!(symbol("__Z3foozi").is_none());
         assert_eq!(abi_parameters(symbol("__Z7consumeP6Widget").as_ref())[0].register,"x0");
         assert!(symbol("__ZN3Foo3barESt6vectorIiE").is_none());
     }
@@ -1940,12 +2244,19 @@ fn recover_internal(
         assert!(!header.contains("- (void)run;")&&!header.contains("- (long long)run;"));
     }
     #[test] fn hash_bound_external_c_prototypes_supply_types_and_reject_unsafe_records() {
+        assert!(valid_apple_sdk_target("arm64-apple-macos14.0", "/SDKs/MacOSX27.0.sdk"));
+        assert!(valid_apple_sdk_target("arm64-apple-ios17.0-simulator", "/SDKs/iPhoneSimulator17.2.sdk"));
+        assert!(!valid_apple_sdk_target("arm64-apple-macos14.0", "/SDKs/MacOSX27..0.sdk"));
         let digest="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let records=format!("# source_sha256={digest}\n_custom\tint custom(const char *name, size_t count);\n_empty\tvoid empty(void);\n");
         let parsed=parse_prototype_database(&records,digest).unwrap();
         let signature=parsed.get("_custom").unwrap();
         assert_eq!(signature.source,"hash-bound analyst C prototype catalog");
         assert_eq!(signature.declaration,"int custom(const char *name, size_t count);");
+        let underscored = format!("# source_sha256={digest}\n__exit\tvoid _exit(int status);\n");
+        assert!(parse_prototype_database(&underscored, digest).unwrap().contains_key("__exit"));
+        let wrong_symbol = format!("# source_sha256={digest}\n__custom\tint custom(int value);\n");
+        assert!(parse_prototype_database(&wrong_symbol, digest).is_err());
         let parameters=abi_parameters(Some(signature));
         assert_eq!(parameters.iter().map(|parameter|parameter.register.as_str()).collect::<Vec<_>>(),vec!["x0","x1"]);
         let (report,pseudocode)=recover_internal(&[0x1000],&[(0x1000,"_custom".into())],"",&[],0x1004,&parsed,None);
@@ -1976,6 +2287,10 @@ fn recover_internal(
         assert_eq!(typed_gp_argument(0xffff_ffff, None), ("0xffffffff".into(), None));
         assert_eq!(typed_gp_argument(1, Some("UnknownAggregate")), ("0x1".into(), None));
         assert_eq!(abi_integer_kind("int /* pointer * is only a comment */"), Some(AbiIntegerKind::Signed));
+        assert_eq!(abi_type("unsigned/* qualifier boundary */long"), Some(AbiType::Integer(8)));
+        assert_eq!(abi_type("u/* token boundary */int64_t"), None);
+        assert_eq!(abi_type("int */"), None);
+        assert_eq!(abi_type("int /* unterminated"), None);
         assert_eq!(typed_gp_argument(0xffff_ffff, Some("int /* pointer * is only a comment */")).0,
             "(int /* pointer * is only a comment */)-1");
         let signature = Signature { language: "C", source: "test prototype", declaration: "void consume(int negative, uint8_t byte, void *pointer);".into() };
@@ -2009,7 +2324,45 @@ fn recover_internal(
         for (barrier, description) in [(0xf900_0020u32,"possible alias"),(0xd100_43ff,"SP update"),(0x9400_0000,"prior call")] {
             let code=[words[0],words[1],barrier].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
             let call=render_linear_statement("call(0x2000);",0x100c,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new());
-            assert!(call.contains("stack argument (slot 0, sp+0x0"),"{description}: {call}");
+            assert!(call.contains("load_stack_argument<int>(sp + 0x0, 4)"),"{description}: {call}");
+        }
+    }
+    #[test] fn stack_float_arguments_use_store_bits_and_reject_invalidated_values() {
+        for (ty, materialize, store, literal) in [
+            ("float", 0x1e2e_1008u32, 0xbd00_03e8u32, "1.0"),
+            ("double", 0x1e7e_1008u32, 0xfd00_03e8u32, "-1.0"),
+            ("float", 0x52a0_000a | (0x7fc0 << 5), 0xb900_03ea, "bitcast<float>(0x7fc00000)"),
+            ("double", 0xd2e0_000a | (0x8000 << 5), 0xf900_03ea, "-0.0"),
+        ] {
+            let signature = Signature { language: "C", source: "test", declaration: format!(
+                "void consume(double a,double b,double c,double d,double e,double f,double g,double h,{ty} ninth);") };
+            let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
+            for barrier in [None, Some(0xf900_0020u32), Some(0xd100_43ff), Some(0x9400_0000), Some(0xb900_03e9)] {
+                let code = [materialize, store].into_iter().chain(barrier).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+                let call = render_linear_statement("call(0x2000);", 0x1000 + code.len() as u64, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+                if barrier.is_none() {
+                    assert!(call.starts_with(&format!("consume(d0, d1, d2, d3, d4, d5, d6, d7, {literal});")), "{call}");
+                    assert!(call.contains("stack_store=0x1004"), "{call}");
+                } else {
+                    assert!(call.contains(&format!("load_stack_argument<{ty}>")), "{call}");
+                }
+            }
+        }
+    }
+    #[test] fn stack_float_arguments_follow_only_intact_stack_pointer_copies() {
+        let signature = Signature { language: "C", source: "test", declaration:
+            "void consume(double a,double b,double c,double d,double e,double f,double g,double h,float ninth);".into() };
+        let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
+        for barrier in [None, Some(0xd280_0008u32), Some(0x5280_0008), Some(0xd100_43ff), Some(0x9400_0000)] {
+            // mov x8,sp; optional clobber; fmov s8,#1; str s8,[x8]
+            let code = [0x9100_03e8u32].into_iter().chain(barrier).chain([0x1e2e_1008, 0xbd00_0108]).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            let call = render_linear_statement("call(0x2000);", 0x1000 + code.len() as u64, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+            if barrier.is_none() {
+                assert!(call.contains(", 1.0);"), "{call}");
+                assert!(call.contains("base_proven_by=[0x1000]"), "{call}");
+            } else {
+                assert!(call.contains("load_stack_argument<float>"), "{call}");
+            }
         }
     }
     #[test] fn protocol_prototypes_keep_scope_optionality_and_implementation_uncertainty() {
@@ -2125,6 +2478,23 @@ fn recover_internal(
         assert!(abi_parameters(Some(&nested))[0].register.contains("implicit C++ receiver"));
         let global = symbol("__Z3fooi").unwrap();
         assert_eq!(abi_parameters(Some(&global))[0].register, "x0");
+        let wide = symbol("__Z3foonf").unwrap();
+        let args = abi_parameters(Some(&wide));
+        assert_eq!(args[0].register, "wide_integer<__int128>(x0, x1)");
+        assert_eq!(args[1].register, "s0");
+        let spilled = Signature { language: "C", source: "test", declaration: "void f(long a,long b,long c,long d,long e,long f,long g,long h,char byte,__int128 wide,long tail);".into() };
+        let args = abi_parameters(Some(&spilled));
+        assert!(args[9].register.contains("sp+0x10, 16 bytes"), "{:?}", args[9]);
+        assert!(args[10].register.contains("sp+0x20"), "{:?}", args[10]);
+        let boundary = Signature { language: "C", source: "test", declaration: "void f(long a,long b,long c,long d,long e,long f,long g,__int128 wide,long tail);".into() };
+        let args = abi_parameters(Some(&boundary));
+        assert!(args[7].register.contains("sp+0x0, 16 bytes"), "{:?}", args[7]);
+        assert!(args[8].register.contains("sp+0x10"), "{:?}", args[8]);
+        let signatures = BTreeMap::from([(0x2000, ("_f".into(), boundary))]);
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        assert!(call.contains("wide_integer_from_stack<__int128>(sp + 0x0)"), "{call}");
+        let result = Signature { language: "C", source: "test", declaration: "unsigned __int128 f(void);".into() };
+        assert!(render_signature_return(Some(&result)).starts_with("return wide_integer<unsigned __int128>(x0, x1);"));
     }
     #[test] fn known_sdk_aggregates_use_register_groups_and_spill_without_splitting() {
         let signature = symbol("_CFArrayContainsValue").unwrap();
@@ -2150,6 +2520,32 @@ fn recover_internal(
         assert!(render_signature_return(Some(&range)).starts_with("return aggregate<NSRange>(x0, x1);"));
         assert_eq!(abi_type("CustomRange /* not a pointer */"), None);
     }
+    #[test] fn spilled_large_aggregate_consumes_only_a_pointer_slot() {
+        let signature = Signature { language: "C", source: "test", declaration: "void f(long a,long b,long c,long d,long e,long f,long g,long h,CGAffineTransform value,long tail);".into() };
+        let args = abi_parameters(Some(&signature));
+        assert!(args[8].register.contains("sp+0x0, 8-byte pointer to 48-byte"), "{:?}", args[8]);
+        assert!(args[9].register.contains("sp+0x8"), "{:?}", args[9]);
+        let signatures = BTreeMap::from([(0x2000, ("_f".into(), signature))]);
+        let code = [0x528000e9u32, 0xf90007e9].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        assert!(call.contains("aggregate_from_pointer<CGAffineTransform>(load64(sp + 0x0)), (long)0x7"), "{call}");
+    }
+    #[test] fn indirect_aggregate_pointer_is_not_a_source_value_seed() {
+        let signature = Signature { language: "C", source: "test", declaration: "void f(CGAffineTransform value, long next);".into() };
+        let seeds = parameter_name_seeds(Some(&signature), "", 0);
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].name, "next");
+        assert_eq!(seeds[0].register, 1);
+    }
+    #[test] fn indirect_aggregate_pointer_is_not_rendered_as_the_argument_value() {
+        let signature = Signature { language: "C", source: "test prototype", declaration: "void consume(CGAffineTransform value, long next);".into() };
+        let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
+        let code = [0xd2802460u32, 0xd28000e1].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        assert!(call.starts_with("consume(aggregate_from_pointer<CGAffineTransform>(x0),"), "{call}");
+        assert!(call.contains("(long)0x7"), "{call}");
+        assert!(call.contains("by-pointer aggregate<CGAffineTransform>"), "{call}");
+    }
     #[test] fn recovered_returns_select_scalar_fp_gp_void_and_unresolved_layouts() {
         for (ty, expected) in [("void", "return;"), ("void *", "return x0;"), ("double", "return d0;"),
             ("float", "return s0;"), ("BOOL", "return w0;"), ("uint64_t", "return x0;"), ("CustomRange", "return /* result ABI unresolved")] {
@@ -2165,11 +2561,205 @@ fn recover_internal(
         assert!(body.contains("return x0;"), "{body}");
         assert!(!body.contains("void return supported"), "{body}");
     }
+    #[test] fn calls_assign_proven_scalar_results() {
+        for (ty, prefix) in [("int", "w0 = "), ("void *", "x0 = "), ("double", "d0 = "), ("float", "s0 = "), ("void", ""), ("Unknown", "")] {
+            let signature = Signature { language: "C", source: "test", declaration: format!("{ty} produce(void);") };
+            let signatures = BTreeMap::from([(0x2000, ("_produce".into(), signature))]);
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+            assert!(call.starts_with(&format!("{prefix}produce();")), "{call}");
+        }
+        assert_eq!(scalar_call_result(Some(&objc_method("-[NSNumber doubleValue]", "d16@0:8").unwrap())), Some("d0"));
+    }
+    #[test] fn calls_assign_known_aggregate_result_registers() {
+        for (ty, expected) in [("NSRange", "(x0, x1)"), ("CGRect", "(d0, d1, d2, d3)"), ("__int128", "(x0, x1)")] {
+            let signature = Signature { language:"C", source:"test", declaration:format!("{ty} make(void);") };
+            assert_eq!(call_result_destination(Some(&signature)).as_deref(), Some(expected));
+        }
+        let indirect = Signature { language:"C", source:"test", declaration:"CGAffineTransform make(void);".into() };
+        assert_eq!(call_result_destination(Some(&indirect)), None);
+        let inputs = BTreeMap::from([("x0".into(),"owner".into()),("x1".into(),"count".into())]);
+        assert_eq!(replace_instruction_register_names("(x0, x1) = make(x0, x1);", &inputs, Some(&BTreeMap::new())), "(x0, x1) = make(owner, count);");
+    }
+    #[test] fn calls_expose_hidden_result_buffer_without_shifting_arguments() {
+        let signature = Signature { language:"C", source:"test", declaration:"CGAffineTransform make(long value);".into() };
+        let signatures = BTreeMap::from([(0x2000,("_make".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);",0x1000,0x1000,&[],&signatures,None,"",&[],0x1000,false,&BTreeMap::new());
+        assert!(call.starts_with("make(x0, /* hidden result buffer */ result_buffer<CGAffineTransform>(x8));"), "{call}");
+        let branch=0x14000400u32.to_le_bytes();
+        let tail=render_arm64_body(0x1000,0x1004,"_caller",None,&[],&signatures,&branch,0x1000,0,&[],"",&[(0x1000,0x1000,0x2000)],"",&BTreeMap::new(),None).unwrap();
+        assert!(tail.contains("make(x0, /* hidden result buffer */ result_buffer<CGAffineTransform>(x8))"), "{tail}");
+    }
     #[test] fn variadic_calls_show_fixed_prototype_and_unknown_anonymous_arguments() {
         let signature = symbol("_printf").unwrap();
         let signatures = BTreeMap::from([(0x2000, ("_printf".into(), signature))]);
         let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
-        assert!(call.starts_with("printf(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */);"), "{call}");
+        assert!(call.starts_with("w0 = printf(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */);"), "{call}");
+        for (mangled, expected) in [
+            ("__Z3fooiz", "foo(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */);"),
+            ("__Z3fooz", "foo(/* variadic arguments unresolved; Apple arm64 stack ABI */);")
+        ] {
+            let signatures = BTreeMap::from([(0x2000, (mangled.into(), symbol(mangled).unwrap()))]);
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+            assert!(call.starts_with(expected), "{call}");
+        }
+    }
+    #[test] fn itanium_member_cv_and_reference_qualifiers_are_retained() {
+        // These symbols were emitted by Apple clang for out-of-line methods.
+        for (mangled, expected) in [
+            ("__ZNK1A1fEi", "A::f(int arg0) const;"),
+            ("__ZNVR1A1gEv", "A::g() volatile &;"),
+            ("__ZNKO1A1hEv", "A::h() const &&;"),
+        ] {
+            let signature = symbol(mangled).unwrap();
+            assert!(signature.declaration.ends_with(expected), "{}", signature.declaration);
+            assert!(parameter_name_seeds(Some(&signature), "", 0).is_empty());
+        }
+        for malformed in ["__ZNKK1A1fEv", "__ZNKV1A1fEv", "__ZNR1fEv", "__ZNRO1A1fEv"] {
+            assert!(symbol(malformed).is_none(), "{malformed}");
+        }
+    }
+    #[test] fn itanium_constructors_and_destructors_retain_class_names() {
+        for (mangled, expected) in [
+            ("__ZN1AC1Ei", "A::A(int arg0);"),
+            ("__ZN1AC2Ei", "A::A(int arg0);"),
+            ("__ZN1AC3Ev", "A::A();"),
+            ("__ZN1AD0Ev", "A::~A();"),
+            ("__ZN1AD1Ev", "A::~A();"),
+            ("__ZN1AD2Ev", "A::~A();"),
+            ("__ZN2ns1AC1Ev", "ns::A::A();"),
+        ] {
+            let signature = symbol(mangled).unwrap();
+            assert!(signature.declaration.ends_with(expected), "{}", signature.declaration);
+            assert!(parameter_name_seeds(Some(&signature), "", 0).is_empty());
+        }
+        for malformed in ["__ZNC1Ev", "__ZN1AC4Ev", "__ZNK1AC1Ev", "__ZN1AD1Ei", "__ZN1AC11xEv"] {
+            assert!(symbol(malformed).is_none(), "{malformed}");
+        }
+    }
+    #[test] fn itanium_operator_names_are_recovered() {
+        for (mangled, expected) in [
+            ("__ZNK1AplEi", "A::operator+(int arg0) const;"),
+            ("__ZN1AixEi", "A::operator[](int arg0);"),
+            ("__Zpl1Ai", "operator+(A arg0, int arg1);"),
+            ("__Znwm", "operator new(unsigned long arg0);"),
+        ] {
+            assert!(symbol(mangled).unwrap().declaration.ends_with(expected), "{mangled}");
+        }
+        for malformed in ["__ZNplEv", "__ZN1Apl1BEv", "__Zzzv"] {
+            assert!(symbol(malformed).is_none(), "{malformed}");
+        }
+    }
+    #[test] fn cpp_calls_keep_demangled_names_and_unresolved_receivers() {
+        for (mangled, expected) in [
+            ("__ZNK1AplEi", "A::operator+(/* possible implicit C++ receiver unresolved */, unresolved_argument"),
+            ("__ZN1AD1Ev", "A::~A(/* possible implicit C++ receiver unresolved */)"),
+            ("__Znwm", "operator new(x0)"),
+        ] {
+            let signatures = BTreeMap::from([(0x2000, (mangled.into(), symbol(mangled).unwrap()))]);
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+            assert!(call.starts_with(expected), "{call}");
+        }
+    }
+    #[test] fn tail_calls_render_proven_register_and_stack_constants() {
+        for result in ["void", "double"] {
+            let signature = Signature { language: "C", source: "test", declaration: format!("{result} take(int value, double scale);") };
+            let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
+            let code = [0x5280_0540u32, 0x1e6e_1000, 0x1400_03fe].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+            let body = render_arm64_body(0x1000, 0x100c, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1008,0x2000)], "", &BTreeMap::new(), None).unwrap();
+            assert!(body.contains("take((int)0x2a, 1.0);"), "{body}");
+            assert!(body.contains("constant argument evidence:"), "{body}");
+            assert!(body.contains("proven_by=[0x1000]"), "{body}");
+            assert!(body.contains("proven_by=[0x1004]"), "{body}");
+        }
+        let signature = Signature { language: "C", source: "test", declaration: "double take(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j);".into() };
+        let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
+        let code = [0x1e6e_1008u32, 0x1e7e_1009, 0x6d00_27e8, 0x1400_03fd].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let body = render_arm64_body(0x1000, 0x1010, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x100c,0x2000)], "", &BTreeMap::new(), None).unwrap();
+        assert!(body.contains("return take(d0, d1, d2, d3, d4, d5, d6, d7, 1.0, -1.0);"), "{body}");
+        assert!(body.contains("stack_store=0x1008"), "{body}");
+    }
+    #[test] fn tail_calls_retain_receiver_and_variadic_uncertainty() {
+        let code = 0x14000400u32.to_le_bytes(); // b 0x2000 from 0x1000
+        for (mangled, expected) in [
+            ("__ZNK1AplEi", "A::operator+(/* possible implicit C++ receiver unresolved */, unresolved_argument"),
+            ("__Z3fooiz", "foo(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */)"),
+        ] {
+            let signatures = BTreeMap::from([(0x2000, (mangled.into(), symbol(mangled).unwrap()))]);
+            let body = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None).unwrap();
+            assert!(body.contains(expected), "{body}");
+            assert!(body.contains("tail-call candidate"), "{body}");
+        }
+    }
+    #[test] fn tail_calls_render_indirect_aggregate_and_wide_stack_values() {
+        let code = 0x14000400u32.to_le_bytes();
+        for (declaration, expected) in [
+            ("void take(CGAffineTransform value);", "take(aggregate_from_pointer<CGAffineTransform>(x0))"),
+            ("void take(long a, long b, long c, long d, long e, long f, long g, long h, CGAffineTransform value);", "aggregate_from_pointer<CGAffineTransform>(load64(sp + 0x0))"),
+            ("void take(long a, long b, long c, long d, long e, long f, long g, __int128 value);", "wide_integer_from_stack<__int128>(sp + 0x0)"),
+        ] {
+            let signature = Signature { language: "C", source: "test", declaration: declaration.into() };
+            let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
+            let body = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None).unwrap();
+            assert!(body.contains(expected), "{body}");
+        }
+    }
+    #[test] fn stack_scalar_arguments_render_typed_loads_in_calls_and_tail_calls() {
+        let signature = Signature { language: "C", source: "test", declaration: "void take(long a,long b,long c,long d,long e,long f,long g,long h,signed char i,short j,int k,double f0,double f1,double f2,double f3,double f4,double f5,double f6,double f7,float f8);".into() };
+        let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let branch = 0x14000400u32.to_le_bytes();
+        let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None).unwrap();
+        for output in [call, tail] {
+            for expected in ["load_stack_argument<signed char>(sp + 0x0, 1)", "load_stack_argument<short>(sp + 0x2, 2)", "load_stack_argument<int>(sp + 0x4, 4)", "load_stack_argument<float>(sp + 0x8, 4)"] {
+                assert!(output.contains(expected), "{output}");
+            }
+        }
+    }
+    #[test] fn spilled_aggregates_render_as_direct_stack_values() {
+        let signature = Signature { language: "C", source: "test", declaration: "void take(long a,long b,long c,long d,long e,long f,long g,long h,NSRange range,double f0,double f1,double f2,double f3,double f4,double f5,double f6,double f7,CGPoint point,CGAffineTransform transform);".into() };
+        let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let branch = 0x14000400u32.to_le_bytes();
+        let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None).unwrap();
+        for output in [call, tail] {
+            for expected in ["aggregate_from_stack<NSRange>(sp + 0x0, 16)", "aggregate_from_stack<CGPoint>(sp + 0x10, 16)", "aggregate_from_pointer<CGAffineTransform>(load64(sp + 0x20))"] {
+                assert!(output.contains(expected), "{output}");
+            }
+        }
+    }
+    #[test] fn selector_arity_does_not_prove_argument_registers() {
+        let selectors = BTreeMap::from([(0x1004, "setValue:".into())]);
+        let code = 0xd28000e2u32.to_le_bytes(); // x2 = 7; selector might take a double in d0 instead
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &selectors);
+        assert!(call.contains("setValue:argument_0 /* ABI location unresolved */"), "{call}");
+        assert!(!call.contains("setValue:0x7"), "{call}");
+        let long = BTreeMap::from([(0x1004, "a:b:c:d:e:f:g:".into())]);
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &long);
+        assert!(call.contains("g:argument_6 /* ABI location unresolved */"), "{call}");
+        for (selector, expected) in [("foo::", " :argument_1"), (":", " :argument_0")] {
+            let selectors = BTreeMap::from([(0x1004, selector.into())]);
+            let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &selectors);
+            assert!(call.contains(expected), "{call}");
+        }
+        let empty = BTreeMap::from([(0x1004, String::new())]);
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &empty);
+        assert!(!call.contains("objc_msgSend selector validated"), "{call}");
+    }
+    #[test] fn super_dispatch_keeps_its_structure_pointer_explicit() {
+        for name in ["_objc_msgSendSuper", "_objc_msgSendSuper2"] {
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[(0x2000, name.into())], &BTreeMap::new(), None, "", &[], 0x1000, false, &BTreeMap::new());
+            assert!(call.contains("(x0, x1, /* message arguments unresolved */)"), "{call}");
+            assert!(call.contains("x0 points to objc_super"), "{call}");
+            assert!(call.contains("direct call target 0x2000"), "{call}");
+        }
+        let other = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[(0x2000, "__objc_msgSendSuper".into())], &BTreeMap::new(), None, "", &[], 0x1000, false, &BTreeMap::new());
+        assert!(!other.contains("x0 points to objc_super"), "{other}");
+        let signature = Signature { language: "C", declaration: "id objc_msgSendSuper2(void *super, SEL selector);".into(), source: "test" };
+        let signatures = BTreeMap::from([(0x2000, ("_objc_msgSendSuper2".into(), signature))]);
+        let call = render_linear_statement("call(0x2000); /* indirect via x9; proven_by=[0x1000] */", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        assert!(call.contains("indirect target resolved through a register 0x2000"), "{call}");
+        assert!(call.contains("indirect via x9; proven_by=[0x1000]"), "{call}");
+        assert!(call.contains("indirect via x9; proven_by=[0x1000]"), "{call}");
     }
     #[test] fn abi_parameters_resolve_objc_hidden_arguments_and_fp_register_banks() {
         let objc = objc_method("-[RoadmapScorer score:]", "q24@0:8q16").unwrap();
@@ -2249,6 +2839,9 @@ fn recover_internal(
         let names = BTreeMap::from([("x0".to_string(), "value".to_string())]);
         let substituted = replace_instruction_register_names("x0 = *(x0 + 0x8); /* load through x0 */", &names, None);
         assert_eq!(substituted, "value = *(value + 0x8); /* load through x0 */");
+        let names = BTreeMap::from([("x0".into(), "self".into())]);
+        assert_eq!(replace_instruction_register_names("x0 = sp + 0x0;", &names, None), "self = sp + 0x0;");
+        assert_eq!(replace_instruction_register_names("x0 = x0->x0 + object.x0;", &names, None), "self = self->x0 + object.x0;");
     }
     #[test] fn instruction_destinations_and_writeback_never_reuse_input_names() {
         let signature=Signature { language:"C",source:"test",declaration:"long load(long *owner, long value);".into() };
@@ -2367,9 +2960,11 @@ fn recover_internal(
             0x1004, 0x1000, &[(0x3000, "_CFRelease_data_symbol".into())], &BTreeMap::new(),
             None, "", &[], 0x1000, false, &BTreeMap::new(),
         );
-        assert!(data_only.contains("unresolved target 0x3000"), "{data_only}");
+        assert!(data_only.contains("unnamed target 0x3000"), "{data_only}");
+        assert!(data_only.contains("indirect via x9; proven_by=[0x1000]"), "{data_only}");
     }
     #[test] fn direct_calls_use_candidate_arity_without_prototype() {
+        assert_eq!(callable_name("__exit", None), "_exit");
         let symbols = [(0x2000, "_consume".into())];
         let evidence = "function 0x0000000000002000 _consume parameter-registers=[x0, x2] highest-abi-position=3 classification=incoming-parameter-candidate\n";
         let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &symbols, &BTreeMap::new(), None, evidence, &[], 0x1000, false, &BTreeMap::new());

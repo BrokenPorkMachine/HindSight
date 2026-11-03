@@ -6,6 +6,14 @@ row begins with its unslid instruction address and includes the source word, so
 the IR view can pivot to the exact disassembly evidence. Addressed rows also
 enter the worker's typed evidence sideband and the synthesis fingerprint.
 
+Scalar `SCVTF`, `UCVTF`, `FCVTZS`, and `FCVTZU` conversions support independent
+32/64-bit integer widths and single/double FP precision, including fixed-point
+scales permitted by the integer width. The native instruction display and
+shared IR decode these forms; review pseudocode calls out rounding and
+exceptional-value limitations. FPCR/FPSR effects remain unresolved, so these
+operations block strict machine-state export. The mixed-width encodings and
+scale boundaries are checked against Apple Clang-assembled examples.
+
 This slice models the move-wide immediate family (`MOVN`, `MOVZ`, `MOVK`),
 flag-neutral `ADD`/`SUB` with immediate or register operands (including an
 `LSL`/`LSR`/`ASR`-shifted register operand),

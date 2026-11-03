@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 private enum VGBinaryCenterMode: String, CaseIterable, Identifiable {
     case split = "Split"
@@ -23,6 +24,7 @@ private enum VGBinaryRightMode: String, CaseIterable, Identifiable {
 }
 
 struct VGBinaryWorkspace: View {
+    let binaryPath: String
     let functionsText: String
     let dyldImageIdentity: String?
     let symbolResolverText: String
@@ -72,6 +74,12 @@ struct VGBinaryWorkspace: View {
     @State private var overrideConfidence: VGAnalysisConfidence = .unclassified
     @State private var sourceSelection = "review"
     @State private var expressionSelection: String?
+    @State private var showPatch = false
+    @State private var patchOffset = ""
+    @State private var patchExpected = ""
+    @State private var patchReplacement = ""
+    @State private var patchStatus = ""
+    @State private var stagedPatches: [VGBinaryPatch.Edit] = []
 
     private var functions: [VGFunctionRecord] {
         VGGraphParser.functions(functionsText, symbolResolver: symbolResolverText, objcClasses: objcClassesText).map { function in
@@ -172,6 +180,97 @@ struct VGBinaryWorkspace: View {
             if enabled { synchronizeExternalSelection() }
         }
         .sheet(isPresented: $showFunctionOverride) { functionOverrideEditor }
+        .sheet(isPresented: $showPatch) { patchEditor }
+    }
+
+    private var patchEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Patch Binary Copy").font(.headline)
+            Text("Enter a file offset and matching original bytes. The patched copy must be reanalyzed; modifying a signed binary invalidates its signature.").font(.caption)
+            TextField("File offset (decimal or 0x hexadecimal)", text: $patchOffset)
+            TextField("Original bytes (hex)", text: $patchExpected)
+            TextField("Replacement bytes (hex)", text: $patchReplacement)
+            HStack {
+                Button("Read Original Bytes") { readPatchOriginal() }
+                Button("Stage Edit") { stagePatch() }
+            }
+            if !stagedPatches.isEmpty {
+                Text("\(stagedPatches.count) staged edits").font(.headline)
+                ScrollView {
+                    ForEach(stagedPatches) { edit in
+                        HStack {
+                            Text(String(format: "0x%llx", edit.offset)).monospaced()
+                            Text("\(patchHex(edit.expected)) → \(patchHex(edit.replacement))").font(.caption).textSelection(.enabled)
+                            Spacer()
+                            Button("Remove") { stagedPatches.removeAll { $0.id == edit.id } }
+                        }
+                    }
+                }.frame(maxHeight: 180)
+            }
+            Text(patchStatus).font(.caption).textSelection(.enabled)
+            HStack {
+                Button("Cancel") { showPatch = false }
+                Spacer()
+                Button("Save Patched Copy…") { savePatchedCopy() }
+            }
+        }.padding().frame(minWidth: 560)
+    }
+
+    private func patchHex(_ bytes: [UInt8]) -> String {
+        bytes.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+
+    private func parsedPatchOffset() throws -> UInt64 {
+        let text = patchOffset.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let value = text.hasPrefix("0x") ? UInt64(text.dropFirst(2), radix: 16) : UInt64(text) else {
+            throw NSError(domain: "BinaryPatch", code: 1, userInfo: [NSLocalizedDescriptionKey: "Enter a valid file offset."])
+        }
+        return value
+    }
+
+    private func readPatchOriginal() {
+        do {
+            let offset = try parsedPatchOffset()
+            let length = try VGBinaryPatch.bytes(patchReplacement).count
+            let data = try Data(contentsOf: URL(fileURLWithPath: binaryPath))
+            guard offset <= UInt64(data.count), UInt64(length) <= UInt64(data.count) - offset else { throw VGBinaryPatch.PatchError.outOfBounds }
+            patchExpected = patchHex(Array(data[Int(offset)..<(Int(offset) + length)]))
+            patchStatus = "Read \(length) original bytes at the selected file offset."
+        } catch { patchStatus = error.localizedDescription }
+    }
+
+    private func stagePatch() {
+        do {
+            let edit = VGBinaryPatch.Edit(offset: try parsedPatchOffset(), expected: try VGBinaryPatch.bytes(patchExpected), replacement: try VGBinaryPatch.bytes(patchReplacement))
+            let data = try Data(contentsOf: URL(fileURLWithPath: binaryPath))
+            _ = try VGBinaryPatch.apply(data, edits: stagedPatches + [edit])
+            stagedPatches.append(edit)
+            patchOffset = ""; patchExpected = ""; patchReplacement = ""
+            patchStatus = "Edit staged. Add another edit or save the patched copy."
+        } catch { patchStatus = error.localizedDescription }
+    }
+
+    private func savePatchedCopy() {
+        do {
+            var edits = stagedPatches
+            if !patchOffset.isEmpty || !patchExpected.isEmpty || !patchReplacement.isEmpty {
+                edits.append(VGBinaryPatch.Edit(offset: try parsedPatchOffset(), expected: try VGBinaryPatch.bytes(patchExpected), replacement: try VGBinaryPatch.bytes(patchReplacement)))
+            }
+            guard !edits.isEmpty else { patchStatus = "Enter or stage an edit first."; return }
+            let source = URL(fileURLWithPath: binaryPath).standardizedFileURL
+            let original = try Data(contentsOf: source)
+            let patched = try VGBinaryPatch.apply(original, edits: edits)
+            let panel = NSSavePanel()
+            panel.title = "Save Patched Binary Copy"
+            panel.nameFieldStringValue = source.lastPathComponent + ".patched"
+            guard panel.runModal() == .OK, let destination = panel.url?.standardizedFileURL else { return }
+            guard destination.resolvingSymlinksInPath() != source.resolvingSymlinksInPath() else { patchStatus = "Choose a different file from the original."; return }
+            try patched.write(to: destination, options: .atomic)
+            if let permissions = try FileManager.default.attributesOfItem(atPath: source.path)[.posixPermissions] {
+                try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: destination.path)
+            }
+            patchStatus = "Saved \(destination.path). Import it for a new analysis."
+        } catch { patchStatus = error.localizedDescription }
     }
 
     private var functionOverrideEditor: some View {
@@ -239,6 +338,8 @@ struct VGBinaryWorkspace: View {
                 }
             }
             VGFlowLayout {
+                Button { patchStatus = ""; showPatch = true } label: { Label("Patch Binary", systemImage: "pencil") }
+                    .buttonStyle(.borderless)
                 Button { showFunctions.toggle() } label: { Label("Functions", systemImage: "sidebar.left") }
                     .buttonStyle(.borderless)
                     .help(showFunctions ? "Hide function browser" : "Show function browser")
