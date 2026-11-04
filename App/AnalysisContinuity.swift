@@ -397,7 +397,7 @@ struct VGAnalysisDelta: Codable, Hashable, Sendable {
     let unchangedChannels: Int
 }
 
-struct VGAnalysisContinuityDocument: Codable {
+struct VGAnalysisContinuityDocument: Codable, @unchecked Sendable {
     var schema: Int = 7
     var pins: [VGAnalysisPin] = []
     var recent: [VGAnalysisVisit] = []
@@ -475,6 +475,7 @@ enum VGAnalysisContinuityStore {
     static let maximumSavedSearches = 64
     private static let directoryName = ".vectorglass"
     private static let fileName = "analysis-continuity-v1.json"
+    private static let persistenceQueue = DispatchQueue(label: "ca.zensoftware.HindSight.analysis-continuity", qos: .utility)
 
     static func load(projectPath: String) -> VGAnalysisContinuityDocument {
         do {
@@ -550,6 +551,10 @@ enum VGAnalysisContinuityStore {
         } catch { return .empty }
     }
 
+    static func loadConsistent(projectPath: String) -> VGAnalysisContinuityDocument {
+        persistenceQueue.sync { load(projectPath: projectPath) }
+    }
+
     static func save(_ document: VGAnalysisContinuityDocument, projectPath: String) throws {
         guard let directory = try storageDirectory(projectPath: projectPath, create: true) else {
             throw NSError(domain: "HindSight", code: 70, userInfo: [NSLocalizedDescriptionKey: "Analysis continuity storage is unavailable."])
@@ -564,6 +569,13 @@ enum VGAnalysisContinuityStore {
             throw NSError(domain: "HindSight", code: 72, userInfo: [NSLocalizedDescriptionKey: "Analysis continuity state exceeds its 1 MiB project-local budget."])
         }
         try data.write(to: target, options: .atomic)
+    }
+
+    static func saveAsync(_ document: VGAnalysisContinuityDocument, projectPath: String, completion: @escaping (Error?) -> Void) {
+        persistenceQueue.async {
+            do { try save(document, projectPath: projectPath); completion(nil) }
+            catch { completion(error) }
+        }
     }
 
     static func snapshot(recordID: String, sourceSHA256: String, report: AnalysisReport, engineIdentity: String = engine) -> VGAnalysisSnapshot {
@@ -715,7 +727,7 @@ enum VGAnalysisContinuityStore {
 @MainActor
 extension WorkbenchModel {
     func loadAnalysisContinuity(projectPath: String) {
-        analysisContinuityDocument = VGAnalysisContinuityStore.load(projectPath: projectPath)
+        analysisContinuityDocument = VGAnalysisContinuityStore.loadConsistent(projectPath: projectPath)
         refreshAnalysisContinuityProjection()
     }
 
@@ -1272,8 +1284,14 @@ extension WorkbenchModel {
     }
 
     func persistAnalysisContinuity(projectPath: String) {
-        do { try VGAnalysisContinuityStore.save(analysisContinuityDocument, projectPath: projectPath) }
-        catch { status = "Analysis continuity state was not saved: \(error.localizedDescription)" }
+        let snapshot = analysisContinuityDocument
+        VGAnalysisContinuityStore.saveAsync(snapshot, projectPath: projectPath) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                guard let self, self.project?.path == projectPath else { return }
+                self.status = "Analysis continuity state was not saved: \(error.localizedDescription)"
+            }
+        }
     }
 
     func decompilerFunctionOverrides(for recordID: String) -> [UInt64: VGDecompilerFunctionOverride] {

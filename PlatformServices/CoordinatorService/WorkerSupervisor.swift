@@ -203,22 +203,40 @@ final class WorkerSupervisor {
             maxFrameBytes: WorkbenchProtocolLimits.analysisWorkerFrameBytes, deadlineSeconds: 240,
             admissionBytes: 512 * 1_048_576,
             evidenceSink: { evidenceBox.bundle = $0 }) { [weak self] result in
-            do {
-                let data = try result.get()
-                self?.updateRecent(id: id, phase: .validating, detail: "Validating analysis identity, bounds, and schema.", progressPercent: 98, progressStage: "validate")
-                guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      Set(object.keys) == AnalysisReport.jsonFields else {
-                    throw WorkbenchError("Unexpected analysis fields.")
-                }
-                let report = try JSONDecoder().decode(AnalysisReport.self, from: data)
-                if let failure = report.validationFailure(id: id, digest: digest) {
-                    throw WorkbenchError("Analysis identity or bounds mismatch: \(failure).")
-                }
-                self?.updateRecent(id: id, phase: .publishing, detail: "Analysis validated; publishing the bounded result to the workbench.", progressPercent: 99, progressStage: "publish")
-                completion(.success((report, evidenceBox.bundle)))
-            } catch {
-                self?.updateRecent(id: id, phase: .failed, detail: error.localizedDescription)
+            guard let self else { completion(.failure(WorkbenchError("Worker supervisor was released before analysis publication."))); return }
+            let data: Data
+            switch result {
+            case .success(let value): data = value
+            case .failure(let error):
+                self.updateRecent(id: id, phase: .failed, detail: error.localizedDescription)
                 completion(.failure(error))
+                return
+            }
+            self.updateRecent(id: id, phase: .validating, detail: "Validating analysis identity, bounds, and schema.", progressPercent: 98, progressStage: "validate")
+            let evidence = evidenceBox.bundle
+            DispatchQueue.global(qos: .utility).async {
+                let validation: Result<(AnalysisReport, WorkerEvidenceBundle?), Error>
+                do {
+                    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          Set(object.keys) == AnalysisReport.jsonFields else {
+                        throw WorkbenchError("Unexpected analysis fields.")
+                    }
+                    let report = try JSONDecoder().decode(AnalysisReport.self, from: data)
+                    if let failure = report.validationFailure(id: id, digest: digest) {
+                        throw WorkbenchError("Analysis identity or bounds mismatch: \(failure).")
+                    }
+                    validation = .success((report, evidence))
+                } catch { validation = .failure(error) }
+
+                self.queue.async { [self] in
+                    switch validation {
+                    case .success:
+                        self.updateRecent(id: id, phase: .publishing, detail: "Analysis validated; publishing the bounded result to the workbench.", progressPercent: 99, progressStage: "publish")
+                    case .failure(let error):
+                        self.updateRecent(id: id, phase: .failed, detail: error.localizedDescription)
+                    }
+                    completion(validation)
+                }
             }
         }
     }

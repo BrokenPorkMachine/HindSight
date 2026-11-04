@@ -9,6 +9,80 @@ private enum VGSemanticPaneMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private struct VGGraphWorkspaceInput: Equatable, Sendable {
+    let cfg: String
+    let functions: String
+    let disassembly: String
+    let ir: String
+    let dataflow: String
+}
+
+private struct VGGraphWorkspacePrepared: Sendable {
+    let graph: VGCFGGraph
+    let functions: [VGFunctionRecord]
+    let layout: VGCFGLayout
+    let codeByBlock: [String: [VGDisassemblyRow]]
+    let irByBlock: [String: [Substring]]
+    let dataflowByBlock: [String: [Substring]]
+}
+
+private enum VGGraphWorkspacePreparation {
+    static func build(_ input: VGGraphWorkspaceInput, viewport: CGSize) -> VGGraphWorkspacePrepared {
+        let functions = VGGraphParser.functions(input.functions)
+        let graph = VGGraphParser.cfg(input.cfg, functionStarts: Set(functions.map(\.start)))
+        let layout = graph.layout(
+            limit: 240,
+            functionStarts: Set(functions.map(\.start)),
+            availableWidth: viewport.width > 1 ? Double(viewport.width / 0.85) : nil,
+            availableHeight: viewport.height > 1 ? Double(viewport.height / 0.85) : nil
+        )
+        let orderedBlocks = graph.blocks.sorted { $0.start < $1.start }
+        let hasDisjointRanges = zip(orderedBlocks, orderedBlocks.dropFirst()).allSatisfy { left, right in
+            left.end <= right.start
+        }
+
+        func blockID(containing address: UInt64) -> String? {
+            guard hasDisjointRanges else {
+                return graph.blocks.first(where: { $0.contains(address) })?.id
+            }
+            var lower = 0
+            var upper = orderedBlocks.count
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if orderedBlocks[middle].start <= address { lower = middle + 1 }
+                else { upper = middle }
+            }
+            guard lower > 0 else { return nil }
+            let block = orderedBlocks[lower - 1]
+            return block.contains(address) ? block.id : nil
+        }
+
+        var codeByBlock: [String: [VGDisassemblyRow]] = [:]
+        for row in VGDisassemblyParser.parse(input.disassembly) where row.kind == .instruction {
+            guard let address = VGGraphParser.address(from: row.address), let blockID = blockID(containing: address) else { continue }
+            codeByBlock[blockID, default: []].append(row)
+        }
+
+        func indexLines(_ source: String) -> [String: [Substring]] {
+            var result: [String: [Substring]] = [:]
+            for raw in source.split(separator: "\n", omittingEmptySubsequences: true) {
+                guard let address = VGGraphParser.address(from: String(raw)), let blockID = blockID(containing: address) else { continue }
+                result[blockID, default: []].append(raw)
+            }
+            return result
+        }
+
+        return VGGraphWorkspacePrepared(
+            graph: graph,
+            functions: functions,
+            layout: layout,
+            codeByBlock: codeByBlock,
+            irByBlock: indexLines(input.ir),
+            dataflowByBlock: indexLines(input.dataflow)
+        )
+    }
+}
+
 struct VGGraphWorkspace: View {
     let imageName: String
     let cfgText: String
@@ -31,6 +105,10 @@ struct VGGraphWorkspace: View {
     @State private var graph: VGCFGGraph
     @State private var functions: [VGFunctionRecord]
     @State private var layout: VGCFGLayout
+    @State private var codeByBlock: [String: [VGDisassemblyRow]] = [:]
+    @State private var irByBlock: [String: [Substring]] = [:]
+    @State private var dataflowByBlock: [String: [Substring]] = [:]
+    @State private var preparingGraph = true
     @State private var graphViewportSize: CGSize = .zero
     @State private var mapOffset: CGSize = .zero
     @State private var mapOffsetAnchor: CGSize = .zero
@@ -59,11 +137,10 @@ struct VGGraphWorkspace: View {
         self.debugPC = debugPC
         self.onSelectAddress = onSelectAddress
 
-        let parsedFunctions = VGGraphParser.functions(functionsText)
-        let parsedGraph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
-        _graph = State(initialValue: parsedGraph)
-        _functions = State(initialValue: parsedFunctions)
-        _layout = State(initialValue: parsedGraph.layout(limit: 240, functionStarts: Set(parsedFunctions.map(\.start))))
+        let emptyGraph = VGCFGGraph(blocks: [], edges: [])
+        _graph = State(initialValue: emptyGraph)
+        _functions = State(initialValue: [])
+        _layout = State(initialValue: emptyGraph.layout(limit: 240))
     }
 
     private var selectedAddressValue: UInt64? { VGGraphParser.address(from: selectedAddress) }
@@ -76,16 +153,24 @@ struct VGGraphWorkspace: View {
         for edge in visible {
             if let targetID = edge.targetBlockID { incoming[targetID, default: []].append(edge) }
         }
-        func offset(_ edge: VGCFGEdge, peers: [VGCFGEdge]) -> Double {
-            let ordered = peers.sorted { $0.id < $1.id }
-            guard ordered.count > 1, let index = ordered.firstIndex(of: edge) else { return 0 }
-            let spacing = min(26, Double(nodeWidth) * 0.7 / Double(ordered.count - 1))
-            return (Double(index) - Double(ordered.count - 1) / 2) * spacing
+        func offsets(_ groups: [String: [VGCFGEdge]]) -> [String: Double] {
+            var result: [String: Double] = [:]
+            for peers in groups.values {
+                let ordered = peers.sorted { $0.id < $1.id }
+                guard ordered.count > 1 else { continue }
+                let spacing = min(26, Double(nodeWidth) * 0.7 / Double(ordered.count - 1))
+                for (index, edge) in ordered.enumerated() {
+                    result[edge.id] = (Double(index) - Double(ordered.count - 1) / 2) * spacing
+                }
+            }
+            return result
         }
+        let sourceOffsets = offsets(outgoing)
+        let targetOffsets = offsets(incoming)
         return visible.compactMap { edge in
-            guard let targetID = edge.targetBlockID else { return nil }
-            let source = offset(edge, peers: outgoing[edge.sourceBlockID] ?? [])
-            let target = offset(edge, peers: incoming[targetID] ?? [])
+            guard edge.targetBlockID != nil else { return nil }
+            let source = sourceOffsets[edge.id] ?? 0
+            let target = targetOffsets[edge.id] ?? 0
             return (edge, source, target, (source + target) * 0.55)
         }
     }
@@ -136,39 +221,27 @@ struct VGGraphWorkspace: View {
             }
         }
         .background(Color.primary.opacity(0.012))
+        .task(id: VGGraphWorkspaceInput(cfg: cfgText, functions: functionsText, disassembly: disassemblyText, ir: irText, dataflow: dataflowText)) {
+            preparingGraph = true
+            let input = VGGraphWorkspaceInput(cfg: cfgText, functions: functionsText, disassembly: disassemblyText, ir: irText, dataflow: dataflowText)
+            let viewport = graphViewportSize
+            let prepared = await Task.detached(priority: .utility) {
+                VGGraphWorkspacePreparation.build(input, viewport: viewport)
+            }.value
+            guard !Task.isCancelled else { return }
+            graph = prepared.graph
+            functions = prepared.functions
+            layout = prepared.layout
+            codeByBlock = prepared.codeByBlock
+            irByBlock = prepared.irByBlock
+            dataflowByBlock = prepared.dataflowByBlock
+            preparingGraph = false
+            mapOffset = .zero
+            mapOffsetAnchor = .zero
+            fitGraph(widthOnly: true)
+            synchronizeSelection()
+        }
         .onAppear { synchronizeSelection() }
-        .onChange(of: cfgText) { _, newValue in
-            let parsedFunctions = VGGraphParser.functions(functionsText)
-            functions = parsedFunctions
-            let parsedGraph = VGGraphParser.cfg(newValue, functionStarts: Set(parsedFunctions.map(\.start)))
-            graph = parsedGraph
-            layout = parsedGraph.layout(
-                limit: 240,
-                functionStarts: Set(parsedFunctions.map(\.start)),
-                availableWidth: graphViewportSize.width > 1 ? Double(graphViewportSize.width / 0.85) : nil,
-                availableHeight: graphViewportSize.height > 1 ? Double(graphViewportSize.height / 0.85) : nil
-            )
-            mapOffset = .zero
-            mapOffsetAnchor = .zero
-            fitGraph(widthOnly: true)
-            synchronizeSelection()
-        }
-        .onChange(of: functionsText) { _, newValue in
-            let parsedFunctions = VGGraphParser.functions(newValue)
-            functions = parsedFunctions
-            let parsedGraph = VGGraphParser.cfg(cfgText, functionStarts: Set(parsedFunctions.map(\.start)))
-            graph = parsedGraph
-            layout = parsedGraph.layout(
-                limit: 240,
-                functionStarts: Set(parsedFunctions.map(\.start)),
-                availableWidth: graphViewportSize.width > 1 ? Double(graphViewportSize.width / 0.85) : nil,
-                availableHeight: graphViewportSize.height > 1 ? Double(graphViewportSize.height / 0.85) : nil
-            )
-            mapOffset = .zero
-            mapOffsetAnchor = .zero
-            fitGraph(widthOnly: true)
-            synchronizeSelection()
-        }
         .onChange(of: selectedAddress) { _, _ in synchronizeSelection() }
     }
 
@@ -326,8 +399,16 @@ struct VGGraphWorkspace: View {
             }
             .overlay(alignment: .topLeading) {
                 if graph.blocks.isEmpty {
-                    ContentUnavailableView("No flow graph", systemImage: "point.3.connected.trianglepath.dotted", description: Text("Run Analyze binary to build the bounded CFG."))
+                    if preparingGraph {
+                        VStack(spacing: 10) {
+                            ProgressView()
+                            Text("Preparing bounded flow graph…").font(.caption).foregroundStyle(.secondary)
+                        }
                         .frame(width: proxy.size.width, height: proxy.size.height)
+                    } else {
+                        ContentUnavailableView("No flow graph", systemImage: "point.3.connected.trianglepath.dotted", description: Text("Run Analyze binary to build the bounded CFG."))
+                            .frame(width: proxy.size.width, height: proxy.size.height)
+                    }
                 }
             }
             .onAppear { relayout(for: proxy.size) }
@@ -486,9 +567,9 @@ struct VGGraphWorkspace: View {
                     case .code:
                         codeForBlock(block)
                     case .ir:
-                        semanticLines(irText, block: block, empty: "No IR records intersect this block.")
+                        semanticLines(irByBlock[block.id] ?? [], empty: "No IR records intersect this block.")
                     case .flow:
-                        semanticLines(dataflowText, block: block, empty: "No modeled register-flow records intersect this block.")
+                        semanticLines(dataflowByBlock[block.id] ?? [], empty: "No modeled register-flow records intersect this block.")
                     }
                 }
             } else {
@@ -500,10 +581,7 @@ struct VGGraphWorkspace: View {
     }
 
     @ViewBuilder private func codeForBlock(_ block: VGCFGBlock) -> some View {
-        let rows = VGDisassemblyParser.parse(disassemblyText).filter { row in
-            guard row.kind != .metadata, let address = VGGraphParser.address(from: row.address) else { return false }
-            return block.contains(address)
-        }
+        let rows = codeByBlock[block.id] ?? []
 
         if rows.isEmpty {
             Text("No annotated disassembly intersects \(block.id).")
@@ -543,20 +621,16 @@ struct VGGraphWorkspace: View {
         }
     }
 
-    @ViewBuilder private func semanticLines(_ text: String, block: VGCFGBlock, empty: String) -> some View {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: true).map(String.init).filter { line in
-            guard let address = VGGraphParser.address(from: line) else { return false }
-            return block.contains(address)
-        }
+    @ViewBuilder private func semanticLines(_ lines: [Substring], empty: String) -> some View {
         if lines.isEmpty {
             Text(empty).font(.caption).foregroundStyle(.secondary).padding(12)
         } else {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(lines.prefix(128).enumerated()), id: \.offset) { _, line in
                     Button {
-                        if let address = VGGraphParser.address(from: line) { selectAddress(address) }
+                        if let address = VGGraphParser.address(from: String(line)) { selectAddress(address) }
                     } label: {
-                        Text(line)
+                        Text(String(line))
                             .font(.system(size: 10, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)

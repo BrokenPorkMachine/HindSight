@@ -1,6 +1,6 @@
 import Foundation
 
-struct VGDisassemblyRow: Identifiable, Hashable {
+struct VGDisassemblyRow: Identifiable, Hashable, Sendable {
     enum Kind: Hashable {
         case instruction
         case symbol

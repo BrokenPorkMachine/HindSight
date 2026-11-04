@@ -75,12 +75,12 @@ struct VGMinimapProjection {
     }
 }
 
-struct VGGraphPoint: Hashable {
+struct VGGraphPoint: Hashable, Sendable {
     let x: Double
     let y: Double
 }
 
-struct VGFunctionRecord: Identifiable, Hashable {
+struct VGFunctionRecord: Identifiable, Hashable, Sendable {
     let start: UInt64
     let end: UInt64
     let byteCount: UInt64
@@ -96,7 +96,7 @@ struct VGFunctionRecord: Identifiable, Hashable {
     }
 }
 
-struct VGCFGEdge: Identifiable, Hashable {
+struct VGCFGEdge: Identifiable, Hashable, Sendable {
     let sourceAddress: UInt64
     let targetAddress: UInt64
     let kind: String
@@ -112,7 +112,7 @@ struct VGCFGEdge: Identifiable, Hashable {
     var isConditional: Bool { kind.contains("cond") || kind == "cbz" || kind == "cbnz" || kind == "tbz" || kind == "tbnz" }
 }
 
-struct VGCFGBlock: Identifiable, Hashable {
+struct VGCFGBlock: Identifiable, Hashable, Sendable {
     let id: String
     let start: UInt64
     let end: UInt64
@@ -127,14 +127,14 @@ struct VGCFGBlock: Identifiable, Hashable {
     }
 }
 
-struct VGCFGLayout {
+struct VGCFGLayout: Sendable {
     let positions: [String: VGGraphPoint]
     let width: Double
     let height: Double
     let visibleBlockIDs: Set<String>
 }
 
-struct VGCFGGraph {
+struct VGCFGGraph: Sendable {
     let blocks: [VGCFGBlock]
     let edges: [VGCFGEdge]
 
@@ -388,9 +388,27 @@ enum VGGraphParser {
         finish(current, into: &pending)
 
         let startToID = Dictionary(uniqueKeysWithValues: pending.map { ($0.start, $0.id) })
+        let addressOrdered = pending.sorted { $0.start < $1.start }
+        let disjointRanges = zip(addressOrdered, addressOrdered.dropFirst()).allSatisfy { pair in
+            pair.0.end <= pair.1.start
+        }
 
         func blockID(containing address: UInt64) -> String? {
             if let exact = startToID[address] { return exact }
+            if disjointRanges {
+                var lower = 0
+                var upper = addressOrdered.count
+                while lower < upper {
+                    let middle = lower + (upper - lower) / 2
+                    if addressOrdered[middle].start <= address { lower = middle + 1 }
+                    else { upper = middle }
+                }
+                guard lower > 0 else { return nil }
+                let candidate = addressOrdered[lower - 1]
+                return address < candidate.end ? candidate.id : nil
+            }
+            // Preserve the legacy first-match behavior for malformed overlapping
+            // ranges; valid CFGs take the logarithmic disjoint-range path above.
             return pending.first { $0.start <= address && address < $0.end }?.id
         }
 

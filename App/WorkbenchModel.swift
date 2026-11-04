@@ -312,7 +312,6 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var virtualizationREPattern = "d4200000"
     @Published var virtualizationImagePath = ""
     @Published var virtualizationFirmwareGPA = "0x0"
-    @Published var terminalOutput = ""
     @Published var terminalDisplayOutput = ""
     @Published var terminalInput = ""
     @Published var terminalWorkingDirectory = ""
@@ -2817,7 +2816,6 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
 
     func clearTerminalOutput() {
-        terminalOutput = ""
         terminalDisplayOutput = ""
         terminalDisplayStream.reset()
     }
@@ -2859,7 +2857,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
 
     private func startTerminalPolling() {
         stopTerminalPolling()
-        terminalPollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        terminalPollTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pollTerminal() }
         }
         pollTerminal()
@@ -2878,9 +2876,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             self.terminalPollInFlight = false
             guard case .success(let text) = result, let data = text.data(using: .utf8), let reply = try? JSONDecoder().decode(TerminalReply.self, from: data) else { return }
             if let output = reply.output {
-                self.terminalOutput = Self.boundedTail(self.terminalOutput + output, limit: 500_000)
-                self.terminalDisplayOutput.append(self.terminalDisplayStream.append(output))
-                self.terminalDisplayOutput = Self.boundedTail(self.terminalDisplayOutput, limit: 500_000)
+                let displayChunk = self.terminalDisplayStream.append(output)
+                if !displayChunk.isEmpty {
+                    self.terminalDisplayOutput = Self.boundedTail(self.terminalDisplayOutput + displayChunk, limit: 120_000)
+                }
             }
             self.terminalRunning = reply.running
             if !reply.message.isEmpty { self.terminalStatus = reply.message }
