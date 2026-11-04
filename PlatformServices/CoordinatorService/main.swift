@@ -16,8 +16,21 @@ final class BoundedServiceLane {
         let work: () -> String
         let attempt: Int
     }
+    struct Telemetry: Codable {
+        var submitted: UInt64 = 0
+        var completed: UInt64 = 0
+        var cancelled: UInt64 = 0
+        var saturated: UInt64 = 0
+        var resourceTimeout: UInt64 = 0
+        var superseded: UInt64 = 0
+        var totalWaitNanoseconds: UInt64 = 0
+        var totalRunNanoseconds: UInt64 = 0
+        var maxWaitNanoseconds: UInt64 = 0
+        var maxRunNanoseconds: UInt64 = 0
+    }
     private let lock = NSLock()
     private let queue: DispatchQueue
+    private let name: String
     private let maxConcurrent: Int
     private let maxPending: Int
     private let reservationBytes: UInt64
@@ -25,20 +38,38 @@ final class BoundedServiceLane {
     private var running: Set<UUID> = []
     private var generation: UInt64 = 0
     private var sequence: UInt64 = 0
+    private var telemetry = Telemetry()
+    private var runningStart: [UUID: UInt64] = [:]
 
     init(name: String, qos: DispatchQoS, maxConcurrent: Int, maxPending: Int = 64, reservationBytes: UInt64 = 32 * 1_048_576) {
         precondition(maxConcurrent > 0 && maxPending > 0)
+        self.name = name
         queue = DispatchQueue(label: name, qos: qos, attributes: .concurrent)
         self.maxConcurrent = maxConcurrent
         self.maxPending = maxPending
         self.reservationBytes = reservationBytes
+    }
+    func snapshotTelemetry() -> Telemetry {
+        lock.lock()
+        defer { lock.unlock() }
+        return telemetry
+    }
+    func telemetryJSON() -> String {
+        let snapshot = snapshotTelemetry()
+        if let data = try? JSONEncoder().encode(snapshot),
+           let s = String(data: data, encoding: .utf8) {
+            return "{\"lane\":\"\(name)\",\(String(s.dropFirst()))"
+        }
+        return "{\"lane\":\"\(name)\",\"submitted\":\(snapshot.submitted),\"completed\":\(snapshot.completed)}"
     }
     @discardableResult
     func submit(priority: Priority = .utility,
                 reply: @escaping (String) -> Void,
                 work: @escaping () -> String) -> Bool {
         lock.lock()
+        telemetry.submitted &+= 1
         guard pending.count < maxPending else {
+            telemetry.saturated &+= 1
             lock.unlock()
             reply(ServiceReply.failure("Background dispatch lane saturated; retry after active work completes."))
             return false
@@ -60,6 +91,7 @@ final class BoundedServiceLane {
         generation &+= 1
         let rejected = pending
         pending.removeAll()
+        telemetry.cancelled &+= UInt64(rejected.count)
         lock.unlock()
         for job in rejected { job.reply(ServiceReply.failure("Queued operation cancelled.")) }
     }
@@ -79,6 +111,10 @@ final class BoundedServiceLane {
             }) else { break }
             let job = pending.remove(at: index)
             running.insert(job.id)
+            let wait = now &- job.submittedAt
+            telemetry.totalWaitNanoseconds &+= wait
+            if wait > telemetry.maxWaitNanoseconds { telemetry.maxWaitNanoseconds = wait }
+            runningStart[job.id] = now
             result.append(job)
         }
         return result
@@ -92,32 +128,68 @@ final class BoundedServiceLane {
     }
     private func execute(_ job: Job) {
         queue.async { [self] in
+            lock.lock()
+            let current = generation == job.generation
+            if !current {
+                running.remove(job.id)
+                runningStart.removeValue(forKey: job.id)
+            }
+            let ready = current ? [] : takeReadyLocked(now: DispatchTime.now().uptimeNanoseconds)
+            lock.unlock()
+            guard current else {
+                lock.lock()
+                telemetry.superseded &+= 1
+                lock.unlock()
+                job.reply(ServiceReply.failure("Queued operation cancelled."))
+                start(ready)
+                return
+            }
             guard let token = SharedResourceLedger.shared.reserve(reservationBytes) else {
                 // Requeue with a bounded delay; resource pressure does not occupy a worker slot.
                 lock.lock()
                 running.remove(job.id)
+                runningStart.removeValue(forKey: job.id)
                 let valid = generation == job.generation
-                if valid && job.attempt < 20 {
+                let retry = valid && job.attempt < 20 && pending.count < maxPending
+                if retry {
                     let retryAt = DispatchTime.now().uptimeNanoseconds &+ 250_000_000
                     pending.append(Job(id: job.id, generation: job.generation,
                                        priority: job.priority, sequence: job.sequence,
                                        submittedAt: job.submittedAt, notBefore: retryAt,
                                        reply: job.reply, work: job.work,
                                        attempt: job.attempt + 1))
+                } else {
+                    telemetry.resourceTimeout &+= 1
                 }
                 let next = takeReadyLocked(now: DispatchTime.now().uptimeNanoseconds)
                 lock.unlock()
-                if !valid || job.attempt >= 20 {
+                if !retry {
                     job.reply(ServiceReply.failure("Resource admission timed out or cancelled."))
                 }
                 start(next)
-                if valid && job.attempt < 20 { queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.pump() } }
+                if retry { queue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.pump() } }
                 return
             }
+            let startRun = DispatchTime.now().uptimeNanoseconds
             let response: String = { defer { SharedResourceLedger.shared.release(token) }; return job.work() }()
+            let endRun = DispatchTime.now().uptimeNanoseconds
             lock.lock()
             let valid = generation == job.generation
             running.remove(job.id)
+            if let s = runningStart.removeValue(forKey: job.id) {
+                let run = endRun &- s
+                telemetry.totalRunNanoseconds &+= run
+                if run > telemetry.maxRunNanoseconds { telemetry.maxRunNanoseconds = run }
+            } else if endRun >= startRun {
+                let run = endRun &- startRun
+                telemetry.totalRunNanoseconds &+= run
+                if run > telemetry.maxRunNanoseconds { telemetry.maxRunNanoseconds = run }
+            }
+            if valid {
+                telemetry.completed &+= 1
+            } else {
+                telemetry.superseded &+= 1
+            }
             let next = takeReadyLocked(now: DispatchTime.now().uptimeNanoseconds)
             lock.unlock()
             job.reply(valid ? response : ServiceReply.failure("Operation superseded by newer session."))
@@ -132,7 +204,12 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         let prototypes: Data?
         let eligibleDeclarations: Int
     }
-    private let queue = DispatchQueue(label: "ca.zensoftware.VectorGlass.coordinator")
+    // ProjectStore and WorkerSupervisor state belongs exclusively to this queue.
+    private let queue = DispatchQueue(label: "ca.zensoftware.VectorGlass.coordinator", qos: .userInitiated)
+    // Native operations can block; they must never hold up project replies or cancellation.
+    private let debugQueue = DispatchQueue(label: "ca.zensoftware.VectorGlass.debugger", qos: .userInitiated)
+    private let virtualizationQueue = DispatchQueue(label: "ca.zensoftware.VectorGlass.virtualization", qos: .userInitiated)
+    private let terminalQueue = DispatchQueue(label: "ca.zensoftware.VectorGlass.terminal", qos: .userInitiated)
     private var store: ProjectStore?
     private var sdkLookups: [String: DarwinSDKLookupCancellation] = [:]
     private var sdkLookupCache: [String: SDKLookupCacheEntry] = [:]
@@ -316,14 +393,17 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     throw WorkbenchError("Reconstruction currently requires an unmapped thin AArch64 Mach-O; custom mappings and other formats remain unsupported.")
                 }
                 let before = try VerifiedPageCache.stamp(source.path)
+                let projectTypeCatalog = try current.projectTypeCatalog()
                 func launch(_ prototypes: Data?, _ sdkNote: String,
-                            _ sdkCatalogReference: DarwinSDKDeclarationCatalogReference? = nil) {
+                            _ sdkCatalogReference: DarwinSDKDeclarationCatalogReference? = nil,
+                            _ projectTypes: [ProjectTypeCandidate] = []) {
                     do {
                         guard store === current, try VerifiedPageCache.stamp(source.path) == before else {
                             throw WorkbenchError("Project or captured source changed before reconstruction.")
                         }
                         supervisor.reconstruct(path: source.path, digest: source.digest, size: source.size,
-                                               start: start, end: end, id: requestID, prototypes: prototypes) { [self] result in
+                                               start: start, end: end, id: requestID, prototypes: prototypes,
+                                               projectTypes: projectTypes) { [self] result in
                             do {
                                 guard store === current, try VerifiedPageCache.stamp(source.path) == before else {
                                     throw WorkbenchError("Project or captured source changed during reconstruction.")
@@ -336,16 +416,32 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                         }
                     } catch { reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription)) }
                 }
+                func launchWithMatchingProjectTypes(_ note: String) {
+                    DispatchQueue.global(qos: .utility).async { [self] in
+                        let dependencies: [ProjectTypeCandidate]
+                        do {
+                            let context = try DarwinSDKDeclarations.verifiedTargetContext(path: source.path,
+                                expectedSHA256: source.digest, expectedSize: source.size)
+                            dependencies = projectTypeCatalog.resolvedDeclarations(sourceSHA256: source.digest,
+                                target: context.triple)
+                        } catch { dependencies = [] }
+                        queue.async {
+                            let typeNote = dependencies.isEmpty ? " No matching project type dependencies were found." :
+                                " Supplied \(dependencies.count) unique source- and target-matched project type dependency candidate(s)."
+                            launch(nil, note + typeNote, nil, dependencies)
+                        }
+                    }
+                }
                 let engineIdentity = source.options.map { "multiarch-v1:" + SHA256.hash(data: Data($0.cacheIdentity.utf8)).map { String(format: "%02x", $0) }.joined().prefix(48) } ?? (analysisCacheEngineVersion + "-patterns1-" + BinaryImportOptions.analysisRevision)
                 guard let cached = try? current.cachedAnalysis(digest: source.digest, requestID: requestID,
                                                                engineVersion: engineIdentity, compatibleLegacyProductVersions: []) else {
-                    launch(nil, " SDK lookup needs a current analysis; no declaration catalog was supplied.")
+                    launchWithMatchingProjectTypes(" SDK lookup needs a current analysis; no SDK declaration catalog was supplied.")
                     return
                 }
                 let candidates = try DarwinSDKDeclarations.importCandidates(linkageRecords: cached.report.linkage_records)
-                guard !candidates.isEmpty else { launch(nil, " No eligible public SDK imports were found."); return }
+                guard !candidates.isEmpty else { launchWithMatchingProjectTypes(" No eligible public SDK imports were found."); return }
                 guard let header = Bundle.main.url(forResource: "sdk_declarations", withExtension: "h") else {
-                    launch(nil, " Bundled SDK declaration header is unavailable.")
+                    launchWithMatchingProjectTypes(" Bundled SDK declaration header is unavailable.")
                     return
                 }
                 let candidateBytes = try JSONEncoder().encode(candidates)
@@ -361,6 +457,7 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                     let prototypes: Data?
                     let catalogData: Data?
                     let note: String
+                    var projectTypeDependencies: [ProjectTypeCandidate] = []
                     var cacheEntry: SDKLookupCacheEntry?
                     do {
                         let deadline = DispatchTime.now().uptimeNanoseconds + 120_000_000_000
@@ -368,6 +465,8 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                             expectedSHA256: source.digest, expectedSize: source.size, cancellation: cancellation)
                         let environment = try DarwinSDKDeclarations.collectionEnvironment(context: context,
                             headerPath: header.path, cancellation: cancellation)
+                        projectTypeDependencies = projectTypeCatalog.resolvedDeclarations(
+                            sourceSHA256: source.digest, target: environment.context.triple)
                         guard DispatchTime.now().uptimeNanoseconds < deadline else {
                             throw DarwinSDKDeclarations.Invalid(message: "SDK declaration collection exceeded its total deadline.")
                         }
@@ -433,14 +532,14 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
                                         }
                                     }
                                     completionNote += " Full SDK lookup evidence retained as analysis-cache/\(receipt.fileName) (SHA-256 \(receipt.catalogSHA256))."
-                                    launch(workerCatalog, completionNote, reference)
+                                    launch(workerCatalog, completionNote, reference, projectTypeDependencies)
                                     return
                                 } catch {
                                     workerCatalog = nil
                                     completionNote += " The SDK catalog could not be retained; declarations were withheld from reconstruction (\(error.localizedDescription))."
                                 }
                             }
-                            launch(workerCatalog, completionNote)
+                            launch(workerCatalog, completionNote, nil, projectTypeDependencies)
                         } catch {
                             reply(ReconstructionReply.encode(id: requestID, message: error.localizedDescription))
                         }
@@ -519,13 +618,13 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         }
     }
     func debugAttach(_ pid: Int32, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(debugServer.attach(pid: pid)) }
+        debugQueue.async { [self] in reply(debugServer.attach(pid: pid)) }
     }
     func debugLaunch(_ path: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(debugServer.launch(path: path)) }
+        debugQueue.async { [self] in reply(debugServer.launch(path: path)) }
     }
     func debugCommand(_ command: String, address: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in
+        debugQueue.async { [self] in
             let value = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let raw = value.hasPrefix("0x") ? String(value.dropFirst(2)) : value
             let parsed = raw.isEmpty ? nil : UInt64(raw, radix: 16)
@@ -534,29 +633,29 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         }
     }
     func debugSnapshot(withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in
+        debugQueue.async { [self] in
             switch debugServer.snapshot() { case .success(let value): reply(value); case .failure(let error): reply(DebugCommandReply.failure(error.localizedDescription)) }
         }
     }
     func debugReadMemory(_ address: String, length: Int, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in
+        debugQueue.async { [self] in
             var value = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(); if value.hasPrefix("0x") { value.removeFirst(2) }
             guard let parsed = UInt64(value, radix: 16) else { reply(DebugCommandReply.failure("Invalid hexadecimal address.")); return }
             switch debugServer.memory(address: parsed, length: length) { case .success(let value): reply(value); case .failure(let error): reply(DebugCommandReply.failure(error.localizedDescription)) }
         }
     }
     func debugPollEvent(withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in
+        debugQueue.async { [self] in
             switch debugServer.event() { case .success(let value): reply(value); case .failure(let error): reply(DebugCommandReply.failure(error.localizedDescription)) }
         }
     }
     func debugQuery(_ query: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in
+        debugQueue.async { [self] in
             switch debugServer.query(query) { case .success(let value): reply(value); case .failure(let error): reply(DebugCommandReply.failure(error.localizedDescription)) }
         }
     }
     func debugSelectThread(_ threadID: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in
+        debugQueue.async { [self] in
             var raw = threadID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(); if raw.hasPrefix("0x") { raw.removeFirst(2) }
             guard let value = UInt64(raw, radix: 16) else { reply(DebugCommandReply.failure("Invalid thread ID.")); return }
             reply(debugServer.selectThread(value))
@@ -566,7 +665,10 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         scriptingLane.submit(priority: .initiated, reply: reply) { [scriptingHost] in scriptingHost.run(source: source, contextJSON: contextJSON, capabilities: ["selection.read", "analysis.read", "debugger.read", "navigation.write", "breakpoint.write", "debugger.control", "notes.write", "annotation.read", "annotation.write", "data.read", "data.write"], timeoutMS: timeoutMS, interpreter: interpreter) }
     }
     func pluginList(withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(scriptingHost.listPlugins(projectPath: store?.path)) }
+        queue.async { [self] in
+            let projectPath = store?.path
+            scriptingLane.submit(reply: reply) { [scriptingHost] in scriptingHost.listPlugins(projectPath: projectPath) }
+        }
     }
     func pluginRun(_ pluginID: String, contextJSON: String, timeoutMS: Int, interpreter: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in
@@ -593,16 +695,16 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
         queue.async { [self] in let projectPath=store?.path; scriptingLane.submit(reply: reply) { [scriptingHost] in scriptingHost.setPluginSetting(id: pluginID, key:key, valueJSON:valueJSON, projectPath:projectPath) } }
     }
     func virtualizationProfiles(withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(virtualizationHost.profilesJSON()) }
+        virtualizationQueue.async { [self] in reply(virtualizationHost.profilesJSON()) }
     }
     func virtualizationStart(_ profileID: String, ramMiB: Int, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(virtualizationHost.start(profileID: profileID, ramMiB: ramMiB)) }
+        virtualizationQueue.async { [self] in reply(virtualizationHost.start(profileID: profileID, ramMiB: ramMiB)) }
     }
     func virtualizationCommand(_ command: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(virtualizationHost.command(command)) }
+        virtualizationQueue.async { [self] in reply(virtualizationHost.command(command)) }
     }
     func virtualizationRE(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
-        queue.async { [self] in reply(virtualizationHost.reCommand(requestJSON)) }
+        virtualizationQueue.async { [self] in reply(virtualizationHost.reCommand(requestJSON)) }
     }
     func firmwareRuntime(_ requestJSON: String, withReply reply: @escaping (String) -> Void) {
         firmwareLane.submit(priority: .initiated, reply: reply) { [firmwareRuntimeHost] in firmwareRuntimeHost.command(requestJSON) }
@@ -627,28 +729,43 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             } catch { reply(ServiceReply.failure(error.localizedDescription)) }
         }
     }
-    func disconnect() { queue.async { [self] in sdkLookups.values.forEach { $0.cancel() }; sdkLookupCache.removeAll(); supervisor.stopAll(); firmwareLane.cancelQueued(); scriptingLane.cancelQueued(); reaLane.cancelQueued(); debugServer.shutdown(); terminalHost.stop(); pageCache.clear(); store = nil } }
+    func dispatchTelemetry(withReply reply: @escaping (String) -> Void) {
+        let payload = "[\(firmwareLane.telemetryJSON()),\(scriptingLane.telemetryJSON()),\(reaLane.telemetryJSON())]"
+        reply(ServiceReply.success(payload))
+    }
+    func disconnect() {
+        firmwareLane.cancelQueued(); reaLane.cancelQueued()
+        debugQueue.async { [self] in debugServer.shutdown() }
+        virtualizationQueue.async { [self] in virtualizationHost.stop() }
+        terminalQueue.async { [self] in terminalHost.stop() }
+        queue.async { [self] in
+            // Project-scoped plugin submissions above must be admitted before cancellation.
+            scriptingLane.cancelQueued()
+            sdkLookups.values.forEach { $0.cancel() }
+            sdkLookupCache.removeAll(); supervisor.stopAll(); pageCache.clear(); store = nil
+        }
+    }
 
     func terminalStart(_ workingDirectory: String, withReply reply: @escaping (String) -> Void) {
-        reply(terminalHost.start(workingDirectory: workingDirectory))
+        terminalQueue.async { [self] in reply(terminalHost.start(workingDirectory: workingDirectory)) }
     }
     func terminalWrite(_ input: String, withReply reply: @escaping (String) -> Void) {
-        reply(terminalHost.write(input))
+        terminalQueue.async { [self] in reply(terminalHost.write(input)) }
     }
     func terminalRead(withReply reply: @escaping (String) -> Void) {
-        reply(terminalHost.read())
+        terminalQueue.async { [self] in reply(terminalHost.read()) }
     }
     func terminalResize(_ columns: Int, rows: Int, withReply reply: @escaping (String) -> Void) {
-        reply(terminalHost.resize(columns: columns, rows: rows))
+        terminalQueue.async { [self] in reply(terminalHost.resize(columns: columns, rows: rows)) }
     }
     func terminalInterrupt(withReply reply: @escaping (String) -> Void) {
-        reply(terminalHost.interrupt())
+        terminalQueue.async { [self] in reply(terminalHost.interrupt()) }
     }
     func terminalEOF(withReply reply: @escaping (String) -> Void) {
-        reply(terminalHost.eof())
+        terminalQueue.async { [self] in reply(terminalHost.eof()) }
     }
     func terminalStop(withReply reply: @escaping (String) -> Void) {
-        terminalHost.stop(); reply(TerminalReply.encode(TerminalReply(ok: true, message: "Terminal stopped.")))
+        terminalQueue.async { [self] in terminalHost.stop(); reply(TerminalReply.encode(TerminalReply(ok: true, message: "Terminal stopped."))) }
     }
 }
 final class ServiceDelegate: NSObject, NSXPCListenerDelegate {

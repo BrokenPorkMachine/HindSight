@@ -1,4 +1,6 @@
-// Isolated catalog of this helper's Darwin runtime, never an arbitrary target loader.
+// Darwin runtime catalog. By default it inspects only libraries already loaded in this
+// helper; --image/--target may additionally load one Mach-O image through dyld/dlfcn
+// and extract its Objective-C classes/methods through the runtime.
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -165,18 +167,78 @@ int main(int argc, const char **argv) {
         NSMutableArray *classes = [NSMutableArray array], *symbols = [NSMutableArray array];
         NSMutableArray *missing_classes = [NSMutableArray array], *missing_symbols = [NSMutableArray array];
         BOOL truncated = NO;
-        for (int index = 1; index < argc; index += 2) {
-            if (index + 1 >= argc || strlen(argv[index + 1]) > 1024) return 2;
-            if (!strcmp(argv[index], "--class") && classes.count + missing_classes.count < 32) {
+        char *image_path = NULL;
+        BOOL enumerate_classes = NO;
+        BOOL load_image = NO;
+        for (int index = 1; index < argc; ) {
+            if ((!strcmp(argv[index], "--image") || !strcmp(argv[index], "--target") || !strcmp(argv[index], "--load") ||
+                 !strcmp(argv[index], "--binary") || !strcmp(argv[index], "--dylib") || !strcmp(argv[index], "--macho")) &&
+                index + 1 < argc && strlen(argv[index + 1]) <= 1024) {
+                free(image_path);
+                image_path = strdup(argv[index + 1]);
+                load_image = YES;
+                index += 2;
+                continue;
+            }
+            if (!strcmp(argv[index], "--all-classes") || !strcmp(argv[index], "--classes") ||
+                !strcmp(argv[index], "--list-classes") || !strcmp(argv[index], "--enumerate-classes")) {
+                enumerate_classes = YES;
+                index += 1;
+                continue;
+            }
+            if (!strcmp(argv[index], "--class") && index + 1 < argc && strlen(argv[index + 1]) <= 1024 &&
+                classes.count + missing_classes.count < 32) {
                 Class cls = objc_lookUpClass(argv[index + 1]);
                 if (cls) [classes addObject:class_record(cls, &truncated)];
                 else [missing_classes addObject:text(argv[index + 1])];
-            } else if (!strcmp(argv[index], "--symbol") && symbols.count + missing_symbols.count < 128) {
+                index += 2;
+                continue;
+            }
+            if (!strcmp(argv[index], "--symbol") && index + 1 < argc && strlen(argv[index + 1]) <= 1024 &&
+                symbols.count + missing_symbols.count < 128) {
                 void *address = dlsym(RTLD_DEFAULT, argv[index + 1]);
                 if (address) [symbols addObject:@{@"lookup_name": text(argv[index + 1]), @"runtime_address": hex((uintptr_t)address),
                                                   @"image": image_for_address(address), @"source": @"Darwin dlsym(RTLD_DEFAULT)"}];
                 else [missing_symbols addObject:text(argv[index + 1])];
-            } else return 2;
+                index += 2;
+                continue;
+            }
+            return 2;
+        }
+
+        void *loaded_image = NULL;
+        char image_load_error[512] = {0};
+        if (load_image && image_path) {
+            loaded_image = dlopen(image_path, RTLD_NOW | RTLD_LOCAL);
+            if (!loaded_image) {
+                const char *message = dlerror();
+                snprintf(image_load_error, sizeof(image_load_error), "%s", message ? message : "dlopen failed");
+            }
+        }
+
+        // When a target image is loaded (or explicitly requested), extract its
+        // Objective-C classes through the runtime instead of requiring every
+        // class name to be supplied. This mirrors Hopper's dynamic extraction
+        // style: dyld loads the image, then the Objective-C runtime exposes
+        // its class/method/property/ivar metadata.
+        const char *image_basename = image_path ? strrchr(image_path, '/') : NULL;
+        image_basename = image_basename ? image_basename + 1 : image_path;
+        if (loaded_image && (enumerate_classes || (classes.count == 0 && missing_classes.count == 0))) {
+            unsigned class_count = 0;
+            Class *all_classes = objc_copyClassList(&class_count);
+            for (unsigned class_index = 0; class_index < class_count && classes.count + missing_classes.count < 32; class_index++) {
+                Class candidate = all_classes[class_index];
+                const char *declaring = class_getImageName(candidate);
+                BOOL matches = YES;
+                if (image_path && declaring) {
+                    const char *declaring_base = strrchr(declaring, '/');
+                    declaring_base = declaring_base ? declaring_base + 1 : declaring;
+                    matches = (image_basename && declaring_base && !strcmp(declaring_base, image_basename));
+                }
+                if (!matches) continue;
+                [classes addObject:class_record(candidate, &truncated)];
+            }
+            free(all_classes);
         }
         char build[256] = {0}; size_t build_size = sizeof(build);
         if (sysctlbyname("kern.osversion", build, &build_size, NULL, 0)) build[0] = 0;
@@ -188,7 +250,10 @@ int main(int argc, const char **argv) {
             RECORD(CGRect, FIELD(CGRect, origin), FIELD(CGRect, size)),
             RECORD(mach_msg_header_t, FIELD(mach_msg_header_t, msgh_bits), FIELD(mach_msg_header_t, msgh_size), FIELD(mach_msg_header_t, msgh_id))
         ];
-        NSDictionary *document = @{@"schema": @1, @"producer": @"hindsight-darwin-native-v1", @"scope": @"helper-process loaded runtime; no target loaded",
+        const char *scope = load_image
+            ? "helper-process loaded target image through dyld/dlfcn; classes and methods reflect that loaded image"
+            : "helper-process loaded runtime; no target loaded";
+        NSDictionary *document = @{@"schema": @1, @"producer": @"hindsight-darwin-native-v1", @"scope": text(scope),
             @"host_os": NSProcessInfo.processInfo.operatingSystemVersionString, @"os_build": text(build),
 #if defined(__arm64e__)
             @"architecture": @"arm64e",
@@ -200,11 +265,16 @@ int main(int argc, const char **argv) {
             @"architecture": @"unknown",
 #endif
             @"pointer_size": @(sizeof(void *)), @"classes": classes, @"symbols": symbols, @"types": layouts,
-            @"missing_classes": missing_classes, @"missing_symbols": missing_symbols, @"truncated": @(truncated)};
+            @"missing_classes": missing_classes, @"missing_symbols": missing_symbols, @"truncated": @(truncated),
+            @"loaded_image": image_path ? text(image_path) : @"",
+            @"image_load_error": text(image_load_error),
+            @"enumerate_classes": @(enumerate_classes)};
         NSError *error = nil;
         NSData *encoded = [NSJSONSerialization dataWithJSONObject:document options:NSJSONWritingSortedKeys error:&error];
         if (!encoded || encoded.length > 8 * 1024 * 1024) return 3;
-        if (fwrite(encoded.bytes, 1, encoded.length, stdout) != encoded.length) return 4;
+        if (fwrite(encoded.bytes, 1, encoded.length, stdout) != encoded.length) { if (loaded_image) dlclose(loaded_image); free(image_path); return 4; }
+        if (loaded_image) dlclose(loaded_image);
+        free(image_path);
         return 0;
     }
 }

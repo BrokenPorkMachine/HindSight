@@ -46,5 +46,6 @@ import Foundation
     func terminalInterrupt(withReply reply: @escaping (String) -> Void)
     func terminalEOF(withReply reply: @escaping (String) -> Void)
     func terminalStop(withReply reply: @escaping (String) -> Void)
+    @objc optional func dispatchTelemetry(withReply reply: @escaping (String) -> Void)
 }
 enum ServiceIdentity { static let coordinator = "ca.zensoftware.VectorGlass.CoordinatorService" }

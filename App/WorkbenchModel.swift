@@ -2891,7 +2891,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
     private func pollDebugEvent() {
         guard debugAttached, !debugPollInFlight else { return }; debugPollInFlight = true
-        client.request(timeout: 3, operation: { $0.debugPollEvent(withReply: $1) }) { [weak self] result in
+        client.request(timeout: 3, invalidateConnectionOnTimeout: false, operation: { $0.debugPollEvent(withReply: $1) }) { [weak self] result in
             guard let self else { return }; self.debugPollInFlight = false
             do {
                 let text = try result.get()
@@ -3588,6 +3588,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
 
     func importInvestigationCase() {
+        guard let currentProject = project, let localLedger = investigationLedger else {
+            status = "Open a project before importing a HindSight case."
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = "Import HindSight Case"
         if let caseType = UTType(filenameExtension: "vgcase") {
@@ -3599,11 +3603,30 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         do {
             let data = try Data(contentsOf: url, options: [.mappedIfSafe])
             let bundle = try VGLedgerStore.decodeCase(data)
-            let restored = bundle.runtime.compactMap { event in
-                VGRuntimeSample.restore(event, previous: runtimeSamples.last)
+            var recordIDMap: [String: String] = [:]
+            for artifact in bundle.artifacts {
+                guard let digest = artifact.sourceSHA256?.lowercased(), digest.count == 64,
+                      let local = currentProject.records.first(where: { $0.result.source_sha256?.lowercased() == digest }) else { continue }
+                recordIDMap[artifact.id] = local.id
             }
-            guard restored.count == bundle.runtime.count else {
-                throw NSError(domain: "HindSightCase", code: 4, userInfo: [NSLocalizedDescriptionKey: "The case contains runtime events with invalid addresses."])
+
+            let importedLedger = VGLedgerStore.merging(bundle.ledger, into: localLedger, recordIDMap: recordIDMap)
+            var nextRuntimeSequence = runtimeSequence
+            var previousSample = runtimeSamples.last
+            var importedSamples: [VGRuntimeSample] = []
+            for event in bundle.runtime {
+                nextRuntimeSequence += 1
+                let remappedEvent = VGCaseRuntimeEvent(
+                    sequence: nextRuntimeSequence, timestamp: event.timestamp, event: event.event,
+                    reason: event.reason, threadID: event.threadID, stopped: event.stopped,
+                    pc: event.pc, sp: event.sp, fp: event.fp, lr: event.lr,
+                    registers: event.registers, breakpoints: event.breakpoints
+                )
+                guard let sample = VGRuntimeSample.restore(remappedEvent, previous: previousSample) else {
+                    throw NSError(domain: "HindSightCase", code: 4, userInfo: [NSLocalizedDescriptionKey: "The case contains runtime events with invalid addresses."])
+                }
+                importedSamples.append(sample)
+                previousSample = sample
             }
             func decodeHex(_ value: String) -> [UInt8]? {
                 let chars = Array(value)
@@ -3612,24 +3635,37 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     UInt8(String(chars[index...index + 1]), radix: 16)
                 }.count == chars.count / 2 ? stride(from: 0, to: chars.count, by: 2).compactMap { index in UInt8(String(chars[index...index + 1]), radix: 16) } : nil
             }
+            var nextMemorySequence = runtimeMemorySequence
             let memory = bundle.memory.compactMap { observation -> VGRuntimeMemoryObservation? in
                 guard let address = VGTargetUtilities.parseHex(observation.address), let bytes = decodeHex(observation.bytesHex) else { return nil }
-                return VGRuntimeMemoryObservation(id: observation.sequence, timestamp: observation.timestamp, address: address, bytes: bytes)
+                nextMemorySequence += 1
+                return VGRuntimeMemoryObservation(id: nextMemorySequence, timestamp: observation.timestamp, address: address, bytes: bytes)
             }
             guard memory.count == bundle.memory.count else {
                 throw NSError(domain: "HindSightCase", code: 5, userInfo: [NSLocalizedDescriptionKey: "The case contains invalid memory-observation bytes."])
             }
-            runtimeSamples = restored
-            runtimeMemoryObservations = memory
-            reaEvidence = Array((bundle.reaEvidence ?? []).suffix(32))
-            runtimeSequence = restored.map(\.id).max() ?? 0
-            runtimeMemorySequence = memory.map(\.id).max() ?? 0
-            if let artifact = bundle.artifacts.first, project?.records.contains(where: { $0.id == artifact.id }) == true { selectedID = artifact.id }
-            workspace = reaEvidence.isEmpty ? "Trace Explorer" : "REA Agent"
+            try VGLedgerStore.save(importedLedger, projectPath: currentProject.path)
+            let mergedREAIDs = Set(reaEvidence.map(\.id))
+            let mergedREA = Array((reaEvidence + (bundle.reaEvidence ?? []).filter { !mergedREAIDs.contains($0.id) }).suffix(32))
+            runtimeSamples = Array((runtimeSamples + importedSamples).suffix(256))
+            runtimeMemoryObservations = Array((runtimeMemoryObservations + memory).suffix(64))
+            reaEvidence = mergedREA
+            runtimeSequence = runtimeSamples.map(\.id).max() ?? 0
+            runtimeMemorySequence = runtimeMemoryObservations.map(\.id).max() ?? 0
+            investigationLedger = importedLedger
+            if let artifact = bundle.artifacts.first(where: { recordIDMap[$0.id] != nil }), let localID = recordIDMap[artifact.id] {
+                selectedID = localID
+            }
+            workspace = "Investigation Ledger"
             caseIntegrityStatus = bundle.integrity == nil
                 ? "Imported legacy case without an integrity manifest; contents passed schema and bounds checks."
                 : "Imported case integrity verified with SHA-256 manifest."
-            ledgerStatus = "Imported \(restored.count) runtime observations and \(reaEvidence.count) REA evidence record(s) from \(url.lastPathComponent); \(caseIntegrityStatus) Debugger remains detached."
+            recordLedger(kind: .caseImported, provenance: .asserted,
+                         detail: "Merged \(bundle.ledger.entries.count) timeline events, \(bundle.ledger.hypotheses.count) hypotheses, \(bundle.ledger.bookmarks.count) bookmarks, and \(bundle.ledger.snapshots.count) snapshots from \(url.lastPathComponent).")
+            let evidenceStatus = bundle.evidence == nil
+                ? "The case contains no static evidence snapshot."
+                : "Its static evidence snapshot remains in the case archive; importing a bundle does not activate an analysis report or attach to its target."
+            ledgerStatus = "Merged case history, \(importedSamples.count) runtime observations, and \(memory.count) memory observations. \(caseIntegrityStatus) \(evidenceStatus) Debugger remains detached."
             status = ledgerStatus
         } catch { status = "Case import failed: \(error.localizedDescription)" }
     }

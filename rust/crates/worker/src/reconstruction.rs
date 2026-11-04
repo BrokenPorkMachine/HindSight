@@ -40,7 +40,19 @@ pub struct Input<'a> {
     /// Exact, source-hash-bound or built-in C prototypes keyed to target
     /// symbol addresses for direct-call source reconstruction.
     pub call_prototypes: Vec<(u64, String, crate::signatures::Signature)>,
+    /// Hash- and target-bound analyst type declarations supplied by the
+    /// project catalog. These are source dependencies only; they never
+    /// establish ABI layout or instruction semantics by themselves.
+    pub project_types: Vec<ProjectTypeDependency>,
     pub native: NativeEvidence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTypeDependency {
+    pub name: String,
+    pub declaration: String,
+    pub target: String,
+    pub source_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

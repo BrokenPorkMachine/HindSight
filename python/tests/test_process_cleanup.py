@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_external_process_hosts_bound_descendant_cleanup_to_process_groups():
     sources = [
-        ROOT / "PlatformServices/CoordinatorService/ScriptingHost.swift",
+        ROOT / "PlatformServices/CoordinatorService/BoundedProcessRunner.swift",
         ROOT / "PlatformServices/CoordinatorService/REAAgentHost.swift",
         ROOT / "PlatformServices/CoordinatorService/FirmwareRuntimeHost.swift",
     ]

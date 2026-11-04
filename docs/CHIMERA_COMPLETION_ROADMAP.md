@@ -206,7 +206,7 @@ bound to a different capture. Type candidates accept only bounded ASCII,
 balanced typedef/struct/union/enum declarations, with directives, comments and
 quoted code rejected. Candidate provenance is fixed to `analyst` for this input
 path, so caller-supplied labels cannot impersonate trusted catalog sources.
-Feeding resolved project types into reconstruction remains open.
+Feeding resolved project types into reconstruction remains open. A shared resolver now selects only validated, unique declarations matching the exact captured-source digest and target; duplicate corroborating declarations collapse, while conflicting names are withheld. Its Swift contract passes stale-source, other-target and conflict cases. Next: thread those declarations through the per-function request into worker-generated source dependencies, retain catalog identity and provenance in the artifact, and invalidate dependent reconstruction when the catalog changes. Do not use declarations to claim ABI layout until the target compiler establishes that layout.
 
 This short queue is the live handoff; C00–C16 below retain the full acceptance
 criteria. `[~]` means implemented in part or under verification, never complete.
@@ -563,6 +563,33 @@ and interactive batch/recovery qualification stay open.
 ## Active priority: AArch64 pseudocode and source reconstruction
 
 Re-plotted 2026-10-18. The next product outcome is dependable, named, typed AArch64 pseudocode for Apple binaries; the next is evidence-backed, recompilable C17/Objective-C reconstruction. Near-1:1 fidelity is a separate measured goal, not permission to invent erased source information. ARM64e uses this pipeline with authentication effects explicit until qualified.
+
+### User-visible milestone: review and validate one ARM64 function end to end
+
+The first suite-quality outcome is one complete, usable analyst loop: open an ARM64 Mach-O, select a function, inspect named pseudocode, trace each recovered value to its instruction and semantic evidence, record a clearly attributed correction, export the supported function with its required declarations/dependencies as C17, compile it, and compare its behavior with the original under a recorded ABI and memory model. Unsupported effects and erased source information remain visible. Behavioral agreement and similarity to the original source are separate results.
+
+This milestone is deliberately a vertical slice. It does not claim that every ARM64 instruction, Objective-C/C++/Swift pattern, binary format, or operating system is fully decompiled. The later suite-completion phase broadens coverage only after this first path is dependable and reproducible.
+
+### Implementation plan
+
+| Phase | Deliverable | Completion evidence |
+| --- | --- | --- |
+| 1. Dependable semantics | Close correctness gaps in instruction effects, widths, frame updates, calls, and invalidation for the first scalar integer/FP slice; unsupported/reserved operations stop unsafe identity propagation. | `-O0`/`-O2` native fixtures agree on supported register, flag, vector, memory, and frame effects; unknown effects cannot leave stale names or values. |
+| 2. Evidence-linked pseudocode | Use structured IR/SSA and source/type evidence to render named values; connect every expression to machine origins and explain unresolved alternatives. | Selecting a pseudocode expression navigates to all contributing instructions; edits remain analyst hypotheses and invalidate only dependent derived output. |
+| 3. Complete function export | Emit supported C17/Objective-C functions, required declarations/dependencies, and stable source maps; block strict output when reachable effects are unresolved. | Export compiles with a recorded native toolchain; artifact identity, function bounds, dependencies, blockers, and source maps validate. |
+| 4. Behavioral comparison | Execute original, IR, and generated forms only in the qualified harness; compare returns, memory, traps, and calls under explicit assumptions. | Deterministic differential corpus reports supported paths, seeds, ABI/model, unresolved effects, and behavior separately from source-fidelity scoring. |
+| 5. Integrated review | Finish per-function correction, provenance, cancellation, reanalysis, and honest completeness in Binary Workspace. | The analyst can navigate, annotate, export, cancel/retry, and recover without stale results or losing completed evidence. |
+| 6. Suite expansion | Add broader ARM64e, C++/Swift, x86-64, ELF/PE/COFF, interoperability, team workflows, and release qualification in the dependency order below. | Each newly advertised language, ISA, format, and workflow has its own bounded correctness and usability gate. |
+
+Execution begins with Phase 1 and follows the priority table below. Phase 2–5 evidence starts with each supported slice rather than waiting for full ISA coverage. Phase 6 must not displace correctness work unless a new capability directly unblocks the vertical slice.
+
+### Execution checkpoint — 2026-11-04
+
+- **Phase 1, supported slice:** worker unit gate passed (403 tests); parameter/frame-name native gate passed (6 functions, 1,560 result checks); decompilation corpus passed (16 optimization/symbol variants, 1,412 valid source-mapped rows).
+- **Phases 3–4, initial scalar source slice:** recovered-source native qualification passed (544 function/configuration variants, 100,640 result comparisons).
+- **Boundary:** these gates establish correctness only for their declared fixtures and modeled behaviors. They do not establish arbitrary-binary correctness, full-ISA effects, complete Objective-C/C++/Swift reconstruction, or formal equivalence.
+- **SIMD/system audit:** reviewed system-register lifting and shared effects. NZCV has exact flag effects; other MRS/MSR encodings and unmodeled/reserved SIMD instructions remain whole-state barriers, so this pass found no unsafe stale-state preservation. Strict artifact generation continues to block on those unknown effects and FPCR/FPSR-dependent floating-point behavior. Follow-up: model selected system-register reads with explicit encoding and trap assumptions before narrowing their barriers.
+- **Next execution focus:** extend the origin-linked source slice through broader type/layout and review corrections while keeping unsupported reachable effects blocking strict output. Resume SIMD/system work only with an explicit machine-state and trap model.
 
 Existing inputs are not restart tasks: normalized function boundaries, shared instruction/CFG records, bounded GPR SSA, prototype ABI recovery, isolated Darwin collection, Apple Clang prototype import, and bounded target property/ivar joins already exist. Their limited scope does not close general semantics, memory SSA, type inference or source reconstruction. Extend these implementations rather than build a second decompiler.
 

@@ -125,6 +125,25 @@ struct ProjectTypeCatalog: Codable {
         return declarations.first
     }
 
+    /// Type declarations eligible to influence one reconstruction request.
+    /// Exact capture and target matching prevents stale or cross-target analyst
+    /// assertions from becoming source dependencies. Conflicting names are
+    /// withheld as a group, even if one candidate happens to be encountered
+    /// first in storage order.
+    func resolvedDeclarations(sourceSHA256: String, target: String) -> [ProjectTypeCandidate] {
+        guard validated() != nil,
+              sourceSHA256.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil,
+              target.range(of: #"^[A-Za-z0-9_.-]{1,128}$"#, options: .regularExpression) != nil else { return [] }
+        let eligible = candidates.filter {
+            $0.sourceSHA256 == sourceSHA256 && $0.target == target && $0.validated != nil
+        }
+        let grouped = Dictionary(grouping: eligible, by: \.name)
+        return grouped.keys.sorted().compactMap { name in
+            guard let rows = grouped[name], Set(rows.map(\.declaration)).count == 1 else { return nil }
+            return rows.first
+        }
+    }
+
     func validated() -> ProjectTypeCatalog? {
         guard schema == Self.currentSchema, candidates.count <= 10_000,
               candidates.allSatisfy({ $0.validated != nil }),

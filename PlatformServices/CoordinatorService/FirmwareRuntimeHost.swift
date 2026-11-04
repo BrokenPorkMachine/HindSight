@@ -630,63 +630,15 @@ final class FirmwareRuntimeHost {
 
     private func runTool(_ executable: String, _ args: [String], timeout: TimeInterval, max: Int) throws -> String {
         guard max > 0 else { throw HostError("Tool output bound must be positive.") }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = args
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        final class Capture: @unchecked Sendable {
-            private let lock = NSLock()
-            private var data = Data()
-            private var exceeded = false
-            func append(_ chunk: Data, max: Int) {
-                lock.lock(); defer { lock.unlock() }
-                guard !exceeded else { return }
-                if chunk.count > max - data.count {
-                    exceeded = true
-                    let remaining = max - data.count
-                    if remaining > 0 { data.append(chunk.prefix(remaining)) }
-                    return
-                }
-                data.append(chunk)
-            }
-            func snapshot() -> (Data, Bool) {
-                lock.lock(); defer { lock.unlock() }
-                return (data, exceeded)
-            }
-        }
-
-        let capture = Capture()
-        let finished = DispatchSemaphore(value: 0)
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if !chunk.isEmpty { capture.append(chunk, max: max) }
-        }
-        process.terminationHandler = { _ in finished.signal() }
-
-        do { try process.run() }
-        catch {
-            pipe.fileHandleForReading.readabilityHandler = nil
-            throw error
-        }
-        let grouped = establishProcessGroup(for: process)
-
-        if finished.wait(timeout: .now() + timeout) != .success {
-            terminateProcess(process, grouped: grouped, wait: finished)
-            pipe.fileHandleForReading.readabilityHandler = nil
-            throw HostError("Tool timed out.")
-        }
-
-        pipe.fileHandleForReading.readabilityHandler = nil
-        let tail = pipe.fileHandleForReading.readDataToEndOfFile()
-        if !tail.isEmpty { capture.append(tail, max: max) }
-        let (data, exceeded) = capture.snapshot()
+        let output = try BoundedProcessRunner.run(executable: URL(fileURLWithPath: executable),
+                                                  arguments: args, timeout: timeout, limit: max,
+                                                  mergeOutput: true)
+        guard !output.timedOut else { throw HostError("Tool timed out.") }
+        let data = output.stdout, exceeded = output.exceeded
         guard !exceeded else { throw HostError("Tool output exceeded bound.") }
-        guard process.terminationStatus == 0 else {
+        guard (output.status ?? -1) == 0 else {
             let message = String(decoding: data.prefix(2048), as: UTF8.self)
-            throw HostError(message.isEmpty ? "Tool exited with status \(process.terminationStatus)." : message)
+            throw HostError(message.isEmpty ? "Tool exited with status \((output.status ?? -1))." : message)
         }
         return String(decoding: data, as: UTF8.self)
     }

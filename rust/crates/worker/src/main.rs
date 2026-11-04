@@ -24,7 +24,7 @@ mod semantic;
 mod objc;
 mod signatures;
 mod reconstruction;
-use std::{fs::File,io::{self,Read}};
+use std::{fs::File,io::{self,Read,Write}};
 use reworkbench_protocol::{read_frame,write_frame,write_frame_with_limit,MAX_ANALYSIS_FRAME};
 fn quote(text:&str)->String{
  let mut out=String::from("\"");
@@ -95,6 +95,13 @@ fn run()->io::Result<()>{
  if args.len()==2 && args[1]=="--echo-frames"{
   let mut input=io::stdin().lock();let mut output=io::stdout().lock();
   while let Some(frame)=read_frame(&mut input)?{write_frame(&mut output,&frame)?;}return Ok(());
+ }
+ // Internal isolation mode: introspect one image in a disposable child process
+ // and stream the bounded runtime evidence back to the analysis process.
+ if args.len()==4 && args[1]=="--runtime-objc"{
+  let text=preview::runtime_objc_child(&args[2],&args[3]);
+  io::stdout().lock().write_all(text.as_bytes())?;
+  return Ok(());
  }
  let is_analysis=(args.len()==6 && args[1]=="--analyze") || (args.len()==10 && args[1]=="--analyze-image");
  let is_reconstruction=(args.len()==8 && args[1]=="--reconstruct") || (args.len()==9 && args[1]=="--interpret");

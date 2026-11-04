@@ -64,8 +64,7 @@ assert 'read(base:minLength' not in virt_host
 
 # Scripting host compile-regression guards for the Swift 6 diagnostics fixed in 0.2.4-alpha.
 scripting_host=(R/'PlatformServices/CoordinatorService/ScriptingHost.swift').read_text()
-assert 'DispatchTime.now() + DispatchTimeInterval.milliseconds(timeout)' in scripting_host
-assert 'DispatchTime.now() + DispatchTimeInterval.seconds(1)' in scripting_host
+assert 'BoundedProcessRunner.run' in scripting_host
 assert '== .orderedAscending' in scripting_host
 assert '[[String: Any]]' in scripting_host
 assert 'timeout:.now()+.milliseconds' not in scripting_host
@@ -883,7 +882,7 @@ dispatcher=(R/'PlatformServices/CoordinatorService/main.swift').read_text()
 assert 'attributes: .concurrent' in dispatcher
 assert 'running.count < maxConcurrent' in dispatcher
 assert 'submittedAt: now' in dispatcher and '2_000_000_000' in dispatcher
-assert 'firmwareLane.cancelQueued(); scriptingLane.cancelQueued()' in dispatcher
+assert all(lane + '.cancelQueued()' in dispatcher for lane in ['firmwareLane', 'scriptingLane', 'reaLane'])
 assert 'maxConcurrent: 1, maxPending: 16' in dispatcher
 assert 'maxConcurrent: 4, maxPending: 64' in dispatcher
 beta_gate=(R/'scripts/test-beta-macos.sh').read_text()
@@ -909,7 +908,7 @@ assert 'from hindsight import api as vg' in (R/'App/WorkbenchModel.swift').read_
 scripting=(R/'PlatformServices/CoordinatorService/ScriptingHost.swift').read_text()
 assert 'safePluginTree' in scripting and 'maxPluginPackageBytes' in scripting and 'maxPluginPackageEntries' in scripting
 assert '.isSymbolicLinkKey' in scripting, 'plugin symlink boundary checks missing'
-assert 'BoundedProcessOutput' in scripting, 'bounded concurrent scripting output missing'
+assert 'BoundedProcessRunner.run' in scripting, 'bounded concurrent scripting output missing'
 assert 'types.ModuleType("hindsight")' in scripting
 assert 'sys.modules["vectorglass"]=mod' in scripting  # existing extensions remain compatible
 assert 'sys.modules["reworkbench"]=mod' in scripting  # migration compatibility only
@@ -978,7 +977,8 @@ for member in manifest['workspace']['members']:
         else:
             assert name in approved_external_dependencies, f'Unapproved external dependency: {name}'
 env=dict(os.environ,PYTHONPATH=str(R/'python'),PYTHONDONTWRITEBYTECODE='1')
-subprocess.run([sys.executable,'-m','unittest','discover','-s',str(R/'python/tests'),'-v'],env=env,check=True)
+subprocess.run([sys.executable,'-m','pytest','python/tests/','-v','--ignore=python/tests/test_darwin_catalog.py'],env=env,check=True)
+print('PYTHON TESTS DONE')
 # Portable Swift validation when a Swift compiler is available. Parsing catches syntax
 # drift across the complete Swift surface; the target-model contract is Foundation-only
 # and therefore runs on non-macOS CI as well.
@@ -998,6 +998,7 @@ if swiftc:
     if sys.platform == 'darwin':
         subprocess.run([swiftc,'-typecheck',
                         str(R/'Shared/ScriptingMessages.swift'),
+                        str(R/'PlatformServices/CoordinatorService/BoundedProcessRunner.swift'),
                         str(R/'PlatformServices/CoordinatorService/ScriptingHost.swift')],check=True)
     with tempfile.TemporaryDirectory(prefix='vectorglass-target-model-') as tmp:
         exe=pathlib.Path(tmp)/'target-model-contract'

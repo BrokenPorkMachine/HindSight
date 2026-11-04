@@ -241,21 +241,42 @@ final class WorkerSupervisor {
         }
     }
     func reconstruct(path: String, digest: String, size: String, start: UInt64, end: UInt64, id: String, prototypes: Data? = nil,
+                     projectTypes: [ProjectTypeCandidate] = [],
                      completion: @escaping (Result<String, Error>) -> Void) {
         var prototypePath: String?
         var prototypeDirectory: URL?
-        if let prototypes {
+        if prototypes != nil || !projectTypes.isEmpty {
             do {
-                guard prototypes.count <= 4 * 1024 * 1024,
-                      String(data: prototypes, encoding: .utf8)?.hasPrefix("# source_sha256=\(digest)\n") == true else {
+                var catalog = prototypes ?? Data("# source_sha256=\(digest)\n".utf8)
+                guard catalog.count <= 4 * 1024 * 1024,
+                      String(data: catalog, encoding: .utf8)?.hasPrefix("# source_sha256=\(digest)\n") == true else {
                     throw WorkbenchError("Reconstruction prototype catalog is not bound to the captured source.")
+                }
+                let validTypes = projectTypes.filter { $0.validated != nil && $0.sourceSHA256 == digest }
+                guard validTypes.count == projectTypes.count,
+                      Dictionary(grouping: validTypes, by: { "\($0.target)|\($0.name)" })
+                        .values.allSatisfy({ Set($0.map(\.declaration)).count == 1 }) else {
+                    throw WorkbenchError("Project type dependencies contain stale or conflicting evidence.")
+                }
+                if !validTypes.isEmpty {
+                    guard var text = String(data: catalog, encoding: .utf8) else {
+                        throw WorkbenchError("Reconstruction catalog is not UTF-8.")
+                    }
+                    for candidate in validTypes {
+                        let declaration = Data(candidate.declaration.utf8).map { String(format: "%02x", $0) }.joined()
+                        text += "# project_type\t\(digest)\t\(candidate.target)\t\(candidate.name)\t\(declaration)\n"
+                    }
+                    catalog = Data(text.utf8)
+                }
+                guard catalog.count <= 12 * 1024 * 1024 else {
+                    throw WorkbenchError("Combined reconstruction declarations exceed the byte budget.")
                 }
                 let directory = FileManager.default.temporaryDirectory.appendingPathComponent("hindsight-prototypes-\(UUID().uuidString)")
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
                                                         attributes: [.posixPermissions: 0o700])
                 prototypeDirectory = directory
                 let file = directory.appendingPathComponent("prototypes.tsv")
-                guard FileManager.default.createFile(atPath: file.path, contents: prototypes,
+                guard FileManager.default.createFile(atPath: file.path, contents: catalog,
                                                      attributes: [.posixPermissions: 0o600]) else {
                     throw WorkbenchError("Cannot create request-scoped prototype catalog.")
                 }

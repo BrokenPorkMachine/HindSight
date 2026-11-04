@@ -472,7 +472,6 @@ struct VGBinaryWorkspace: View {
                             }
                         }
                         .padding(.vertical, 5)
-                        .frame(minWidth: 760, alignment: .leading)
                     }
                     .onAppear { scrollAssembly(to: activeAddress, using: proxy) }
                     .onChange(of: activeAddress) { _, address in scrollAssembly(to: address, using: proxy) }
@@ -487,12 +486,10 @@ struct VGBinaryWorkspace: View {
             HStack {
                 paneHeader("SEMANTIC VIEW", detail: semanticMode == .pseudocode ? "reconstructed sketch" : semanticMode == .lifted ? "conservative lift" : "worker IR", icon: "curlybraces")
                 Spacer()
-                Picker("Semantic", selection: $semanticMode) {
+                Picker("Semantic view", selection: $semanticMode) {
                     ForEach(VGBinarySemanticMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
                 }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 390)
+                .pickerStyle(.menu)
                 .padding(.trailing, 8)
             }
             Divider()
@@ -554,7 +551,6 @@ struct VGBinaryWorkspace: View {
             }
         }
         .padding(12)
-        .frame(minWidth: 760, alignment: .leading)
     }
 
     private var matchingReconstruction: ReconstructionArtifact? {
@@ -689,7 +685,7 @@ struct VGBinaryWorkspace: View {
                 Text("Thin AArch64 Mach-O only. Reconstruction verifies captured bytes and canonical function bounds; unsupported effects remain explicit. This does not start a debugger, VM, compiler or imported binary.")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.padding(12).frame(minWidth: 760, alignment: .leading)
+        }.padding(12)
     }
     private var reconstructionEvidence: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -766,7 +762,6 @@ struct VGBinaryWorkspace: View {
             }
         }
         .padding(.vertical, 4)
-        .frame(minWidth: 760, alignment: .leading)
     }
 
     private var irContent: some View {
@@ -803,7 +798,6 @@ struct VGBinaryWorkspace: View {
             }
         }
         .padding(.vertical, 4)
-        .frame(minWidth: 760, alignment: .leading)
     }
 
     private var cfgContent: some View {
@@ -836,7 +830,6 @@ struct VGBinaryWorkspace: View {
             }
         }
         .padding(.vertical, 4)
-        .frame(minWidth: 760, alignment: .leading)
     }
 
     private var rightInspector: some View {

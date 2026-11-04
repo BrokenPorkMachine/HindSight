@@ -144,8 +144,8 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 - [ ] **P2 Coverage:** Data references/strings (pointer/string xrefs, CFString/CFData, globals), library idiom recognition (bounds checks, tagged pointers, dispatch blocks), switch tables/indirect control flow (case-range proof, index normalization, vtable recovery), x86-64 Mach-O lifter through shared IR, stripped/optimized code handling (unwind metadata, thunk recognition, prologue evidence, call graph constraints), function/call graphs with confidence and navigation.
 
 ### 0.6.3 — Team Research Foundations (planned)
-- [ ] Shareable investigation bundles with content hashing.
-- [ ] Comment/review state, findings, evidence links, reproducible experiment recipes.
+- [x] Shareable investigation bundles with content hashing: `.vgcase` bundles include bounded artifact identities, ledger, runtime observations, an optional static-evidence snapshot, and a SHA-256 integrity manifest. Import merges analyst history and runtime observations into the open project; it does not restore the bundled binary, activate a report, or attach to a live target.
+- [~] Comment/review state, findings, and evidence links are available through analyst annotations, review collections, and the Investigation Ledger. Reproducible experiment recipes and richer cross-case review remain open.
 - [ ] Extension policy, signatures, allowlists, organization settings (capability-gated `.vgplugin` with signing/trust already in 0.5).
 - [ ] Optional on-prem execution node for headless analysis pipelines.
 
@@ -153,11 +153,11 @@ The [active delivery sequence and immediate queue](CHIMERA_COMPLETION_ROADMAP.md
 
 - [ ] Stable project schema and migrations (beyond v1).
 - [ ] Stable SDK and target protocol (versioned, documented).
-- [ ] Crash recovery and resumable long jobs (worker checkpointing, coordinator recovery).
+- [ ] Crash recovery and resumable long jobs (worker checkpointing, coordinator recovery). Captured artifacts, completed analysis caches, and case ledgers recover independently; an interrupted full analysis restarts from the beginning, while reconstruction batches have a narrower resume path.
 - [ ] Performance budgets with regression tests (CI-enforced).
 - [ ] Signed/notarized distribution and updater (sparkle or equivalent) — intentionally deferred until further notice.
 - [ ] Licensing tiers without crippling offline/local analysis.
-- [ ] Documentation, guided labs, onboarding datasets (legally redistributable), enterprise deployment material.
+- [~] Documentation and a bundled synthetic first-investigation fixture/tutorial are available. Guided labs, a broader legally redistributable dataset set, and enterprise deployment material remain open.
 
 ## North-star engineering rule
 

@@ -25,6 +25,7 @@ enum VGLedgerEntryKind: String, Codable, CaseIterable, Hashable {
     case snapshotCreated = "snapshot-created"
     case snapshotRestored = "snapshot-restored"
     case caseExported = "case-exported"
+    case caseImported = "case-imported"
     case extensionTrustChanged = "extension-trust-changed"
     case extensionStateChanged = "extension-state-changed"
     case reaEvidenceCaptured = "rea-evidence-captured"
@@ -45,6 +46,7 @@ enum VGLedgerEntryKind: String, Codable, CaseIterable, Hashable {
         case .snapshotCreated: return "Session snapshot"
         case .snapshotRestored: return "Snapshot restored"
         case .caseExported: return "Case exported"
+        case .caseImported: return "Case imported"
         case .extensionTrustChanged: return "Extension trust changed"
         case .extensionStateChanged: return "Extension state changed"
         case .reaEvidenceCaptured: return "REA evidence captured"
@@ -594,6 +596,20 @@ enum VGLedgerStore {
               (bundle.reaEvidence ?? []).count <= 32 else {
             throw NSError(domain: "HindSightCase", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unsupported or oversized HindSight case bundle."])
         }
+        let ledger = bundle.ledger
+        let ledgerEncoder = JSONEncoder()
+        ledgerEncoder.dateEncodingStrategy = .iso8601
+        guard ledger.schema == VGInvestigationLedger.schemaVersion,
+              ledger.caseID.utf8.count <= 128, ledger.projectName.utf8.count <= 512,
+              ledger.entries.count <= 4096, ledger.hypotheses.count <= 512,
+              ledger.bookmarks.count <= 1024, ledger.snapshots.count <= 128,
+              Set(ledger.entries.map(\.id)).count == ledger.entries.count,
+              Set(ledger.hypotheses.map(\.id)).count == ledger.hypotheses.count,
+              Set(ledger.bookmarks.map(\.id)).count == ledger.bookmarks.count,
+              Set(ledger.snapshots.map(\.id)).count == ledger.snapshots.count,
+              try ledgerEncoder.encode(ledger).count <= maxLedgerBytes else {
+            throw NSError(domain: "HindSightCase", code: 8, userInfo: [NSLocalizedDescriptionKey: "Case ledger exceeds its schema or 8 MiB size limits."])
+        }
         guard bundle.runtime.allSatisfy({ event in
             event.pc.utf8.count <= 32 && event.reason.utf8.count <= 4096 && event.event.utf8.count <= 128 &&
             event.registers.count <= 256 && event.registers.keys.allSatisfy({ $0.utf8.count <= 128 }) &&
@@ -642,6 +658,60 @@ enum VGLedgerStore {
             }
         }
         return bundle
+    }
+
+    static func merging(_ imported: VGInvestigationLedger, into local: VGInvestigationLedger,
+                        recordIDMap: [String: String]) -> VGInvestigationLedger {
+        func remap(_ context: VGLedgerContext) -> VGLedgerContext {
+            var value = context
+            value.recordID = context.recordID.flatMap { recordIDMap[$0] }
+            return value
+        }
+
+        let localEntryIDs = Set(local.entries.map(\.id))
+        let importedEntries = imported.entries.filter { !localEntryIDs.contains($0.id) }.map { entry in
+            VGLedgerEntry(id: entry.id, timestamp: entry.timestamp, kind: entry.kind,
+                          provenance: entry.provenance, title: entry.title, detail: entry.detail,
+                          context: remap(entry.context))
+        }
+        var entries = (local.entries + importedEntries).sorted {
+            $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp < $1.timestamp
+        }
+        if entries.count > 4096 { entries.removeFirst(entries.count - 4096) }
+
+        let localHypothesisIDs = Set(local.hypotheses.map(\.id))
+        var hypotheses = local.hypotheses + imported.hypotheses.filter { !localHypothesisIDs.contains($0.id) }
+        if hypotheses.count > 512 { hypotheses.removeFirst(hypotheses.count - 512) }
+
+        let localBookmarkIDs = Set(local.bookmarks.map(\.id))
+        let importedBookmarks = imported.bookmarks.filter { !localBookmarkIDs.contains($0.id) }.map { bookmark in
+            VGCaseBookmark(id: bookmark.id, timestamp: bookmark.timestamp, title: bookmark.title,
+                           note: bookmark.note, workspace: bookmark.workspace, address: bookmark.address,
+                           symbol: bookmark.symbol, recordID: bookmark.recordID.flatMap { recordIDMap[$0] })
+        }
+        var bookmarks = local.bookmarks + importedBookmarks
+        if bookmarks.count > 1024 { bookmarks.removeFirst(bookmarks.count - 1024) }
+
+        let localSnapshotIDs = Set(local.snapshots.map(\.id))
+        let importedSnapshots = imported.snapshots.filter { !localSnapshotIDs.contains($0.id) }.map { snapshot in
+            VGInvestigationSnapshot(id: snapshot.id, timestamp: snapshot.timestamp, title: snapshot.title,
+                                    workspace: snapshot.workspace, layoutPreset: snapshot.layoutPreset,
+                                    address: snapshot.address, cfgFocus: snapshot.cfgFocus,
+                                    analysisSearch: snapshot.analysisSearch, selectedSymbol: snapshot.selectedSymbol,
+                                    selectedRecordID: snapshot.selectedRecordID.flatMap { recordIDMap[$0] },
+                                    selectedTargetID: snapshot.selectedTargetID, evidence: snapshot.evidence)
+        }
+        var snapshots = local.snapshots + importedSnapshots
+        if snapshots.count > 128 { snapshots.removeFirst(snapshots.count - 128) }
+
+        var merged = VGInvestigationLedger(projectName: local.projectName,
+                                           caseID: local.caseID, now: local.createdAt)
+        merged.updatedAt = max(local.updatedAt, imported.updatedAt)
+        merged.entries = entries
+        merged.hypotheses = hypotheses
+        merged.bookmarks = bookmarks
+        merged.snapshots = snapshots
+        return merged
     }
 
     static func pdf(_ bundle: VGCaseBundle) -> Data {

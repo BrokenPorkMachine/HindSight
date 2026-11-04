@@ -1058,6 +1058,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         boundary_sources,
         signatures,
         call_prototypes: prototype_candidates,
+        project_types,
         native,
     } = input;
     if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
@@ -1203,7 +1204,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("readonly", prop.readonly.into()),
                     ("nonatomic", prop.nonatomic.into()),
                 ])))),
-                ("source", "macho-objc-metadata".into()),
+                ("source", if layout.runtime { "libobjc-runtime" } else { "macho-objc-metadata" }.into()),
                 ("image_origin", "captured-binary".into()),
             ]),
             ranges(layout.address, layout.address.saturating_add(40)),
@@ -1212,6 +1213,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     }
 
     // Objective-C IMP names derived from validated class/method metadata.
+    let runtime_imp = |address: u64| native.objc_layouts.iter()
+        .any(|layout| layout.runtime && layout.methods.iter().any(|method| method.implementation == address));
     for (symbol_address, name) in &native.objc_function_names {
         if *symbol_address >= start && *symbol_address < end {
             let id = builder.record(
@@ -1220,7 +1223,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 object([
                     ("name", name.clone().into()),
                     ("address", address(*symbol_address)),
-                    ("source", "macho-objc-imp".into()),
+                    ("source", if runtime_imp(*symbol_address) { "libobjc-runtime-imp" } else { "macho-objc-imp" }.into()),
                     ("image_origin", "captured-binary".into()),
                 ]),
                 ranges(*symbol_address, *symbol_address + 4),
@@ -2043,7 +2046,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 if signature.source.contains("analyst") { "analyst-assertion" } else { "derived" },
                 object([("declaration", signature.declaration.clone().into()),
                         ("source", signature.source.into())]), array([]))?;
-            source::emit_header(&mut builder, &source_signature, &declaration, start, end, objc_header.as_deref())?;
+            source::emit_header(&mut builder, &source_signature, &declaration, start, end,
+                objc_header.as_deref(), &project_types)?;
             Some(declaration)
         } else { None }
     } else { None };
@@ -2052,7 +2056,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let (name, signature) = &signatures[0];
             crate::signatures::source_signature(name, signature)
                 .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
-                .and_then(|signature| source::recover(start, &trees, &models, signature, &call_prototypes))
+                .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types))
         } else {
             Err(if signatures.is_empty() {
                 "no exact source signature"

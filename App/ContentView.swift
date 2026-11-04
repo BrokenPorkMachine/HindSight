@@ -2795,7 +2795,7 @@ struct ContentView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 5) {
                         sidebarSectionHeading("Matching Tools")
-                        let matches = Array(VGWorkspaceCatalog.search(sidebarQuery).prefix(24))
+                        let matches = VGWorkspaceCatalog.search(sidebarQuery)
                         if matches.isEmpty {
                             Text("No tools match ‘\(sidebarQuery)’.")
                                 .font(.caption)
@@ -3210,9 +3210,13 @@ struct ContentView: View {
                 )
                 quickStartGuideStep(
                     "3", "Run bounded analysis",
-                    "Start with Analysis Triage, then follow address- and symbol-backed evidence into code or CFG.",
-                    actionTitle: "Open Triage", action: { model.workspace = "Analysis Triage" },
-                    enabled: model.currentAnalysis != nil
+                    "Requires a selected captured artifact and a ready project session. If no report is loaded, this starts bounded analysis and opens Triage.",
+                    actionTitle: model.currentAnalysis == nil ? "Analyze & Open Triage" : "Open Triage",
+                    action: {
+                        model.workspace = "Analysis Triage"
+                        if model.currentAnalysis == nil { model.analyzeSelected() }
+                    },
+                    enabled: model.currentAnalysis != nil || (model.selected?.result.captured == true && model.projectServiceReady && !model.busy)
                 )
                 quickStartGuideStep(
                     "4", "Document and export",

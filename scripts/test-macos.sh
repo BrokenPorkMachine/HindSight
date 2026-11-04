@@ -17,6 +17,7 @@ python3 "$ROOT/scripts/test-recovered-pointees.py" "$ROOT/build/rust/debug/rewor
 python3 "$ROOT/scripts/test-recovered-headers.py" "$ROOT/build/rust/debug/reworker"
 "$ROOT/scripts/test-app-typecheck.sh"
 "$ROOT/scripts/test-coordinator-typecheck.sh"
+bash "$ROOT/scripts/test-process-dispatch.sh"
 python3 "$ROOT/scripts/test-rea-bridge.py"
 "$ROOT/scripts/test-scripting-host-typecheck.sh"
 "$ROOT/scripts/test-firmware-runtime-typecheck.sh"

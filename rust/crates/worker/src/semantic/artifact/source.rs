@@ -7,7 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Declaration recovery does not depend on proving the implementation body.
 pub(super) fn emit_header(builder: &mut Builder, s: &crate::signatures::SourceDeclaration, declaration: &str,
-                         start: u64, end: u64, objc_header: Option<&str>) -> io::Result<String> {
+                         start: u64, end: u64, objc_header: Option<&str>,
+                         project_types: &[crate::reconstruction::ProjectTypeDependency]) -> io::Result<String> {
     let mut headers = String::from("#include <stdint.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <sys/types.h>\n#include <objc/objc.h>\n");
     let mentions = |prefix: &str| std::iter::once(s.result_spelling.as_str())
         .chain(s.parameters.iter().map(|parameter| parameter.0.as_str()))
@@ -19,8 +20,17 @@ pub(super) fn emit_header(builder: &mut Builder, s: &crate::signatures::SourceDe
     let parameters = s.parameters.iter()
         .map(|parameter| format!("{} {}", parameter.0.replace("_Bool", "bool"), parameter.1))
         .collect::<Vec<_>>().join(", ");
+    let required_types = s.parameters.iter().fold(c_identifiers(&s.result_spelling), |mut names, (ty, _)| {
+        names.extend(c_identifiers(ty));
+        names
+    });
+    let type_dependencies = select_project_type_dependencies(required_types, project_types);
+    let type_declarations = if type_dependencies.is_empty() { String::new() } else {
+        format!("/* Source- and target-matched project type declarations; layout is not independently validated. */\n{}\n",
+            type_dependencies.iter().map(|dependency| dependency.declaration.as_str()).collect::<Vec<_>>().join("\n"))
+    };
     let mut text = format!(
-        "/* Recovered declaration for {start:#x}..{end:#x}; Apple LP64 ABI.\n * Declaration evidence only: implementation recovery and behavioral equivalence are not implied. */\n#pragma once\n{headers}\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n{} {}({});\n#ifdef __cplusplus\n}}\n#endif\n",
+        "/* Recovered declaration for {start:#x}..{end:#x}; Apple LP64 ABI.\n * Declaration evidence only: implementation recovery and behavioral equivalence are not implied. */\n#pragma once\n{headers}\n{type_declarations}\n#ifdef __cplusplus\nextern \"C\" {{\n#endif\n{} {}({});\n#ifdef __cplusplus\n}}\n#endif\n",
         s.result_spelling.replace("_Bool", "bool"), s.name,
         if parameters.is_empty() { "void" } else { &parameters });
     if let Some(declarations)=objc_header { text.push('\n');text.push_str(declarations); }
@@ -33,6 +43,16 @@ pub(super) fn emit_header(builder: &mut Builder, s: &crate::signatures::SourceDe
         ("contract", if objc_header.is_some(){"exact IMP entry declaration plus target-local class/member review declarations; superclass/protocol/type dependencies unresolved; no complete class ABI or implementation claim"}else{"exact declaration for Apple LP64 and named SDK types; no register-location, implementation or equivalence claim"}.into()),
     ]), array([]))?;
     builder.edge(declaration, &header, "types")?;
+    for dependency in type_dependencies {
+        let evidence = builder.record("project-type-dependency", "analyst-assertion", object([
+            ("name", dependency.name.clone().into()),
+            ("declaration", dependency.declaration.clone().into()),
+            ("target", dependency.target.clone().into()),
+            ("source_sha256", dependency.source_sha256.clone().into()),
+            ("abi_layout_claimed", false.into()),
+        ]), array([]))?;
+        builder.edge(&evidence, &header, "required-source-dependency")?;
+    }
     Ok(header)
 }
 
@@ -1239,6 +1259,40 @@ fn role_name(node: &Expr, id: usize) -> String {
     format!("hs_{}_{id}", node.role)
 }
 
+fn c_identifiers(text: &str) -> BTreeSet<String> {
+    text.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty() && token.bytes().next().is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_'))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn declared_type_identifiers(signature: &SourceSignature) -> BTreeSet<String> {
+    let mut names = c_identifiers(&signature.result_spelling);
+    for parameter in &signature.parameters {
+        names.extend(c_identifiers(&parameter.spelling));
+    }
+    names
+}
+
+fn select_project_type_dependencies(
+    mut required_names: BTreeSet<String>,
+    project_types: &[crate::reconstruction::ProjectTypeDependency],
+) -> Vec<crate::reconstruction::ProjectTypeDependency> {
+    let mut selected = BTreeMap::<String, crate::reconstruction::ProjectTypeDependency>::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for dependency in project_types {
+            if required_names.contains(&dependency.name) && !selected.contains_key(&dependency.name) {
+                required_names.extend(c_identifiers(&dependency.declaration));
+                selected.insert(dependency.name.clone(), dependency.clone());
+                changed = true;
+            }
+        }
+    }
+    selected.into_values().collect()
+}
+
 pub(super) struct Recovery {
     dag: Dag,
     result: usize,
@@ -1253,6 +1307,7 @@ pub(super) struct Recovery {
     ordered_call_memory: bool,
     ordered_volatile_accesses: bool,
     loops: Vec<SourceLoop>,
+    project_types: Vec<crate::reconstruction::ProjectTypeDependency>,
 }
 pub(super) fn recover(
     start: u64,
@@ -1260,6 +1315,17 @@ pub(super) fn recover(
     operations: &[IrOperation],
     signature: SourceSignature,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
+) -> Result<Recovery, String> {
+    recover_with_types(start, trees, operations, signature, call_prototypes, &[])
+}
+
+pub(super) fn recover_with_types(
+    start: u64,
+    trees: &[Tree],
+    operations: &[IrOperation],
+    signature: SourceSignature,
+    call_prototypes: &BTreeMap<u64, SourceSignature>,
+    project_types: &[crate::reconstruction::ProjectTypeDependency],
 ) -> Result<Recovery, String> {
     if operations
         .iter()
@@ -1512,6 +1578,12 @@ pub(super) fn recover(
             }
         }
     }
+    // Resolve dependencies from structured type spellings. Scanning the full
+    // rendered declaration also sees function and parameter identifiers, which
+    // can spuriously pull in an unrelated typedef with the same name.
+    let mut required_names = declared_type_identifiers(&signature);
+    for prototype in &called_prototypes { required_names.extend(declared_type_identifiers(prototype)); }
+    let selected_types = select_project_type_dependencies(required_names, project_types);
     Ok(Recovery {
         dag,
         result,
@@ -1524,6 +1596,7 @@ pub(super) fn recover(
         ordered_call_memory,
         ordered_volatile_accesses,
         loops: source_loops,
+        project_types: selected_types,
         frame_objects: objects
             .into_iter()
             .map(|((offset, bytes), version)| FrameObject {
@@ -2103,7 +2176,11 @@ impl Recovery {
                 ));
             }
         }
-        let output=format!("{headers}{call_declarations}{}\nstatic inline uint64_t hs_load1(uintptr_t a) {{ uint8_t v; memcpy(&v,(const void *)a,1); return v; }}\nstatic inline uint64_t hs_load2(uintptr_t a) {{ uint16_t v; memcpy(&v,(const void *)a,2); return v; }}\nstatic inline uint64_t hs_load4(uintptr_t a) {{ uint32_t v; memcpy(&v,(const void *)a,4); return v; }}\nstatic inline uint64_t hs_load8(uintptr_t a) {{ uint64_t v; memcpy(&v,(const void *)a,8); return v; }}\nstatic inline void hs_store8(uintptr_t a, uint64_t x) {{ uint64_t v=x; memcpy((void *)a,&v,8); }}\nstatic inline void hs_store4(uintptr_t a, uint64_t x) {{ uint32_t v=(uint32_t)x; memcpy((void *)a,&v,4); }}\nstatic inline void hs_store2(uintptr_t a, uint64_t x) {{ uint16_t v=(uint16_t)x; memcpy((void *)a,&v,2); }}\nstatic inline void hs_store1(uintptr_t a, uint64_t x) {{ uint8_t v=(uint8_t)x; memcpy((void *)a,&v,1); }}\n{volatile_helpers}/* Recovered from bounded structured IR; external memory effects require valid memory; volatile accesses retain instruction order alongside qualified scalar calls on each supported path; loop-carried register values are explicit locals; local frame effects are eliminated. */\n{} {}({}) {{\n{assertions}    (void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_flags_arith;(void)hs_load1;(void)hs_load2;(void)hs_load4;(void)hs_load8;(void)hs_store1;(void)hs_store2;(void)hs_store4;(void)hs_store8;\n{unused}{declarations}{loop_code}{effects_code}{return_code}}}\n",include_str!("bitvector_runtime.h"),s.result_spelling,s.name,if parameters.is_empty(){"void"}else{&parameters});
+        let project_type_declarations = if self.project_types.is_empty() { String::new() } else {
+            format!("/* Source dependencies from the matching analyst project type catalog; no ABI layout claim. */\n{}\n",
+                self.project_types.iter().map(|dependency| dependency.declaration.as_str()).collect::<Vec<_>>().join("\n"))
+        };
+        let output=format!("{headers}{project_type_declarations}\n{call_declarations}{}\nstatic inline uint64_t hs_load1(uintptr_t a) {{ uint8_t v; memcpy(&v,(const void *)a,1); return v; }}\nstatic inline uint64_t hs_load2(uintptr_t a) {{ uint16_t v; memcpy(&v,(const void *)a,2); return v; }}\nstatic inline uint64_t hs_load4(uintptr_t a) {{ uint32_t v; memcpy(&v,(const void *)a,4); return v; }}\nstatic inline uint64_t hs_load8(uintptr_t a) {{ uint64_t v; memcpy(&v,(const void *)a,8); return v; }}\nstatic inline void hs_store8(uintptr_t a, uint64_t x) {{ uint64_t v=x; memcpy((void *)a,&v,8); }}\nstatic inline void hs_store4(uintptr_t a, uint64_t x) {{ uint32_t v=(uint32_t)x; memcpy((void *)a,&v,4); }}\nstatic inline void hs_store2(uintptr_t a, uint64_t x) {{ uint16_t v=(uint16_t)x; memcpy((void *)a,&v,2); }}\nstatic inline void hs_store1(uintptr_t a, uint64_t x) {{ uint8_t v=(uint8_t)x; memcpy((void *)a,&v,1); }}\n{volatile_helpers}/* Recovered from bounded structured IR; external memory effects require valid memory; volatile accesses retain instruction order alongside qualified scalar calls on each supported path; loop-carried register values are explicit locals; local frame effects are eliminated. */\n{} {}({}) {{\n{assertions}    (void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_flags_arith;(void)hs_load1;(void)hs_load2;(void)hs_load4;(void)hs_load8;(void)hs_store1;(void)hs_store2;(void)hs_store4;(void)hs_store8;\n{unused}{declarations}{loop_code}{effects_code}{return_code}}}\n",include_str!("bitvector_runtime.h"),s.result_spelling,s.name,if parameters.is_empty(){"void"}else{&parameters});
         let root = builder.ast(
             "source-function",
             Some(&s.result_spelling),
@@ -2140,6 +2217,16 @@ impl Recovery {
             Some(format!("/* Recovered Objective-C method adapter over the validated IR-derived IMP body below.\n * Category packaging is synthetic; not original source or a complete class implementation.\n * Class/type dependencies and deployment integration still require review. */\n{header}\n{output}\n@interface {class} (HSRecovered_{start:x})\n{method};\n@end\n@implementation {class} (HSRecovered_{start:x})\n{method} {{\n    {call}\n}}\n@end\n"))
         });
         let node=builder.record("metadata","derived",object([("artifact_kind","recovered-source".into()),("source",output.into()),("status","generated-uncompiled".into()),("name",s.name.clone().into()),("ast_root",root.clone().into()),("declaration",s.signature.declaration.clone().into()),("contract","apple-aapcs64-lp64-reads-writes-calls-volatile-call-ordered-natural-loop-guarded-call-events-loop-memory-v14".into()),("observables","declared scalar result, bounded ordinary memory reads and ordered ordinary writes under supported path guards, exact-prototype scalar direct calls whose complete returning callee walk proves no memory reads, writes, or onward calls, supported exact self-recursion, ABI nonvolatile GPR/SP restoration, exact-width volatile accesses scheduled in instruction order with supported calls and path guards, and supported sequential single-entry scalar natural loops with per-iteration ordered external loads and stores; caller memory effects before or after proven calls are emitted in per-path instruction order for bounded acyclic control flow; call instructions still block strict machine-state C; fault/source-fidelity/formal-equivalence behavior is not claimed".into())]),array([]))?;
+        for dependency in &self.project_types {
+            let evidence = builder.record("project-type-dependency", "analyst-assertion", object([
+                ("name", dependency.name.clone().into()),
+                ("declaration", dependency.declaration.clone().into()),
+                ("target", dependency.target.clone().into()),
+                ("source_sha256", dependency.source_sha256.clone().into()),
+                ("abi_layout_claimed", false.into()),
+            ]), array([]))?;
+            builder.edge(&evidence, &node, "required-source-dependency")?;
+        }
         if let Some(source)=objc_output{
             let objc=builder.record("metadata","derived",object([
                 ("artifact_kind","recovered-objective-c".into()),("source",source.into()),
@@ -2198,6 +2285,7 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconstruction::Value;
     fn test_signature(name: &str, declaration: &str) -> SourceSignature {
         crate::signatures::source_signature(
             name,
@@ -2207,6 +2295,62 @@ mod tests {
                 source: "test declaration",
             },
         ).expect("test source signature")
+    }
+
+    #[test]
+    fn project_type_dependencies_follow_types_not_parameter_or_function_names() {
+        let signature = test_signature("_Widget", "int Widget(int Pair);");
+        let identifiers = declared_type_identifiers(&signature);
+        assert!(identifiers.contains("int"));
+        assert!(!identifiers.contains("Widget"));
+        assert!(!identifiers.contains("Pair"));
+    }
+
+    #[test]
+    fn recovered_header_includes_only_signature_and_transitive_project_types() {
+        let dependency = |name: &str, declaration: &str| crate::reconstruction::ProjectTypeDependency {
+            name: name.into(), declaration: declaration.into(), target: "arm64-apple-macos14.0".into(),
+            source_sha256: "a".repeat(64),
+        };
+        let dependencies = vec![
+            dependency("Widget", "typedef Base Widget;"),
+            dependency("Base", "typedef unsigned long Base;"),
+            dependency("Unused", "typedef int Unused;"),
+        ];
+        let declaration = crate::signatures::SourceDeclaration {
+            signature: crate::signatures::Signature {
+                language: "C", declaration: "Widget * create(void);".into(), source: "project type test",
+            },
+            name: "create".into(), result_spelling: "Widget *".into(), parameters: Vec::new(),
+        };
+        let mut builder = Builder::new(&"a".repeat(64), 0x1000, 0x1004, "arm64", Some("create"), Value::Null)
+            .expect("builder");
+        let type_record = builder.record("type", "analyst-assertion", object([
+            ("declaration", "Widget * create(void);".into()), ("source", "project type test".into()),
+        ]), array([])).expect("declaration record");
+        let header_id = emit_header(&mut builder, &declaration, &type_record, 0x1000, 0x1004,
+            None, &dependencies).expect("header");
+        let source = builder.nodes[&header_id].get("payload").and_then(|payload| payload.get("source"))
+            .expect("header source");
+        let Value::String(source) = source else { panic!("header source is not a string") };
+        assert!(source.contains("typedef Base Widget;"));
+        assert!(source.contains("typedef unsigned long Base;"));
+        assert!(!source.contains("typedef int Unused;"));
+        let dependency_edges: Vec<_> = builder.edges.values()
+            .filter(|edge| edge.get("relation") == Some(&Value::from("required-source-dependency")))
+            .collect();
+        assert_eq!(dependency_edges.len(), 2, "both transitive declarations must be explicit evidence dependencies");
+        for edge in dependency_edges {
+            let dependency_id = match edge.get("source") {
+                Some(Value::String(id)) => id,
+                _ => panic!("dependency edge source is not an identifier"),
+            };
+            let payload = builder.nodes.get(dependency_id)
+                .and_then(|node| node.get("payload")).expect("dependency evidence payload");
+            assert_eq!(payload.get("source_sha256"), Some(&Value::from("a".repeat(64))));
+            assert_eq!(payload.get("target"), Some(&Value::from("arm64-apple-macos14.0")));
+            assert_eq!(payload.get("abi_layout_claimed"), Some(&Value::Bool(false)));
+        }
     }
 
     #[test]

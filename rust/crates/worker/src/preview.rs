@@ -202,7 +202,11 @@ fn export_function_starts(exports:&str,window:&[u8],code_start:u64,scan_end:u64)
  }).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
 }
 fn resolved_function_name<'a>(address:u64,symbols:&'a[(u64,String)],objc:&'a std::collections::BTreeMap<u64,String>,exports:&'a std::collections::BTreeMap<u64,String>,stubs:&'a std::collections::BTreeMap<u64,String>)->Option<&'a str>{
- symbol_name_at(symbols,address).or_else(||objc.get(&address).map(String::as_str)).or_else(||exports.get(&address).map(String::as_str)).or_else(||stubs.get(&address).map(String::as_str))
+ // Objective-C IMP selectors are the most specific name at a boundary.
+ objc.get(&address).map(String::as_str)
+  .or_else(||symbol_name_at(symbols,address))
+  .or_else(||exports.get(&address).map(String::as_str))
+  .or_else(||stubs.get(&address).map(String::as_str))
 }
 fn function_for(starts:&[u64], address:u64)->u64{
  let idx=starts.partition_point(|&x|x<=address);if idx==0{starts[0]}else{starts[idx-1]}
@@ -652,7 +656,7 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<(String,Ve
    let expected_properties=if properties_address==0{Some(0)}else{read_va(file,&secs,size,properties_address,8)?.map(|header|le32(&header[4..8]) as usize)};
    let ivars_complete=expected_members==Some(members.len());let properties_complete=expected_properties==Some(declared_properties.len());
    if !ivars_complete||!properties_complete{out.push_str("  member coverage incomplete; affected source member/type reconstruction withheld\n")}
-   layouts.push(super::objc::ClassLayout{address:class_address,name,instance_start,instance_size,ivars:members,properties:declared_properties,methods:declared_methods,ivars_complete,properties_complete});
+   layouts.push(super::objc::ClassLayout{address:class_address,name,instance_start,instance_size,ivars:members,properties:declared_properties,methods:declared_methods,ivars_complete,properties_complete,runtime:false});
    if out.len()>60_000{return Ok((out,Vec::new()))}
   }
  }
@@ -1639,12 +1643,20 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let map=mapping(&window,size).map_err(|message|io::Error::new(io::ErrorKind::InvalidData,message))?;if map.encrypted{return Err(invalid("Encrypted code cannot be reconstructed"));}
  let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
- let facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let mut facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ merge_runtime_objc(&mut facts,path,&window,map.address,map.address+code.len() as u64);
  let export_names=export_function_names(&facts.export_trie,&window,&facts.starts,map.address+code.len() as u64);
  // Use the same validated export/stub names as analysis. Undefined nlist
  // symbols alone do not identify the address of an imported call target.
  let (_,_,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;
  let signature_symbols=reconstruction_symbols(&facts.symbols,&export_names,&indirect_facts);
+ // ObjC IMP names participate in signature/prototype recovery but are not
+ // reported as nlist symbols: their provenance is the ObjC records above.
+ let mut recovery_symbols=signature_symbols.clone();
+ for (address,name) in &facts.objc_function_names {
+  if !recovery_symbols.iter().any(|(candidate,_)|candidate==address) { recovery_symbols.push((*address,name.clone())); }
+ }
+ recovery_symbols.sort();recovery_symbols.dedup();
  let native=super::reconstruction::NativeEvidence{symbols:signature_symbols.clone(),objc_layouts:facts.objc_layouts.clone(),objc_records:facts.objc_classes.clone(),objc_function_names:facts.objc_function_names.clone(),export_names,export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
  let index=facts.starts.binary_search(&start).map_err(|_|invalid("Start is not an admitted function boundary"))?;
  if index+1==facts.starts.len()&&(code.len() as u64)<map.bytes{return Err(invalid("Final function bound is outside the code scan budget"));}
@@ -1654,17 +1666,21 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  if facts.lc_function_starts.contains(&start){sources.push("LC_FUNCTION_STARTS".into());}
  if facts.unwind_starts.contains(&start){sources.push("__unwind_info".into());}
  if facts.direct_call_starts.contains(&start){sources.push("direct BL target candidate".into());}
- let names=signature_symbols.iter().filter(|(address,_)|*address==start).map(|(_,name)|name.as_str()).collect::<std::collections::BTreeSet<_>>();
+ let names=recovery_symbols.iter().filter(|(address,_)|*address==start).map(|(_,name)|name.as_str()).collect::<std::collections::BTreeSet<_>>();
  if facts.symbols.iter().any(|(address,_)|*address==start){sources.push("exact nlist symbol".into());}
  if facts.objc_starts.contains(&start){sources.push("validated Objective-C IMP".into());}
  if facts.export_starts.contains(&start){sources.push("export trie".into());}
  if sources.is_empty(){sources.push("section-start fallback candidate".into());}
- let name=if names.len()==1{names.iter().next().copied()}else if names.is_empty(){facts.objc_function_names.get(&start).map(String::as_str)}else{None};
+ // A validated ObjC IMP is the most specific name when an nlist/export/stub
+ // alias also lands on the same address; conflicting non-ObjC names stay
+ // unresolved rather than being guessed.
+ let name=if names.len()==1{names.iter().next().copied()}else{facts.objc_function_names.get(&start).map(String::as_str)};
  let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
  let external=super::signatures::external_prototype_database(digest)?;
+ let project_types=super::signatures::external_project_type_dependencies(digest,architecture)?;
  let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
  let mut call_prototypes=Vec::new();
- for (address,symbol_name) in &signature_symbols {
+ for (address,symbol_name) in &recovery_symbols {
   // Preserve SDK/catalog disagreements for the artifact's conflict gate;
   // lookup precedence must not silently turn a contradiction into certainty.
   for (name,signature) in super::signatures::source_candidates(*address,&[symbol_name.as_str()],"",&external) {
@@ -1673,7 +1689,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  }
  call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
  call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,native};
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)
@@ -1720,7 +1736,9 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(20,"metadata","Mach-O, symbol, runtime, relocation, and data-in-code metadata recovered.");
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
- let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let mut fb_facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ if !map.encrypted { merge_runtime_objc(&mut fb_facts,path,&window,map.address,scan_end); }
+ let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=fb_facts;
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
  for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
  for address in &unwind_starts{boundary_sources.entry(*address).or_default().insert("__unwind_info");}
@@ -1794,6 +1812,12 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let mut signature_symbols=symbols.clone();
  signature_symbols.extend(export_names.iter().map(|(address,name)|(*address,name.clone())));
  signature_symbols.extend(indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())));
+ // Also add objc resolved names
+ for (addr, name) in objc_function_names.iter() {
+     if !signature_symbols.iter().any(|(a,_)| *a == *addr) {
+         signature_symbols.push((*addr, name.clone()));
+     }
+ }
  let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols,&indirect_facts)?;
  let external_prototypes=super::signatures::external_prototype_database(digest)?;
  let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address);
@@ -1850,6 +1874,482 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(97,"finalize","Rechecking captured-object identity and serializing the bounded analysis report.");
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured object changed during analysis"));}
  Ok(format!("{{\"protocol\":1,\"kind\":\"analysis_result\",\"request_id\":{},\"source_sha256\":{},\"function_count\":{},\"symbol_count\":{},\"basic_block_count\":{},\"analyzed_instructions\":{},\"truncated\":{},\"functions\":{},\"cfg\":{},\"ir\":{},\"strings\":{},\"xrefs\":{},\"call_graph\":{},\"typed_call_graph\":{},\"call_effect_summaries\":{},\"prototype_conflicts\":{},\"dataflow\":{},\"ssa\":{},\"dominators\":{},\"phi_nodes\":{},\"dominance_frontiers\":{},\"relocations\":{},\"jump_tables\":{},\"metadata\":{},\"runtime_records\":{},\"annotated_disassembly\":{},\"ssa_renamed\":{},\"runtime_graph\":{},\"swift_types\":{},\"selector_xrefs\":{},\"phi_operands\":{},\"objc_classes\":{},\"swift_contexts\":{},\"call_values\":{},\"chained_fixups\":{},\"chained_starts\":{},\"objc_protocols\":{},\"swift_fields\":{},\"swift_field_records\":{},\"interblock_values\":{},\"predecessor_values\":{},\"chained_pointers\":{},\"chained_multistarts\":{},\"arm64e_pointers\":{},\"swift_field_ownership\":{},\"propagated_values\":{},\"indirect_calls\":{},\"dyld_imports\":{},\"dyld_linking\":{},\"softlinking\":{},\"symbolication\":{},\"symbol_resolver\":{},\"apple_symbolication\":{},\"arm64e_bind_symbols\":{},\"dylib_ordinals\":{},\"resolved_imports\":{},\"authenticated_bind_targets\":{},\"indirect_symbols\":{},\"pointer_slots\":{},\"export_trie\":{},\"symbol_provenance\":{},\"linkage_records\":{},\"symbol_callers\":{},\"got_auth_slots\":{},\"import_export_collisions\":{},\"function_intelligence\":{},\"data_references\":{},\"tail_call_candidates\":{},\"function_neighborhoods\":{},\"analysis_quality\":{},\"analysis_insights\":{},\"semantic_preview\":{},\"summary\":{}}}",super::quote(id),super::quote(digest),starts.len(),symbols.len(),block_count,instruction_words,if truncated{"true"}else{"false"},super::quote(&functions),super::quote(&cfg),super::quote(&ir),super::quote(&strings),super::quote(&xrefs),super::quote(&call_graph),super::quote(&typed_call_graph),super::quote(&call_effect_summaries),super::quote(&prototype_conflicts),super::quote(&dataflow),super::quote(&ssa),super::quote(&dominators),super::quote(&phi_nodes),super::quote(&dominance_frontiers),super::quote(&relocation_xrefs),super::quote(&jump_tables),super::quote(&metadata),super::quote(&runtime_records),super::quote(&annotated_disassembly),super::quote(&ssa_renamed),super::quote(&runtime_graph),super::quote(&swift_types),super::quote(&selector_xrefs),super::quote(&phi_operands),super::quote(&objc_classes),super::quote(&swift_contexts),super::quote(&call_values),super::quote(&chained_fixups),super::quote(&chained_starts),super::quote(&objc_protocols),super::quote(&swift_fields),super::quote(&swift_field_records),super::quote(&interblock_values),super::quote(&predecessor_values),super::quote(&chained_pointers),super::quote(&chained_multistarts),super::quote(&arm64e_pointers),super::quote(&swift_field_ownership),super::quote(&propagated_values),super::quote(&indirect_calls),super::quote(&dyld_imports),super::quote(&dyld_linking),super::quote(&softlinking),super::quote(&symbolication),super::quote(&symbol_resolver),super::quote(&apple_symbolication),super::quote(&arm64e_bind_symbols),super::quote(&dylib_ordinals),super::quote(&resolved_imports),super::quote(&authenticated_bind_targets),super::quote(&indirect_symbols),super::quote(&pointer_slots),super::quote(&export_trie),super::quote(&symbol_provenance),super::quote(&linkage_records),super::quote(&symbol_callers),super::quote(&got_auth_slots),super::quote(&import_export_collisions),super::quote(&function_intelligence),super::quote(&data_references),super::quote(&tail_call_candidates),super::quote(&function_neighborhoods),super::quote(&analysis_quality),super::quote(&analysis_insights),super::quote(&semantic_preview),super::quote(&summary)))
+}
+
+#[derive(Clone)]
+struct RuntimeObjcClass {
+    text: String,
+    layout: super::objc::ClassLayout,
+    methods: Vec<(u64, String)>,
+}
+
+/// True when a Mach-O image declares an Objective-C class list. Runtime
+/// introspection is pointless (and needlessly risky) for images without one.
+fn image_declares_objc(window: &[u8]) -> bool {
+    sections(window).iter().any(|section| section.sect == "__objc_classlist")
+}
+
+/// Mach-O load address: the vmaddr of the segment that maps the file header
+/// (file offset zero, normally `__TEXT`). `mapping()` reports the `__text`
+/// section VA instead, so runtime pointers must not be rebased against it.
+fn image_base_address(window: &[u8]) -> Option<u64> {
+    if window.len() < 32 || &window[..4] != [0xcf, 0xfa, 0xed, 0xfe] { return None; }
+    let count = le32(&window[16..20]) as usize;
+    let mut at = 32usize;
+    for _ in 0..count {
+        if at + 8 > window.len() { return None; }
+        let command = le32(&window[at..at + 4]);
+        let size = le32(&window[at + 4..at + 8]) as usize;
+        if size < 8 || at + size > window.len() { return None; }
+        if command == 0x19 && size >= 72 && le64(&window[at + 40..at + 48]) == 0 && le64(&window[at + 48..at + 56]) != 0 {
+            return Some(le64(&window[at + 24..at + 32]));
+        }
+        at += size;
+    }
+    None
+}
+
+/// Adopt runtime Objective-C layouts only when the static pass recovered none
+/// and the captured image really carries Objective-C metadata. Static
+/// superclass/protocol text stays authoritative; runtime-only classes are
+/// appended so the header and ABI passes can use exact offsets and IMPs.
+fn merge_runtime_objc(facts: &mut FunctionBoundaryFacts, path: &str, window: &[u8], scan_start: u64, scan_end: u64) {
+    if !facts.objc_layouts.is_empty() || !image_declares_objc(window) { return; }
+    // Runtime dlopen executes initializers/+load; require explicit opt-in for
+    // untrusted artifacts.
+    if std::env::var_os("HINDSIGHT_TRUSTED_RUNTIME_OBJC").is_none() { return; }
+    let Some(image_base) = image_base_address(window) else { return; };
+    let Some(classes) = isolated_runtime_objc_classes(path, image_base) else { return; };
+    apply_runtime_objc(facts, classes, scan_start, scan_end);
+}
+
+/// Runtime introspection runs in a short-lived copy of this worker. A malformed
+/// image can terminate the Objective-C runtime during class realization (the
+/// corrupt-ivar fixture does), and that must never take the analysis process
+/// with it. The child speaks a bounded, hex-encoded line protocol.
+fn isolated_runtime_objc_classes(path: &str, image_base: u64) -> Option<Vec<RuntimeObjcClass>> {
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (path, image_base); return None; }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let executable = std::env::current_exe().ok()?;
+        let path = std::fs::canonicalize(path).ok()?;
+        let path = path.to_str()?;
+        let mut child = Command::new(executable)
+            .arg("--runtime-objc").arg(path).arg(format!("{image_base:x}"))
+            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().ok()?;
+        let stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = stdout.take(16 * 1024 * 1024).read_to_end(&mut output);
+            output
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) => { let _ = child.wait(); return None; }
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                Ok(None) => { let _ = child.kill(); let _ = child.wait(); let _ = reader.join(); return None; }
+                Err(_) => { let _ = child.kill(); let _ = child.wait(); let _ = reader.join(); return None; }
+            }
+        }
+        let output = reader.join().ok()?;
+        return parse_runtime_objc(&String::from_utf8_lossy(&output));
+    }
+}
+
+fn hex_encode(value: &str) -> String {
+    value.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(value: &str) -> Option<String> {
+    // The child serializes at most 8 MiB per class, so a 4 MiB text field
+    // arrives as an 8 MiB hex field. Keep the decode bound aligned with that.
+    if value.len() % 2 != 0 || value.len() > 8 * 1024 * 1024 { return None; }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let raw = value.as_bytes();
+    for pair in raw.chunks_exact(2) {
+        let text = std::str::from_utf8(pair).ok()?;
+        bytes.push(u8::from_str_radix(text, 16).ok()?);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn serialize_runtime_objc(classes: &[RuntimeObjcClass]) -> String {
+    const BUDGET: usize = 8 * 1024 * 1024;
+    let mut out = String::from("hs-objc-1\n");
+    for class in classes.iter().take(4096) {
+        let layout = &class.layout;
+        let mut block = format!("class {:x} {} {} {} {} {} {}\n",
+            layout.address, layout.instance_start, layout.instance_size,
+            u8::from(layout.ivars_complete), u8::from(layout.properties_complete),
+            hex_encode(&layout.name), hex_encode(&class.text));
+        for ivar in layout.ivars.iter().take(65536) {
+            block.push_str(&format!("ivar {:x} {:x} {} {} {} {} {}\n",
+                ivar.record, ivar.offset_pointer, ivar.offset, ivar.size, ivar.alignment,
+                hex_encode(&ivar.name), hex_encode(&ivar.encoding)));
+        }
+        for property in layout.properties.iter().take(65536) {
+            block.push_str(&format!("property {:x} {} {}\n",
+                property.record, hex_encode(&property.name), hex_encode(&property.attributes)));
+        }
+        for method in layout.methods.iter().take(65536) {
+            block.push_str(&format!("method {:x} {}\n", method.implementation, u8::from(method.class_method)));
+        }
+        for (address, name) in class.methods.iter().take(65536) {
+            block.push_str(&format!("name {:x} {}\n", address, hex_encode(name)));
+        }
+        block.push_str("endclass\n");
+        // Emit whole classes only. A partially written class would advertise
+        // completeness flags that no longer match the members actually sent.
+        if out.len() + block.len() > BUDGET { break; }
+        out.push_str(&block);
+    }
+    out.push_str("end\n");
+    out
+}
+
+fn parse_runtime_objc(text: &str) -> Option<Vec<RuntimeObjcClass>> {
+    let mut lines = text.lines();
+    if lines.next()? != "hs-objc-1" { return None; }
+    let mut classes = Vec::new();
+    let mut current: Option<(ClassHeader, Vec<super::objc::IvarLayout>, Vec<super::objc::PropertyLayout>, Vec<super::objc::MethodLayout>, Vec<(u64, String)>)> = None;
+    for line in lines {
+        let mut fields = line.split(' ');
+        let tag = fields.next()?;
+        if tag == "end" { break; }
+        if tag == "class" {
+            if current.is_some() || classes.len() >= 4096 { return None; }
+            let header = ClassHeader {
+                address: u64::from_str_radix(fields.next()?, 16).ok()?,
+                instance_start: fields.next()?.parse().ok()?,
+                instance_size: fields.next()?.parse().ok()?,
+                ivars_complete: fields.next()? == "1",
+                properties_complete: fields.next()? == "1",
+                name: hex_decode(fields.next()?)?,
+                text: hex_decode(fields.next()?)?,
+            };
+            current = Some((header, Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            continue;
+        }
+        let (_header, ivars, properties, methods, names) = current.as_mut()?;
+        match tag {
+            "ivar" if ivars.len() < 65536 => ivars.push(super::objc::IvarLayout {
+                record: u64::from_str_radix(fields.next()?, 16).ok()?,
+                offset_pointer: u64::from_str_radix(fields.next()?, 16).ok()?,
+                offset: fields.next()?.parse().ok()?,
+                size: fields.next()?.parse().ok()?,
+                alignment: fields.next()?.parse().ok()?,
+                name: hex_decode(fields.next()?)?,
+                encoding: hex_decode(fields.next()?)?,
+            }),
+            "property" if properties.len() < 65536 => {
+                let record = u64::from_str_radix(fields.next()?, 16).ok()?;
+                let name = hex_decode(fields.next()?)?;
+                let attributes = hex_decode(fields.next()?)?;
+                properties.push(super::objc::PropertyLayout::parse(record, name, attributes)?);
+            }
+            "method" if methods.len() < 65536 => methods.push(super::objc::MethodLayout {
+                implementation: u64::from_str_radix(fields.next()?, 16).ok()?,
+                class_method: fields.next()? == "1",
+            }),
+            "name" if names.len() < 65536 => names.push((
+                u64::from_str_radix(fields.next()?, 16).ok()?,
+                hex_decode(fields.next()?)?,
+            )),
+            "endclass" => {
+                let (header, ivars, properties, methods, names) = current.take()?;
+                classes.push(RuntimeObjcClass {
+                    text: header.text,
+                    layout: super::objc::ClassLayout {
+                        address: header.address, name: header.name,
+                        instance_start: header.instance_start, instance_size: header.instance_size,
+                        ivars, properties, methods,
+                        ivars_complete: header.ivars_complete, properties_complete: header.properties_complete,
+                        runtime: true,
+                    },
+                    methods: names,
+                });
+            }
+            _ => return None,
+        }
+    }
+    current.is_none().then_some(classes)
+}
+
+struct ClassHeader {
+    address: u64,
+    instance_start: u32,
+    instance_size: u32,
+    ivars_complete: bool,
+    properties_complete: bool,
+    name: String,
+    text: String,
+}
+
+/// Child-process entry point: serialize runtime classes to stdout, or "none".
+pub(crate) fn runtime_objc_child(path: &str, base: &str) -> String {
+    if path.len() > 16384 || !std::path::Path::new(path).is_absolute() { return "none".into(); }
+    let base = match u64::from_str_radix(base, 16) { Ok(base) => base, Err(_) => return "none".into() };
+    match macos_runtime_objc_classes(path, base) {
+        Some(classes) => serialize_runtime_objc(&classes),
+        None => "none".into(),
+    }
+}
+
+/// Merge runtime classes into static evidence: static superclass/protocol text
+/// stays authoritative for classes it already described, runtime-only classes
+/// are appended, and only in-range 4-byte-aligned IMPs become boundaries.
+///
+/// Layouts are admitted even when static text already names the class: static
+/// text can survive a member/record budget failure that discards the structured
+/// layouts, and the runtime layout is then the only exact member evidence.
+fn apply_runtime_objc(facts: &mut FunctionBoundaryFacts, classes: Vec<RuntimeObjcClass>, scan_start: u64, scan_end: u64) {
+    let known_text = facts.objc_classes.lines()
+        .filter(|line| line.starts_with("reconstructed class "))
+        .filter_map(|line| line.split_whitespace().find_map(|field| field.strip_prefix("name=")))
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut seen_layouts = facts.objc_layouts.iter()
+        .map(|layout| (layout.name.clone(), layout.address))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut text = String::new();
+    for class in classes {
+        for (address, name) in class.methods {
+            if address < scan_start || address >= scan_end || (address - scan_start) % 4 != 0 { continue; }
+            facts.objc_function_names.entry(address).or_insert(name);
+            if !facts.objc_starts.contains(&address) { facts.objc_starts.push(address); }
+            if !facts.starts.contains(&address) { facts.starts.push(address); }
+        }
+        if seen_layouts.insert((class.layout.name.clone(), class.layout.address)) {
+            facts.objc_layouts.push(class.layout.clone());
+        }
+        if !known_text.contains(&class.layout.name) {
+            text.push_str(&class.text);
+        }
+    }
+    if !text.is_empty() { facts.objc_classes.push_str(&text); }
+    facts.starts.sort_unstable();
+    facts.starts.dedup();
+    facts.objc_starts.sort_unstable();
+    facts.objc_starts.dedup();
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct DlInfo { dli_fname: *const std::os::raw::c_char, dli_fbase: *mut std::ffi::c_void, dli_sname: *const std::os::raw::c_char, dli_saddr: *mut std::ffi::c_void }
+
+/// Introspect one already-loadable image with libobjc. Every runtime address is
+/// rebased onto the captured file's static virtual address by subtracting the
+/// per-image ASLR slide reported through `dladdr`; addresses that do not sit in
+/// this image are never guessed or wrapped.
+#[cfg(target_os = "macos")]
+fn macos_runtime_objc_classes(path: &str, image_base: u64) -> Option<Vec<RuntimeObjcClass>> {
+    use std::ffi::{CStr, CString};
+    use super::objc;
+    type Class = *const std::ffi::c_void;
+    type Method = *const std::ffi::c_void;
+    type Ivar = *const std::ffi::c_void;
+    type Property = *const std::ffi::c_void;
+    type Protocol = *const std::ffi::c_void;
+    type Sel = *const std::ffi::c_void;
+    extern "C" {
+        fn dlopen(filename: *const std::os::raw::c_char, flags: i32) -> *mut std::ffi::c_void;
+        fn dlclose(handle: *mut std::ffi::c_void) -> i32;
+        fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+        fn objc_copyClassList(out_count: *mut u32) -> *mut Class;
+        fn class_getName(cls: Class) -> *const std::os::raw::c_char;
+        fn class_getSuperclass(cls: Class) -> Class;
+        fn class_getInstanceSize(cls: Class) -> usize;
+        fn object_getClass(obj: *const std::ffi::c_void) -> Class;
+        fn class_copyMethodList(cls: Class, out_count: *mut u32) -> *mut Method;
+        fn method_getName(m: Method) -> Sel;
+        fn method_getTypeEncoding(m: Method) -> *const std::os::raw::c_char;
+        fn method_getImplementation(m: Method) -> *const std::ffi::c_void;
+        fn sel_getName(sel: Sel) -> *const std::os::raw::c_char;
+        fn class_copyIvarList(cls: Class, out_count: *mut u32) -> *mut Ivar;
+        fn ivar_getName(iv: Ivar) -> *const std::os::raw::c_char;
+        fn ivar_getOffset(iv: Ivar) -> isize;
+        fn ivar_getTypeEncoding(iv: Ivar) -> *const std::os::raw::c_char;
+        fn class_copyPropertyList(cls: Class, out_count: *mut u32) -> *mut Property;
+        fn property_getName(p: Property) -> *const std::os::raw::c_char;
+        fn property_getAttributes(p: Property) -> *const std::os::raw::c_char;
+        fn class_copyProtocolList(cls: Class, out_count: *mut u32) -> *mut Protocol;
+        fn protocol_getName(p: Protocol) -> *const std::os::raw::c_char;
+        fn NSGetSizeAndAlignment(r#type: *const std::os::raw::c_char, size: *mut usize, align: *mut usize) -> *const std::os::raw::c_char;
+        fn free(ptr: *mut std::ffi::c_void);
+    }
+
+    // dyld records the resolved image path; compare against that same identity.
+    let path = std::fs::canonicalize(path).ok()?;
+    let path = path.to_str()?;
+    let cpath = CString::new(path).ok()?;
+    // RTLD_LAZY|RTLD_LOCAL: introspect the target without publishing its symbols.
+    let handle = unsafe { dlopen(cpath.as_ptr(), 1 | 4) };
+    if handle.is_null() { return None; }
+    let text = |ptr: *const std::os::raw::c_char| -> String {
+        if ptr.is_null() { String::new() } else { unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned() }
+    };
+    let unslide = |address: usize, slide: i128| -> Option<u64> {
+        let value = address as i128 - slide;
+        (value >= 0 && value <= u64::MAX as i128).then_some(value as u64)
+    };
+
+    // Bound every runtime list to the same member/class budget the child
+    // protocol and parser enforce; a malformed image must not force unbounded
+    // allocation before the isolation timeout can fire.
+    const CLASS_LIMIT: u32 = 4096;
+    const MEMBER_LIMIT: u32 = 65536;
+    const TEXT_LIMIT: usize = 4 * 1024 * 1024;
+    let mut total: u32 = 0;
+    let classes = unsafe { objc_copyClassList(&mut total) };
+    if classes.is_null() { unsafe { dlclose(handle); } return None; }
+    let mut out = Vec::new();
+    for i in 0..total.min(CLASS_LIMIT) {
+        let cls = unsafe { *classes.add(i as usize) };
+        if cls.is_null() { continue; }
+        let mut info = DlInfo { dli_fname: std::ptr::null(), dli_fbase: std::ptr::null_mut(), dli_sname: std::ptr::null(), dli_saddr: std::ptr::null_mut() };
+        if unsafe { dladdr(cls as *const std::ffi::c_void, &mut info) } == 0 || info.dli_fbase.is_null() { continue; }
+        if text(info.dli_fname) != path { continue; }
+        let slide = info.dli_fbase as i128 - image_base as i128;
+        let Some(cls_addr) = unslide(cls as usize, slide) else { continue };
+        let name = text(unsafe { class_getName(cls) });
+        if !objc::identifier(&name) { continue; }
+        let superclass = unsafe { class_getSuperclass(cls) };
+        let super_name = if superclass.is_null() { String::new() } else {
+            let candidate = text(unsafe { class_getName(superclass) });
+            // The name is emitted into a single evidence line and later used as
+            // a header relationship. Admit only a bounded identifier-like name.
+            if !candidate.is_empty() && candidate.len() <= 256
+                && candidate.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')) { candidate } else { String::new() }
+        };
+        let super_addr = if superclass.is_null() { 0 } else {
+            let mut sinfo = DlInfo { dli_fname: std::ptr::null(), dli_fbase: std::ptr::null_mut(), dli_sname: std::ptr::null(), dli_saddr: std::ptr::null_mut() };
+            if unsafe { dladdr(superclass as *const std::ffi::c_void, &mut sinfo) } == 0 || sinfo.dli_fbase.is_null() { 0 }
+            else if text(sinfo.dli_fname) != path { 0 }
+            else { unslide(superclass as usize, sinfo.dli_fbase as i128 - image_base as i128).unwrap_or(0) }
+        };
+        let instance_start = if superclass.is_null() { 8 } else { unsafe { class_getInstanceSize(superclass) }.min(u32::MAX as usize) as u32 };
+        let instance_size = unsafe { class_getInstanceSize(cls) }.min(u32::MAX as usize) as u32;
+        let metaclass = unsafe { object_getClass(cls as *const std::ffi::c_void) };
+        let mut block = String::new();
+        let mut text_truncated = false;
+        let mut methods = Vec::new();
+        let mut names = Vec::new();
+        for (target, class_method) in [(cls, false), (metaclass, true)] {
+            if target.is_null() { continue; }
+            let mut method_count: u32 = 0;
+            let list = unsafe { class_copyMethodList(target, &mut method_count) };
+            if list.is_null() { continue; }
+            for mi in 0..method_count.min(MEMBER_LIMIT) {
+                let method = unsafe { *list.add(mi as usize) };
+                if method.is_null() { continue; }
+                let selector = text(unsafe { sel_getName(method_getName(method)) });
+                if selector.is_empty() || selector.len() > 512 || selector.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()) { continue; }
+                let encoding = text(unsafe { method_getTypeEncoding(method) });
+                // Encodings are embedded in one evidence line; reject anything
+                // that is not a bounded printable ASCII type string.
+                if encoding.is_empty() || encoding.len() > 2048 || !encoding.is_ascii() || encoding.bytes().any(|byte| byte.is_ascii_control()) { continue; }
+                // Categories from other loaded images can attach methods to this
+                // class. Only admit IMPs that resolve into the captured image;
+                // otherwise an external IMP would be rebased onto a fabricated
+                // in-image address.
+                let implementation = unsafe { method_getImplementation(method) };
+                let mut iinfo = DlInfo { dli_fname: std::ptr::null(), dli_fbase: std::ptr::null_mut(), dli_sname: std::ptr::null(), dli_saddr: std::ptr::null_mut() };
+                if unsafe { dladdr(implementation, &mut iinfo) } == 0 || iinfo.dli_fbase.is_null() { continue; }
+                if text(iinfo.dli_fname) != path { continue; }
+                let Some(imp) = unslide(implementation as usize, iinfo.dli_fbase as i128 - image_base as i128) else { continue };
+                let resolved = format!("{}[{} {}]", if class_method { "+" } else { "-" }, name, selector);
+                if block.len() + encoding.len() < TEXT_LIMIT {
+                    block.push_str(&format!("  {} method {imp:#018x}  name={selector}  types={encoding}  imp={imp:#018x} resolved={resolved} confidence=validated\n", if class_method { "class" } else { "instance" }));
+                } else { text_truncated = true; }
+                methods.push(objc::MethodLayout { implementation: imp, class_method });
+                names.push((imp, resolved));
+            }
+            unsafe { free(list as *mut std::ffi::c_void) };
+        }
+        let mut ivars = Vec::new();
+        let mut ivar_count: u32 = 0;
+        let list = unsafe { class_copyIvarList(cls, &mut ivar_count) };
+        if !list.is_null() {
+            for ii in 0..ivar_count.min(MEMBER_LIMIT) {
+                let ivar = unsafe { *list.add(ii as usize) };
+                if ivar.is_null() { continue; }
+                let ivar_name = text(unsafe { ivar_getName(ivar) });
+                if !objc::identifier(&ivar_name) { continue; }
+                let encoding = text(unsafe { ivar_getTypeEncoding(ivar) });
+                if encoding.is_empty() || encoding.len() > 2048 || !encoding.is_ascii() || encoding.bytes().any(|byte| byte.is_ascii_control()) { continue; }
+                let Ok(cencoding) = CString::new(encoding.clone()) else { continue; };
+                let raw_offset = unsafe { ivar_getOffset(ivar) };
+                if raw_offset < 0 { continue; }
+                let offset = raw_offset as u64;
+                if offset < u64::from(instance_start) || offset >= u64::from(instance_size.max(instance_start)) { continue; }
+                let mut size: usize = 0;
+                let mut align: usize = 1;
+                unsafe { NSGetSizeAndAlignment(cencoding.as_ptr(), &mut size, &mut align) };
+                if size == 0 || size > u32::MAX as usize { continue; }
+                let align = align.clamp(1, u32::MAX as usize);
+                if block.len() + encoding.len() < TEXT_LIMIT {
+                    block.push_str(&format!("  ivar {cls_addr:#018x} name={ivar_name} type={encoding} offset_ptr=0x0 offset={offset:#x} size={size} alignment={align} confidence=validated\n"));
+                } else { text_truncated = true; }
+                ivars.push(objc::IvarLayout { record: cls_addr, offset_pointer: 0, name: ivar_name, encoding, offset: offset as u32, size: size as u32, alignment: align as u32 });
+            }
+            unsafe { free(list as *mut std::ffi::c_void) };
+        }
+        let mut properties = Vec::new();
+        let mut prop_count: u32 = 0;
+        let list = unsafe { class_copyPropertyList(cls, &mut prop_count) };
+        if !list.is_null() {
+            for pi in 0..prop_count.min(MEMBER_LIMIT) {
+                let property = unsafe { *list.add(pi as usize) };
+                if property.is_null() { continue; }
+                let pname = text(unsafe { property_getName(property) });
+                let attrs = text(unsafe { property_getAttributes(property) });
+                let Some(prop) = objc::PropertyLayout::parse(cls_addr, pname, attrs) else { continue; };
+                if block.len() + prop.attributes.len() < TEXT_LIMIT {
+                    block.push_str(&format!("  property {cls_addr:#018x} name={} attributes={} getter={} setter={} backing_ivar={} confidence=validated\n",
+                        prop.name, prop.attributes, prop.getter, prop.setter.as_deref().unwrap_or("<readonly>"), prop.ivar.as_deref().unwrap_or("<unresolved>")));
+                } else { text_truncated = true; }
+                properties.push(prop);
+            }
+            unsafe { free(list as *mut std::ffi::c_void) };
+        }
+        let mut protocol_count: u32 = 0;
+        let list = unsafe { class_copyProtocolList(cls, &mut protocol_count) };
+        let mut protocols = std::collections::BTreeSet::new();
+        if !list.is_null() {
+            for pi in 0..protocol_count.min(MEMBER_LIMIT) {
+                let protocol = unsafe { *list.add(pi as usize) };
+                if protocol.is_null() { continue; }
+                let protocol_name = text(unsafe { protocol_getName(protocol) });
+                if objc::identifier(&protocol_name) { protocols.insert(protocol_name); }
+            }
+            unsafe { free(list as *mut std::ffi::c_void) };
+        }
+        let conforms = protocols.into_iter().collect::<Vec<_>>().join(",");
+        let header = format!("reconstructed class {cls_addr:#018x}  name={name}  super={super_addr:#018x}  super_name={super_name}  ro=0x0  conforms={conforms} instance_start={instance_start} instance_size={instance_size}\n");
+        out.push(RuntimeObjcClass {
+            text: format!("{header}{block}"),
+            layout: objc::ClassLayout { address: cls_addr, name, instance_start, instance_size, ivars, properties, methods,
+                ivars_complete: ivar_count <= MEMBER_LIMIT && !text_truncated,
+                properties_complete: prop_count <= MEMBER_LIMIT && !text_truncated,
+                runtime: true },
+            methods: names,
+        });
+    }
+    unsafe { free(classes as *mut std::ffi::c_void); }
+    unsafe { dlclose(handle); }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_runtime_objc_classes(_path: &str, _image_base: u64) -> Option<Vec<RuntimeObjcClass>> {
+    None
 }
 
 #[cfg(test)]
@@ -2039,4 +2539,144 @@ mod tests {
   assert!(report.contains("parameter-registers=[x0, x1]"));
   assert!(report.contains("highest-abi-position=2"));
  }
+ #[test]
+ fn runtime_objc_merge_keeps_static_text_and_admits_only_aligned_in_range_imps() {
+  let runtime_class=|name:&str,address:u64,methods:Vec<(u64,String)>| super::RuntimeObjcClass{
+   text:format!("reconstructed class {address:#018x}  name={name}  super=0x0  super_name=  ro=0x0  conforms=  instance_start=8 instance_size=16\n"),
+   layout:super::super::objc::ClassLayout{
+    address,name:name.into(),instance_start:8,instance_size:16,ivars:vec![],properties:vec![],
+    methods:methods.iter().map(|(implementation,_)|super::super::objc::MethodLayout{implementation:*implementation,class_method:false}).collect(),
+    ivars_complete:true,properties_complete:true,runtime:true,
+   },
+   methods,
+  };
+  let mut facts=super::FunctionBoundaryFacts{
+   symbols:vec![],starts:vec![0x1000],lc_function_starts:vec![],direct_call_starts:Default::default(),unwind_starts:vec![],
+   objc_classes:"reconstructed class 0x0000000000001100  name=Known  super=0x0  super_name=  ro=0x0  conforms=NSCopying instance_start=8 instance_size=16\n".into(),
+   objc_layouts:vec![],objc_function_names:Default::default(),objc_starts:vec![],export_trie:String::new(),export_starts:vec![],
+  };
+  let classes=vec![
+   runtime_class("Known",0x1100,vec![(0x2000,"-[Known a]".into())]),
+   runtime_class("Novel",0x1200,vec![(0x2004,"-[Novel b]".into()),(0x2002,"-[Novel misaligned]".into()),(0x9000,"-[Novel outside]".into())]),
+  ];
+  super::apply_runtime_objc(&mut facts,classes,0x1000,0x3000);
+  // Static relationship text is retained, runtime-only classes are appended.
+  assert!(facts.objc_classes.contains("name=Known"));
+  assert!(facts.objc_classes.contains("conforms=NSCopying"));
+  assert!(facts.objc_classes.contains("name=Novel"));
+  // Static text survives, but the runtime layout is admitted for both classes:
+  // text alone is not proof that a structured layout exists.
+  assert_eq!(facts.objc_layouts.iter().map(|layout|layout.name.as_str()).collect::<Vec<_>>(),vec!["Known","Novel"]);
+  // Only the aligned, in-range IMP becomes a boundary.
+  assert!(facts.starts.contains(&0x2000));
+  assert!(facts.starts.contains(&0x2004));
+  assert!(!facts.starts.contains(&0x2002));
+  assert!(!facts.starts.contains(&0x9000));
+  assert_eq!(facts.objc_function_names.get(&0x2004).map(String::as_str),Some("-[Novel b]"));
+  // Merging the same evidence again changes nothing.
+  let starts= facts.starts.clone();
+  super::apply_runtime_objc(&mut facts,vec![
+   runtime_class("Known",0x1100,vec![(0x2000,"-[Known a]".into())]),
+   runtime_class("Novel",0x1200,vec![(0x2004,"-[Novel b]".into())]),
+  ],0x1000,0x3000);
+  assert_eq!(facts.starts,starts);
+  assert_eq!(facts.objc_layouts.len(),2);
+  assert_eq!(facts.objc_classes.matches("name=Novel").count(),1);
+ }
+
+ #[cfg(target_os = "macos")]
+ #[test]
+ fn runtime_objc_introspection_rebases_onto_captured_image() {
+  use std::process::Command;
+  let directory=std::env::temp_dir().join(format!("hs-runtime-objc-{}",std::process::id()));
+  let _=std::fs::remove_dir_all(&directory);
+  if std::fs::create_dir_all(&directory).is_err(){return}
+  let output=directory.join("catalog");
+  let fixture=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../Tests/Fixtures/Decompilation/darwin_catalog_sample.m");
+  let built=Command::new("xcrun").args(["--sdk","macosx","clang","-target","arm64-apple-macos14.0","-fobjc-arc","-DHS_CATALOG_STANDALONE","-Wl,-no_fixup_chains","-framework","Foundation"])
+   .arg(&fixture).arg("-o").arg(&output).status();
+  let Ok(built)=built else{return};
+  if !built.success(){let _=std::fs::remove_dir_all(&directory);return}
+  let window=std::fs::read(&output).expect("fixture bytes");
+  let base=super::image_base_address(&window).expect("image base");
+  assert_eq!(base,0x1_0000_0000,"fixture image base");
+  let mapped=super::mapping(&window,window.len() as u64).expect("mapped __text");
+  assert_ne!(mapped.address,base,"__text VA must not be used as the image base");
+  let classlist=super::sections(&window).into_iter().find(|section|section.sect=="__objc_classlist").expect("class list");
+  let mut expected=Vec::new();
+  for entry in window[classlist.offset as usize..(classlist.offset+classlist.size) as usize].chunks_exact(8) {
+   expected.push(u64::from_le_bytes(entry.try_into().unwrap()));
+  }
+  expected.sort_unstable();
+  let classes=super::macos_runtime_objc_classes(output.to_str().expect("utf8 fixture path"),base);
+  let _=std::fs::remove_dir_all(&directory);
+  let classes=classes.expect("runtime Objective-C classes");
+  let mut actual=classes.iter().map(|class|class.layout.address).collect::<Vec<_>>();
+  actual.sort_unstable();
+  assert_eq!(actual,expected,"runtime class addresses must equal captured class-list pointers");
+  assert!(classes.iter().any(|class|class.layout.name=="HSNativeCatalogFixture"));
+  let derived=classes.iter().find(|class|class.layout.name=="HSNativeCatalogDerived").expect("derived class");
+  assert!(derived.text.contains("super_name=HSNativeCatalogFixture"),"{}",derived.text);
+  assert!(derived.text.contains("conforms=NSCopying"),"{}",derived.text);
+  assert!(derived.layout.instance_start>8,"superclass size must define the ivar start");
+  assert!(derived.layout.methods.iter().all(|method|method.implementation>=base));
+  for class in &classes {
+   assert!(class.layout.address>=base);
+   for (address,_) in &class.methods { assert!(*address>=base); assert_eq!(address%4,0); }
+  }
+ }
+
+ #[test]
+ fn runtime_objc_serialization_round_trips_and_rejects_damage() {
+  let class=super::RuntimeObjcClass{
+   text:"reconstructed class 0x1100  name=Widget  super=0x0  super_name=  ro=0x0  conforms=NSCopying instance_start=8 instance_size=24\n  instance method 0x2000  name=run:  types=v24@0:8@16  imp=0x2000 resolved=-[Widget run:] confidence=validated\n".into(),
+   layout:super::super::objc::ClassLayout{
+    address:0x1100,name:"Widget".into(),instance_start:8,instance_size:24,
+    ivars:vec![super::super::objc::IvarLayout{record:0x1100,offset_pointer:0,name:"_count".into(),encoding:"Q".into(),offset:8,size:8,alignment:8}],
+    properties:vec![super::super::objc::PropertyLayout::parse(0x1100,"count".into(),"TQ,N,V_count".into()).unwrap()],
+    methods:vec![super::super::objc::MethodLayout{implementation:0x2000,class_method:false}],
+    ivars_complete:true,properties_complete:true,runtime:true,
+   },
+   methods:vec![(0x2000,"-[Widget run:]".into())],
+  };
+  let encoded=super::serialize_runtime_objc(std::slice::from_ref(&class));
+  let decoded=super::parse_runtime_objc(&encoded).expect("round trip");
+  assert_eq!(decoded.len(),1);
+  assert_eq!(decoded[0].text,class.text);
+  assert_eq!(decoded[0].layout.name,"Widget");
+  assert_eq!(decoded[0].layout.address,0x1100);
+  assert_eq!(decoded[0].layout.instance_start,8);
+  assert!(decoded[0].layout.ivars_complete&&decoded[0].layout.properties_complete);
+  assert_eq!(decoded[0].layout.ivars[0].name,"_count");
+  assert_eq!(decoded[0].layout.ivars[0].encoding,"Q");
+  assert_eq!(decoded[0].layout.properties[0].getter,"count");
+  assert_eq!(decoded[0].layout.methods[0].implementation,0x2000);
+  assert_eq!(decoded[0].methods[0].1,"-[Widget run:]");
+  assert!(super::parse_runtime_objc("").is_none());
+  assert!(super::parse_runtime_objc("hs-objc-1\nclass 0 8 8 1 1 0 0\n").is_none(),"unterminated class block is rejected");
+  assert!(super::parse_runtime_objc("hs-objc-1\nclass 0 8 8 1 1 zz 0\nendclass\nend\n").is_none(),"bad hex is rejected");
+ }
+
+ #[test]
+ fn runtime_objc_serialization_never_emits_a_partial_class() {
+  let small=super::RuntimeObjcClass{
+   text:"reconstructed class 0x1100  name=Widget  super=0x0  super_name=  ro=0x0  conforms=  instance_start=8 instance_size=16\n".into(),
+   layout:super::super::objc::ClassLayout{
+    address:0x1100,name:"Widget".into(),instance_start:8,instance_size:16,
+    ivars:vec![],properties:vec![],methods:vec![],
+    ivars_complete:true,properties_complete:true,runtime:true,
+   },
+   methods:vec![],
+  };
+  let mut oversized=small.clone();
+  oversized.text=String::with_capacity(9*1024*1024);
+  oversized.text.push_str(&"x".repeat(9*1024*1024));
+  let encoded=super::serialize_runtime_objc(&[oversized,small]);
+  // A class that cannot fit the budget is omitted whole and ends the stream;
+  // the stream still carries its terminator and never exposes a partial class.
+  let decoded=super::parse_runtime_objc(&encoded).expect("truncated stream still terminates");
+  assert_eq!(decoded.len(),0);
+  assert!(encoded.ends_with("end\n"));
+ }
+
 }

@@ -25,21 +25,6 @@ final class ScriptingHost {
     ]
     private let fm = FileManager.default
 
-    private func establishProcessGroup(for process: Process) -> Bool {
-        let pid = process.processIdentifier
-        return pid > 0 && setpgid(pid, pid) == 0
-    }
-
-    private func terminateProcessTree(_ process: Process, grouped: Bool, termination: DispatchSemaphore) {
-        guard process.isRunning else { return }
-        let pid = process.processIdentifier
-        if grouped { _ = kill(-pid, SIGTERM) } else { process.terminate() }
-        _ = termination.wait(timeout: DispatchTime.now() + DispatchTimeInterval.seconds(1))
-        if process.isRunning {
-            if grouped { _ = kill(-pid, SIGKILL) } else { _ = kill(pid, SIGKILL) }
-        }
-    }
-
     private func extensionPolicyMode() -> String {
         switch UserDefaults.standard.string(forKey: Self.extensionPolicyDefaultsKey) {
         case "disabled": return "disabled"
@@ -66,26 +51,6 @@ final class ScriptingHost {
     private func pluginLock(for id: String) -> NSRecursiveLock {
         let bucket = UInt(bitPattern: id.hashValue) % UInt(pluginLocks.count)
         return pluginLocks[Int(bucket)]
-    }
-
-    private final class BoundedProcessOutput: @unchecked Sendable {
-        private let lock = NSLock()
-        private var stdout = Data()
-        private var stderr = Data()
-        func appendStdout(_ data: Data, limit: Int) {
-            lock.lock(); defer { lock.unlock() }
-            guard stdout.count < limit else { return }
-            stdout.append(data.prefix(limit - stdout.count))
-        }
-        func appendStderr(_ data: Data, limit: Int) {
-            lock.lock(); defer { lock.unlock() }
-            guard stderr.count < limit else { return }
-            stderr.append(data.prefix(limit - stderr.count))
-        }
-        func snapshot() -> (Data, Data) {
-            lock.lock(); defer { lock.unlock() }
-            return (stdout, stderr)
-        }
     }
 
     private struct Manifest: Codable {
@@ -190,34 +155,23 @@ except BaseException:
         let executable:URL; let arguments:[String]
         if !interpreter.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { executable=URL(fileURLWithPath:interpreter); arguments=["-I","-c",runner] }
         else { executable=URL(fileURLWithPath:"/usr/bin/env"); arguments=["python3","-I","-c",runner] }
-        let p=Process(); p.executableURL=executable; p.arguments=arguments
-        let stdin=Pipe(), stdout=Pipe(), stderr=Pipe(); p.standardInput=stdin; p.standardOutput=stdout; p.standardError=stderr
-        let output = BoundedProcessOutput()
-        stdout.fileHandleForReading.readabilityHandler={ h in output.appendStdout(h.availableData, limit: Self.maxOutputBytes) }
-        stderr.fileHandleForReading.readabilityHandler={ h in output.appendStderr(h.availableData, limit: Self.maxOutputBytes) }
-        let sem=DispatchSemaphore(value:0); p.terminationHandler={_ in sem.signal()}
-        do { try p.run() } catch { return encodeRun(ok:false,stderr:"",message:"Python 3 could not be launched: \(error.localizedDescription).",duration:0) }
-        let grouped = establishProcessGroup(for: p)
-        stdin.fileHandleForWriting.write(input); try? stdin.fileHandleForWriting.close()
         let timeout = max(250, min(timeoutMS, 30_000))
-        let deadline = DispatchTime.now() + DispatchTimeInterval.milliseconds(timeout)
-        let timedOut = sem.wait(timeout: deadline) == .timedOut
-        if timedOut {
-            terminateProcessTree(p, grouped: grouped, termination: sem)
-            _ = sem.wait(timeout: DispatchTime.now() + DispatchTimeInterval.seconds(1))
-        }
-        stdout.fileHandleForReading.readabilityHandler=nil; stderr.fileHandleForReading.readabilityHandler=nil
-        output.appendStdout(stdout.fileHandleForReading.readDataToEndOfFile(), limit: Self.maxOutputBytes)
-        output.appendStderr(stderr.fileHandleForReading.readDataToEndOfFile(), limit: Self.maxOutputBytes)
-        let (out, err) = output.snapshot()
+        let output: BoundedProcessRunner.Output
+        do {
+            output = try BoundedProcessRunner.run(executable: executable, arguments: arguments,
+                                                 input: input, timeout: Double(timeout) / 1000,
+                                                 limit: Self.maxOutputBytes)
+        } catch { return encodeRun(ok:false,stderr:"",message:"Python 3 could not be launched: \(error.localizedDescription).",duration:0) }
+        let timedOut = output.timedOut
+        let out = output.stdout, err = output.stderr
         var outText=String(decoding:out,as:UTF8.self); let errText=String(decoding:err,as:UTF8.self); var result:String?; var actions:[ScriptAction]=[]
         if let r=outText.range(of:"__REWORKBENCH_ACTIONS__",options:.backwards) { let tail=String(outText[r.upperBound...]).split(separator:"\n",maxSplits:1).first.map(String.init) ?? "[]"; if let d=tail.data(using:.utf8), let decoded=try? JSONDecoder().decode([ScriptAction].self,from:d) { actions=Array(decoded.prefix(Self.maxActions)) }; outText.removeSubrange(r.lowerBound..<outText.endIndex) }
         if let r=outText.range(of:"__REWORKBENCH_RESULT__",options:.backwards) { let tail=String(outText[r.upperBound...]).split(separator:"\n",maxSplits:1).first.map(String.init) ?? "null"; if let d=tail.data(using:.utf8), let obj=try? JSONSerialization.jsonObject(with:d), let rendered=try? JSONSerialization.data(withJSONObject:obj,options:[.prettyPrinted,.sortedKeys]) { result=String(decoding:rendered,as:UTF8.self) }; outText.removeSubrange(r.lowerBound..<outText.endIndex) }
         let ms=Int((DispatchTime.now().uptimeNanoseconds-start.uptimeNanoseconds)/1_000_000)
-        if p.isRunning {
+        if output.status == nil {
             return encodeRun(ok:false,stdout:outText,stderr:errText,result:result,message:"Python execution did not terminate cleanly after timeout.",duration:ms,actions:actions)
         }
-        let status = p.terminationStatus
+        let status = output.status ?? -1
         return encodeRun(ok:!timedOut && status==0,stdout:outText,stderr:errText,result:result,message:timedOut ? "Python execution timed out after \(timeout) ms." : (status==0 ? "Python completed." : "Python exited with status \(status)."),duration:ms,actions:actions)
     }
 

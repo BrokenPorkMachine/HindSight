@@ -24,6 +24,11 @@ fn main(){
  run(Command::new(env::var("AR").unwrap_or_else(|_|"ar".into())).arg("crs").arg(out.join("libre_macho.a")).arg(out.join("inspect.o")).arg(out.join("capture.o")).arg(out.join("decode.o")).arg(out.join("llvm_decode.o")));
  println!("cargo:rustc-link-search=native={}",out.display());println!("cargo:rustc-link-lib=static=re_macho");
  if !apple{println!("cargo:rustc-link-lib=crypto");println!("cargo:rustc-link-lib=dl");}
+ // Link Objective-C runtime for in-worker dyld/dlfcn Objective-C extraction.
+ if apple{
+   println!("cargo:rustc-link-lib=framework=Foundation");
+   println!("cargo:rustc-link-lib=dylib=objc");
+ }
  println!("cargo:rerun-if-env-changed=CC");println!("cargo:rerun-if-env-changed=AR");
  println!("cargo:rerun-if-env-changed=SDKROOT");println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
 }

@@ -42,6 +42,9 @@ pub struct ClassLayout {
     pub methods: Vec<MethodLayout>,
     pub ivars_complete: bool,
     pub properties_complete: bool,
+    /// True when libobjc realized this layout at analysis time instead of the
+    /// worker decoding the captured image's `__objc_*` metadata.
+    pub runtime: bool,
 }
 
 pub fn identifier(value: &str) -> bool {
@@ -136,7 +139,7 @@ mod tests {
     fn member_recovery_rejects_wrong_width_bank_interior_and_overlapping_fields() {
         let field = IvarLayout { record: 0x2000, offset_pointer: 0x3000, name: "_weight".into(), encoding: "d".into(), offset: 8, size: 8, alignment: 8 };
         let mut class = ClassLayout { address: 0x1000, name: "Widget".into(), instance_start: 8, instance_size: 16,
-            ivars: vec![field.clone()], properties: vec![], methods:vec![], ivars_complete:true, properties_complete:true };
+            ivars: vec![field.clone()], properties: vec![], methods:vec![], ivars_complete:true, properties_complete:true, runtime:false };
         assert!(class.member(8, 8, true).is_some());
         for (offset, width, floating) in [(8, 4, true), (8, 8, false), (12, 4, true), (16, 8, true)] {
             assert!(class.member(offset, width, floating).is_none());

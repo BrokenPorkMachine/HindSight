@@ -33,6 +33,7 @@
     "Config/App-Info.plist",
     "Config/Coordinator-Info.plist",
     "Config/Coordinator.entitlements",
+    "PlatformServices/CoordinatorService/BoundedProcessRunner.swift",
     "PlatformServices/CoordinatorService/DebugServer.swift",
     "PlatformServices/CoordinatorService/FirmwareRuntimeHost.swift",
     "PlatformServices/CoordinatorService/ProjectStore.swift",
@@ -135,10 +136,11 @@
       "native/macho/decode.c",
       "native/virtualization/hv_vm.c",
       "native/terminal/terminal_pty.c",
+      "PlatformServices/CoordinatorService/BoundedProcessRunner.swift",
       "Shared/ReconstructionArtifact.swift",
       "Shared/DarwinSDKDeclarations.swift"
     ]
   },
   "embedded_service": "ca.zensoftware.VectorGlass.CoordinatorService",
-  "project_sha256": "ead3cd1eabefbacec6ee08491b8d30b0bb7a0e1d5d37a87b3daed47e9c08ff4a"
+  "project_sha256": "f305571d7d528452abe5e59888c869a1616c99425be1521b8af90fe884ea3927"
 }

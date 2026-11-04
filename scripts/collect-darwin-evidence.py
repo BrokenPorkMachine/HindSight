@@ -21,13 +21,19 @@ def compile_helper(output, extra_sources=()):
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
 
 
-def collect(helper, classes, symbols):
+def collect(helper, classes, symbols, image=None):
     if len(classes) > 32 or len(symbols) > 128:
         raise ValueError("native catalog request exceeds class/symbol budget")
     for name in classes + symbols:
         if not name or len(name.encode()) > 1024 or any(ord(ch) < 32 for ch in name):
             raise ValueError("invalid native catalog name")
+    if image is not None and (not image or len(image.encode()) > 4096 or any(ord(ch) < 32 for ch in image)):
+        raise ValueError("invalid native catalog image path")
     command = [str(helper)]
+    if image is not None:
+        command.extend(["--image", image])
+        if not classes and not symbols:
+            command.append("--all-classes")
     for name in classes:
         command.extend(["--class", name])
     for name in symbols:
@@ -48,14 +54,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--class", dest="classes", action="append")
     parser.add_argument("--symbol", dest="symbols", action="append")
+    parser.add_argument("--image", dest="image", default=None)
+    parser.add_argument("--target", dest="image", default=None)
+    parser.add_argument("--load", dest="image", default=None)
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("Darwin native catalog collection requires macOS")
     with tempfile.TemporaryDirectory(prefix="hindsight-darwin-catalog-") as directory:
         helper = pathlib.Path(directory) / "catalog"
         compile_helper(helper)
-        document = collect(helper, args.classes or ["NSObject", "NSString", "NSNumber"],
-                           args.symbols or ["malloc", "objc_msgSend", "_dyld_image_count"])
+        document = collect(helper, args.classes or (["NSObject", "NSString", "NSNumber"] if args.image is None else []),
+                           args.symbols or (["malloc", "objc_msgSend", "_dyld_image_count"] if args.image is None else []),
+                           image=args.image)
         print(json.dumps(document, sort_keys=True, indent=2))
 
 

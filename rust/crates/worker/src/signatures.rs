@@ -139,7 +139,7 @@ fn objc_signature_candidates(records:&str)->Vec<(u64,(String,Signature))>{
 }
 
 fn parse_prototype_database(contents: &str, source_sha256: &str) -> Result<BTreeMap<String,Signature>, &'static str> {
-    if contents.len()>4*1024*1024||contents.lines().count()>20_000{return Err("External prototype catalog exceeds byte/record budget")}
+    if contents.len()>12*1024*1024||contents.lines().count()>20_000{return Err("External prototype catalog exceeds byte/record budget")}
     let mut bound=false;let mut saw_declaration=false;let mut metadata=BTreeMap::<&str,&str>::new();let mut result=BTreeMap::new();
     for line in contents.lines() {
         if let Some(expected)=line.strip_prefix("# source_sha256="){
@@ -220,8 +220,54 @@ fn valid_apple_sdk_target(target: &str, sdk_path: &str) -> bool {
 pub fn external_prototype_database(source_sha256:&str)->io::Result<BTreeMap<String,Signature>>{
     let Some(path)=std::env::var_os("HINDSIGHT_PROTOTYPE_DB")else{return Ok(BTreeMap::new())};let path=std::path::PathBuf::from(path);
     if !path.is_absolute()||path.to_string_lossy().len()>16*1024{return Err(io::Error::new(io::ErrorKind::InvalidInput,"HINDSIGHT_PROTOTYPE_DB must be an absolute path"))}
-    let mut contents=String::new();std::fs::File::open(path)?.take(4*1024*1024+1).read_to_string(&mut contents)?;
+    let mut contents=String::new();std::fs::File::open(path)?.take(12*1024*1024+1).read_to_string(&mut contents)?;
+    if contents.len()>12*1024*1024{return Err(io::Error::new(io::ErrorKind::InvalidData,"External prototype catalog exceeds byte budget"))}
     parse_prototype_database(&contents,source_sha256).map_err(|message|io::Error::new(io::ErrorKind::InvalidData,message))
+}
+
+/// Read project type dependencies embedded in the same source-bound request
+/// catalog as external prototypes. These declarations are presentation/source
+/// dependencies only; no ABI layout is inferred from their spelling.
+pub fn external_project_type_dependencies(source_sha256: &str, architecture: &str) -> io::Result<Vec<crate::reconstruction::ProjectTypeDependency>> {
+    let Some(path)=std::env::var_os("HINDSIGHT_PROTOTYPE_DB") else { return Ok(Vec::new()) };
+    let path=std::path::PathBuf::from(path);
+    if !path.is_absolute()||path.to_string_lossy().len()>16*1024 { return Err(io::Error::new(io::ErrorKind::InvalidInput,"HINDSIGHT_PROTOTYPE_DB must be an absolute path")) }
+    let mut contents=String::new();
+    std::fs::File::open(path)?.take(12*1024*1024+1).read_to_string(&mut contents)?;
+    if contents.len()>12*1024*1024 { return Err(io::Error::new(io::ErrorKind::InvalidData,"Project type catalog exceeds byte budget")) }
+    let compatible_architecture = |target: &str| {
+        let target_arch = target.split('-').next().unwrap_or("");
+        match architecture { "arm64" => matches!(target_arch,"arm64"|"aarch64"), "arm64e" => matches!(target_arch,"arm64"|"arm64e"|"aarch64"), _ => false }
+    };
+    let mut result = BTreeMap::<String, crate::reconstruction::ProjectTypeDependency>::new();
+    for line in contents.lines().filter_map(|line| line.strip_prefix("# project_type\t")) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len()!=4 { return Err(io::Error::new(io::ErrorKind::InvalidData,"Malformed project type catalog record")) }
+        let (record_digest,target,name,encoded)=(fields[0],fields[1],fields[2],fields[3]);
+        if record_digest!=source_sha256||target.len()>128||!target.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b'.'|b'-'))||!compatible_architecture(target)
+            ||name.is_empty()||name.len()>256||!name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')
+            ||encoded.is_empty()||encoded.len()>32*1024||encoded.len()%2!=0||!encoded.bytes().all(|b|b.is_ascii_hexdigit()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,"Invalid project type catalog identity or bounds"))
+        }
+        let bytes: Result<Vec<u8>,_> = encoded.as_bytes().chunks_exact(2).map(|pair| {
+            let digit=|b:u8| match b { b'0'..=b'9'=>Some(b-b'0'),b'a'..=b'f'=>Some(b-b'a'+10),b'A'..=b'F'=>Some(b-b'A'+10),_=>None };
+            Some(digit(pair[0])?*16+digit(pair[1])?)
+        }).collect::<Option<Vec<_>>>().ok_or(());
+        let declaration=String::from_utf8(bytes.map_err(|_|io::Error::new(io::ErrorKind::InvalidData,"Invalid project type hex encoding"))?)
+            .map_err(|_|io::Error::new(io::ErrorKind::InvalidData,"Project type declaration is not UTF-8"))?;
+        if declaration.len()>16*1024||!declaration.is_ascii()||!declaration.trim_end().ends_with(';')
+            ||!(["typedef ","struct ","union ","enum "].iter().any(|prefix|declaration.trim_start().starts_with(prefix)))
+            ||declaration.chars().any(|ch|ch.is_control()&&!matches!(ch,'\n'|'\t')||matches!(ch,'#'|'\\'|'"'|'\''))
+            ||!declaration.split(|character: char| !character.is_ascii_alphanumeric() && character!='_').any(|token|token==name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,"Unsafe or mismatched project type declaration"))
+        }
+        let dependency=crate::reconstruction::ProjectTypeDependency{name:name.into(),declaration,target:target.into(),source_sha256:record_digest.into()};
+        if result.get(name).is_some_and(|old|old.declaration!=dependency.declaration) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,"Conflicting project type declarations reached the worker"))
+        }
+        result.insert(name.into(),dependency);
+    }
+    Ok(result.into_values().collect())
 }
 
 fn clean(text: &str) -> bool {
@@ -391,12 +437,18 @@ fn objc_value_type(encoding: &str) -> Option<String> {
 fn object_declarations(layouts: &[super::objc::ClassLayout]) -> String {
     let mut output = String::new();
     for layout in layouts.iter().take(64).filter(|layout|super::objc::identifier(&layout.name)) {
-        let mut declaration = format!("// target class metadata={:#x}; static instance size={} bytes\n@interface {} {{\n", layout.address, layout.instance_size, layout.name);
+        let source = if layout.runtime { "libobjc-runtime (target initializers executed)" } else { "macho-objc-metadata" };
+        let mut declaration = format!("// target class metadata={:#x}; layout source={source}; instance size={} bytes\n@interface {} {{\n", layout.address, layout.instance_size, layout.name);
         if !layout.ivars_complete||!layout.properties_complete{declaration.push_str("    /* partial member metadata; missing members/layout remain unresolved */\n")}
         for ivar in &layout.ivars {
             let Some(ty) = objc_value_type(&ivar.encoding) else { continue };
-            declaration.push_str(&format!("    {ty} {}; /* ivar={:#x}; offset_slot={:#x}; declared_offset={:#x}; size={}; alignment={} */\n",
-                ivar.name, ivar.record, ivar.offset_pointer, ivar.offset, ivar.size, ivar.alignment));
+            if layout.runtime {
+                declaration.push_str(&format!("    {ty} {}; /* runtime ivar; offset={:#x}; size={}; alignment={} */\n",
+                    ivar.name, ivar.offset, ivar.size, ivar.alignment));
+            } else {
+                declaration.push_str(&format!("    {ty} {}; /* ivar={:#x}; offset_slot={:#x}; declared_offset={:#x}; size={}; alignment={} */\n",
+                    ivar.name, ivar.record, ivar.offset_pointer, ivar.offset, ivar.size, ivar.alignment));
+            }
         }
         declaration.push_str("}\n");
         for property in &layout.properties {
@@ -408,8 +460,9 @@ fn object_declarations(layouts: &[super::objc::ClassLayout]) -> String {
             if property.getter != property.name { attributes.push(format!("getter={}",property.getter)); }
             if let Some(setter) = &property.setter { attributes.push(format!("setter={setter}")); }
             let attributes = if attributes.is_empty() { String::new() } else { format!("({}) ",attributes.join(", ")) };
-            declaration.push_str(&format!("@property {attributes}{ty} {}; /* property={:#x}; backing_ivar={} */\n",
-                property.name,property.record,property.ivar.as_deref().unwrap_or("unresolved")));
+            let note=if layout.runtime { "runtime property".to_owned() } else { format!("property={:#x}",property.record) };
+            declaration.push_str(&format!("@property {attributes}{ty} {}; /* {note}; backing_ivar={} */\n",
+                property.name,property.ivar.as_deref().unwrap_or("unresolved")));
         }
         declaration.push_str("@end\n\n");
         if output.len()+declaration.len()>12_000 { break; }
@@ -2093,7 +2146,7 @@ fn recover_internal(
         ClassLayout { address:0x2000,name:"Widget".into(),instance_start:8,instance_size:16,
             ivars:vec![IvarLayout{record:0x3000,offset_pointer:0x4000,name:"x0".into(),encoding:"q".into(),offset:8,size:8,alignment:8}],
             properties:vec![PropertyLayout::parse(0x5000,"label".into(),"T@\"NSString\",R".into()).unwrap()],
-            methods:vec![MethodLayout{implementation:0x1000,class_method:false}],ivars_complete:true,properties_complete:true }
+            methods:vec![MethodLayout{implementation:0x1000,class_method:false}],ivars_complete:true,properties_complete:true,runtime:false }
     }
 
     #[test] fn property_types_refine_only_unambiguous_generic_id_accessors() {
@@ -2222,7 +2275,7 @@ fn recover_internal(
     #[test] fn objc_review_headers_require_one_owner_and_keep_conflicts_unresolved() {
         let layout=crate::objc::ClassLayout{address:0x2000,name:"Widget".into(),instance_start:8,instance_size:8,
             ivars:vec![],properties:vec![],methods:vec![crate::objc::MethodLayout{implementation:0x1000,class_method:false}],
-            ivars_complete:true,properties_complete:true};
+            ivars_complete:true,properties_complete:true,runtime:false};
         let records=" instance method 0x3000 name=run types=v16@0:8 imp=0x1000 resolved=-[Widget run] confidence=validated\n";
         let header=objc_header_for_imp(0x1000,records,std::slice::from_ref(&layout)).unwrap();
         assert!(header.contains("@interface Widget")&&header.contains("- (void)run;"));

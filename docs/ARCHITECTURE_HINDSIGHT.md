@@ -22,6 +22,25 @@ CoordinatorService.xpc
 
 The app owns presentation and investigation state. The coordinator owns bounded execution, subprocess lifecycle, trust decisions, and OS services. Heavy parsers and engines stay outside the SwiftUI process.
 
+## Dispatch ownership
+
+| Component | Execution context |
+| --- | --- |
+| Presentation and XPC completion delivery | Main actor |
+| Project store, analysis worker supervision, page cache, SDK lookup bookkeeping | Coordinator serial queue |
+| Native debugger | Dedicated debugger serial queue |
+| Hypervisor state and commands | Dedicated virtualization serial queue |
+| Terminal lifecycle, input, resize, polling | Dedicated terminal serial queue |
+| Scripts, plugin execution and discovery | Bounded scripting lane (four active jobs) |
+| Firmware tools and emulator control | Bounded firmware lane (one active job) |
+| REA requests | Bounded REA lane (one active job); cancellation/progress use the host lock |
+
+Keep each host's teardown on its owning queue. Do not synchronously dispatch between these queues. Capture project paths on the coordinator queue before submitting plugin work. Resource-admission retries must respect the pending-job cap; cancelled dispatched jobs must check their generation before starting work.
+
+Python and firmware command execution uses `BoundedProcessRunner` on worker lanes. Nonblocking stdin/stdout/stderr share an execution deadline, output storage is capped, and completion does not wait for pipe EOF from descendants. Terminal input has a 250 ms overall write budget; shutdown gives a shell 250 ms to exit before SIGKILL. Debugger and terminal status polls allow only one outstanding request each and do not invalidate unrelated XPC work on a poll timeout.
+
+Run `bash scripts/test-process-dispatch.sh` for queue admission/cancellation, subprocess backpressure/inherited-pipe, and terminal shutdown regression tests. The macOS test gate includes these contracts.
+
 ## Major subsystems
 
 ### Investigation shell
