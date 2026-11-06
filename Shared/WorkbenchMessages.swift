@@ -1,4 +1,27 @@
 import Foundation
+import CryptoKit
+/// Platform-specific indicators for workspaces.
+enum VGWorkspacePlatform: String, CaseIterable {
+    case apple = "Machine Lab"
+    case ecu = "Ecu Platform"
+}
+
+enum VGArtifactProfile: String, Codable, CaseIterable {
+    case apple
+    case ecu
+    case generic
+
+    static func derive(from record: ProjectRecord?) -> VGArtifactProfile {
+        guard let record else { return .generic }
+        let options = record.result.import_options
+        if options?.format == "ecu" || options?.architecture == "c167"
+            || record.result.architecture.localizedCaseInsensitiveContains("C167")
+            || record.result.file_kind.localizedCaseInsensitiveContains("ecu") { return .ecu }
+        if record.result.file_kind.localizedCaseInsensitiveContains("mach-o") { return .apple }
+        return .generic
+    }
+}
+
 /// Persisted import interpretation, included in page and analysis cache identity.
 struct BinaryImportOptions: Codable, Equatable {
     var format: String = "auto"
@@ -6,14 +29,14 @@ struct BinaryImportOptions: Codable, Equatable {
     var load_address: String = "0"
     var file_offset: String = "0"
     static let automatic = BinaryImportOptions()
-    static let analysisRevision = "prototype-abi-v37"
+    static let analysisRevision = "prototype-abi-v38"
     private static func number(_ text: String) -> UInt64? {
         if text.hasPrefix("0x") { return UInt64(text.dropFirst(2), radix: 16) }
         return UInt64(text)
     }
     var validated: BinaryImportOptions? {
-        guard ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"].contains(format),
-              ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"].contains(architecture),
+        guard ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw", "ecu"].contains(format),
+              ["auto", "aarch64", "i386", "x86_64", "arm", "thumb", "c167"].contains(architecture),
               let address = Self.number(load_address), let offset = Self.number(file_offset),
               offset < 8_589_934_592 else { return nil }
         return BinaryImportOptions(format: format, architecture: architecture,
@@ -49,14 +72,93 @@ struct ProjectRecord: Codable, Identifiable {
     var revision: Int
 }
 
+struct ProjectTypeLayoutField: Codable, Equatable {
+    let name: String
+    let declaration: String
+    let offsetBits: Int
+    let bitWidth: Int?
+
+    private enum CodingKeys: String, CodingKey { case name, declaration, offsetBits, bitWidth }
+}
+
+struct ProjectTypeLayoutRecord: Codable, Equatable {
+    let name: String
+    let kind: String
+    let size: Int
+    let alignment: Int
+    let fields: [ProjectTypeLayoutField]
+    let fieldOffsetsComplete: Bool
+}
+
+struct ProjectTypeLayoutEvidence: Codable, Equatable {
+    let schema: Int
+    let producer: String
+    let sdk: String
+    let sdkPath: String
+    let sdkBuild: String
+    let target: String
+    let compiler: String
+    let declarationsSHA256: String
+    let record: ProjectTypeLayoutRecord
+
+    private enum CodingKeys: String, CodingKey {
+        case schema, producer, sdk, sdkPath, sdkBuild, target, compiler, declarationsSHA256, record
+    }
+
+    func validated(for candidate: ProjectTypeCandidate) -> Bool {
+        let digest = SHA256.hash(data: Data(candidate.declaration.utf8)).map { String(format: "%02x", $0) }.joined()
+        let simulator = target.hasSuffix("-simulator")
+        let ios = target.contains("-apple-ios")
+        let sdkMatches = ios ? (simulator ? sdk == "iphonesimulator" : sdk == "iphoneos") : sdk == "macosx"
+        let sdkLeaf = URL(fileURLWithPath: sdkPath).lastPathComponent
+        let sdkDirectoryMatches: Bool
+        switch sdk {
+        case "macosx": sdkDirectoryMatches = sdkLeaf.hasPrefix("MacOSX") && sdkLeaf.hasSuffix(".sdk")
+        case "iphoneos": sdkDirectoryMatches = sdkLeaf.hasPrefix("iPhoneOS") && sdkLeaf.hasSuffix(".sdk")
+        default: sdkDirectoryMatches = sdkLeaf.hasPrefix("iPhoneSimulator") && sdkLeaf.hasSuffix(".sdk")
+        }
+        let tripleValid = target.range(of: #"^(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-simulator)?$"#,
+                                       options: .regularExpression) != nil
+        let safeMetadata: (String, Int) -> Bool = { value, limit in
+            !value.isEmpty && value.utf8.count <= limit
+                && !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+        }
+        let powerOfTwo = record.alignment > 0 && (record.alignment & (record.alignment - 1)) == 0
+        let (recordBits, overflow) = record.size.multipliedReportingOverflow(by: 8)
+        guard schema == 1, producer == "hindsight-apple-clang-record-layout-v1",
+              ["macosx", "iphoneos", "iphonesimulator"].contains(sdk),
+              sdkPath.hasPrefix("/"), safeMetadata(sdkPath, 4096), sdkDirectoryMatches,
+              sdkBuild.range(of: #"^[A-Za-z0-9_.-]{1,128}$"#, options: .regularExpression) != nil,
+              target == candidate.target, tripleValid, sdkMatches,
+              compiler.hasPrefix("Apple clang version"), safeMetadata(compiler, 512),
+              declarationsSHA256 == digest, record.name == candidate.name,
+              ["struct", "union"].contains(record.kind), record.size > 0, record.size <= 1_048_576,
+              powerOfTwo, !overflow, record.fieldOffsetsComplete, record.fields.count <= 1024,
+              Set(record.fields.map(\.name)).count == record.fields.count else { return false }
+        for field in record.fields {
+            guard field.name.range(of: #"^[A-Za-z_][A-Za-z0-9_]{0,127}$"#, options: .regularExpression) != nil,
+                  safeMetadata(field.declaration, 512), field.offsetBits >= 0, field.offsetBits < recordBits else { return false }
+            if let width = field.bitWidth, width <= 0 || width > recordBits - field.offsetBits { return false }
+        }
+        return true
+    }
+}
+
 struct ProjectTypeCandidate: Codable, Equatable, Identifiable {
     let name: String
     let declaration: String
     let target: String
     let source: String
     let sourceSHA256: String
+    var layoutEvidence: ProjectTypeLayoutEvidence? = nil
     var id: String {
-        [name, declaration, target, source, sourceSHA256].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        let base = [name, declaration, target, source, sourceSHA256].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        guard let layoutEvidence else { return base }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(layoutEvidence) else { return base }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return base + "|layout:\(digest)"
     }
 
     var validated: ProjectTypeCandidate? {
@@ -71,7 +173,12 @@ struct ProjectTypeCandidate: Codable, Equatable, Identifiable {
             && !declaration.unicodeScalars.contains(where: {
                 CharacterSet.controlCharacters.contains($0) && $0.value != 0x0a && $0.value != 0x09
             }) && Self.isTypeDeclaration(declaration)
-        return identifier && targetValid && sourceValid && digestValid && declarationValid ? self : nil
+        let layoutValid = layoutEvidence.map { evidence in
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return evidence.validated(for: self) && ((try? encoder.encode(evidence).count).map { $0 <= 256 * 1024 } ?? false)
+        } ?? true
+        return identifier && targetValid && sourceValid && digestValid && declarationValid && layoutValid ? self : nil
     }
 
     private static func isTypeDeclaration(_ declaration: String) -> Bool {
@@ -113,7 +220,8 @@ struct ProjectTypeCatalog: Codable {
         let matching = target.map { value in candidates.filter { $0.target == value } } ?? candidates
         let declarations = Dictionary(grouping: matching, by: { "\($0.name)|\($0.target)" })
         return Set(declarations.values.compactMap { rows -> String? in
-            guard Set(rows.map { $0.declaration }).count > 1 else { return nil }
+            let distinctLayouts = Set(rows.compactMap { Self.layoutFactIdentity($0.layoutEvidence) })
+            guard Set(rows.map { $0.declaration }).count > 1 || distinctLayouts.count > 1 else { return nil }
             return rows.first?.name
         })
     }
@@ -139,8 +247,40 @@ struct ProjectTypeCatalog: Codable {
         }
         let grouped = Dictionary(grouping: eligible, by: \.name)
         return grouped.keys.sorted().compactMap { name in
-            guard let rows = grouped[name], Set(rows.map(\.declaration)).count == 1 else { return nil }
-            return rows.first
+            guard let rows = grouped[name], Set(rows.map(\.declaration)).count == 1,
+                  Set(rows.compactMap({ Self.layoutFactIdentity($0.layoutEvidence) })).count <= 1 else { return nil }
+            return rows.sorted { left, right in
+                if (left.layoutEvidence != nil) != (right.layoutEvidence != nil) { return left.layoutEvidence != nil }
+                return left.id < right.id
+            }.first
+        }
+    }
+
+    private static func layoutFactIdentity(_ evidence: ProjectTypeLayoutEvidence?) -> String? {
+        guard let evidence else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(evidence.record) else { return "invalid-layout" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Candidates portable to a selected captured image. The source digest is
+    /// exact; architecture aliases are normalized while the candidate's full
+    /// target triple remains intact for later ABI matching.
+    func candidates(sourceSHA256: String, architecture: String) -> [ProjectTypeCandidate] {
+        guard validated() != nil else { return [] }
+        func normalizedArchitecture(_ value: String) -> String {
+            let token = value.split(separator: "-", maxSplits: 1).first.map(String.init)?.lowercased() ?? ""
+            switch token {
+            case "aarch64", "arm64e": return "arm64"
+            case "i686": return "i386"
+            default: return token
+            }
+        }
+        let wantedArchitecture = normalizedArchitecture(architecture)
+        guard !wantedArchitecture.isEmpty else { return [] }
+        return candidates.filter {
+            $0.sourceSHA256 == sourceSHA256 && normalizedArchitecture($0.target) == wantedArchitecture
         }
     }
 
@@ -150,7 +290,8 @@ struct ProjectTypeCatalog: Codable {
               Set(candidates.map { $0.id }).count == candidates.count else { return nil }
         let estimatedBytes = candidates.reduce(0) {
             $0 + $1.name.utf8.count + $1.declaration.utf8.count + $1.target.utf8.count
-                + $1.source.utf8.count + $1.sourceSHA256.utf8.count + 256
+                + $1.source.utf8.count + $1.sourceSHA256.utf8.count
+                + ((try? JSONEncoder().encode($1.layoutEvidence).count) ?? 0) + 256
         }
         guard estimatedBytes <= 4 * 1024 * 1024 else { return nil }
         return self
@@ -170,6 +311,52 @@ struct ProjectTypeCatalogReply: Codable {
         return text
     }
 }
+
+struct FunctionNameExchange: Decodable {
+    struct Function: Decodable {
+        let offset: String
+        let name: String
+        let provenance: String
+    }
+    let schema: String
+    let address_space: String
+    let source_sha256: String
+    let source_image_base: String
+    let producer: String
+    let functions: [Function]
+
+    func resolved(sourceSHA256: String, knownStarts: Set<UInt64>) -> (matches: [(UInt64, String, String)], unmatched: Int)? {
+        guard schema == "hindsight.functions.v1", address_space == "image-relative",
+              source_sha256.lowercased() == sourceSHA256.lowercased(),
+              source_sha256.count == 64, source_sha256.allSatisfy({ $0.isHexDigit }),
+              let base = Self.address(source_image_base),
+              !producer.isEmpty, producer.utf8.count <= 256,
+              !producer.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              functions.count <= 20_000 else { return nil }
+        var seen = Set<UInt64>()
+        var matches: [(UInt64, String, String)] = []
+        var unmatched = 0
+        for function in functions {
+            guard let offset = Self.address(function.offset), offset <= UInt64.max - base,
+                  function.name.utf8.count <= 128, !function.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  function.provenance.utf8.count <= 512,
+                  !function.name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                  !function.provenance.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
+            let address = base + offset
+            guard seen.insert(address).inserted else { return nil }
+            if knownStarts.contains(address) { matches.append((address, function.name, function.provenance)) }
+            else { unmatched += 1 }
+        }
+        return (matches, unmatched)
+    }
+
+    private static func address(_ text: String) -> UInt64? {
+        guard text.hasPrefix("0x"), (3...18).contains(text.count),
+              text.dropFirst(2).allSatisfy({ $0.isHexDigit }) else { return nil }
+        return UInt64(text.dropFirst(2), radix: 16)
+    }
+}
+
 /// Versioned project boundary shared by the app, Coordinator and remote API.
 ///
 /// Older coordinators emitted only `path` and `records`; decoding those
@@ -529,6 +716,69 @@ struct AnalysisReply: Codable, Sendable {
                 return "{\"ok\":false,\"message\":\"Analysis reply exceeds the bounded XPC transport limit.\"}"
             }
             return String(decoding: fallbackData, as: UTF8.self)
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+struct C167EmulationFlags: Codable, Sendable, Hashable {
+    let carry: Bool
+    let zero: Bool
+    let negative: Bool
+    let overflow: Bool
+}
+
+struct C167EmulationTrace: Codable, Sendable, Hashable, Identifiable {
+    let pc: UInt64
+    let bytes: String
+    let text: String
+    var id: String { "\(pc):\(bytes)" }
+}
+
+struct C167EmulationResult: Codable, Sendable {
+    let `protocol`: Int
+    let kind: String
+    let request_id: String
+    let pc: UInt64
+    let sp: UInt64
+    let cp: UInt16
+    let csp: UInt8
+    let mdh: UInt16
+    let mdl: UInt16
+    let steps: UInt64
+    let stop: String
+    let flags: C167EmulationFlags
+    let registers: [String: UInt16]
+    let dpp: [String: UInt16]
+    let ram_seed_bytes: Int
+    let ram_write_bytes: Int
+    let ram_truncated: Bool
+    let ram: [String: UInt8]
+    let trace: [C167EmulationTrace]
+
+    func validated(requestID: String) -> C167EmulationResult? {
+        guard `protocol` == 1, kind == "c167_emulation_result", request_id == requestID,
+              pc <= 0x00ff_ffff, sp <= 0x1_0000, cp & 0x03ff == 0, steps <= 1_000_000,
+              registers.count == 16, dpp.count == 4, ram_seed_bytes <= 4096,
+              ram_write_bytes <= 2 * 1024 * 1024, ram.count <= 256, trace.count <= 4096,
+              registers.keys.allSatisfy({ key in
+                  key.first == "r" && Int(key.dropFirst()).map { (0..<16).contains($0) } == true
+              }), dpp.allSatisfy({ key, value in
+                  key.hasPrefix("dpp") && Int(key.dropFirst(3)).map { (0..<4).contains($0) } == true && value <= 0x03ff
+              }), ram.keys.allSatisfy({ key in key.count == 6 && UInt32(key, radix: 16) != nil }),
+              trace.allSatisfy({ $0.pc <= 0x00ff_ffff && $0.bytes.utf8.count <= 8 && $0.text.utf8.count <= 256 }) else { return nil }
+        return self
+    }
+}
+
+struct C167EmulationReply: Codable, Sendable {
+    let ok: Bool
+    let message: String
+    let result: C167EmulationResult?
+    static func encode(result: C167EmulationResult? = nil, error: String = "") -> String {
+        let value = C167EmulationReply(ok: result != nil, message: result == nil ? error : "Bounded C167 execution completed.", result: result)
+        guard let data = try? JSONEncoder().encode(value), data.count <= WorkbenchProtocolLimits.defaultXPCReplyBytes else {
+            return "{\"ok\":false,\"message\":\"C167 emulator reply encoding failed.\",\"result\":null}"
         }
         return String(decoding: data, as: UTF8.self)
     }

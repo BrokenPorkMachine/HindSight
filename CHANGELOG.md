@@ -1,3 +1,14 @@
+# Unreleased — ECU firmware support (Infineon C167 / ME7-class)
+
+- Add the `ecu` import format: validates ME7-class ECU flash dumps through their C167 trap/interrupt vector table (consecutive `JMPA` instructions at offset 0), 256 KiB–2 MiB size classes, and tail-padding notes; actionable rejections for non-ME7 input.
+- Add the native Infineon C167 (C166 core) architecture and instruction decoder: 2/4-byte forms, in-segment wrapped relative targets, far `seg:caddr` transfers, undefined opcodes and reserved-field violations as barriers. Encoding facts follow the Infineon C166 Instruction Set Manual V2.0 (2001); the form table is ported with attribution from the Apache-2.0 `therudywolf/MS4X` reference. LLVM has no C16x target, so no LLVM dependency is introduced.
+- Add bounded ME7 region analysis: vector inventory, checksum descriptor verification at offset 0x1F810 (word sums with inverted copies; INVALID entries report computed values), checksummed region candidates and identifier candidates, emitted through the existing Metadata evidence source.
+- Correct ME7 checksum descriptors to treat their end address as inclusive across worker analysis and staged UI repairs; add a bounded full-corpus worker parity gate.
+- Add bounded exact-byte discovery for the ME7 multipoint-checksum code signature and candidate containing-function boundary, independently cross-checked by the corpus gate.
+- Extend the bounded C167 execution core with indirect/post-increment short ALU operands, exact-count `EXTP` page overrides, all `CMPI1/CMPI2/CMPD1/CMPD2` forms, and segmented `CALLS`/`RETS` stack behavior; publish CSP beside the existing register and trace state. Correct long direct register operands (`F2`/`F3`/`F6`/`F7`) so the decoder and executor agree on C166 `RR` selectors. The representative Volvo checksum primitive now executes its inner checksum loop instead of stopping at its loop-control instruction. Explicit bounded physical RAM seed spans now overlay private RAM and never mutate captured flash; their seed/write accounting and preview cross the worker, coordinator, and UI boundary. Descriptor-driven checksum-routine state construction and corpus-wide dynamic parity remain future work.
+- Expose ECU firmware (ME7-class) and Infineon C167 in the import dialog and validated import options. Existing Mach-O/raw behavior and the analysis report schema are unchanged.
+- Plan for the task-tailored layout (artifact profiles gate the toolset per loaded record) and the remaining ECU phases: docs/ECU_FIRMWARE_SUPPORT_PLAN.md.
+
 # 0.5.15 — C/Objective-C reconstruction and binary patching
 
 - Improve typed call and tail-call pseudocode, scalar/aggregate results, hidden result buffers, and proven integer/FP stack arguments, including paired stores and temporary SP copies.

@@ -1,6 +1,7 @@
 """Qualify real Apple runtime metadata and compiler declarations on macOS."""
 
 import importlib.util
+import hashlib
 from pathlib import Path
 import sys
 import struct
@@ -171,6 +172,67 @@ class DarwinCatalogTests(unittest.TestCase):
         self.assertEqual(types["CGRect"]["fields"][1]["offset"], 16)
         self.assertEqual(types["mach_msg_header_t"]["size"], 24)
         self.assertFalse(self.catalog["truncated"])
+
+    def test_clang_record_layouts_are_bound_to_declarations_and_target(self):
+        declarations = "struct HSLayoutProbe { char tag; long double value; int code; unsigned flags:3; };"
+        arm = SDK.collect_record_layouts(declarations, ["HSLayoutProbe"])
+        x86 = SDK.collect_record_layouts(declarations, ["HSLayoutProbe"], target="x86_64-apple-macos14.0")
+        arm_record, x86_record = arm["records"][0], x86["records"][0]
+        self.assertEqual(arm["producer"], "hindsight-apple-clang-record-layout-v1")
+        self.assertEqual(arm_record["kind"], "struct")
+        self.assertEqual(arm["declarations_sha256"], hashlib.sha256(declarations.encode()).hexdigest())
+        self.assertEqual(arm_record["fields"][0]["offset_bits"], 0)
+        self.assertEqual(arm_record["fields"][1]["offset_bits"], 64)
+        self.assertEqual(arm_record["fields"][3]["bit_width"], 3)
+        self.assertEqual(x86_record["fields"][1]["offset_bits"], 128)
+        self.assertGreater(x86_record["alignment"], arm_record["alignment"])
+        with tempfile.TemporaryDirectory(prefix="hindsight-layout-cli-") as directory:
+            source = Path(directory) / "types.h"
+            source.write_text(declarations)
+            command = [sys.executable, str(ROOT / "scripts/collect-darwin-record-layouts.py"), str(source), "--record", "HSLayoutProbe"]
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
+            cli = json.loads(result.stdout)
+            self.assertEqual(cli["declarations_sha256"], arm["declarations_sha256"])
+            self.assertEqual(cli["records"], arm["records"])
+            catalog_command = command + ["--project-source-sha256", "a" * 64]
+            catalog_result = subprocess.run(catalog_command, check=True, capture_output=True, text=True, timeout=60)
+            imported = json.loads(catalog_result.stdout)
+            self.assertEqual(imported["candidates"][0]["sourceSHA256"], "a" * 64)
+            self.assertEqual(imported["candidates"][0]["layoutEvidence"]["record"]["size"], arm_record["size"])
+        with self.assertRaisesRegex(ValueError, "did not emit complete layouts"):
+            SDK.collect_record_layouts(declarations, ["MissingLayout"])
+
+    def test_clang_parent_layout_excludes_nested_record_members(self):
+        declarations = (
+            "struct HSLayoutInner { int nested; }; "
+            "struct HSLayoutOuter { struct HSLayoutInner inner; int tail; };"
+        )
+        result = SDK.collect_record_layouts(declarations, ["HSLayoutOuter"])
+        fields = result["records"][0]["fields"]
+        self.assertEqual(
+            [(field["name"], field["declaration"], field["offset_bits"]) for field in fields],
+            [("inner", "struct HSLayoutInner inner", 0), ("tail", "int tail", 32)],
+        )
+        with tempfile.TemporaryDirectory(prefix="hindsight-nested-layout-cli-") as directory:
+            source = Path(directory) / "types.h"
+            source.write_text(declarations)
+            command = [sys.executable, str(ROOT / "scripts/collect-darwin-record-layouts.py"),
+                       str(source), "--record", "HSLayoutOuter", "--project-source-sha256", "a" * 64]
+            result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
+            catalog = json.loads(result.stdout)
+            candidate = catalog["candidates"][0]
+            self.assertEqual(candidate["name"], "HSLayoutOuter")
+            self.assertEqual(candidate["declaration"], declarations)
+            self.assertEqual([field["name"] for field in candidate["layoutEvidence"]["record"]["fields"]],
+                             ["inner", "tail"])
+
+    def test_clang_record_layout_request_rejects_ambiguous_or_unsafe_inputs(self):
+        with self.assertRaisesRegex(ValueError, "distinct C record names"):
+            SDK.collect_record_layouts("struct Point { int x; };", ["Point", "Point"])
+        with self.assertRaisesRegex(ValueError, "invalid Apple target"):
+            SDK.collect_record_layouts("struct Point { int x; };", ["Point"], target="arm64-unknown-linux")
+        with self.assertRaisesRegex(ValueError, "cannot safely identify a field"):
+            SDK.collect_record_layouts("struct Point { unsigned int : 3; int x; };", ["Point"])
 
     def test_clang_declaration_flows_to_source_bound_worker_prototype(self):
         record = self.declarations["functions"][0]

@@ -30,6 +30,7 @@ struct VGWorkspaceDescriptor: Identifiable, Hashable {
     let subtitle: String
     let keywords: [String]
     let sidebarPriority: Int?
+    var platforms: Set<VGWorkspacePlatform> = [.apple, .ecu]
 
     var id: String { name }
     var appearsInSidebar: Bool { sidebarPriority != nil }
@@ -54,7 +55,7 @@ struct VGWorkspaceDescriptor: Identifiable, Hashable {
 enum VGWorkspaceCatalog {
     static let descriptors: [VGWorkspaceDescriptor] = {
         var result: [VGWorkspaceDescriptor] = []
-        func add(_ group: VGWorkspaceGroup, _ names: [String], sidebar: [String], subtitle: String, icon: String, overrides: [String: (String, String)] = [:]) {
+        func add(_ group: VGWorkspaceGroup, _ names: [String], sidebar: [String], subtitle: String, icon: String, platforms: Set<VGWorkspacePlatform> = [.apple, .ecu], overrides: [String: (String, String)] = [:]) {
             for (index, name) in names.enumerated() {
                 let override = overrides[name]
                 result.append(VGWorkspaceDescriptor(
@@ -64,7 +65,8 @@ enum VGWorkspaceCatalog {
                     group: group,
                     subtitle: subtitle,
                     keywords: [group.rawValue, subtitle] + name.split(separator: " ").map(String.init),
-                    sidebarPriority: sidebar.firstIndex(of: name).map { $0 + (index * 0) }
+                    sidebarPriority: sidebar.firstIndex(of: name).map { $0 + (index * 0) },
+                    platforms: platforms
                 ))
             }
         }
@@ -117,6 +119,7 @@ enum VGWorkspaceCatalog {
             sidebar: ["Trace Explorer", "Debugger"],
             subtitle: "Inspect a live process, execution state, memory, modules, and stops.",
             icon: "ladybug",
+            platforms: [.apple],
             overrides: [
                 "Trace Explorer": ("Trace Explorer", "point.topleft.down.to.point.bottomright.curvepath"),
                 "Runtime Correlation": ("Runtime Correlation", "point.3.filled.connected.trianglepath.dotted"),
@@ -133,6 +136,7 @@ enum VGWorkspaceCatalog {
             sidebar: ["VectorEmu Lab", "Hypervisor RE Suite", "Firmware Runtime Lab", "SoC Virtualization", "dyld Cache Browser", "IPSW Catalog"],
             subtitle: "Move from files to machine state, emulation, virtualization, and firmware.",
             icon: "cpu",
+            platforms: [.apple],
             overrides: [
                 "VectorEmu Lab": ("VectorEmu", "cpu"),
                 "Hypervisor RE Suite": ("Hypervisor · Experimental", "memorychip"),
@@ -141,6 +145,20 @@ enum VGWorkspaceCatalog {
                 "dyld Cache Browser": ("dyld Cache", "shippingbox.and.arrow.backward"),
                 "IPSW Catalog": ("IPSW Catalog", "archivebox"),
                 "Full-System iPhemeral": ("Full-System iPhemeral · Experimental", "memorychip")
+            ])
+
+        add(.staticAnalysis,
+            ["ECU Overview", "Container & Regions", "Checksums", "ECU Definitions", "ECU Emulator"],
+            sidebar: ["ECU Overview", "Container & Regions", "Checksums", "ECU Definitions", "ECU Emulator"],
+            subtitle: "Inspect validated C166/C167 firmware structure and checksum evidence.",
+            icon: "memorychip",
+            platforms: [.ecu],
+            overrides: [
+                "ECU Overview": ("ECU Overview", "car.side"),
+                "Container & Regions": ("Container & Regions", "square.3.layers.3d"),
+                "Checksums": ("Checksums", "checkmark.shield"),
+                "ECU Definitions": ("Definitions", "tablecells"),
+                "ECU Emulator": ("ECU Emulator", "cpu")
             ])
 
         add(.automation,
@@ -191,6 +209,17 @@ enum VGWorkspaceCatalog {
         descriptors
             .filter { $0.group == group && $0.appearsInSidebar }
             .sorted { ($0.sidebarPriority ?? 999) < ($1.sidebarPriority ?? 999) }
+    }
+
+    static func allows(_ name: String, profile: VGArtifactProfile) -> Bool {
+        guard let descriptor = descriptors.first(where: { $0.name == name }) else { return false }
+        switch profile {
+        case .ecu: return descriptor.platforms.contains(.ecu)
+        case .apple: return descriptor.platforms.contains(.apple)
+        // Preserve the pre-profile workspace set for raw/unknown artifacts while
+        // keeping ECU-only evidence surfaces scoped to positively identified ECUs.
+        case .generic: return descriptor.platforms.contains(.apple)
+        }
     }
 
     static func search(_ query: String) -> [VGWorkspaceDescriptor] {

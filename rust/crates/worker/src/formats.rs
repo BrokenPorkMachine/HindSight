@@ -689,6 +689,9 @@ fn elf_dynamic(
     let pltrel = take(20)?;
     let jmprel = take(23)?;
     let gnu_hash = take(0x6ffffef5)?;
+    let relr = take(36)?;
+    let relrsz = take(35)?;
+    let relrent = take(37)?;
     if rela.is_some() != relasz.is_some() {
         return Err(bad("ELF DT_RELA relocation tags are incomplete"));
     }
@@ -719,8 +722,12 @@ fn elf_dynamic(
         }
     }
     push(&mut i.inventory, &format!("ELF PT_DYNAMIC VA={va:#x} file={offset:#x} bytes={size} entries={}\n", entries.len()));
-    if [35i64, 36, 37].iter().any(|tag| entries.iter().any(|&(t, _)| t == *tag)) {
-        push(&mut i.inventory, "ELF DT_RELR relative-relocation records are unsupported; references remain unapplied.\n");
+    let relr_word = if wide { 8u64 } else { 4 };
+    if relr.is_some() != relrsz.is_some() || relr.is_some() != relrent.is_some() {
+        return Err(bad("ELF DT_RELR tags are incomplete"));
+    }
+    if relrent.is_some_and(|value| value != relr_word) {
+        return Err(bad("Invalid ELF DT_RELRENT entry size"));
     }
 
     let mut symbol_count: Option<u64> = None;
@@ -943,6 +950,41 @@ fn elf_dynamic(
             records += 1;
         }
         table_bytes += sz as usize;
+    }
+    if let (Some(want), Some(sz), Some(_)) = (relr, relrsz, relrent) {
+        if sz % relr_word != 0 || records.saturating_add((sz / relr_word) as usize) > 200_000
+            || table_bytes.saturating_add(sz as usize) > 16 * 1024 * 1024 {
+            return Err(bad("Invalid or over-budget ELF DT_RELR table"));
+        }
+        let at = resolve(want, sz)?;
+        let raw = read(file, add(i.origin, at)?, sz as usize)?;
+        let mut next = None::<u64>;
+        for entry in raw.chunks_exact(relr_word as usize) {
+            let value = if wide { u64v(entry, be) } else { u32v(entry, be) as u64 };
+            let mut sites = Vec::new();
+            if value & 1 == 0 {
+                if value % relr_word != 0 { return Err(bad("Unaligned ELF DT_RELR address")); }
+                if next.is_some_and(|previous| value < previous) { return Err(bad("Unordered ELF DT_RELR address")); }
+                sites.push(value);
+                next = Some(add(value, relr_word)?);
+            } else {
+                let base = next.ok_or_else(|| bad("ELF DT_RELR bitmap precedes an address entry"))?;
+                for bit in 1..(relr_word * 8) {
+                    if value & (1u64 << bit) != 0 {
+                        sites.push(add(base, (bit - 1) * relr_word)?);
+                    }
+                }
+                next = Some(add(base, (relr_word * 8 - 1) * relr_word)?);
+            }
+            for site in sites {
+                if records >= 200_000 { return Err(bad("ELF dynamic relocation record budget exceeded")); }
+                if !loads.iter().any(|&(a, m, _, _, _)| m >= relr_word && site >= a && site - a <= m - relr_word) {
+                    return Err(bad("ELF DT_RELR site outside load mappings"));
+                }
+                push(&mut i.foreign.relocations, &format!("0x{site:016x} ELF relocation type=RELATIVE symbol-index=0 addend=implicit-unapplied source=DT_RELR\n"));
+                records += 1;
+            }
+        }
     }
     if records > 0 {
         push(&mut i.inventory, &format!("ELF dynamic relocation records={records}; references remain unapplied.\n"));

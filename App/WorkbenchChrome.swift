@@ -86,12 +86,13 @@ struct VGStatusPill: View {
 struct VGCommandPalette: View {
     @Binding var isPresented: Bool
     let currentWorkspace: String
+    let profile: VGArtifactProfile
     let onSelect: (String) -> Void
     @State private var query = ""
     @FocusState private var queryFocused: Bool
 
     private var results: [VGWorkspaceDescriptor] {
-        Array(VGWorkspaceCatalog.search(query).prefix(60))
+        Array(VGWorkspaceCatalog.search(query).filter { VGWorkspaceCatalog.allows($0.name, profile: profile) }.prefix(60))
     }
 
     var body: some View {

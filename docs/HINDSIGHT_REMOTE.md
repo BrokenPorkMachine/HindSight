@@ -55,7 +55,7 @@ responses before submitting the analysis job. Remaining product work is actual
 LAN/browser interoperability, uploads, event streaming, multi-project
 authorization, and remote execution security. The dependency-ordered next
 actions are in the
-[Chimera current queue](CHIMERA_COMPLETION_ROADMAP.md#current-actionable-queue-2026-10-18).
+[Master roadmap](MASTER_ROADMAP.md).
 
 ## Security audit and supported-scope limits
 

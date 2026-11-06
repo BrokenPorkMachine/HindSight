@@ -36,7 +36,9 @@ or by the `DT_GNU_HASH` bucket/chain structure. When `DT_HASH` or
 supply defined dynamic symbols, function starts, undefined imports and visible
 exports with table/binding/visibility provenance; a missing hash table leaves
 symbol counts and names unrecovered and relocation symbol indices transcribed
-as raw evidence. `DT_RELR` records are noted but remain unapplied. The same
+as raw evidence. `DT_RELR` address and bitmap entries expand to validated
+relocation-site evidence; implicit addends and runtime relocation values remain
+unapplied. The same
 200,000-record/16 MiB budgets apply. Relocations remain evidence only and are
 never applied.
 

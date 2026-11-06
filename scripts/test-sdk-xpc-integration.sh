@@ -16,7 +16,15 @@ trap 'rm -f "$harness"; rm -rf "$work"' EXIT
 xcrun --sdk macosx clang -target arm64-apple-macos14.0 -O0 \
   "$ROOT/Tests/Fixtures/Decompilation/sdk_import_xpc.c" -o "$work/sdk-import-fixture"
 python3 "$ROOT/Tests/sdk_xpc_baseline.py" "$service/Contents/MacOS/reworker" "$work/sdk-import-fixture"
+python3 "$ROOT/Tests/create_legacy_project.py" "$work/project-v1"
 env CLANG_MODULE_CACHE_PATH="$work/swift-module-cache" xcrun swiftc \
   "$ROOT/Shared/CoordinatorProtocol.swift" "$ROOT/Tests/sdk_xpc_reconstruction_contract.swift" \
   -o "$harness"
-"$harness" "$work/sdk-import-fixture" "$work/project"
+"$harness" "$work/sdk-import-fixture" "$work/project" "$work/project-v1"
+python3 - "$work/project-v1/project.sqlite" <<'PY'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+assert db.execute("SELECT schema_version FROM project_meta").fetchone()[0] == 3
+assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+PY

@@ -21,17 +21,30 @@ def file_hash(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def publish(path, value):
-    """Replace only the batch's own metadata after flushing its new contents."""
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".batch-", mode="w", delete=False) as stream:
-        temporary = Path(stream.name)
-        json.dump(value, stream, sort_keys=True, indent=2)
-        stream.flush()
-        os.fsync(stream.fileno())
+def atomic_write(path, data, prefix):
+    """Durably publish one complete file with a same-directory atomic rename."""
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=prefix)
+    temporary = Path(temporary_name)
     try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def publish(path, value):
+    """Atomically replace batch metadata after flushing its new contents."""
+    data = json.dumps(value, sort_keys=True, indent=2).encode()
+    atomic_write(path, data, ".batch-")
 
 
 def request(worker, binary, digest, size, command, arguments, prototypes):
@@ -237,8 +250,7 @@ def run_batch(args, report=None, sdk_catalog=None):
                             file_hash(path) != hashlib.sha256(data).hexdigest()):
                         raise ValueError("uncheckpointed output differs from regenerated content")
                 else:
-                    with path.open("xb") as destination:
-                        destination.write(data)
+                    atomic_write(path, data, ".function-")
                 entry["files"].append({"path": filename, "bytes": len(data),
                                        "sha256": hashlib.sha256(data).hexdigest()})
                 output_bytes += len(data)

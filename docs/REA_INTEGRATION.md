@@ -6,12 +6,12 @@ HindSight will support [REA](https://github.com/morluto/rea) as an optional loca
 
 The bridge will:
 
-1. Launch a user-approved `rea-agents` command as a child process over stdio.
+1. Launch a user-configured, already-installed `rea-agents` command as a child process over stdio. Normal operation never downloads a package.
 2. Initialize MCP and call `binary_session` to discover the available providers and tools.
 3. Require an explicit target path and operation before starting analysis.
 4. Stream bounded progress and results without blocking SwiftUI or the coordinator.
 5. Preserve REA evidence IDs, target hashes, provider identity, analysis profile, limitations, and provenance in the HindSight ledger.
-6. Keep raw REA output on disk and pass references through XPC instead of placing unbounded payloads in the UI process.
+6. Keep every payload bounded across XPC and case storage. A future external evidence store may replace inline case payloads without changing provider identity fields.
 
 The bridge must fail closed when REA, Node, or the selected provider is unavailable. It must never silently upload target contents or broaden a target scope. REA remains opt-in and local-first.
 
@@ -29,8 +29,25 @@ The bridge must fail closed when REA, Node, or the selected provider is unavaila
 - [x] Expose retained REA records as provenance nodes in the Evidence Graph.
 - [x] Restore retained REA records when importing a `.vgcase`.
 - [x] Add bounded streamed progress history and retained evidence to the REA Agent workspace.
-- [ ] Import REA evidence into cases and the evidence graph with compatibility checks.
+- [x] Import REA evidence into cases and the evidence graph with compatibility checks.
 - [x] Add a deterministic MCP fixture contract for handshake, capability gating, and progress retention.
-- [ ] Add release qualification coverage for the bridge.
+- [x] Add deterministic release-preflight qualification coverage for the bridge; real-provider qualification remains a manual release-host gate.
 
-The first bridge implementation should pin a tested `rea-agents` version instead of using an unbounded `latest` dependency. Users can install REA with the upstream setup flow, then select the executable/package in HindSight.
+Release qualification pins the supported REA version. Users install REA with the upstream setup flow, then configure its local executable and arguments in HindSight. The default `/usr/bin/env rea-agents mcp` resolves only an already-installed command and never invokes `npx`.
+
+## Live qualification
+
+The deterministic fixture remains part of release preflight. On a release host with an approved local target, qualify the actual provider through the same Swift coordinator bridge:
+
+```bash
+python3 scripts/inspect-rea-mcp.py
+python3 scripts/qualify-rea-live.py /absolute/path/to/rea-agents /absolute/path/to/approved-target
+```
+
+For the bundled Warhead surface, start the configured local model endpoint and run:
+
+```bash
+python3 scripts/qualify-warhead-live.py model-tag
+```
+
+This verifies model transport and bounded REA evidence delivery. It is not an assessment of the selected model's analytical quality.

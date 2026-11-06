@@ -37,15 +37,22 @@ def interrupted_publish(path, value):
             os.kill(os.getpid(), signal.SIGKILL)
     else:
         publish(path, value)
+atomic_write = module.atomic_write
+def interrupted_atomic_write(path, data, prefix):
+    atomic_write(path, data, prefix)
+    if sys.argv[6] == 'after-orphan-file' and path.name == sys.argv[7]:
+        os.kill(os.getpid(), signal.SIGKILL)
+module.atomic_write = interrupted_atomic_write
 module.publish = interrupted_publish
 module.run(types.SimpleNamespace(binary=pathlib.Path(sys.argv[2]), output=pathlib.Path(sys.argv[3]),
     worker=pathlib.Path(sys.argv[4]), prototypes=pathlib.Path(sys.argv[5]), resume=False,
     start=None, end=None, include_callees=False, max_functions=3, max_bytes=256*1024*1024))
 """
-    for boundary in ["after-first-checkpoint", "before-second-checkpoint"]:
+    for boundary in ["after-first-checkpoint", "before-second-checkpoint", "after-orphan-file"]:
         output = root / boundary
+        orphan_file = reference["functions"][1]["files"][0]["path"]
         killed = subprocess.run([sys.executable, "-c", launcher, str(ROOT / "scripts"),
-                                 str(binary), str(output), str(worker), str(prototypes), boundary],
+                                 str(binary), str(output), str(worker), str(prototypes), boundary, orphan_file],
                                 capture_output=True, timeout=120)
         assert killed.returncode == -signal.SIGKILL, (boundary, killed.stderr)
         checkpoint = json.loads((output / "checkpoint.json").read_bytes())
@@ -53,8 +60,10 @@ module.run(types.SimpleNamespace(binary=pathlib.Path(sys.argv[2]), output=pathli
         assert not (output / "manifest.json").exists()
         retained = {path.name: (path.read_bytes(), path.stat().st_mtime_ns)
                     for path in output.iterdir() if path.name.startswith("function-")}
-        expected_files = sum(len(entry["files"]) for entry in reference["functions"][:
-                             1 if boundary == "after-first-checkpoint" else 2])
+        expected_count = 1 if boundary in {"after-first-checkpoint", "after-orphan-file"} else 2
+        expected_files = sum(len(entry["files"]) for entry in reference["functions"][:expected_count])
+        if boundary == "after-orphan-file":
+            expected_files += 1
         assert len(retained) == expected_files > 0, (boundary, retained)
         resumed = subprocess.run([sys.executable, str(ROOT / "scripts/reconstruct-binary.py"),
                                   str(binary), str(output), "--worker", str(worker),

@@ -80,20 +80,35 @@ final class ProjectStore {
                      declaration TEXT NOT NULL,
                      target TEXT NOT NULL,
                      source TEXT NOT NULL,
-                     source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64)
+                     source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64),
+                     layout_json TEXT
                     );
                     CREATE INDEX project_type_candidates_by_name ON project_type_candidates(name);
                     ALTER TABLE project_meta RENAME TO project_meta_v1;
                     CREATE TABLE project_meta (
                      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                     schema_version INTEGER NOT NULL CHECK(schema_version=2)
+                     schema_version INTEGER NOT NULL CHECK(schema_version=3)
                     );
-                    INSERT INTO project_meta VALUES (1,2);
+                    INSERT INTO project_meta VALUES (1,3);
                     DROP TABLE project_meta_v1;
-                    PRAGMA user_version=2;
+                    PRAGMA user_version=3;
                     COMMIT;
                     """)
-                } else if version != 2 || metadataVersion != 2 {
+                } else if version == 2 && metadataVersion == 2 {
+                    try execute("""
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE project_type_candidates ADD COLUMN layout_json TEXT;
+                    ALTER TABLE project_meta RENAME TO project_meta_v2;
+                    CREATE TABLE project_meta (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                     schema_version INTEGER NOT NULL CHECK(schema_version=3)
+                    );
+                    INSERT INTO project_meta VALUES (1,3);
+                    DROP TABLE project_meta_v2;
+                    PRAGMA user_version=3;
+                    COMMIT;
+                    """)
+                } else if version != 3 || metadataVersion != 3 {
                     throw WorkbenchError("Unsupported project schema. No migration performed.")
                 }
             }
@@ -188,7 +203,7 @@ final class ProjectStore {
         return snapshot
     }
     func projectTypeCatalog() throws -> ProjectTypeCatalog {
-        let statement = try prepare("SELECT id,name,declaration,target,source,source_sha256 FROM project_type_candidates ORDER BY name,id LIMIT 10001")
+        let statement = try prepare("SELECT id,name,declaration,target,source,source_sha256,layout_json FROM project_type_candidates ORDER BY name,id LIMIT 10001")
         defer { sqlite3_finalize(statement) }
         var candidates: [ProjectTypeCandidate] = []
         var estimatedBytes = 0
@@ -199,14 +214,21 @@ final class ProjectStore {
                 throw WorkbenchError("Project type catalog exceeds its 10,000-candidate limit or could not be read.")
             }
             let storedID = try text(statement, 0)
+            let layoutEvidence: ProjectTypeLayoutEvidence?
+            if sqlite3_column_type(statement, 6) == SQLITE_NULL { layoutEvidence = nil }
+            else {
+                layoutEvidence = try JSONDecoder().decode(ProjectTypeLayoutEvidence.self, from: Data(try text(statement, 6).utf8))
+            }
             let candidate = ProjectTypeCandidate(name: try text(statement, 1), declaration: try text(statement, 2),
-                target: try text(statement, 3), source: try text(statement, 4), sourceSHA256: try text(statement, 5))
+                target: try text(statement, 3), source: try text(statement, 4), sourceSHA256: try text(statement, 5),
+                layoutEvidence: layoutEvidence)
             let expectedID = SHA256.hash(data: Data(candidate.id.utf8)).map { String(format: "%02x", $0) }.joined()
             guard candidate.validated != nil, storedID == expectedID else {
                 throw WorkbenchError("Project type catalog contains invalid or altered evidence.")
             }
             estimatedBytes += candidate.name.utf8.count + candidate.declaration.utf8.count
-                + candidate.target.utf8.count + candidate.source.utf8.count + candidate.sourceSHA256.utf8.count + 256
+                + candidate.target.utf8.count + candidate.source.utf8.count + candidate.sourceSHA256.utf8.count
+                + ((try? JSONEncoder().encode(candidate.layoutEvidence).count) ?? 0) + 256
             guard estimatedBytes <= 4 * 1024 * 1024 else { throw WorkbenchError("Project type catalog exceeds its 8 MiB reply budget.") }
             candidates.append(candidate)
         }
@@ -218,6 +240,26 @@ final class ProjectStore {
         return catalog
     }
     func addProjectTypeCandidate(_ candidate: ProjectTypeCandidate) throws -> ProjectTypeCatalog {
+        try persistProjectTypeCandidate(candidate)
+        return try projectTypeCatalog()
+    }
+    func addProjectTypeCandidates(_ candidates: [ProjectTypeCandidate]) throws -> ProjectTypeCatalog {
+        guard !candidates.isEmpty, candidates.count <= 10_000,
+              candidates.allSatisfy({ $0.validated != nil }) else {
+            throw WorkbenchError("Invalid or oversized project type evidence batch.")
+        }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            for candidate in candidates { try persistProjectTypeCandidate(candidate) }
+            let catalog = try projectTypeCatalog()
+            try execute("COMMIT")
+            return catalog
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+    private func persistProjectTypeCandidate(_ candidate: ProjectTypeCandidate) throws {
         guard candidate.validated != nil else { throw WorkbenchError("Invalid project type evidence candidate.") }
         let records = try prepare("SELECT header_json FROM records")
         defer { sqlite3_finalize(records) }
@@ -258,7 +300,7 @@ final class ProjectStore {
             guard try scalar("SELECT count(*) FROM project_type_candidates") < 10_000 else {
                 throw WorkbenchError("Project type catalog reached its 10,000-candidate limit.")
             }
-            let insert = try prepare("INSERT INTO project_type_candidates(id,name,declaration,target,source,source_sha256) VALUES(?,?,?,?,?,?)")
+            let insert = try prepare("INSERT INTO project_type_candidates(id,name,declaration,target,source,source_sha256,layout_json) VALUES(?,?,?,?,?,?,?)")
             defer { sqlite3_finalize(insert) }
             guard sqlite3_bind_text(insert, 1, id, -1, transient) == SQLITE_OK else { throw WorkbenchError("Cannot bind project type evidence identity.") }
             try bind(candidate.name, 2, insert)
@@ -266,11 +308,17 @@ final class ProjectStore {
             try bind(candidate.target, 4, insert)
             try bind(candidate.source, 5, insert)
             try bind(candidate.sourceSHA256, 6, insert)
+            if let layoutEvidence = candidate.layoutEvidence {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                try bind(String(decoding: encoder.encode(layoutEvidence), as: UTF8.self), 7, insert)
+            } else if sqlite3_bind_null(insert, 7) != SQLITE_OK {
+                throw WorkbenchError("Cannot bind empty project type layout evidence.")
+            }
             guard sqlite3_step(insert) == SQLITE_DONE else { throw WorkbenchError(String(cString: sqlite3_errmsg(db))) }
         } else if existence != SQLITE_ROW {
             throw WorkbenchError(String(cString: sqlite3_errmsg(db)))
         }
-        return try projectTypeCatalog()
     }
     func removeProjectTypeCandidate(_ candidate: ProjectTypeCandidate) throws -> ProjectTypeCatalog {
         guard candidate.validated != nil else { throw WorkbenchError("Invalid project type evidence identity.") }

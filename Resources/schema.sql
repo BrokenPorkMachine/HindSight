@@ -1,7 +1,7 @@
 PRAGMA foreign_keys = ON;
 BEGIN IMMEDIATE;
-CREATE TABLE project_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=2));
-INSERT INTO project_meta VALUES (1,2);
+CREATE TABLE project_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), schema_version INTEGER NOT NULL CHECK(schema_version=3));
+INSERT INTO project_meta VALUES (1,3);
 CREATE TABLE records (
  id TEXT PRIMARY KEY,
  source_path TEXT NOT NULL,
@@ -16,8 +16,9 @@ CREATE TABLE project_type_candidates (
  declaration TEXT NOT NULL,
  target TEXT NOT NULL,
  source TEXT NOT NULL,
- source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64)
+ source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64),
+ layout_json TEXT
 );
 CREATE INDEX project_type_candidates_by_name ON project_type_candidates(name);
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 COMMIT;

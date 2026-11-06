@@ -34,9 +34,10 @@ def test_change_tracking_is_explicitly_nonsemantic_and_engine_stable():
     assert 'sourceSHA256' in CONT
 
 
-def test_launch_session_schema_two_restores_context_and_accepts_schema_one():
-    assert 'schema: 2' in MODEL
-    assert '[1, 2].contains(session.schema)' in MODEL
+def test_launch_session_schema_three_restores_context_and_accepts_prior_schemas():
+    assert 'schema: 3' in MODEL
+    assert '[1, 2, 3].contains(session.schema)' in MODEL
+    assert 'workspaceByProfile: workspaceByProfile' in MODEL
     for token in ['addressText: String(addressText.prefix(128))', 'cfgFocus: String(cfgFocus.prefix(128))', 'analysisSearch: String(analysisSearch.prefix(1024))', 'selectedSymbol: String(selectedSymbol.prefix(1024))']:
         assert token in MODEL
     for token in ['addressText = session.addressText ?? ""', 'cfgFocus = session.cfgFocus ?? ""', 'analysisSearch = session.analysisSearch ?? ""', 'selectedSymbol = session.selectedSymbol ?? ""']:

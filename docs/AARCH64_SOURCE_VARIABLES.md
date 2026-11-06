@@ -15,15 +15,40 @@ AST reconstruction and canonical memory/FP/flags SSA remain open.
   Distinct copies of the same entry value can agree at a CFG join; conflicts,
   killed paths and entry/backedge disagreements retain machine registers and
   produce bounded join-alternative notes.
+- `EOR` with the architectural zero register is an exact copy for any decoded
+  LSL/LSR/ASR shift of that zero operand, with no negation. A real XOR does not
+  retain either operand's identity; width checks still prevent a W-register
+  truncation from masquerading as the original 64-bit source value.
+- `BIC Rd,Rn,XZR` is also an exact copy because its complement operand is all
+  ones, even when the zero operand has a decoded shift. BIC with any general
+  register remains a value transform for parameter naming.
+- Register `ADD` with XZR on either side and `SUB` with XZR on the right are
+  exact copies, including shifted-zero operands. `0 - Rn` remains a value
+  transform and does not inherit the source identity.
+- `ORR Rn,XZR` retains `Rn` even when the zero operand is shifted. Shifts on
+  the nonzero operand remain value transforms and drop the identity.
+- Decoded bitfield-shift aliases with a zero distance retain the source
+  identity; nonzero shifts do not. General extracts and extensions remain
+  value transforms even when only some bits happen to match.
+- Decoded `CSEL` and `FCSEL` preserve an identity only when both alternatives
+  resolve to the same incoming parameter at a compatible width. Distinct GP or
+  FP inputs remain unaliased; `CSINC`/`CSINV`/`CSNEG` do not inherit identity
+  because they transform the selected value. Native fixtures exercise the
+  agreeing GP/FP cases, with negative unit tests for conflicting inputs and
+  transforming GP selects.
 - W/X and S/D views are not interchangeable source values. Narrowing a known
-  64-bit parameter loses its name; scalar conversions and SIMD lane extracts
-  are not source-variable copies. Both destinations of paired writes matter.
+  64-bit parameter loses its name; a write to Wd zero-extends into Xd and
+  invalidates the old 64-bit identity. Scalar conversions and SIMD lane
+  extracts are not source-variable copies. Both destinations of paired writes
+  matter.
 - Modeled SP/frame adjustments and exact non-overlapping spills/restores can
   retain parameter identities, including GP/FP pairs and pre/post writeback.
   Saved values require compatible bank and sufficient access width. Partial
   overlapping writes, possible aliases, calls and unknown effects invalidate
-  affected saved state. Runtime call summaries and general alias/memory SSA
-  are not implied.
+  affected stack-save state. Across AAPCS64 calls, only callee-saved GP x19-x29
+  and the low 64 bits of v8-v15 retain parameter identities; caller-saved
+  registers, x18 and LR are cleared. This ABI rule does not imply a proven
+  callee memory-effect summary or general alias/memory SSA.
 - Per-instruction input and output names are separate. An overwritten register
   does not keep its former parameter name on the assignment's left side.
   Presentation substitution advances names after each emitted assignment,
@@ -58,10 +83,11 @@ widths, copies, joins, loops, unreachable predecessors, spills, alias/overlap
 invalidation, paired writes, writeback, data-in-code and budgets. The previous
 text-only naming fixtures now exercise the production bytecode analysis.
 
-Six CC0 assembly functions are built by Apple Clang. Hash-bound declarations
-from their header supply legitimate name/type evidence. The integration gate
-checks actual recovered pseudocode and, on Apple Silicon, 1,560 original-native
-result checks over copy/frame/pair/FP/pre-index/overlapping-base fixtures.
-Intel macOS cross-assembles and checks pseudocode without claiming execution.
+Seventeen CC0 assembly functions are built by Apple Clang. Hash-bound
+declarations from their header supply legitimate name/type evidence. The
+integration gate checks actual recovered pseudocode and, on Apple Silicon,
+4,420 original-native result checks over copy/frame/pair/FP/pre-index,
+overlapping-base, zero-register and callee-saved-call fixtures. Intel macOS
+cross-assembles and checks pseudocode without claiming execution.
 These are naming/effect checks, not differential execution of reconstructed
 source: typed AST export and original/IR/generated equivalence are still open.

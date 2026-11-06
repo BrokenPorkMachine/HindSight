@@ -43,6 +43,7 @@ struct VGBinaryWorkspace: View {
     let onSelectAddress: (String) -> Void
     let onSaveFunctionOverride: (UInt64, String, String, String, VGAnalysisConfidence) -> Void
     let onUndoFunctionOverride: (UInt64) -> Void
+    let onImportFunctionNames: () -> Void
     let reconstruction: ReconstructionArtifact?
     let reconstructionSDKCatalog: DarwinSDKDeclarationCatalogReference?
     let reconstructionSDKProviders: [String: String]
@@ -179,6 +180,8 @@ struct VGBinaryWorkspace: View {
         .onChange(of: followPC) { _, enabled in
             if enabled { synchronizeExternalSelection() }
         }
+        .onChange(of: selectedFunctionStart) { _, _ in selectDefaultReconstructionOutput() }
+        .onChange(of: reconstruction?.digest ?? "") { _, _ in selectDefaultReconstructionOutput() }
         .sheet(isPresented: $showFunctionOverride) { functionOverrideEditor }
         .sheet(isPresented: $showPatch) { patchEditor }
     }
@@ -340,6 +343,9 @@ struct VGBinaryWorkspace: View {
             VGFlowLayout {
                 Button { patchStatus = ""; showPatch = true } label: { Label("Patch Binary", systemImage: "pencil") }
                     .buttonStyle(.borderless)
+                Button(action: onImportFunctionNames) { Label("Import Names", systemImage: "person.text.rectangle") }
+                    .buttonStyle(.borderless)
+                    .help("Import source-hash-bound function names as analyst overrides")
                 Button { showFunctions.toggle() } label: { Label("Functions", systemImage: "sidebar.left") }
                     .buttonStyle(.borderless)
                     .help(showFunctions ? "Hide function browser" : "Show function browser")
@@ -559,6 +565,17 @@ struct VGBinaryWorkspace: View {
     }
     private var chosenSource: ReconstructionSource? { matchingReconstruction?.sources.first { $0.id == sourceSelection } }
     private var selectedExpression: ReconstructionExpression? { matchingReconstruction?.expressions.first { $0.id == expressionSelection } }
+
+    private func selectDefaultReconstructionOutput() {
+        guard let artifact = matchingReconstruction else {
+            sourceSelection = "review"
+            expressionSelection = nil
+            return
+        }
+        sourceSelection = artifact.sources.first(where: { $0.kind == "recovered-source" })?.id ?? "review"
+        expressionSelection = nil
+    }
+
     private var reconstructionContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {

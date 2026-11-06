@@ -16,7 +16,7 @@ from darwin_sdk_catalog import collect_declarations, worker_prototypes
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "Tests/Fixtures/Decompilation"
-FUNCTIONS = ["hs_copy_chain", "hs_frame_spill", "hs_pair_spill", "hs_fp_frame", "hs_preindexed", "hs_load_overlap"]
+FUNCTIONS = ["hs_copy_chain", "hs_frame_spill", "hs_pair_spill", "hs_fp_frame", "hs_preindexed", "hs_load_overlap", "hs_csel_same", "hs_fcsel_same", "hs_xor_zero", "hs_bic_zero", "hs_w_overwrite", "hs_add_sub_zero", "hs_shifted_zero_ops", "hs_zero_distance_shift", "hs_w_add_sub_zero", "hs_call_preserved", "hs_call_preserved_fp"]
 
 
 def run(worker):
@@ -44,7 +44,12 @@ def run(worker):
         pseudo = report["semantic_preview"].split("Reconstructed pseudocode\n========================\n", 1)[1]
 
         def body(name):
-            marker = f"// unsigned long {name}(" if name != "hs_fp_frame" else f"// double {name}("
+            if name in {"hs_fp_frame", "hs_fcsel_same", "hs_call_preserved_fp"}:
+                marker = f"// double {name}("
+            elif name == "hs_w_add_sub_zero":
+                marker = f"// unsigned int {name}("
+            else:
+                marker = f"// unsigned long {name}("
             assert marker in pseudo, (name, pseudo)
             return pseudo.split(marker, 1)[1].split("\n}\n", 1)[0]
 
@@ -65,12 +70,52 @@ def run(worker):
         assert "x1 = *(owner" not in pre and "x1 = *(x0 + 0x8)" not in pre, pre
         overlap = body("hs_load_overlap")
         assert re.search(r"pair_addr_[0-9a-f]+ = owner; x0 = \*\(pair_addr_[0-9a-f]+\); x1 = \*\(pair_addr_[0-9a-f]+ \+ 0x8\);", overlap), overlap
+        conditional = body("hs_csel_same")
+        assert "original_copy_x4 = eq ? original_copy_x1 : original_copy_x2;" in conditional, conditional
+        assert "return original;" in conditional, conditional
+        floating_conditional = body("hs_fcsel_same")
+        assert "original_copy_d2 = eq ? original : original_copy_d1;" in floating_conditional, floating_conditional
+        assert "return original;" in floating_conditional, floating_conditional
+        zero_xor = body("hs_xor_zero")
+        assert "original_copy_x4 = original ^ xzr;" in zero_xor, zero_xor
+        assert "return original;" in zero_xor, zero_xor
+        zero_bic = body("hs_bic_zero")
+        assert "original_copy_x4 = original & ~xzr;" in zero_bic, zero_bic
+        assert "return original;" in zero_bic, zero_bic
+        narrow = body("hs_w_overwrite")
+        assert re.search(r"0x[0-9a-f]+: w0 = 0x1;", narrow), narrow
+        assert not re.search(r"0x[0-9a-f]+: original = 0x1;", narrow), narrow
+        arithmetic = body("hs_add_sub_zero")
+        assert "original_copy_x4 = original + xzr;" in arithmetic, arithmetic
+        assert "original_copy_x5 = original_copy_x4 - xzr;" in arithmetic, arithmetic
+        assert "original = xzr + original_copy_x5;" in arithmetic, arithmetic
+        shifted_zero = body("hs_shifted_zero_ops")
+        assert re.search(r"original_copy_x4\s*=", shifted_zero), shifted_zero
+        assert re.search(r"original_copy_x5\s*=", shifted_zero), shifted_zero
+        assert re.search(r"original_copy_x6\s*=", shifted_zero), shifted_zero
+        assert "return original;" in shifted_zero, shifted_zero
+        zero_shift = body("hs_zero_distance_shift")
+        assert re.search(r"original_copy_x4\s*=", zero_shift), zero_shift
+        assert re.search(r"original_copy_x5\s*=", zero_shift), zero_shift
+        assert "return original;" in zero_shift, zero_shift
+        narrow_arithmetic = body("hs_w_add_sub_zero")
+        assert "original_copy_x4 = original + wzr;" in narrow_arithmetic, narrow_arithmetic
+        assert "original_copy_x5 = original_copy_x4 - wzr;" in narrow_arithmetic, narrow_arithmetic
+        assert "original_copy_x6 = original_copy_x5 | wzr;" in narrow_arithmetic, narrow_arithmetic
+        across_call = body("hs_call_preserved")
+        assert "original_copy_x19 = xzr | original;" in across_call, across_call
+        assert "original = xzr | original_copy_x19;" in across_call, across_call
+        assert "return original;" in across_call, across_call
+        across_fp_call = body("hs_call_preserved_fp")
+        assert "original_copy_d8 = original;" in across_fp_call, across_fp_call
+        assert "original = original_copy_d8;" in across_fp_call, across_fp_call
+        assert "return original;" in across_fp_call, across_fp_call
         native = platform.machine() == "arm64"
         if native:
             subprocess.run([str(binary)], check=True, capture_output=True, timeout=30)
         print(json.dumps({"functions": len(FUNCTIONS), "native_execution": native,
                           "native_result_checks": len(FUNCTIONS)*260 if native else 0,
-                          "scope": "parameter copies, frame/pair/FP spills, pre-index and overlapping-base loads; not source equivalence"}))
+                          "scope": "parameter copies, frame/pair/FP spills, width-invalidating writes, pre-index and overlapping-base loads, identity-preserving CSEL/FCSEL, and exact zero-register arithmetic/logical copies with shifted operands; not source equivalence"}))
 
 
 if __name__ == "__main__":

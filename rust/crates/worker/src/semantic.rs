@@ -9042,6 +9042,9 @@ mod tests {
         let values = recover(&[0x9100_03e8, 0xd280_0029, 0xd280_004a, 0xa900_2909]);
         assert_eq!(values.len(), 2);
         assert!(values.iter().all(|value| value.3.contains("base_proven_by=[0x1000]")));
+        // A downward SP adjustment changes the outgoing argument area just
+        // as an upward adjustment does; old frame offsets cannot be reused.
+        assert!(recover(&[0xd280_0029, 0xf900_03e9, 0xd100_43ff]).is_empty());
     }
     use super::{decode, lift_operation, render, scalar_float_compare_flags, f16_to_f32_bits, Flow, IrFloatPrecision, KnownValue, Operation, Register};
 

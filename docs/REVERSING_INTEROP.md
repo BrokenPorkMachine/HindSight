@@ -73,8 +73,13 @@ adds a SHA-256 binding rechecked by the worker. Existing nlist and export-trie
 names retain precedence. Catalogs currently affect the structural backend (ELF,
 PE, Intel/ARM32 Mach-O, raw/composite mappings); the legacy ARM64 semantic path
 does not ingest them. This limitation is explicit rather than silently replacing
-semantic analysis with structural analysis. GUI import, type/signature/comment
-exchange, and native tool project parsing remain future work.
+semantic analysis with structural analysis. Binary Workspace can import the
+hash-bound function-name JSON as revisioned analyst overrides after matching the
+captured artifact hash and discovered function starts. The project type catalog
+supports bounded JSON import/export, exact capture-digest checks, architecture
+alias matching, and retention of conflicting declarations; imported declarations
+remain analyst evidence and make no ABI-layout claim. Types, comments, native
+tool project parsing, and live Ghidra/IDA/Binary Ninja qualification remain open.
 
 Tests exercise format validation, export/import round trips, rebasing, conflict
 preview, write ordering, hash mismatches, budget enforcement, tool-adapter

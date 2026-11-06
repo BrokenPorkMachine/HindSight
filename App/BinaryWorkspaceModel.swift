@@ -57,6 +57,232 @@ enum VGBinaryPatch {
     }
 }
 
+struct VGECUChecksumDescriptor: Identifiable, Hashable {
+    enum Verdict: String { case verified = "Verified", invalid = "Invalid" }
+    let index: Int
+    let start: UInt32
+    let end: UInt32
+    let stored: UInt32
+    let complement: UInt32
+    let computed: UInt32
+    let verdict: Verdict
+    let repairable: Bool
+    var id: Int { index }
+    var descriptorOffset: UInt64 { 0x1F810 + UInt64(index * 16) }
+}
+
+enum VGECUChecksums {
+    static let tableOffset = 0x1F810
+    static let maximumDescriptors = 31
+
+    static func descriptors(in data: Data) -> [VGECUChecksumDescriptor] {
+        guard data.count >= tableOffset + 16 else { return [] }
+        func word(_ offset: Int) -> UInt32 {
+            UInt32(data[offset]) | UInt32(data[offset + 1]) << 8 |
+                UInt32(data[offset + 2]) << 16 | UInt32(data[offset + 3]) << 24
+        }
+        var result: [VGECUChecksumDescriptor] = []
+        var summedBytes = 0
+        for index in 0..<maximumDescriptors {
+            let offset = tableOffset + index * 16
+            guard offset + 16 <= data.count else { break }
+            let start = word(offset), end = word(offset + 4)
+            let stored = word(offset + 8), complement = word(offset + 12)
+            if start == 0 && end == 0 && stored == 0 && complement == 0 { break }
+            let span = UInt64(end) >= UInt64(start) ? UInt64(end) - UInt64(start) + 1 : 0
+            guard span > 0, span.isMultiple(of: 2), UInt64(end) < UInt64(data.count),
+                  span <= UInt64(4 * 1024 * 1024 - summedBytes) else {
+                result.append(.init(index: index, start: start, end: end, stored: stored,
+                                    complement: complement, computed: 0, verdict: .invalid, repairable: false))
+                continue
+            }
+            var sum: UInt32 = 0
+            var cursor = Int(start)
+            while cursor < Int(end) {
+                sum &+= UInt32(data[cursor]) | UInt32(data[cursor + 1]) << 8
+                cursor += 2
+            }
+            summedBytes += Int(span)
+            let valid = complement == ~stored && stored == sum
+            result.append(.init(index: index, start: start, end: end, stored: stored,
+                                complement: complement, computed: sum,
+                                verdict: valid ? .verified : .invalid, repairable: true))
+        }
+        return result
+    }
+
+    static func repairEdits(in data: Data, descriptors: [VGECUChecksumDescriptor]) -> [VGBinaryPatch.Edit] {
+        descriptors.filter { $0.verdict == .invalid && $0.repairable }.map { descriptor in
+            let offset = Int(descriptor.descriptorOffset + 8)
+            let expected = Array(data[offset..<(offset + 8)])
+            let replacement = littleEndian(descriptor.computed) + littleEndian(~descriptor.computed)
+            return VGBinaryPatch.Edit(offset: descriptor.descriptorOffset + 8, expected: expected, replacement: replacement)
+        }
+    }
+
+    private static func littleEndian(_ value: UInt32) -> [UInt8] {
+        [UInt8(value & 0xff), UInt8((value >> 8) & 0xff),
+         UInt8((value >> 16) & 0xff), UInt8((value >> 24) & 0xff)]
+    }
+}
+
+struct VGXDFDefinition: Identifiable, Hashable {
+    struct Anchor: Hashable {
+        let kind: String
+        let address: UInt64
+    }
+    let id: String
+    let title: String
+    let address: UInt64
+    let anchors: [Anchor]
+}
+
+struct VGXDFRelocation: Identifiable, Hashable {
+    enum State: String { case verified, candidate, ambiguous, notFound = "not-found" }
+    let definition: VGXDFDefinition
+    let resolvedAddress: UInt64?
+    let state: State
+    let score: Double
+    let matchedAnchors: Int
+    let totalAnchors: Int
+    let delta: Int64?
+    var id: String { definition.id }
+}
+
+enum VGXDFDefinitions {
+    static func parse(_ data: Data) throws -> [VGXDFDefinition] {
+        let delegate = ParserDelegate()
+        let parser = XMLParser(data: data)
+        parser.delegate = delegate
+        parser.shouldResolveExternalEntities = false
+        guard parser.parse() else {
+            throw parser.parserError ?? NSError(domain: "XDF", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The XDF document is not well-formed XML."])
+        }
+        return delegate.definitions.prefix(20_000).map { $0 }
+    }
+
+    static func evidence(for definition: VGXDFDefinition, firmware: Data) -> String {
+        guard definition.address < UInt64(firmware.count) else { return "not-found (address outside image)" }
+        let start = Int(definition.address)
+        let end = min(firmware.count, start + 32)
+        let sample = firmware[start..<end]
+        guard sample.count >= 4 else { return "candidate (insufficient bytes for anchor)" }
+        let distinct = Set(sample).count
+        if distinct <= 1 { return "candidate@0x\(String(definition.address, radix: 16)) (uniform anchor; unverified)" }
+        return "candidate@0x\(String(definition.address, radix: 16)) (bounded data present; anchor unverified)"
+    }
+
+    static func relocate(_ definitions: [VGXDFDefinition], reference: Data, target: Data) -> [VGXDFRelocation] {
+        definitions.prefix(4_000).map { definition in
+            let usable = definition.anchors.prefix(4).compactMap { anchor -> (VGXDFDefinition.Anchor, Data)? in
+                guard anchor.address < UInt64(reference.count) else { return nil }
+                let start = Int(anchor.address), length = min(24, reference.count - start)
+                guard length >= 12 else { return nil }
+                let signature = reference.subdata(in: start..<(start + length))
+                guard Set(signature).count >= 4 else { return nil }
+                return (anchor, signature)
+            }
+            guard !usable.isEmpty else {
+                return .init(definition: definition, resolvedAddress: nil, state: .notFound,
+                             score: 0, matchedAnchors: 0, totalAnchors: 0, delta: nil)
+            }
+            var support: [Int64: Set<String>] = [:]
+            for (anchor, signature) in usable {
+                var searchStart = target.startIndex
+                var matches = 0
+                while searchStart < target.endIndex, matches < 8,
+                      let range = target.range(of: signature, options: [], in: searchStart..<target.endIndex) {
+                    let delta = Int64(range.lowerBound) - Int64(anchor.address)
+                    support[delta, default: []].insert("\(anchor.kind):\(anchor.address)")
+                    matches += 1
+                    searchStart = range.lowerBound + 1
+                }
+            }
+            var ranked: [(delta: Int64, count: Int)] = support.map { entry in
+                (delta: entry.key, count: entry.value.count)
+            }
+            ranked.sort { lhs, rhs in
+                if lhs.count != rhs.count { return lhs.count > rhs.count }
+                return lhs.delta.magnitude < rhs.delta.magnitude
+            }
+            guard let best = ranked.first else {
+                return .init(definition: definition, resolvedAddress: nil, state: .notFound,
+                             score: 0, matchedAnchors: 0, totalAnchors: usable.count, delta: nil)
+            }
+            let tied = ranked.dropFirst().first?.count == best.count
+            guard definition.address <= UInt64(Int64.max) else {
+                return .init(definition: definition, resolvedAddress: nil, state: .notFound,
+                             score: 0, matchedAnchors: best.count, totalAnchors: usable.count, delta: nil)
+            }
+            let addition = Int64(definition.address).addingReportingOverflow(best.delta)
+            guard !addition.overflow else {
+                return .init(definition: definition, resolvedAddress: nil, state: .notFound,
+                             score: 0, matchedAnchors: best.count, totalAnchors: usable.count, delta: nil)
+            }
+            let resolvedSigned = addition.partialValue
+            let resolved = resolvedSigned >= 0 && UInt64(resolvedSigned) < UInt64(target.count) ? UInt64(resolvedSigned) : nil
+            let score = Double(best.count) / Double(usable.count)
+            let state: VGXDFRelocation.State = tied ? .ambiguous : (best.count >= 2 && score >= 0.66 ? .verified : .candidate)
+            return .init(definition: definition, resolvedAddress: resolved, state: resolved == nil ? .notFound : state,
+                         score: score, matchedAnchors: best.count, totalAnchors: usable.count, delta: best.delta)
+        }
+    }
+
+    private final class ParserDelegate: NSObject, XMLParserDelegate {
+        var definitions: [VGXDFDefinition] = []
+        private var tableID = ""
+        private var title = ""
+        private var address: UInt64?
+        private var anchors: [VGXDFDefinition.Anchor] = []
+        private var axisKind = "table"
+        private var titleText = ""
+        private var inTitle = false
+
+        func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+                    qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
+            let name = elementName.uppercased()
+            if name == "XDFTABLE" {
+                tableID = attributeDict["uniqueid"] ?? attributeDict["id"] ?? UUID().uuidString
+                title = "Untitled table"; address = nil; anchors = []; axisKind = "table"
+            } else if !tableID.isEmpty && name == "TITLE" {
+                inTitle = true; titleText = ""
+            } else if !tableID.isEmpty && name == "XDFAXIS" {
+                axisKind = (attributeDict["id"] ?? "axis").lowercased()
+            } else if !tableID.isEmpty && name == "EMBEDDEDDATA" {
+                let raw = attributeDict["mmedaddress"] ?? attributeDict["address"]
+                if let parsed = raw.flatMap(Self.number) {
+                    anchors.append(.init(kind: axisKind, address: parsed))
+                    if axisKind == "z" || address == nil { address = parsed }
+                }
+            }
+        }
+
+        func parser(_ parser: XMLParser, foundCharacters string: String) {
+            if inTitle { titleText += string }
+        }
+
+        func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+            let name = elementName.uppercased()
+            if name == "TITLE", inTitle {
+                let trimmed = titleText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { title = trimmed }
+                inTitle = false
+            } else if name == "XDFTABLE", !tableID.isEmpty {
+                if let address { definitions.append(.init(id: tableID, title: title, address: address, anchors: anchors)) }
+                tableID = ""; address = nil; anchors = []
+            } else if name == "XDFAXIS" {
+                axisKind = "table"
+            }
+        }
+
+        private static func number(_ value: String) -> UInt64? {
+            let text = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return text.hasPrefix("0x") ? UInt64(text.dropFirst(2), radix: 16) : UInt64(text)
+        }
+    }
+}
+
 struct VGBinaryReference: Identifiable, Hashable {
     let source: UInt64
     let target: UInt64

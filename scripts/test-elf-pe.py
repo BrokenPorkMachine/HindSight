@@ -284,6 +284,35 @@ def elf_sectionless_dynamic32():
     return data
 
 
+def elf_sectionless_relr(bitmap_first=False):
+    """Sectionless ELF64 with one DT_RELR address and two bitmap sites."""
+    data = bytearray(elf_sectionless_dynamic())
+    base = 0x400000
+    # The second program header is PT_DYNAMIC. Keep its mapping consistent
+    # with the shortened, terminated dynamic table below.
+    struct.pack_into("<QQ", data, 152, 0x50, 0x50)
+    tags = [(36, base + 0x360), (35, 16), (37, 8), (0, 0)]
+    for index, (tag, value) in enumerate(tags):
+        struct.pack_into("<QQ", data, 0x300 + index * 16, tag, value)
+    # Address entry followed by bits 1 and 3 => +0 and +16 from next slot.
+    relr = [0x4003d8, 1 | (1 << 1) | (1 << 3)]
+    if bitmap_first:
+        relr[0] = 3
+    struct.pack_into("<QQ", data, 0x360, *relr)
+    return data
+
+
+def elf_sectionless_relr32():
+    """Sectionless ELF32 with RELR's four-byte address/bitmap encoding."""
+    data = bytearray(elf_sectionless_dynamic32())
+    base = 0x400000
+    tags = [(36, base + 0x380), (35, 8), (37, 4), (0, 0)]
+    for index, (tag, value) in enumerate(tags):
+        struct.pack_into("<II", data, 0x300 + index * 8, tag, value)
+    struct.pack_into("<II", data, 0x380, base + 0x3c0, 0b11)
+    return data
+
+
 def run(*args, env=None):
     reply = subprocess.run([WORKER, *map(str, args)], capture_output=True, timeout=60, env=env)
     if reply.returncode != 0:
@@ -385,6 +414,28 @@ with tempfile.TemporaryDirectory() as directory:
     assert "0x00000000004003c8 ELF relocation type=2 symbol-index=0 addend=0 source=DT_REL" in result["relocations"], result["relocations"]
     assert "DT_HASH and DT_GNU_HASH are absent" in result["metadata"], result["metadata"]
     assert result["symbol_count"] == 0, result["symbol_count"]
+
+    result, _ = analyze(elf_sectionless_relr(), "elf")
+    assert result["kind"] == "analysis_result", result
+    for site in [0x4003d8, 0x4003e0, 0x4003f0]:
+        assert f"0x{site:016x} ELF relocation type=RELATIVE symbol-index=0 addend=implicit-unapplied source=DT_RELR" in result["relocations"], result["relocations"]
+    result, _ = analyze(elf_sectionless_relr32(), "elf")
+    for site in [0x4003c0, 0x4003c4]:
+        assert f"0x{site:016x} ELF relocation type=RELATIVE symbol-index=0 addend=implicit-unapplied source=DT_RELR" in result["relocations"], result["relocations"]
+    malformed_relr, _ = analyze(elf_sectionless_relr(bitmap_first=True), "elf")
+    assert malformed_relr["kind"] == "error" and "bitmap precedes" in malformed_relr["message"], malformed_relr
+    malformed_relr = bytearray(elf_sectionless_relr())
+    struct.pack_into("<Q", malformed_relr, 0x328, 4)
+    result, _ = analyze(bytes(malformed_relr), "elf")
+    assert result["kind"] == "error" and "DT_RELRENT" in result["message"], result
+    malformed_relr = bytearray(elf_sectionless_relr())
+    struct.pack_into("<Q", malformed_relr, 0x320, 0)
+    result, _ = analyze(bytes(malformed_relr), "elf")
+    assert result["kind"] == "error" and "DT_RELR tags are incomplete" in result["message"], result
+    malformed_relr = bytearray(elf_sectionless_relr())
+    struct.pack_into("<Q", malformed_relr, 0x360, 0x400400)
+    result, _ = analyze(bytes(malformed_relr), "elf")
+    assert result["kind"] == "error" and "site outside load mappings" in result["message"], result
 
     # Malformed sectionless dynamic-link inputs fail closed.
     data = elf_sectionless_dynamic()

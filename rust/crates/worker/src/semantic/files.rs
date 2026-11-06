@@ -568,6 +568,9 @@ mod tests {
         let vectors = instruction_vector_effects(&instruction);
         assert_eq!(vectors.writes, (0..32).map(|register| VectorRange::low(register, 16)).collect::<Vec<_>>());
         assert_eq!(vectors.reads, vectors.writes);
+        let memory = instruction_memory_effects(&instruction, &[PointerProvenance::None; 32]);
+        assert_eq!(memory.reads, vec![MemoryPartition::Unknown]);
+        assert_eq!(memory.writes, vec![MemoryPartition::Unknown]);
     }
 
     #[test]

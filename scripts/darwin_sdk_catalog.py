@@ -17,6 +17,8 @@ import unicodedata
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HEADER = ROOT / "native/reconstruction/sdk_declarations.h"
 MAX_AST_BYTES = 4 * 1024 * 1024
+MAX_LAYOUT_SOURCE_BYTES = 1024 * 1024
+MAX_LAYOUT_OUTPUT_BYTES = 4 * 1024 * 1024
 
 
 def sdk_import_candidates(linkage_records):
@@ -235,6 +237,109 @@ def collect_declarations(functions, header=DEFAULT_HEADER, sdk="macosx", target=
             "target": target, "sdk_build": sdk_build, "compiler": compiler, "header": str(header),
             "header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(), "functions": records,
             "missing_functions": missing, "scope": "SDK declaration evidence; does not establish runtime implementation identity"}
+
+
+def collect_record_layouts(declarations, record_names, sdk="macosx", target="arm64-apple-macos14.0"):
+    """Qualify C record size/alignment and field bit offsets with Apple Clang.
+
+    The supplied declaration context is hashed into the result. This reports
+    compiler layout evidence for that exact context and target; it does not
+    prove that a captured binary uses the declaration or that field accesses
+    in a function refer to those fields.
+    """
+    if (not isinstance(declarations, str) or len(declarations) > MAX_LAYOUT_SOURCE_BYTES
+            or not declarations.strip()):
+        raise ValueError("record declaration context is empty or exceeds its byte budget")
+    try:
+        declaration_bytes = declarations.encode("utf-8")
+    except UnicodeError as error:
+        raise ValueError("record declaration context is not valid UTF-8 text") from error
+    if len(declaration_bytes) > MAX_LAYOUT_SOURCE_BYTES:
+        raise ValueError("record declaration context is empty or exceeds its byte budget")
+    if any(unicodedata.category(char) == "Cc" and char not in "\n\r\t" for char in declarations):
+        raise ValueError("record declaration context contains control characters")
+    if (not isinstance(record_names, list) or not 1 <= len(record_names) <= 128
+            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name)
+                   for name in record_names)
+            or len(set(record_names)) != len(record_names)):
+        raise ValueError("record layout request requires 1–128 distinct C record names")
+    if sdk not in {"macosx", "iphoneos", "iphonesimulator"}:
+        raise ValueError("unsupported Apple SDK")
+    if not isinstance(target, str) or not re.fullmatch(r"(arm64|arm64e|x86_64)-apple-(macos|ios)[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-simulator)?", target):
+        raise ValueError("invalid Apple target triple")
+    expected_sdk = "iphonesimulator" if target.endswith("-simulator") else "iphoneos" if "-ios" in target else "macosx"
+    if sdk != expected_sdk or ("-ios" in target and target.startswith("x86_64-") and not target.endswith("-simulator")):
+        raise ValueError("Apple SDK and target triple disagree")
+
+    sdk_path = subprocess.run(["xcrun", "--sdk", sdk, "--show-sdk-path"], check=True,
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    compiler = subprocess.run(["xcrun", "--sdk", sdk, "clang", "--version"], check=True,
+                              capture_output=True, text=True, timeout=10).stdout.splitlines()[0]
+    sdk_build = subprocess.run(["xcrun", "--sdk", sdk, "--show-sdk-build-version"], check=True,
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+    requested = set(record_names)
+    found = {}
+    with tempfile.TemporaryDirectory(prefix="hindsight-record-layout-") as directory:
+        source = Path(directory) / "layout.c"
+        source.write_text(declarations + "\n", encoding="utf-8")
+        command = ["xcrun", "--sdk", sdk, "clang", "-target", target, "-isysroot", sdk_path,
+                   "-x", "c", "-std=c17", "-fno-modules", "-fsyntax-only",
+                   "-Xclang", "-fdump-record-layouts-complete", str(source)]
+        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as diagnostics:
+            result = subprocess.run(command, stdout=output, stderr=diagnostics, timeout=60)
+            if result.returncode:
+                diagnostics.seek(0)
+                raise ValueError("Apple Clang rejected record declarations: " + diagnostics.read(8192).decode(errors="replace"))
+            output.seek(0)
+            raw = output.read(MAX_LAYOUT_OUTPUT_BYTES + 1)
+            if len(raw) > MAX_LAYOUT_OUTPUT_BYTES:
+                raise ValueError("Clang record layout output exceeds byte budget")
+    text = raw.decode("utf-8", errors="strict")
+    blocks = re.split(r"(?=\n\*\*\* Dumping AST Record Layout\s*\n)", text)
+    for block in blocks:
+        header = re.search(r"(?m)^\s*\d+ \| (struct|union) ([A-Za-z_][A-Za-z0-9_]*)\s*$", block)
+        if header is None or header.group(2) not in requested:
+            continue
+        kind, name = header.groups()
+        if name in found:
+            raise ValueError(f"multiple compiler record layouts named {name}")
+        ending = re.search(r"(?m)^\s*\| \[sizeof=(\d+), align=(\d+)\]\s*$", block)
+        if ending is None:
+            raise ValueError(f"Clang did not provide a complete size/alignment for {name}")
+        fields = []
+        for line in block.splitlines():
+            # Clang indents direct fields by three columns after `|` and
+            # nested record members by additional columns. Keep only the
+            # record's own fields; nested members belong to their own layout
+            # block and must not become phantom fields in the parent.
+            match = re.match(r"^\s*(\d+)(?::(\d+)-(\d+))? \| {3}(\S.*?)\s*$", line)
+            if match is None:
+                continue
+            declaration = match.group(4)
+            field_name = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^]]*\])?(?:\s*:\s*\d+)?$", declaration)
+            type_only = declaration in {
+                "_Bool", "bool", "char", "signed char", "unsigned char", "short", "short int",
+                "unsigned short", "unsigned short int", "int", "signed", "signed int", "unsigned",
+                "unsigned int", "long", "long int", "unsigned long", "unsigned long int",
+                "long long", "long long int", "unsigned long long", "unsigned long long int",
+                "float", "double", "long double",
+            } or re.fullmatch(r"(?:struct|union|enum) [A-Za-z_][A-Za-z0-9_]*", declaration) is not None
+            if field_name is None or type_only:
+                raise ValueError(f"cannot safely identify a field in {name}: {declaration}")
+            bit_start, bit_end = match.group(2), match.group(3)
+            fields.append({"name": field_name.group(1), "declaration": declaration,
+                           "offset_bits": int(match.group(1)) * 8 + (int(bit_start) if bit_start is not None else 0),
+                           "bit_width": int(bit_end) - int(bit_start) + 1 if bit_start is not None else None})
+        found[name] = {"name": name, "kind": kind, "size": int(ending.group(1)), "alignment": int(ending.group(2)),
+                       "fields": fields, "field_offsets_complete": True}
+    missing = sorted(requested - found.keys())
+    if missing:
+        raise ValueError("Clang did not emit complete layouts for: " + ", ".join(missing))
+    return {"schema": 1, "producer": "hindsight-apple-clang-record-layout-v1", "sdk": sdk,
+            "sdk_path": sdk_path, "sdk_build": sdk_build, "target": target, "compiler": compiler,
+            "declarations_sha256": hashlib.sha256(declaration_bytes).hexdigest(),
+            "records": [found[name] for name in record_names],
+            "scope": "Compiler layout for the exact declaration context and target; captured-binary type identity and field-access correspondence are unproven"}
 
 
 def worker_prototypes(catalog, source_sha256):

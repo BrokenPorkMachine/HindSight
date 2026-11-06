@@ -1,0 +1,12 @@
+{
+  "name": "hindsight-warhead-extension-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || ^24.11.0 || >=26.0.0"
+  },
+  "dependencies": {
+    "undici": "7.30.1"
+  }
+}

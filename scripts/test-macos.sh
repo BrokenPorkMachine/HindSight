@@ -19,6 +19,7 @@ python3 "$ROOT/scripts/test-recovered-headers.py" "$ROOT/build/rust/debug/rework
 "$ROOT/scripts/test-coordinator-typecheck.sh"
 bash "$ROOT/scripts/test-process-dispatch.sh"
 python3 "$ROOT/scripts/test-rea-bridge.py"
+python3 "$ROOT/scripts/test-warhead-bundle.py"
 "$ROOT/scripts/test-scripting-host-typecheck.sh"
 "$ROOT/scripts/test-firmware-runtime-typecheck.sh"
 test_archs='arm64'

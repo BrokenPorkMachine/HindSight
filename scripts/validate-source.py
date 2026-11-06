@@ -520,7 +520,7 @@ for token in ['Text("Pinned").tag("Pinned")', 'Text("Recent").tag("Recent")', 'T
               'VGAnalysisDeltaView(model: model)', 'toggleAnalysisPin(', 'recordAnalysisVisit(']:
     assert token in analysis_navigation, token
 workbench_model=(R/'App/WorkbenchModel.swift').read_text()
-for token in ['schema: 2', '[1, 2].contains(session.schema)', 'addressText: String(addressText.prefix(128))',
+for token in ['schema: 3', '[1, 2, 3].contains(session.schema)', 'workspaceByProfile: workspaceByProfile', 'addressText: String(addressText.prefix(128))',
               'analysisSearch: String(analysisSearch.prefix(1024))', 'recordAnalysisSnapshot(', 'loadAnalysisContinuity(projectPath: snapshot.path)']:
     assert token in workbench_model, token
 assert 'App/AnalysisContinuity.swift' in topology['targets']['HindSight']
@@ -977,7 +977,8 @@ for member in manifest['workspace']['members']:
         else:
             assert name in approved_external_dependencies, f'Unapproved external dependency: {name}'
 env=dict(os.environ,PYTHONPATH=str(R/'python'),PYTHONDONTWRITEBYTECODE='1')
-subprocess.run([sys.executable,'-m','pytest','python/tests/','-v','--ignore=python/tests/test_darwin_catalog.py'],env=env,check=True)
+test_python=env.get('HINDSIGHT_PYTHON',sys.executable)
+subprocess.run([test_python,'-m','pytest','python/tests/','-v','--ignore=python/tests/test_darwin_catalog.py'],env=env,check=True)
 print('PYTHON TESTS DONE')
 # Portable Swift validation when a Swift compiler is available. Parsing catches syntax
 # drift across the complete Swift surface; the target-model contract is Foundation-only
@@ -1011,6 +1012,14 @@ if swiftc:
     with tempfile.TemporaryDirectory(prefix='vectorglass-analysis-protocol-') as tmp:
         exe=pathlib.Path(tmp)/'analysis-protocol-contract'
         subprocess.run([swiftc,str(R/'Shared/WorkbenchMessages.swift'),str(R/'Tests/analysis_protocol_contract.swift'),'-o',str(exe)],check=True)
+        subprocess.run([str(exe)],check=True)
+    with tempfile.TemporaryDirectory(prefix='hindsight-function-name-exchange-') as tmp:
+        exe=pathlib.Path(tmp)/'function-name-exchange-contract'
+        subprocess.run([swiftc,str(R/'Shared/WorkbenchMessages.swift'),str(R/'Tests/function_name_exchange_contract.swift'),'-o',str(exe)],check=True)
+        subprocess.run([str(exe)],check=True)
+    with tempfile.TemporaryDirectory(prefix='hindsight-project-type-catalog-') as tmp:
+        exe=pathlib.Path(tmp)/'project-type-catalog-contract'
+        subprocess.run([swiftc,str(R/'Shared/WorkbenchMessages.swift'),str(R/'Tests/project_type_catalog_contract.swift'),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)
     with tempfile.TemporaryDirectory(prefix='vectorglass-analysis-status-') as tmp:
         exe=pathlib.Path(tmp)/'analysis-status-contract'

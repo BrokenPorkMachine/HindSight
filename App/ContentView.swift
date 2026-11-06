@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 
 /// Deliberately limited structural pseudocode. No type, condition or call
@@ -48,6 +50,233 @@ private func vgStructuralPseudocode(_ ir: String) -> String {
         }
     }
     return result.joined(separator: "\n")
+}
+
+private struct VGECUChecksumsWorkspace: View {
+    let binaryPath: String
+    @State private var source = Data()
+    @State private var descriptors: [VGECUChecksumDescriptor] = []
+    @State private var staged: [VGBinaryPatch.Edit] = []
+    @State private var status = "Loading checksum descriptors…"
+
+    private var invalidCount: Int { descriptors.filter { $0.verdict == .invalid }.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("ME7 checksum descriptors").font(.title3.bold())
+                    Text("Parsed at file offset 0x1F810. Repairs update only each invalid descriptor's stored sum and complement; the source file is never overwritten.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Stage fixes") { stageRepairs() }
+                    .disabled(invalidCount == 0 || descriptors.contains { $0.verdict == .invalid && !$0.repairable })
+                Button("Save fixed copy…") { saveCopy() }.disabled(staged.isEmpty)
+            }
+            HStack(spacing: 18) {
+                Label("\(descriptors.count) descriptors", systemImage: "list.number")
+                Label("\(descriptors.count - invalidCount) verified", systemImage: "checkmark.shield")
+                    .foregroundStyle(invalidCount == 0 ? Color.green : Color.secondary)
+                Label("\(invalidCount) invalid", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(invalidCount == 0 ? Color.secondary : Color.orange)
+                if !staged.isEmpty { Label("\(staged.count) fixes staged", systemImage: "square.and.pencil") }
+            }.font(.caption)
+            Divider()
+            ScrollView {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 8) {
+                    GridRow {
+                        Text("#"); Text("Range"); Text("Stored"); Text("Computed"); Text("Complement"); Text("Verdict")
+                    }.font(.caption.bold())
+                    Divider().gridCellColumns(6)
+                    ForEach(descriptors) { descriptor in
+                        GridRow {
+                            Text("\(descriptor.index)")
+                            Text(String(format: "0x%08X–0x%08X", descriptor.start, descriptor.end))
+                            Text(String(format: "0x%08X", descriptor.stored))
+                            Text(descriptor.repairable ? String(format: "0x%08X", descriptor.computed) : "unbounded")
+                            Text(String(format: "0x%08X", descriptor.complement))
+                            Label(descriptor.verdict.rawValue,
+                                  systemImage: descriptor.verdict == .verified ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                                .foregroundStyle(descriptor.verdict == .verified ? .green : .orange)
+                        }.font(.system(.caption, design: .monospaced))
+                    }
+                }.textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text(status).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+        }
+        .padding(14)
+        .task(id: binaryPath) { load() }
+    }
+
+    private func load() {
+        do {
+            source = try Data(contentsOf: URL(fileURLWithPath: binaryPath), options: .mappedIfSafe)
+            descriptors = VGECUChecksums.descriptors(in: source)
+            staged = []
+            status = descriptors.isEmpty
+                ? "No bounded ME7 checksum descriptor table was found."
+                : invalidCount == 0 ? "All bounded descriptors verify." : "Review invalid descriptors before staging fixes."
+        } catch { status = "Could not read the captured firmware: \(error.localizedDescription)" }
+    }
+
+    private func stageRepairs() {
+        let edits = VGECUChecksums.repairEdits(in: source, descriptors: descriptors)
+        do {
+            _ = try VGBinaryPatch.apply(source, edits: edits)
+            staged = edits
+            status = "Staged \(edits.count) checksum repair(s). Save creates a separate copy and re-verifies it first."
+        } catch { staged = []; status = "Could not stage repairs: \(error.localizedDescription)" }
+    }
+
+    private func saveCopy() {
+        do {
+            let patched = try VGBinaryPatch.apply(source, edits: staged)
+            let checked = VGECUChecksums.descriptors(in: patched)
+            guard !checked.isEmpty, checked.allSatisfy({ $0.verdict == .verified }) else {
+                throw NSError(domain: "ECUChecksums", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "The patched preview did not pass checksum re-verification."])
+            }
+            let panel = NSSavePanel()
+            panel.title = "Save Checksum-Fixed Firmware Copy"
+            let original = URL(fileURLWithPath: binaryPath)
+            panel.nameFieldStringValue = original.deletingPathExtension().lastPathComponent + "-checksum-fixed." + (original.pathExtension.isEmpty ? "bin" : original.pathExtension)
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try patched.write(to: url, options: .atomic)
+            status = "Saved and re-verified \(url.lastPathComponent). The original capture was not modified."
+        } catch { status = "Could not save fixed copy: \(error.localizedDescription)" }
+    }
+}
+
+private struct VGECUDefinitionsWorkspace: View {
+    let binaryPath: String
+    @State private var firmware = Data()
+    @State private var definitions: [VGXDFDefinition] = []
+    @State private var relocations: [VGXDFRelocation] = []
+    @State private var referenceFirmware = Data()
+    @State private var sourceName = "No XDF imported"
+    @State private var referenceName = "No reference firmware selected"
+    @State private var status = "Import a TunerPro XDF to evaluate its table addresses against this captured image."
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("ECU Definitions").font(.title3.bold())
+                    Text("XDF addresses are never trusted silently. In-bounds data without a definition-provided anchor remains a candidate, not a verified map.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Import XDF…", action: importXDF)
+                Button("Choose reference BIN…", action: chooseReference)
+                Button("Relocate", action: relocate).disabled(definitions.isEmpty || referenceFirmware.isEmpty || firmware.isEmpty)
+                Button("Export JSON…", action: exportRelocations).disabled(relocations.isEmpty)
+            }
+            HStack {
+                Label(sourceName, systemImage: "doc.text")
+                Label(referenceName, systemImage: "shippingbox")
+            }.font(.caption)
+            Divider()
+            if definitions.isEmpty {
+                ContentUnavailableView("No map definitions", systemImage: "tablecells",
+                    description: Text(status))
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(definitions) { definition in
+                            let relocation = relocations.first { $0.definition.id == definition.id }
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(definition.title).frame(minWidth: 220, alignment: .leading)
+                                Text(String(format: "0x%08llX", definition.address)).monospaced()
+                                Text(relocationText(relocation, definition: definition))
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                        }
+                    }.textSelection(.enabled)
+                }
+                Text(status).font(.caption).foregroundStyle(.secondary)
+            }
+        }.padding(14).task(id: binaryPath) { loadFirmware() }
+    }
+
+    private func loadFirmware() {
+        do { firmware = try Data(contentsOf: URL(fileURLWithPath: binaryPath), options: .mappedIfSafe) }
+        catch { status = "Could not read the captured firmware: \(error.localizedDescription)" }
+    }
+
+    private func importXDF() {
+        let panel = NSOpenPanel()
+        panel.title = "Import TunerPro XDF Definitions"
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.xml, .data]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let parsed = try VGXDFDefinitions.parse(Data(contentsOf: url))
+            definitions = parsed
+            relocations = []
+            sourceName = url.lastPathComponent
+            let outside = parsed.filter { $0.address >= UInt64(firmware.count) }.count
+            status = "Imported \(parsed.count) bounded table definition(s); \(outside) address(es) are outside this image. Candidate labels require analyst verification before use."
+        } catch {
+            definitions = []; sourceName = url.lastPathComponent
+            status = "XDF import failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func chooseReference() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose the Exact Firmware Revision Used by the XDF"
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            referenceFirmware = try Data(contentsOf: url, options: .mappedIfSafe)
+            referenceName = url.lastPathComponent
+            relocations = []
+            status = "Reference loaded. Relocation will use up to four non-uniform X/Y/Z signatures per table."
+        } catch { status = "Reference firmware load failed: \(error.localizedDescription)" }
+    }
+
+    private func relocate() {
+        relocations = VGXDFDefinitions.relocate(definitions, reference: referenceFirmware, target: firmware)
+        let verified = relocations.filter { $0.state == .verified }.count
+        let candidates = relocations.filter { $0.state == .candidate }.count
+        let ambiguous = relocations.filter { $0.state == .ambiguous }.count
+        status = "Relocation complete: \(verified) verified, \(candidates) candidate, \(ambiguous) ambiguous, \(relocations.count - verified - candidates - ambiguous) not found."
+    }
+
+    private func relocationText(_ relocation: VGXDFRelocation?, definition: VGXDFDefinition) -> String {
+        guard let relocation else { return VGXDFDefinitions.evidence(for: definition, firmware: firmware) }
+        guard let address = relocation.resolvedAddress else { return "not-found · \(relocation.matchedAnchors)/\(relocation.totalAnchors) anchors" }
+        let delta = relocation.delta.map { String(format: "%+lld", $0) } ?? "unknown"
+        return "\(relocation.state.rawValue)@0x\(String(address, radix: 16)) · Δ\(delta) · \(relocation.matchedAnchors)/\(relocation.totalAnchors) anchors · \(Int(relocation.score * 100))%"
+    }
+
+    private func exportRelocations() {
+        let records: [[String: Any]] = relocations.map { relocation in
+            ["id": relocation.definition.id,
+             "name": relocation.definition.title,
+             "xdf_address": String(format: "0x%llx", relocation.definition.address),
+             "resolved_address": relocation.resolvedAddress.map { String(format: "0x%llx", $0) as Any } ?? NSNull(),
+             "state": relocation.state.rawValue,
+             "score": relocation.score,
+             "matched_anchors": relocation.matchedAnchors,
+             "total_anchors": relocation.totalAnchors,
+             "delta": relocation.delta.map { NSNumber(value: $0) as Any } ?? NSNull()]
+        }
+        do {
+            let document: [String: Any] = ["schema": 1, "kind": "hindsight-xdf-relocation",
+                                           "xdf": sourceName, "reference": referenceName,
+                                           "target": URL(fileURLWithPath: binaryPath).lastPathComponent,
+                                           "definitions": records]
+            let data = try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys])
+            let panel = NSSavePanel(); panel.title = "Export XDF Relocation Evidence"
+            panel.nameFieldStringValue = "xdf-relocation.json"
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try data.write(to: url, options: .atomic)
+            status = "Exported relocation evidence to \(url.lastPathComponent)."
+        } catch { status = "Relocation export failed: \(error.localizedDescription)" }
+    }
 }
 
 @MainActor
@@ -408,6 +637,9 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 9) {
                     Text("Run an explicit, local REA operation against one target. HindSight sends the selected path and provider directly to REA; it does not infer a broader target scope.")
                         .font(.caption).foregroundStyle(.secondary)
+                    Text("Command: \(model.reaExecutable) \(model.reaArguments)")
+                        .font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary)
+                        .textSelection(.enabled)
                     TextField("Absolute target path", text: $model.reaTargetPath)
                         .textFieldStyle(.roundedBorder)
                     HStack {
@@ -1035,11 +1267,124 @@ struct ContentView: View {
         }
         .onAppear { if model.plugins.isEmpty { model.refreshPlugins() } }
     }
+    @ViewBuilder private func ecuOverview(_ record: ProjectRecord) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            GroupBox("ECU firmware mode") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Infineon C166/C167 · ME7-class static analysis", systemImage: "car.side").font(.headline)
+                    Text("This profile comes from captured import evidence. Container facts, decoded vectors, checksum results, strings, and navigation remain evidence-labelled; HindSight does not perform vehicle-bus access, flashing, emissions modification, or peripheral emulation.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    VGKeyValueField(label: "Artifact", value: record.name, monospaced: true)
+                    VGKeyValueField(label: "Architecture", value: record.result.architecture, monospaced: true)
+                    VGKeyValueField(label: "Size", value: record.result.size, monospaced: true)
+                    analysisToolbar(record)
+                }.padding(8)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 10)], spacing: 10) {
+                reToolCard("Container & Regions", "Review decoded vectors and bounded region candidates", "square.3.layers.3d")
+                reToolCard("Checksums", "Review stored and computed ME7 checksum evidence", "checkmark.shield")
+                reToolCard("ECU Definitions", "Import XDF maps with explicit anchor status", "tablecells")
+                reToolCard("ECU Emulator", "Run the bounded C167 subset with registers and trace", "cpu")
+                reToolCard("Disassembly", "Browse C167 instructions with explicit undecoded barriers", "text.alignleft")
+                reToolCard("Strings", "Inspect bounded firmware strings", "text.quote")
+                reToolCard("Binary Workspace", "Correlate functions, flow, references, and bytes", "rectangle.3.group")
+                reToolCard("Notes", "Record analyst-owned conclusions and follow-ups", "note.text")
+            }
+            if let metadata = model.currentAnalysis?.metadata { monospaced(metadata).frame(minHeight: 220) }
+        }
+    }
+
+    @ViewBuilder private func ecuEvidenceWorkspace(title: String, text: String?, empty: String) -> some View {
+        let display = text.flatMap { $0.isEmpty ? nil : $0 } ?? empty
+        GroupBox(title) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Observed container facts and computed checksum results are distinct from region candidates. Editing and flashing are intentionally outside this workspace.")
+                    .font(.caption).foregroundStyle(.secondary)
+                monospaced(display).frame(minHeight: 420)
+            }.padding(8)
+        }
+    }
+
+    @ViewBuilder private func ecuEmulatorWorkspace() -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            GroupBox("Bounded C167 execution") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Executes only modeled instructions in a private image with a separate 64 KiB stack and bounded CP-selected register banks. Unsupported instructions, unmapped DPP accesses, and exhausted budgets stop explicitly. No peripherals, vehicle buses, or flashing are modeled.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        TextField("Entry", text: $model.c167Entry).frame(maxWidth: 140)
+                        TextField("Steps", text: $model.c167Steps).frame(maxWidth: 120)
+                        TextField("Stack", text: $model.c167Stack).frame(maxWidth: 140)
+                        TextField("Breakpoint", text: $model.c167Breakpoint).frame(maxWidth: 140)
+                        TextField("Physical watch", text: $model.c167Watchpoint).frame(maxWidth: 140)
+                        Button("Run", action: model.runC167Emulator)
+                        Button("Step", action: model.stepC167Emulator)
+                        Button("Continue", action: model.continueC167Emulator)
+                        Button("Reset", action: model.resetC167Emulator)
+                    }.textFieldStyle(.roundedBorder)
+                        .disabled(model.busy || !model.projectServiceReady)
+                    TextField("RAM seeds (physical=hex bytes, comma-separated)", text: $model.c167RAMSeed)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(model.busy || !model.projectServiceReady)
+                    Text(model.c167EmulationStatus).font(.caption).textSelection(.enabled)
+                }.padding(8)
+            }
+            if let result = model.c167Emulation {
+                HStack(alignment: .top, spacing: 12) {
+                    GroupBox("State") {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(String(format: "PC  0x%06llX", result.pc))
+                            Text(String(format: "SP  0x%05llX", result.sp))
+                            Text(String(format: "CP  0x%04X", result.cp))
+                            Text(String(format: "CSP 0x%02X", result.csp))
+                            Text(String(format: "MD  0x%04X:%04X", result.mdh, result.mdl))
+                            Text((0..<4).map { "DPP\($0)=0x" + String(format: "%03X", result.dpp["dpp\($0)"] ?? 0) }.joined(separator: "  "))
+                            Text("C=\(result.flags.carry ? 1 : 0) Z=\(result.flags.zero ? 1 : 0) N=\(result.flags.negative ? 1 : 0) V=\(result.flags.overflow ? 1 : 0)")
+                            Text("RAM seed=\(result.ram_seed_bytes)B writes=\(result.ram_write_bytes)B\(result.ram_truncated ? " preview-truncated" : "")")
+                            Divider()
+                            ForEach(0..<16, id: \.self) { index in
+                                Text(String(format: "r%-2d 0x%04X", index, result.registers["r\(index)"] ?? 0))
+                            }
+                            if !result.ram.isEmpty {
+                                Divider()
+                                Text("RAM preview")
+                                ForEach(Array(result.ram.keys.sorted().prefix(16)), id: \.self) { address in
+                                    Text("\(address)  \(String(format: "%02X", result.ram[address] ?? 0))")
+                                }
+                            }
+                        }.font(.system(.caption, design: .monospaced)).padding(6).textSelection(.enabled)
+                    }.frame(maxWidth: 190)
+                    GroupBox("Trace") {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 5) {
+                                ForEach(result.trace) { row in
+                                    Text(String(format: "0x%06llX  %-8@  %@", row.pc, row.bytes as NSString, row.text as NSString))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }.textSelection(.enabled)
+                        }.padding(6)
+                    }.frame(maxWidth: .infinity, minHeight: 420)
+                }
+            }
+        }.padding(12)
+    }
+
     // Keep the workspace switch behind a concrete return type so callers do
     // not expand every tool's view tree during Swift SIL generation.
     private func workspace(_ record: ProjectRecord) -> AnyView {
         AnyView(Group {
             switch model.workspace {
+            case "ECU Overview":
+                ecuOverview(record)
+            case "Container & Regions":
+                ecuEvidenceWorkspace(title: "Container & Regions", text: model.currentAnalysis?.metadata, empty: "Analyze this ECU image to validate its vector table, container facts, and checksummed-region candidates.")
+            case "Checksums":
+                VGECUChecksumsWorkspace(binaryPath: record.path)
+            case "ECU Definitions":
+                VGECUDefinitionsWorkspace(binaryPath: record.path)
+            case "ECU Emulator":
+                ecuEmulatorWorkspace()
             case "Targets":
                 targetsWorkspace()
             case "Binary Diff":
@@ -1088,6 +1433,7 @@ struct ContentView: View {
                         onUndoFunctionOverride: { address in
                             model.undoDecompilerFunctionOverride(recordID: record.id, address: address)
                         },
+                        onImportFunctionNames: model.importFunctionNameExchange,
                         reconstruction: model.currentReconstruction,
                         reconstructionSDKCatalog: model.reconstructionSDKCatalog,
                         reconstructionSDKProviders: model.reconstructionSDKProviders,
@@ -2017,11 +2363,13 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     GroupBox("Project type evidence") {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Declarations are retained with source digest and target provenance. Identical declarations can corroborate one another; conflicting declarations remain visible and are withheld from type selection.")
+                            Text("Declarations are retained with source digest and target provenance. Compiler layouts are bound to the declaration and target; they do not prove the binary uses that type. Conflicting declarations or layouts remain visible and are withheld from type selection.")
                                 .font(.caption).foregroundStyle(.secondary)
                             HStack {
                                 Text(model.projectTypeCatalogStatus).font(.caption)
                                 Spacer()
+                                Button("Import JSON", action: model.importProjectTypeCatalog)
+                                    .disabled(!model.projectServiceReady || model.selected?.result.source_sha256 == nil)
                                 Button("Export JSON", action: model.exportProjectTypeCatalog)
                                     .disabled(!model.projectServiceReady || model.projectTypeCatalog.candidates.isEmpty)
                                 Button("Refresh", action: model.refreshProjectTypeCatalog)
@@ -2052,6 +2400,12 @@ struct ContentView: View {
                                                         target: candidate.target) != nil {
                                                         Label("Unique for target", systemImage: "checkmark.seal")
                                                             .font(.caption).foregroundStyle(.secondary)
+                                                    }
+                                                    if let layout = candidate.layoutEvidence {
+                                                        Label("Clang layout · \(layout.record.size) B / align \(layout.record.alignment)",
+                                                              systemImage: "ruler")
+                                                            .font(.caption).foregroundStyle(.secondary)
+                                                            .help("\(layout.compiler), SDK \(layout.sdkBuild), \(layout.target); declaration SHA-256 \(layout.declarationsSHA256)")
                                                     }
                                                     Spacer()
                                                     Button(role: .destructive) {
@@ -2644,7 +2998,7 @@ struct ContentView: View {
     }
 
     @ViewBuilder private func sidebarWorkspaceButton(_ descriptor: VGWorkspaceDescriptor) -> some View {
-        let available = workspaceAvailableOnThisHost(descriptor.name)
+        let available = workspaceAvailableOnThisHost(descriptor.name) && model.profileAllows(descriptor.name)
         Button {
             if available { model.workspace = descriptor.name }
         } label: {
@@ -3455,7 +3809,9 @@ struct ContentView: View {
     }
 
     @ViewBuilder private func selectedWorkspaceContent(_ record: ProjectRecord) -> some View {
-        if model.workspace == "CFG" || model.workspace == "Binary Workspace" || model.workspace == "Runtime Correlation" || model.workspace == "Trace Explorer" || model.workspace == "Evidence Graph" || model.workspace == "Investigation Ledger" {
+        if !model.profileAllows(model.workspace) {
+            ContentUnavailableView("Workspace unavailable for this artifact", systemImage: "rectangle.slash", description: Text("Choose a workspace offered by the \(model.artifactProfile.rawValue) artifact profile."))
+        } else if model.workspace == "CFG" || model.workspace == "Binary Workspace" || model.workspace == "Runtime Correlation" || model.workspace == "Trace Explorer" || model.workspace == "Evidence Graph" || model.workspace == "Investigation Ledger" {
             workspace(record)
                 .background(Color(nsColor: .controlBackgroundColor).opacity(0.22))
         } else {
@@ -3720,6 +4076,7 @@ struct ContentView: View {
             VGCommandPalette(
                 isPresented: $commandPalettePresented,
                 currentWorkspace: model.workspace,
+                profile: model.artifactProfile,
                 onSelect: { model.workspace = $0 }
             )
         }

@@ -1,5 +1,8 @@
 /* CC0. Analyst-supplied declarations; function bodies are not recovery inputs. */
 #include <stdint.h>
+struct Point { int x; int y; };
+int hs_point_read(struct Point *point);
+void hs_point_write(struct Point *point, int value);
 uint64_t hs_c_mix(uint64_t first, uint64_t second, uint64_t multiplier, uint64_t shifted, uint64_t shift);
 uint64_t hs_c_select(uint64_t first, uint64_t second);
 uint64_t hs_c_stack(uint64_t first, uint64_t second);

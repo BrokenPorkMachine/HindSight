@@ -1,0 +1,58 @@
+{
+  "id": "com.brokenporkmachine.hindsight.warhead",
+  "name": "Warhead: MGCA (Military Grade Coding Agent)",
+  "version": "0.1.0",
+  "api_version": 2,
+  "entry": "main.py",
+  "capabilities": [
+    "selection.read",
+    "analysis.read",
+    "settings.read",
+    "state.read",
+    "state.write"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "run",
+      "title": "Run Warhead: MGCA",
+      "event": "command.run"
+    },
+    {
+      "id": "clear",
+      "title": "Clear Warhead Result",
+      "event": "command.clear"
+    }
+  ],
+  "panels": [
+    {
+      "id": "warhead",
+      "title": "Warhead: MGCA",
+      "event": "panel.warhead",
+      "dock": "bottom",
+      "min_width": 360,
+      "description": "Military Grade Coding Agent \u2014 code proposals and evidence-backed analysis."
+    }
+  ],
+  "settings": [
+    {
+      "id": "host",
+      "title": "Ollama endpoint (context is sent here)",
+      "type": "string",
+      "default_value": "http://localhost:11434"
+    },
+    {
+      "id": "model",
+      "title": "Model tag",
+      "type": "string",
+      "default_value": ""
+    },
+    {
+      "id": "task",
+      "title": "Task / coding request",
+      "type": "string",
+      "default_value": ""
+    }
+  ],
+  "dependencies": []
+}

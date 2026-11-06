@@ -26,7 +26,13 @@ pub struct SourceDeclaration {
     pub parameters: Vec<(String, String)>,
 }
 
-pub fn source_declaration(name: &str, signature: &Signature) -> Option<SourceDeclaration> {
+#[cfg(test)]
+fn source_declaration(name: &str, signature: &Signature) -> Option<SourceDeclaration> {
+    source_declaration_with_project_types(name, signature, &[])
+}
+
+pub fn source_declaration_with_project_types(name: &str, signature: &Signature,
+    project_types: &[crate::reconstruction::ProjectTypeDependency]) -> Option<SourceDeclaration> {
     if signature.declaration.contains("...") || signature.language == "C++ / Objective-C++" { return None; }
     let recovered_name = if signature.language == "Objective-C / Objective-C++" {
         format!("hs_recovered_imp_{}", name.bytes().map(|b| if b.is_ascii_alphanumeric() { b as char } else { '_' }).collect::<String>())
@@ -37,7 +43,7 @@ pub fn source_declaration(name: &str, signature: &Signature) -> Option<SourceDec
     let safe_type = |ty: &str| matches!(ty.trim(), "float" | "double" | "long double" | "__int128" | "unsigned __int128" |
         "NSRange" | "CFRange" | "CGPoint" | "CGSize" | "CGRect" | "CGAffineTransform") || {
         let probe = Signature { language: "C", declaration: format!("void hs_declaration_probe({ty} value);"), source: signature.source };
-        source_signature("hs_declaration_probe", &probe).is_some()
+        source_signature_with_project_types("hs_declaration_probe", &probe, project_types).is_some()
     };
     let result_spelling = signature_return_type(signature)?;
     if result_spelling.trim() != "void" && !safe_type(&result_spelling) { return None; }
@@ -68,7 +74,24 @@ pub fn abi_parameter_types(signature:&Signature)->Vec<(Option<String>,Option<u8>
     }).collect()
 }
 
+#[cfg(test)]
 pub fn source_signature(name:&str,signature:&Signature)->Option<SourceSignature>{
+    source_signature_with_project_types(name,signature,&[])
+}
+
+fn catalog_pointer_type(spelling:&str, project_types:&[crate::reconstruction::ProjectTypeDependency])->bool {
+    let Some(normalized)=uncomment_type(spelling) else{return false};
+    if !normalized.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b' '|b'*'|b'_'))
+        || normalized.matches('*').count()!=1 {return false}
+    let Some((base,suffix))=normalized.split_once('*') else{return false};
+    if !suffix.trim().is_empty(){return false}
+    let base=base.split_whitespace().filter(|word|!matches!(*word,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"|"__kindof"|"struct"|"union"))
+        .collect::<Vec<_>>().join(" ");
+    base.split_whitespace().count()==1 && project_types.iter().any(|candidate|candidate.name==base)
+}
+
+pub fn source_signature_with_project_types(name:&str,signature:&Signature,
+    project_types:&[crate::reconstruction::ProjectTypeDependency])->Option<SourceSignature>{
     if signature.declaration.contains("...")||signature.language=="C++ / Objective-C++"{return None}
     let objc=signature.language=="Objective-C / Objective-C++";
     let name=if objc {format!("hs_recovered_imp_{}",name.bytes().map(|b|if b.is_ascii_alphanumeric(){b as char}else{'_'}).collect::<String>())}
@@ -81,7 +104,8 @@ pub fn source_signature(name:&str,signature:&Signature)->Option<SourceSignature>
         if !spelling.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b' '|b'*')){return None}
         let bare=spelling.split(|c:char|c.is_whitespace()||c=='*').filter(|s|!s.is_empty()&&!matches!(*s,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"|"__kindof")).collect::<Vec<_>>().join(" ");
         let native=["void","char","signed char","unsigned char","short","short int","signed short","unsigned short","unsigned short int","int","signed","signed int","unsigned","unsigned int","long","long int","unsigned long","unsigned long int","long long","long long int","unsigned long long","unsigned long long int","int8_t","uint8_t","int16_t","uint16_t","int32_t","uint32_t","int64_t","uint64_t","intptr_t","uintptr_t","size_t","ssize_t","ptrdiff_t","id","Class","SEL","NSInteger","NSUInteger","CFIndex","CFTypeID","CFOptionFlags","CFStringEncoding","CFNumberType","CFURLPathStyle","CFPropertyListFormat","dispatch_once_t","CFTypeRef","CFAllocatorRef","CFStringRef","CFArrayRef","CFDictionaryRef","CFBooleanRef","CFNumberRef","CFDataRef","CFBundleRef","CFURLRef","CFPropertyListRef","CFErrorRef","CFRunLoopRef"];
-        if !native.contains(&bare.as_str()) && !matches!(bare.as_str(),"bool"|"_Bool"|"signed int"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
+        let catalog_pointer=catalog_pointer_type(&spelling,project_types);
+        if !native.contains(&bare.as_str()) && !catalog_pointer && !matches!(bare.as_str(),"bool"|"_Bool"|"signed int"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
         let AbiType::Integer(bytes)=abi_type(&spelling)? else{return None};
         let kind=abi_integer_kind(&spelling)?;
         if kind==AbiIntegerKind::Boolean && !matches!(bare.as_str(),"bool"|"_Bool"){return None}
@@ -235,6 +259,122 @@ pub fn external_project_type_dependencies(source_sha256: &str, architecture: &st
     let mut contents=String::new();
     std::fs::File::open(path)?.take(12*1024*1024+1).read_to_string(&mut contents)?;
     if contents.len()>12*1024*1024 { return Err(io::Error::new(io::ErrorKind::InvalidData,"Project type catalog exceeds byte budget")) }
+    parse_project_type_dependencies(&contents, source_sha256, architecture)
+}
+
+#[derive(Debug)]
+enum LayoutJSONValue { String(String), Number(i64), Bool(bool), Null, Array(Vec<LayoutJSONValue>), Object(BTreeMap<String,LayoutJSONValue>) }
+struct LayoutJSON<'a> { bytes: &'a [u8], at: usize }
+impl LayoutJSON<'_> {
+    fn whitespace(&mut self) { while self.bytes.get(self.at).is_some_and(u8::is_ascii_whitespace) { self.at += 1; } }
+    fn take(&mut self, byte: u8) -> bool { self.whitespace(); if self.bytes.get(self.at)==Some(&byte) { self.at+=1; true } else { false } }
+    fn string(&mut self) -> Option<String> {
+        self.whitespace(); if !self.take_raw(b'"') { return None; }
+        let mut out=Vec::new();
+        loop {
+            let byte=*self.bytes.get(self.at)?; self.at+=1;
+            match byte {
+                b'"' => return String::from_utf8(out).ok(),
+                b'\\' => {
+                    let escaped=*self.bytes.get(self.at)?; self.at+=1;
+                    match escaped {
+                        b'"'|b'\\'|b'/' => out.push(escaped), b'b'=>out.push(8),b'f'=>out.push(12),b'n'=>out.push(10),b'r'=>out.push(13),b't'=>out.push(9),
+                        b'u' => {
+                            let first=self.hex4()?;
+                            let scalar=if (0xd800..=0xdbff).contains(&first) {
+                                if self.bytes.get(self.at..self.at+2)!=Some(b"\\u") { return None; }
+                                self.at+=2; let second=self.hex4()?;
+                                if !(0xdc00..=0xdfff).contains(&second) { return None; }
+                                0x10000+((u32::from(first)-0xd800)<<10)+(u32::from(second)-0xdc00)
+                            } else if (0xdc00..=0xdfff).contains(&first) { return None; } else { u32::from(first) };
+                            out.extend(char::from_u32(scalar)?.encode_utf8(&mut [0;4]).as_bytes());
+                        }
+                        _=>return None,
+                    }
+                }
+                0..=31 => return None,
+                _=>out.push(byte),
+            }
+        }
+    }
+    fn take_raw(&mut self, byte:u8)->bool { if self.bytes.get(self.at)==Some(&byte) {self.at+=1;true}else{false} }
+    fn hex4(&mut self)->Option<u16>{
+        let chunk=self.bytes.get(self.at..self.at+4)?; self.at+=4;
+        chunk.iter().try_fold(0u16,|value,byte|Some(value*16+match byte{b'0'..=b'9'=>u16::from(byte-b'0'),b'a'..=b'f'=>u16::from(byte-b'a'+10),b'A'..=b'F'=>u16::from(byte-b'A'+10),_=>return None}))
+    }
+    fn value(&mut self, depth:u8)->Option<LayoutJSONValue> {
+        if depth>32{return None} self.whitespace();
+        if self.bytes.get(self.at)==Some(&b'"'){return self.string().map(LayoutJSONValue::String)}
+        if self.take(b'{') {
+            let mut object=BTreeMap::new(); if self.take(b'}'){return Some(LayoutJSONValue::Object(object))}
+            loop { let key=self.string()?; if !self.take(b':'){return None} let value=self.value(depth+1)?;
+                if object.insert(key,value).is_some(){return None}
+                if self.take(b'}'){return Some(LayoutJSONValue::Object(object))} if !self.take(b','){return None} }
+        }
+        if self.take(b'[') {
+            let mut array=Vec::new(); if self.take(b']'){return Some(LayoutJSONValue::Array(array))}
+            loop { array.push(self.value(depth+1)?); if self.take(b']'){return Some(LayoutJSONValue::Array(array))} if !self.take(b','){return None} }
+        }
+        for (literal,value) in [(&b"true"[..],LayoutJSONValue::Bool(true)),(&b"false"[..],LayoutJSONValue::Bool(false)),(&b"null"[..],LayoutJSONValue::Null)] {
+            if self.bytes.get(self.at..self.at+literal.len())==Some(literal){self.at+=literal.len();return Some(value)}
+        }
+        let start=self.at;
+        if self.bytes.get(self.at)==Some(&b'-'){self.at+=1}
+        if self.bytes.get(self.at)==Some(&b'0'){self.at+=1}else{
+            let digits=self.at; while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit){self.at+=1} if self.at==digits{return None}
+        }
+        if self.bytes.get(self.at).is_some_and(|byte|matches!(byte,b'.'|b'e'|b'E')){return None}
+        std::str::from_utf8(&self.bytes[start..self.at]).ok()?.parse::<i64>().ok().map(LayoutJSONValue::Number)
+    }
+    fn document(mut self)->Option<LayoutJSONValue> {
+        let value=self.value(0)?;self.whitespace();(self.at==self.bytes.len()).then_some(value)
+    }
+}
+
+fn layout_document(json:&str)->Option<LayoutJSONValue> { LayoutJSON{bytes:json.as_bytes(),at:0}.document() }
+fn layout_bindings(json:&str)->Option<BTreeMap<String,String>> {
+    match layout_document(json)? { LayoutJSONValue::Object(object)=>Some(object.into_iter().filter_map(|(key,value)| {
+        matches!(key.as_str(),"producer"|"target"|"declarationsSHA256").then(||match value {LayoutJSONValue::String(value)=>Some((key,value)),_=>None}).flatten()
+    }).collect()),_=>None }
+}
+
+fn parse_layout_record(json:&str)->Option<crate::reconstruction::ProjectTypeLayout> {
+    let LayoutJSONValue::Object(root)=layout_document(json)? else{return None};
+    let LayoutJSONValue::Object(record)=root.get("record")? else{return None};
+    let text=|key:&str|match record.get(key)? {LayoutJSONValue::String(value)=>Some(value.clone()),_=>None};
+    let number=|key:&str|match record.get(key)? {LayoutJSONValue::Number(value) if *value>0=>Some(*value as u64),_=>None};
+    let LayoutJSONValue::Bool(fields_complete)=record.get("fieldOffsetsComplete")? else{return None};
+    let LayoutJSONValue::Array(fields)=record.get("fields")? else{return None};
+    let fields=fields.iter().map(|field| {
+        let LayoutJSONValue::Object(field)=field else{return None};
+        let get_text=|key:&str|match field.get(key)? {LayoutJSONValue::String(value)=>Some(value.clone()),_=>None};
+        let get_num=|key:&str|match field.get(key)? {LayoutJSONValue::Number(value) if *value>=0=>Some(*value as u64),_=>None};
+        let bit_width=match field.get("bitWidth") {None|Some(LayoutJSONValue::Null)=>None,Some(LayoutJSONValue::Number(value)) if *value>0=>Some(*value as u64),_=>return None};
+        Some(crate::reconstruction::ProjectTypeLayoutField {
+            name:get_text("name")?, declaration:get_text("declaration")?, offset_bits:get_num("offsetBits")?, bit_width,
+        })
+    }).collect::<Option<Vec<_>>>()?;
+    Some(crate::reconstruction::ProjectTypeLayout {
+        name:text("name")?,kind:text("kind")?,size:number("size")?,alignment:number("alignment")?,
+        fields_complete:*fields_complete,fields,
+    })
+}
+
+fn valid_project_layout(layout:&crate::reconstruction::ProjectTypeLayout,candidate_name:&str)->bool {
+    let Some(record_bits)=layout.size.checked_mul(8) else{return false};
+    layout.name==candidate_name && matches!(layout.kind.as_str(),"struct"|"union")
+        && layout.size>0 && layout.size<=1_048_576 && layout.alignment.is_power_of_two()
+        && layout.fields_complete && layout.fields.len()<=1024
+        && layout.fields.iter().all(|field|field.name.len()<=128
+            && field.name.bytes().next().is_some_and(|byte|byte.is_ascii_alphabetic()||byte==b'_')
+            && field.name.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'_')
+            && !field.declaration.is_empty() && field.declaration.len()<=512 && field.declaration.is_ascii()
+            && !field.declaration.bytes().any(|byte|byte.is_ascii_control()) && field.offset_bits<record_bits
+            && field.bit_width.map_or(true,|width|width>0 && width<=record_bits-field.offset_bits))
+        && layout.fields.iter().map(|field|field.name.as_str()).collect::<std::collections::BTreeSet<_>>().len()==layout.fields.len()
+}
+
+fn parse_project_type_dependencies(contents: &str, source_sha256: &str, architecture: &str) -> io::Result<Vec<crate::reconstruction::ProjectTypeDependency>> {
     let compatible_architecture = |target: &str| {
         let target_arch = target.split('-').next().unwrap_or("");
         match architecture { "arm64" => matches!(target_arch,"arm64"|"aarch64"), "arm64e" => matches!(target_arch,"arm64"|"arm64e"|"aarch64"), _ => false }
@@ -242,8 +382,8 @@ pub fn external_project_type_dependencies(source_sha256: &str, architecture: &st
     let mut result = BTreeMap::<String, crate::reconstruction::ProjectTypeDependency>::new();
     for line in contents.lines().filter_map(|line| line.strip_prefix("# project_type\t")) {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len()!=4 { return Err(io::Error::new(io::ErrorKind::InvalidData,"Malformed project type catalog record")) }
-        let (record_digest,target,name,encoded)=(fields[0],fields[1],fields[2],fields[3]);
+        if fields.len()!=5 { return Err(io::Error::new(io::ErrorKind::InvalidData,"Malformed project type catalog record")) }
+        let (record_digest,target,name,encoded,layout_encoded)=(fields[0],fields[1],fields[2],fields[3],fields[4]);
         if record_digest!=source_sha256||target.len()>128||!target.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b'.'|b'-'))||!compatible_architecture(target)
             ||name.is_empty()||name.len()>256||!name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_')
             ||encoded.is_empty()||encoded.len()>32*1024||encoded.len()%2!=0||!encoded.bytes().all(|b|b.is_ascii_hexdigit()) {
@@ -261,9 +401,31 @@ pub fn external_project_type_dependencies(source_sha256: &str, architecture: &st
             ||!declaration.split(|character: char| !character.is_ascii_alphanumeric() && character!='_').any(|token|token==name) {
             return Err(io::Error::new(io::ErrorKind::InvalidData,"Unsafe or mismatched project type declaration"))
         }
-        let dependency=crate::reconstruction::ProjectTypeDependency{name:name.into(),declaration,target:target.into(),source_sha256:record_digest.into()};
-        if result.get(name).is_some_and(|old|old.declaration!=dependency.declaration) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,"Conflicting project type declarations reached the worker"))
+        let (layout_evidence,layout_record) = if layout_encoded == "-" { (None,None) } else {
+            if layout_encoded.len() > 128 * 1024 || layout_encoded.is_empty() || layout_encoded.len() % 2 != 0
+                || !layout_encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,"Invalid project type layout encoding or bounds"));
+            }
+            let layout_bytes: Result<Vec<u8>,_> = layout_encoded.as_bytes().chunks_exact(2).map(|pair| {
+                let digit=|b:u8| match b { b'0'..=b'9'=>Some(b-b'0'),b'a'..=b'f'=>Some(b-b'a'+10),b'A'..=b'F'=>Some(b-b'A'+10),_=>None };
+                Some(digit(pair[0])?*16+digit(pair[1])?)
+            }).collect::<Option<Vec<_>>>().ok_or(());
+            let layout = String::from_utf8(layout_bytes.map_err(|_|io::Error::new(io::ErrorKind::InvalidData,"Invalid project type layout encoding"))?)
+                .map_err(|_|io::Error::new(io::ErrorKind::InvalidData,"Project type layout is not UTF-8"))?;
+            let declaration_hash = crate::reconstruction::sha256_hex_bytes(declaration.as_bytes())?;
+            let bindings=layout_bindings(&layout);
+            if !bindings.as_ref().is_some_and(|fields| fields.get("producer").is_some_and(|value|value=="hindsight-apple-clang-record-layout-v1")
+                && fields.get("declarationsSHA256").is_some_and(|value|value.eq_ignore_ascii_case(&declaration_hash))
+                && fields.get("target").is_some_and(|value|value==target)) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,"Project type layout evidence is not bound to its declaration and target"));
+            }
+            let record=parse_layout_record(&layout).filter(|record|valid_project_layout(record,name))
+                .ok_or_else(||io::Error::new(io::ErrorKind::InvalidData,"Project type compiler layout record is invalid or conflicts with its catalog candidate"))?;
+            (Some(layout),Some(record))
+        };
+        let dependency=crate::reconstruction::ProjectTypeDependency{name:name.into(),declaration,target:target.into(),source_sha256:record_digest.into(),layout_evidence,layout:layout_record};
+        if result.get(name).is_some_and(|old| old.declaration != dependency.declaration || old.target != dependency.target || old.layout_evidence != dependency.layout_evidence) {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,"Conflicting project type declarations or target provenance reached the worker"))
         }
         result.insert(name.into(),dependency);
     }
@@ -904,7 +1066,13 @@ pub fn recover_arm64(
 }
 
 #[derive(Default)]
-struct SwitchEvidence { branch_register: u8, index_register: Option<u8>, cases: Vec<(u64,u64)> }
+struct SwitchEvidence {
+    branch_register: u8,
+    index_register: Option<u8>,
+    range: Option<String>,
+    normalization: Option<String>,
+    cases: Vec<(u64,Option<u64>,u64)>,
+}
 
 fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
     let mut result=BTreeMap::new();
@@ -923,12 +1091,21 @@ fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
         }
         let Some(address)=current else{continue};
         if let Some(register)=line.split("table_index=x").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<u8>().ok()) {
-            if let Some(evidence)=result.get_mut(&address){evidence.index_register=Some(register);}
+            if let Some(evidence)=result.get_mut(&address){
+                evidence.index_register=Some(register);
+                if let Some(range)=line.split("case-range=").nth(1).and_then(|s|s.split(" proven-entry-count=").next()) {
+                    evidence.range=Some(range.to_owned());
+                }
+                if let Some(normalization)=line.split("index-normalization=").nth(1).and_then(|s|s.split(" modulo ").next()) {
+                    evidence.normalization=Some(normalization.to_owned());
+                }
+            }
         }
         if line.trim_start().starts_with("case-index=") {
             let case=line.split("case-index=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|s.parse::<u64>().ok());
             let target=line.split("target=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
-            if let (Some(case),Some(target))=(case,target){if let Some(evidence)=result.get_mut(&address){evidence.cases.push((case,target));}}
+            let selector=line.split("selector-bits=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
+            if let (Some(case),Some(target))=(case,target){if let Some(evidence)=result.get_mut(&address){evidence.cases.push((case,selector,target));}}
         }
         if line.starts_with("validated_entries=") { current=None; }
     }
@@ -1766,7 +1943,7 @@ fn render_arm64_body(
         let digits = target.split(|c: char| !c.is_ascii_hexdigit()).next()?;
         u64::from_str_radix(digits,16).ok().filter(|target| instruction_addresses.contains(target))
     }).collect::<std::collections::BTreeSet<_>>();
-    for evidence in switch_evidence.values(){for &(_,target) in &evidence.cases{if instruction_addresses.contains(&target){labels.insert(target);}}}
+    for evidence in switch_evidence.values(){for &(_,_,target) in &evidence.cases{if instruction_addresses.contains(&target){labels.insert(target);}}}
     let incoming_branches=instructions.iter().filter_map(|(source,statement)|branch_target_statement(statement).map(|target|(target,*source))).collect::<Vec<_>>();
 
     let mut out = String::new();
@@ -1809,12 +1986,15 @@ fn render_arm64_body(
         let (address, statement) = &instructions[instruction_index];
         if let Some(evidence)=switch_evidence.get(address).filter(|evidence|statement.starts_with("goto x")&&!evidence.cases.is_empty()){
             let index_register=evidence.index_register?;
-            out.push_str(&format!("    {address:#018x}: switch (x{index_register}) {{ /* bounded jump-table candidate; index interpretation and case range unresolved */\n"));
-            for &(case,target) in &evidence.cases {
+            let bound=evidence.range.as_ref().map(|range|format!(" proven unsigned range: {range};")).unwrap_or_else(||" index range unresolved;".into());
+            let normalization=evidence.normalization.as_ref().map(|value|format!(" normalized index: {value};")).unwrap_or_default();
+            out.push_str(&format!("    {address:#018x}: switch (x{index_register}) {{ /* bounded jump-table candidate;{bound}{normalization} case labels are table indices, source switch remains unproven */\n"));
+            for &(case,selector_bits,target) in &evidence.cases {
                 let destination=if instruction_addresses.contains(&target){format!("goto loc_{target:x};")}else{format!("goto {target:#x}; /* target outside this recovered function */")};
-                out.push_str(&format!("        case {case}: {destination} /* table target {target:#x} */\n"));
+                let selector=selector_bits.map(|bits|format!("; normalized selector bits {bits:#x}")).unwrap_or_default();
+                out.push_str(&format!("        case {case}: {destination} /* table target {target:#x}{selector} */\n"));
             }
-            out.push_str(&format!("        default: goto x{}; /* unresolved indirect target */\n    }}\n",evidence.branch_register));
+            out.push_str(&format!("        default: /* unresolved indirect target in x{}; no edge inferred */\n    }}\n",evidence.branch_register));
             instruction_index+=1;
             continue;
         }
@@ -2090,6 +2270,31 @@ fn recover_internal(
 
 #[cfg(test)] mod tests {
     #[test]
+    fn jump_table_evidence_retains_proven_range_and_modular_selector_bits() {
+        let report = "0x0000000000001000  BR x14  bounded indexed-table evidence\n\
+            table=0x2000 format=table-relative signed offsets entry_width=4 table_index=x8 index-provenance=unknown scan_limit=32 confidence=candidate case-range=CMP/B.HI x8<=3 proven-entry-count=4 index-normalization=w8=(w0-5) modulo 2^32\n\
+              case-index=0 selector-bits=0x5 entry=0x2000 target=0x0000000000001100 validation=executable-aligned\n\
+            validated_entries=1; case mapping remains a candidate.\n";
+        let parsed = super::parse_switch_evidence(report);
+        let evidence = parsed.get(&0x1000).expect("validated table candidate");
+        assert_eq!(evidence.index_register, Some(8));
+        assert_eq!(evidence.range.as_deref(), Some("CMP/B.HI x8<=3"));
+        assert_eq!(evidence.normalization.as_deref(), Some("w8=(w0-5)"));
+        assert_eq!(evidence.cases, vec![(0, Some(5), 0x1100)]);
+
+        let branch = 0xd61f_01c0u32.to_le_bytes(); // br x14
+        let body = super::render_arm64_body(0x1000, 0x1004, "_switch", None, &[],
+            &std::collections::BTreeMap::new(), &branch, 0x1000, 0, &[], "", &[], report,
+            &std::collections::BTreeMap::new(), None).expect("rendered candidate switch");
+        assert!(body.contains("proven unsigned range: CMP/B.HI x8<=3"), "{body}");
+        assert!(body.contains("normalized index: w8=(w0-5)"), "{body}");
+        assert!(body.contains("normalized selector bits 0x5"), "{body}");
+        assert!(body.contains("source switch remains unproven"), "{body}");
+        assert!(body.contains("default: /* unresolved indirect target in x14; no edge inferred */"), "{body}");
+        assert!(!body.contains("default: goto x14"), "{body}");
+    }
+
+    #[test]
     fn source_array_declarators_never_silently_lose_pointer_or_row_shape() {
         for declaration in ["uint64_t hs_test(uint64_t items[][4]);",
             "uint64_t hs_test(uint64_t items[3][4]);", "uint64_t hs_test(uint64_t *items[]);",
@@ -2104,6 +2309,24 @@ fn recover_internal(
             assert!(recovered.parameters[0].pointer);
             assert_eq!(recovered.parameters[0].name, "items");
             assert!(source_declaration("_hs_test", &signature).is_some());
+        }
+    }
+    #[test]
+    fn project_catalog_types_enable_only_exact_single_level_aggregate_pointers() {
+        let project_type=crate::reconstruction::ProjectTypeDependency {
+            name:"Point".into(), declaration:"typedef struct Point { int x; int y; } Point;".into(),
+            target:"arm64-apple-macos14.0".into(), source_sha256:"a".repeat(64), layout_evidence:None, layout:None,
+        };
+        let signature=Signature { language:"C", declaration:"int hs_test(Point *point);".into(), source:"hash-bound analyst C prototype catalog" };
+        assert!(source_signature("_hs_test",&signature).is_none(),"unmatched project aliases must remain unresolved");
+        let recovered=source_signature_with_project_types("_hs_test",&signature,std::slice::from_ref(&project_type)).unwrap();
+        assert_eq!(recovered.parameters[0].spelling,"Point *");
+        assert!(recovered.parameters[0].pointer);
+        assert_eq!(recovered.parameters[0].bits,64);
+        assert!(source_declaration_with_project_types("_hs_test",&signature,std::slice::from_ref(&project_type)).is_some());
+        for declaration in ["int hs_test(Point value);","int hs_test(Point **point);"] {
+            let unsupported=Signature { language:"C", declaration:declaration.into(), source:"test" };
+            assert!(source_signature_with_project_types("_hs_test",&unsupported,std::slice::from_ref(&project_type)).is_none(),"{declaration}");
         }
     }
     #[test]
@@ -2323,6 +2546,62 @@ fn recover_internal(
             format!("# source_sha256={digest}\n_custom\tint custom(int value) {{ return value; }}\n"),
             format!("# source_sha256={digest}\n_custom\tint custom(int value);\n_custom\tdouble custom(double value);\n"),
         ] {assert!(parse_prototype_database(&invalid,digest).is_err(),"{invalid}")}
+    }
+    #[test] fn project_type_catalog_rejects_conflicting_target_provenance() {
+        let digest="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let declaration="typedef struct Widget { int value; } Widget;";
+        let encoded=declaration.bytes().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let record=|target:&str|format!("# project_type\t{digest}\t{target}\tWidget\t{encoded}\t-\n");
+        let same_target=format!("{}{}",record("arm64-apple-macos14.0"),record("arm64-apple-macos14.0"));
+        assert!(parse_project_type_dependencies(&same_target,digest,"arm64").is_ok());
+        let conflicting_target=format!("{}{}",record("arm64-apple-macos14.0"),record("aarch64-apple-ios17.0"));
+        assert!(parse_project_type_dependencies(&conflicting_target,digest,"arm64").is_err());
+        let other_declaration="typedef struct Widget { long value; } Widget;";
+        let other_encoded=other_declaration.bytes().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let conflicting_declaration=format!("{}# project_type\t{digest}\tarm64-apple-macos14.0\tWidget\t{other_encoded}\t-\n",record("arm64-apple-macos14.0"));
+        assert!(parse_project_type_dependencies(&conflicting_declaration,digest,"arm64").is_err());
+
+        let declaration_hash=crate::reconstruction::sha256_hex_bytes(declaration.as_bytes()).unwrap();
+        let layout=format!("{{\"schema\":1,\"producer\":\"hindsight-apple-clang-record-layout-v1\",\"target\":\"arm64-apple-macos14.0\",\"declarationsSHA256\":\"{declaration_hash}\",\"record\":{{\"name\":\"Widget\",\"kind\":\"struct\",\"size\":8,\"alignment\":4,\"fieldOffsetsComplete\":true,\"fields\":[{{\"name\":\"value\",\"declaration\":\"int value\",\"offsetBits\":0,\"bitWidth\":null}}]}}}}");
+        assert!(layout_bindings(&layout).is_some());
+        assert!(layout_bindings(&format!("{{\"nested\":{layout}}}")).unwrap().get("producer").is_none());
+        assert!(layout_bindings(&format!("{{\"producer\":\"wrong\",\"producer\":\"hindsight-apple-clang-record-layout-v1\",\"target\":\"arm64-apple-macos14.0\",\"declarationsSHA256\":\"{declaration_hash}\"}}")).is_none());
+        assert!(layout_bindings(&format!("not-json {layout}")).is_none());
+        let layout_hex=layout.bytes().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let with_layout=format!("# source_sha256={digest}\n# project_type\t{digest}\tarm64-apple-macos14.0\tWidget\t{encoded}\t{layout_hex}\n");
+        let parsed=parse_project_type_dependencies(&with_layout,digest,"arm64").unwrap();
+        assert_eq!(parsed[0].layout_evidence.as_deref(),Some(layout.as_str()));
+        assert_eq!(parsed[0].layout.as_ref().unwrap().fields[0].offset_bits,0);
+        for invalid_layout in [layout.replace("\"offsetBits\":0","\"offsetBits\":64"),
+            layout.replace("\"name\":\"Widget\",\"kind\"","\"name\":\"Other\",\"kind\"")] {
+            let invalid_hex=invalid_layout.bytes().map(|byte|format!("{byte:02x}")).collect::<String>();
+            let invalid_record=format!("# source_sha256={digest}\n# project_type\t{digest}\tarm64-apple-macos14.0\tWidget\t{encoded}\t{invalid_hex}\n");
+            assert!(parse_project_type_dependencies(&invalid_record,digest,"arm64").is_err());
+        }
+        let wrong_hash=layout.replace(&declaration_hash,&"f".repeat(64));
+        let wrong_hash_hex=wrong_hash.bytes().map(|byte|format!("{byte:02x}")).collect::<String>();
+        let tampered=format!("# source_sha256={digest}\n# project_type\t{digest}\tarm64-apple-macos14.0\tWidget\t{encoded}\t{wrong_hash_hex}\n");
+        assert!(parse_project_type_dependencies(&tampered,digest,"arm64").is_err());
+    }
+    #[test]
+    fn project_type_catalog_accepts_nested_record_declaration_context() {
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let declaration = "struct Inner { int value; }; struct Outer { struct Inner inner; int tail; };";
+        let encoded = declaration.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let declaration_hash = crate::reconstruction::sha256_hex_bytes(declaration.as_bytes()).unwrap();
+        let layout = format!(
+            "{{\"schema\":1,\"producer\":\"hindsight-apple-clang-record-layout-v1\",\"target\":\"arm64-apple-macos14.0\",\"declarationsSHA256\":\"{declaration_hash}\",\"record\":{{\"name\":\"Outer\",\"kind\":\"struct\",\"size\":8,\"alignment\":4,\"fieldOffsetsComplete\":true,\"fields\":[{{\"name\":\"inner\",\"declaration\":\"struct Inner inner\",\"offsetBits\":0,\"bitWidth\":null}},{{\"name\":\"tail\",\"declaration\":\"int tail\",\"offsetBits\":32,\"bitWidth\":null}}]}}}}"
+        );
+        let layout_hex = layout.bytes().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let catalog = format!(
+            "# source_sha256={digest}\n# project_type\t{digest}\tarm64-apple-macos14.0\tOuter\t{encoded}\t{layout_hex}\n"
+        );
+        let parsed = parse_project_type_dependencies(&catalog, digest, "arm64").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "Outer");
+        assert_eq!(parsed[0].declaration, declaration);
+        let fields = &parsed[0].layout.as_ref().unwrap().fields;
+        assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["inner", "tail"]);
     }
     #[test] fn typed_argument_casts_use_prototype_width_signedness_and_pointer_evidence() {
         for (value, ty, expected) in [
@@ -2844,6 +3123,78 @@ fn recover_internal(
         let text=replace_instruction_register_names("x2 = *(x0 + 0x10);",&names.inputs[&0x1004],Some(&names.outputs[&0x1004]));
         assert_eq!(text,"x2 = *(self + 0x10);");
     }
+    #[test] fn narrow_register_write_invalidates_the_wide_parameter_identity() {
+        let signature = Signature { language: "C", source: "test prototype",
+            declaration: "unsigned long overwrite(unsigned long original);".into() };
+        // mov w0,#1 zero-extends and replaces the incoming 64-bit x0 value.
+        let names = names_fixture(&[0x5280_0020, 0xd65f_03c0], &signature);
+        assert_eq!(names.inputs[&0x1000]["x0"], "original");
+        assert!(!names.outputs[&0x1000].contains_key("x0"));
+        assert!(!names.outputs[&0x1000].contains_key("w0"));
+        assert!(!names.inputs[&0x1004].contains_key("x0"));
+    }
+    #[test] fn xor_with_zero_register_is_an_exact_parameter_copy() {
+        let signature = symbol("_CFRelease").unwrap();
+        // eor x2,x0,xzr; ret.
+        let names = names_fixture(&[0xca1f_0002, 0xd65f_03c0], &signature);
+        assert_eq!(names.outputs[&0x1000]["x2"], "cf_copy_x2");
+        let shifted = names_fixture(&[0xca5f_0c02, 0xd65f_03c0], &signature);
+        assert_eq!(shifted.outputs[&0x1000]["x2"], "cf_copy_x2");
+
+        // A real XOR is not an alias, even if one operand carries a parameter.
+        let real_xor = names_fixture(&[0xca01_0002, 0xd65f_03c0], &Signature {
+            language: "C", source: "test prototype",
+            declaration: "void mix(unsigned long left, unsigned long right);".into(),
+        });
+        assert!(!real_xor.outputs[&0x1000].contains_key("x2"));
+    }
+    #[test] fn bic_zero_register_is_an_exact_parameter_copy() {
+        let signature = symbol("_CFRelease").unwrap();
+        // bic x2,x0,xzr is x0 & ~0, an exact 64-bit copy.
+        let names = names_fixture(&[0x8a3f_0002, 0xd65f_03c0], &signature);
+        assert_eq!(names.outputs[&0x1000]["x2"], "cf_copy_x2");
+        let shifted = names_fixture(&[0x8a3f_0802, 0xd65f_03c0], &signature);
+        assert_eq!(shifted.outputs[&0x1000]["x2"], "cf_copy_x2");
+
+        // A nonzero mask still changes the value and cannot carry identity.
+        let masked = names_fixture(&[0x8a21_0002, 0xd65f_03c0], &Signature {
+            language: "C", source: "test prototype",
+            declaration: "void mask(unsigned long value, unsigned long bits);".into(),
+        });
+        assert!(!masked.outputs[&0x1000].contains_key("x2"));
+    }
+    #[test] fn shifted_orr_of_zero_does_not_change_the_other_operand() {
+        let signature = symbol("_CFRelease").unwrap();
+        // orr x2,x0,xzr,lsl #2 remains x0.
+        let copied = names_fixture(&[0xaa1f_0802, 0xd65f_03c0], &signature);
+        assert_eq!(copied.outputs[&0x1000]["x2"], "cf_copy_x2");
+
+        // Shifting the actual source changes the value and must drop its name.
+        let shifted_source = names_fixture(&[0xaa00_0802, 0xd65f_03c0], &signature);
+        assert!(!shifted_source.outputs[&0x1000].contains_key("x2"));
+    }
+    #[test] fn zero_distance_bitfield_shift_preserves_parameter_identity() {
+        let signature = symbol("_CFRelease").unwrap();
+        // UBFM x2,x0,#0,#63 is LSR x2,x0,#0, an exact copy.
+        let copied = names_fixture(&[0xd340_fc02, 0xd65f_03c0], &signature);
+        assert_eq!(copied.outputs[&0x1000]["x2"], "cf_copy_x2");
+        let arithmetic_zero = names_fixture(&[0x9340_fc02, 0xd65f_03c0], &signature);
+        assert_eq!(arithmetic_zero.outputs[&0x1000]["x2"], "cf_copy_x2");
+
+        // LSR by one changes the value.
+        let shifted = names_fixture(&[0xd341_fc02, 0xd65f_03c0], &signature);
+        assert!(!shifted.outputs[&0x1000].contains_key("x2"));
+    }
+    #[test] fn shifted_add_sub_zero_register_forms_preserve_only_exact_copies() {
+        let signature = symbol("_CFRelease").unwrap();
+        for word in [0x8b1f_0002, 0x8b00_03e2, 0xcb1f_0002] {
+            let names = names_fixture(&[word, 0xd65f_03c0], &signature);
+            assert_eq!(names.outputs[&0x1000].get("x2").map(String::as_str), Some("cf_copy_x2"), "{word:#010x}");
+        }
+        // 0 - x0 is not a copy of x0.
+        let negate = names_fixture(&[0xcb00_03e2, 0xd65f_03c0], &signature);
+        assert!(!negate.outputs[&0x1000].contains_key("x2"));
+    }
     #[test] fn modeled_frame_pointer_updates_preserve_incoming_argument_names() {
         let signature=Signature{language:"C",source:"test",declaration:"int sum(int left, int right);".into()};
         let names=names_fixture(&[0xd10043ff,0xb9000fe0,0xb9000be1,0xd65f03c0],&signature);
@@ -2860,6 +3211,27 @@ fn recover_internal(
         let called=names_fixture(&[0x94000400,0xd65f03c0],&signature);
         assert_eq!(called.inputs[&0x1000]["x0"],"cf");
         assert!(!called.inputs[&0x1004].contains_key("x0"));
+    }
+    #[test] fn conditional_select_keeps_only_an_agreeing_parameter_identity() {
+        let one = symbol("_CFRelease").unwrap();
+        // mov x1,x0; csel x2,x0,x1,eq; ret. Either flag outcome selects the
+        // same entry parameter, so the destination remains a proven alias.
+        let agreeing = names_fixture(&[0xaa00_03e1, 0x9a81_0002, 0xd65f_03c0], &one);
+        assert_eq!(agreeing.inputs[&0x1004]["x0"], "cf");
+        assert_eq!(agreeing.inputs[&0x1004]["x1"], "cf_copy_x1");
+        assert_eq!(agreeing.outputs[&0x1004]["x2"], "cf_copy_x2");
+
+        let two = Signature { language: "C", source: "test prototype",
+            declaration: "void choose(void *left, void *right);".into() };
+        // csel x2,x0,x1,eq cannot preserve either input name when they differ.
+        let conflicting = names_fixture(&[0x9a81_0002, 0xd65f_03c0], &two);
+        assert!(!conflicting.outputs[&0x1000].contains_key("x2"));
+
+        // The agreeing alternatives are still transformed by these variants.
+        for transformed in [0x9a81_0402, 0xda81_0002, 0xda81_0402] {
+            let names = names_fixture(&[0xaa00_03e1, transformed, 0xd65f_03c0], &one);
+            assert!(!names.outputs[&0x1004].contains_key("x2"), "{transformed:#010x}");
+        }
     }
     #[test] fn unresolved_indirect_transfers_keep_the_body_register_explicit() {
         let signature=symbol("_CFRelease").unwrap();
@@ -2928,6 +3300,15 @@ fn recover_internal(
         assert_eq!(names.get("s0").map(String::as_str), Some("factor"));
         assert_eq!(names.get("d0").map(String::as_str), None);
         assert_eq!(names.get("d1").map(String::as_str), Some("value"));
+
+        let same_fp = Signature { language: "C", source: "test prototype",
+            declaration: "double select(double value);".into() };
+        let selected = names_fixture(&[0x1e60_0c02, 0xd65f_03c0], &same_fp); // fcsel d2,d0,d0,eq
+        assert_eq!(selected.outputs[&0x1000]["d2"], "value_copy_d2");
+        let different_fp = Signature { language: "C", source: "test prototype",
+            declaration: "double choose(double left, double right);".into() };
+        let selected = names_fixture(&[0x1e61_0c02, 0xd65f_03c0], &different_fp); // fcsel d2,d0,d1,eq
+        assert!(!selected.outputs[&0x1000].contains_key("d2"));
     }
     #[test] fn reciprocal_results_remain_unknown_while_unrelated_call_arguments_survive() {
         let code = [0x1e6e_1000, 0x1e6e_1001, 0x5ee1_d820, 0x9400_03fd]

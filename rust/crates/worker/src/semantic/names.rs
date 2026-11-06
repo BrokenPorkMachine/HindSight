@@ -288,6 +288,22 @@ impl NameState {
         let effects = operation.gpr_effects();
         let mut result = self.clone();
         result.frame = self.frame.transfer(operation, &BTreeSet::new());
+        if matches!(operation, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) {
+            // AAPCS64 preserves x19-x29 and the low 64 bits of v8-v15 across
+            // calls. Caller-saved values, x18 (platform-specific/reserved),
+            // and LR are invalidated. Stack evidence is cleared because a
+            // call may reach caller-owned storage through an escaped pointer.
+            for index in (0..=18).chain(std::iter::once(30)) {
+                result.registers[index] = None;
+            }
+            for index in 0..32 {
+                if !(8..=15).contains(&index) {
+                    result.registers[fp(index as u8)] = None;
+                }
+            }
+            result.saved.clear();
+            return result;
+        }
         if effects.barrier {
             result.registers.fill(None);
             result.saved.clear();
@@ -336,17 +352,64 @@ impl NameState {
                         self.read(source_index, source.bits.min(destination.bits), seeds);
                 }
             }
+            IrOperation::ConditionalSelect {
+                destination,
+                if_true,
+                if_false,
+                else_op: IrSelectElse::None,
+                ..
+            } => {
+                if let (Some(destination_index), Some(true_index), Some(false_index)) =
+                    (gp(destination), gp(if_true), gp(if_false))
+                {
+                    let required_bits = if_true.bits.min(if_false.bits).min(destination.bits);
+                    let true_value = self.read(true_index, required_bits, seeds);
+                    let false_value = self.read(false_index, required_bits, seeds);
+                    if true_value.is_some() && true_value == false_value {
+                        result.registers[destination_index] = true_value;
+                    }
+                }
+            }
+            IrOperation::LogicalRegister {
+                destination,
+                left,
+                right,
+                operator: IrBinaryOp::And,
+                negate_right: true,
+                ..
+            } if right.class == IrRegisterClass::Zero => {
+                if let (Some(destination_index), Some(source_index)) = (gp(destination), gp(left)) {
+                    result.registers[destination_index] =
+                        self.read(source_index, left.bits.min(destination.bits), seeds);
+                }
+            }
+            IrOperation::LogicalRegister {
+                destination,
+                left,
+                right,
+                operator: IrBinaryOp::Xor,
+                negate_right: false,
+                ..
+            } if left.class == IrRegisterClass::Zero || right.class == IrRegisterClass::Zero => {
+                let source = if left.class == IrRegisterClass::Zero { right } else { left };
+                if let (Some(destination_index), Some(source_index)) = (gp(destination), gp(source)) {
+                    result.registers[destination_index] =
+                        self.read(source_index, source.bits.min(destination.bits), seeds);
+                }
+            }
             IrOperation::LogicalRegister {
                 destination,
                 left,
                 right,
                 operator: IrBinaryOp::Or,
                 negate_right: false,
-                shift: None,
+                shift,
             } => {
                 let source = if left.class == IrRegisterClass::Zero {
-                    Some(right)
-                } else if right.class == IrRegisterClass::Zero || left == right {
+                    shift.is_none().then_some(right)
+                } else if right.class == IrRegisterClass::Zero
+                    || (shift.is_none() && left == right)
+                {
                     Some(left)
                 } else {
                     None
@@ -355,6 +418,33 @@ impl NameState {
                     result.registers[destination_index] = gp(source).and_then(|index| {
                         self.read(index, source.bits.min(destination.bits), seeds)
                     });
+                }
+            }
+            IrOperation::Binary {
+                destination,
+                operator,
+                left: IrOperand::Register(left),
+                right: IrOperand::Register(right),
+            } => {
+                let source = if right.class == IrRegisterClass::Zero
+                    && matches!(operator, IrBinaryOp::Add | IrBinaryOp::Subtract)
+                {
+                    Some(left)
+                } else if operator == IrBinaryOp::Add && left.class == IrRegisterClass::Zero {
+                    Some(right)
+                } else {
+                    None
+                };
+                if let Some(source) = source {
+                    if let (Some(destination_index), Some(source_index)) =
+                        (gp(destination), gp(source))
+                    {
+                        result.registers[destination_index] = self.read(
+                            source_index,
+                            source.bits.min(destination.bits),
+                            seeds,
+                        );
+                    }
                 }
             }
             IrOperation::Binary {
@@ -369,6 +459,43 @@ impl NameState {
                         self.read(source_index, source.bits.min(destination.bits), seeds);
                 }
             }
+            IrOperation::ShiftedArithmetic {
+                destination,
+                left,
+                right,
+                subtract,
+                ..
+            } => {
+                let source = if right.class == IrRegisterClass::Zero {
+                    Some(left)
+                } else if !subtract && left.class == IrRegisterClass::Zero {
+                    Some(right)
+                } else {
+                    None
+                };
+                if let Some(source) = source {
+                    if let (Some(destination_index), Some(source_index)) =
+                        (gp(destination), gp(source))
+                    {
+                        result.registers[destination_index] = self.read(
+                            source_index,
+                            source.bits.min(destination.bits),
+                            seeds,
+                        );
+                    }
+                }
+            }
+            IrOperation::Shift {
+                destination,
+                source,
+                amount: 0,
+                ..
+            } => {
+                if let (Some(destination_index), Some(source_index)) = (gp(destination), gp(source)) {
+                    result.registers[destination_index] =
+                        self.read(source_index, source.bits.min(destination.bits), seeds);
+                }
+            }
             IrOperation::ScalarFloatMove {
                 destination,
                 source,
@@ -376,6 +503,20 @@ impl NameState {
             } => {
                 result.registers[fp(destination)] =
                     self.read(fp(source), float_bits(precision), seeds);
+            }
+            IrOperation::ScalarFloatSelect {
+                destination,
+                if_true,
+                if_false,
+                precision,
+                ..
+            } => {
+                let bits = float_bits(precision);
+                let true_value = self.read(fp(if_true), bits, seeds);
+                let false_value = self.read(fp(if_false), bits, seeds);
+                if true_value.is_some() && true_value == false_value {
+                    result.registers[fp(destination)] = true_value;
+                }
             }
             IrOperation::VectorBitwise {
                 destination,
@@ -846,6 +987,35 @@ mod tests {
         assert_eq!(state.display(&seeds)["x2"], "value0_copy_x2");
         let restored = state.transfer(copy(0, 2, 64), &seeds);
         assert_eq!(restored.display(&seeds)["x0"], "value0");
+    }
+
+    #[test]
+    fn calls_retain_only_aapcs64_callee_saved_parameter_identities() {
+        let seeds = [
+            seed(0, 64, false),
+            seed(19, 64, false),
+            seed(29, 64, false),
+            seed(0, 64, true),
+            seed(8, 64, true),
+            seed(16, 64, true),
+        ];
+        let state = NameState::entry(&seeds);
+        for operation in [
+            IrOperation::DirectCall { target: 0x2000 },
+            IrOperation::IndirectCall { target: reg(0, 64) },
+        ] {
+            let after = state.transfer(operation, &seeds);
+            let names = after.display(&seeds);
+            assert!(!names.contains_key("x0"));
+            assert!(!names.contains_key("x18"));
+            assert!(names.contains_key("x19"));
+            assert!(names.contains_key("x29"));
+            assert!(!names.contains_key("x30"));
+            assert!(!names.contains_key("d0"));
+            assert!(names.contains_key("d8"));
+            assert!(!names.contains_key("d16"));
+            assert!(after.saved.is_empty());
+        }
     }
 
     #[test]

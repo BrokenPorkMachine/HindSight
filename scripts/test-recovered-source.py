@@ -12,10 +12,12 @@ import subprocess
 import sys
 import tempfile
 
-from darwin_sdk_catalog import collect_declarations, verify_macho_target, worker_prototypes
+from darwin_sdk_catalog import collect_declarations, collect_record_layouts, verify_macho_target, worker_prototypes
 from reconstruction_artifact import ReconstructionArtifact
 
 ROOT=Path(__file__).resolve().parents[1]
+POINT_DECLARATION="struct Point { int x; int y; };"
+TARGET="arm64-apple-macos14.0"
 def module(name,path):
     spec=importlib.util.spec_from_file_location(name,path);result=importlib.util.module_from_spec(spec);spec.loader.exec_module(result);return result
 TEST=module("machine_test",ROOT/"scripts/test-machine-state.py")
@@ -26,7 +28,18 @@ def run(worker):
         print("Recovered source native qualification requires Apple Silicon macOS; skipped");return
     fixtures=ROOT/"Tests/Fixtures/Decompilation"
     names = ["hs_c_mix", "hs_c_select", "hs_c_stack", "hs_c_signed", "hs_c_narrow", "hs_c_u32", "hs_c_nested", "hs_c_load", "hs_c_load_volatile_u32", "hs_c_load_volatile_twice", "hs_c_load_volatile_branch", "hs_c_volatile_load_then_call", "hs_c_call_then_volatile_load", "hs_c_volatile_store_call_load", "hs_c_loop_volatile_store", "hs_c_loop_volatile_accumulate", "hs_c_loop_two_volatile_pointers", "hs_c_load_signed16", "hs_c_load_signed32", "hs_c_load_signed64", "hs_c_load_unsigned8", "hs_c_load_unsigned16", "hs_c_load_signed_offset", "hs_c_load_word_offset", "hs_c_load_dynamic", "hs_c_load_dynamic_s16", "hs_c_load_dynamic_u32", "hs_c_store", "hs_c_store_volatile", "hs_c_store_volatile_twice", "hs_c_store_u16", "hs_c_store_u32", "hs_c_store_s16", "hs_c_store_s32", "hs_c_store_twice", "hs_c_store_conditional", "hs_c_store_dynamic", "hs_c_store_dynamic_u32", "hs_c_store_dynamic_s16", "hs_c_store_then_load", "hs_c_load_then_store", "hs_c_conditional_store_then_load", "hs_c_alternate_store_then_load", "hs_c_recursive", "hs_c_recursive_pair", "hs_c_recursive_store", "hs_c_call_helper", "hs_c_call_twice", "hs_c_volatile_store_then_call", "hs_c_call_then_volatile_store", "hs_c_store_then_call", "hs_c_store_load_then_call", "hs_c_branch_store_call", "hs_c_call_then_store", "hs_c_call_then_store_branch", "hs_c_conditional_call_store", "hs_c_call_then_load", "hs_c_call_load_store", "hs_m_signed_div", "hs_m_loop", "hs_m_word", "hs_m_rotate", "hs_m_pair", "hs_m_keep", "hs_m_flagwrite", "hs_m_addflags", "hs_m_andflags"]
-    catalog=collect_declarations(names+["hs_c_leaf_helper","hs_m_memory"],fixtures/"machine_state.h")
+    catalog=collect_declarations(names+["hs_c_leaf_helper","hs_m_memory","hs_point_read","hs_point_write"],fixtures/"machine_state.h")
+    point_layout=collect_record_layouts(POINT_DECLARATION,["Point"],"macosx",TARGET)
+    point_record=point_layout["records"][0]
+    point_layout_evidence={
+        "schema":point_layout["schema"],"producer":point_layout["producer"],"sdk":point_layout["sdk"],
+        "sdkPath":point_layout["sdk_path"],"sdkBuild":point_layout["sdk_build"],"target":point_layout["target"],
+        "compiler":point_layout["compiler"],"declarationsSHA256":point_layout["declarations_sha256"],
+        "record":{"name":point_record["name"],"kind":point_record["kind"],"size":point_record["size"],
+                  "alignment":point_record["alignment"],"fieldOffsetsComplete":point_record["field_offsets_complete"],
+                  "fields":[{"name":field["name"],"declaration":field["declaration"],"offsetBits":field["offset_bits"],
+                             "bitWidth":field["bit_width"]} for field in point_record["fields"]]},
+    }
     edge=[0,1,2,0x7f,0x80,0x7fffffff,0x80000000,0xffffffff,0x7fffffffffffffff,0x8000000000000000,0xffffffffffffffff]
     vectors=[[a,b,a^b,a*3&0xffffffffffffffff,b&63,0,0,0] for a in edge for b in edge]
     rng=random.Random(0x48535352)
@@ -41,7 +54,12 @@ def run(worker):
             binary=root/("original"+build_name+".dylib")
             TEST.execute(["xcrun","clang","-target","arm64-apple-macos14.0",optimization,"-fno-stack-protector","-Wl,-no_fixup_chains","-dynamiclib",fixtures/"machine_state.c",fixtures/"machine_state.m",fixtures/"machine_state.s","-lobjc","-o",binary])
             if stripped:TEST.execute(["xcrun","strip","-S","-x",binary])
-            prototypes=root/"prototypes.tsv";prototypes.write_text(worker_prototypes(catalog,verify_macho_target(binary,"arm64-apple-macos14.0")))
+            source_digest=verify_macho_target(binary,TARGET)
+            prototypes=root/"prototypes.tsv"
+            prototype_text=worker_prototypes(catalog,source_digest)
+            layout_hex=json.dumps(point_layout_evidence,sort_keys=True,separators=(",",":")).encode().hex()
+            project_type_line=f"# project_type\t{source_digest}\t{TARGET}\tPoint\t{POINT_DECLARATION.encode().hex()}\t{layout_hex}\n"
+            prototypes.write_text(prototype_text+project_type_line)
             report=request(worker,binary,"--analyze")
             ranges={m[3].split("  source=",1)[0]:(m[1],m[2]) for line in report["functions"].splitlines() if (m:=re.match(r"^(0x[0-9a-f]+)\s+(0x[0-9a-f]+)\s+\d+\s+bytes\s+(.+)$",line))}
             objc=next(name for name in ranges if "HSMachineStateFixture mix:with:" in name)
@@ -340,6 +358,54 @@ int main(void) {{
                 assert document==repeated,(name,optimization,[key for key in document if document[key]!=repeated.get(key)])
                 TEST.retain_validation(document,generated,{"artifact_kind":"recovered-source-qualification","toolchain":TEST.execute(["xcrun","clang","--version"]).splitlines()[0],"original_flags":[optimization,"-fno-stack-protector","-Wl,-no_fixup_chains","-target","arm64-apple-macos14.0"],"strip_flags":["-S","-x"] if stripped else [],"generated_flags":["-std=c17","-O2","-Wall","-Wextra","-Werror","-fsanitize=undefined","-fno-sanitize-recover=all"],"cases":len(vectors),"seed":"0x48535352","inputs_x0_x7":[[hex(v) for v in values] for values in vectors],"prototype_catalog_sha256":hashlib.sha256(prototypes.read_bytes()).hexdigest(),"source_sha256":hashlib.sha256(source.encode()).hexdigest(),"qualification_script_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),"comparison":"declared scalar result bits; not undefined high result bits, volatile-register/stack trace equivalence","formal_equivalence":False},evidence_root/f"recovered-source{build_name}-{name}.json")
                 qualified.append({"name":name,"optimization":optimization,"stripped":stripped,"cases":len(vectors),"function_id":document["function"]["id"],"scope":document["scope"]})
+            point_values=[(0,0,0),(1,2,3),(0x7fffffff,0x80000000,0xffffffff),(0xffffffff,0xffffffff,0),(0x12345678,0x9abcdef0,0xdeadbeef)]
+            point_rng=random.Random(0x504f494e)
+            point_values += [(point_rng.getrandbits(32),point_rng.getrandbits(32),point_rng.getrandbits(32)) for _ in range(64)]
+            point_stdin="".join(f"{x:x} {y:x} {value:x}\n" for x,y,value in point_values)
+            point_driver=root/"point_driver.c"
+            for name,event_kind in [("hs_point_read","source-memory-read"),("hs_point_write","source-memory-store")]:
+                start,end=ranges["_"+name]
+                point_operation=("int read_value=hs_point_read(&point);" if name=="hs_point_read"
+                                 else "hs_point_write(&point,(int32_t)value); int read_value=0;")
+                point_driver.write_text(f'''#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "machine_state.h"
+int main(void) {{
+    uint32_t x, y, value;
+    while (scanf("%" SCNx32 " %" SCNx32 " %" SCNx32, &x, &y, &value) == 3) {{
+        struct Point point = {{(int32_t)x, (int32_t)y}};
+        {point_operation}
+        printf("%08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\\n",
+               (uint32_t)read_value, (uint32_t)point.x, (uint32_t)point.y);
+    }}
+    return 0;
+}}
+''')
+                original_point=root/"original-point"
+                TEST.execute(["xcrun","clang","-std=c17","-O2","-Wall","-Wextra","-Werror","-Wno-unused-parameter","-I",fixtures,fixtures/"machine_state.c",fixtures/"machine_state.s",point_driver,"-o",original_point])
+                original_point_rows=TEST.execute([original_point],point_stdin).splitlines()
+                assert len(original_point_rows)==len(point_values),(name,optimization,"original aggregate oracle")
+                document=request(worker,binary,"--reconstruct",start,end,prototypes=prototypes)
+                ReconstructionArtifact(document)
+                payloads=[node["payload"] for node in document["nodes"]]
+                bodies=[payload["source"] for payload in payloads if payload.get("artifact_kind")=="recovered-source"]
+                assert len(bodies)==1,(name,optimization,[payload for payload in payloads if "reason" in payload])
+                generated_point=next(node for node in document["nodes"] if node["payload"].get("artifact_kind")=="recovered-source")
+                source=bodies[0]
+                assert "->y" in source,(name,optimization,source)
+                accesses=[node for node in document["ast"]["nodes"] if node["kind"]==event_kind]
+                assert len(accesses)==1,(name,optimization,accesses)
+                layout=accesses[0]["attributes"]["member_layout"]
+                assert (layout["record"],layout["field"],layout["offset_bits"])==("Point","y",32),(name,optimization,layout)
+                assert layout["source_sha256"]==source_digest and layout["captured_type_identity_proven"] is False
+                recovered_source=root/(name+".c");recovered_source.write_text(source)
+                recovered_point=root/(name+"-point")
+                TEST.execute(["xcrun","clang","-std=c17","-O2","-Wall","-Wextra","-Werror","-fsanitize=undefined","-fno-sanitize-recover=all","-I",fixtures,recovered_source,point_driver,"-o",recovered_point])
+                recovered_rows=TEST.execute([recovered_point],point_stdin).splitlines()
+                assert original_point_rows==recovered_rows,(name,optimization,next((i,a,b) for i,(a,b) in enumerate(zip(original_point_rows,recovered_rows)) if a!=b))
+                TEST.retain_validation(document,generated_point,{"artifact_kind":"project-layout-member-qualification","toolchain":TEST.execute(["xcrun","clang","--version"]).splitlines()[0],"original_flags":[optimization,"-target",TARGET,"-fno-stack-protector"],"generated_flags":["-std=c17","-O2","-Wall","-Wextra","-Werror","-fsanitize=undefined","-fno-sanitize-recover=all"],"cases":len(point_values),"seed":"0x504f494e","layout_sha256":hashlib.sha256(json.dumps(point_layout_evidence,sort_keys=True,separators=(",",":")).encode()).hexdigest(),"prototype_catalog_sha256":hashlib.sha256(prototypes.read_bytes()).hexdigest(),"qualification_script_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),"comparison":"native result and final aggregate fields; no captured-binary type identity or formal-equivalence claim","formal_equivalence":False},evidence_root/f"project-layout-{build_name}-{name}.json")
+                qualified.append({"name":name,"optimization":optimization,"stripped":stripped,"cases":len(point_values),"function_id":document["function"]["id"],"scope":document["scope"]})
             for name in ["hs_m_memory"]:
                 start,end=ranges["_"+name]
                 document=request(worker,binary,"--reconstruct",start,end,prototypes=prototypes)

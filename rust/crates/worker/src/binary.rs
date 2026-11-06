@@ -17,6 +17,94 @@ use std::{
 mod compression;
 #[path = "formats.rs"]
 mod formats;
+#[path = "c167.rs"]
+mod c167;
+#[path = "c167_emu.rs"]
+mod c167_emu;
+
+pub fn emulate_c167(path: &str, entry: &str, steps: &str, stack: &str, breakpoint: &str, watchpoint: &str, ram: &str, request_id: &str) -> io::Result<String> {
+    fn number(text: &str) -> Option<u32> {
+        text.strip_prefix("0x").and_then(|v| u32::from_str_radix(v, 16).ok())
+            .or_else(|| text.parse().ok())
+    }
+    fn quoted(text: &str) -> String {
+        let mut out = String::from("\"");
+        for ch in text.chars() {
+            match ch { '\"' => out.push_str("\\\""), '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"), '\r' => out.push_str("\\r"), '\t' => out.push_str("\\t"),
+                c if c < '\u{20}' => out.push_str(&format!("\\u{:04x}", c as u32)), c => out.push(c) }
+        }
+        out.push('\"'); out
+    }
+    fn ram_spans(text: &str) -> io::Result<Vec<(u32, Vec<u8>)>> {
+        if text.is_empty() || text == "none" { return Ok(vec![]); }
+        if text.len() > 16_384 { return Err(bad("C167 RAM seed text exceeds 16 KiB")); }
+        let mut spans = Vec::new();
+        let mut total = 0usize;
+        for item in text.split(',') {
+            let (address, hex) = item.split_once('=').ok_or_else(|| bad("Invalid C167 RAM seed span"))?;
+            let address = number(address).filter(|value| *value <= 0x00ff_ffff)
+                .ok_or_else(|| bad("Invalid C167 RAM seed address"))?;
+            if hex.is_empty() || hex.len() & 1 != 0 || hex.len() > 8192
+                || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(bad("Invalid C167 RAM seed bytes"));
+            }
+            let bytes = hex.as_bytes().chunks_exact(2).map(|pair| {
+                std::str::from_utf8(pair).ok().and_then(|value| u8::from_str_radix(value, 16).ok())
+                    .ok_or_else(|| bad("Invalid C167 RAM seed bytes"))
+            }).collect::<io::Result<Vec<_>>>()?;
+            total = total.checked_add(bytes.len()).ok_or_else(|| bad("C167 RAM seed size overflow"))?;
+            if total > 4096 || spans.len() >= 256 { return Err(bad("C167 RAM seeds exceed bounded limits")); }
+            spans.push((address, bytes));
+        }
+        Ok(spans)
+    }
+    if !std::path::Path::new(path).is_absolute() || path.len() > 16_384 || request_id.len() != 36
+        || !request_id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-') {
+        return Err(bad("Invalid C167 emulator request"));
+    }
+    let entry = number(entry).ok_or_else(|| bad("Invalid C167 entry address"))?;
+    let steps = u64::from(number(steps).ok_or_else(|| bad("Invalid C167 step budget"))?);
+    let stack = number(stack).ok_or_else(|| bad("Invalid C167 stack address"))?;
+    let breakpoint = if breakpoint.is_empty() || breakpoint == "none" { None } else {
+        Some(number(breakpoint).filter(|value| *value <= 0x00ff_ffff)
+            .ok_or_else(|| bad("Invalid C167 breakpoint address"))?)
+    };
+    let watchpoint = if watchpoint.is_empty() || watchpoint == "none" { None } else {
+        Some(number(watchpoint).filter(|value| *value <= 0x00ff_ffff)
+            .ok_or_else(|| bad("Invalid C167 physical watchpoint address"))?)
+    };
+    let ram = ram_spans(ram)?;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 2 * 1024 * 1024 {
+        return Err(bad("C167 emulator requires a regular image no larger than 2 MiB"));
+    }
+    let image = std::fs::read(path)?;
+    let mut machine = c167_emu::Machine::new(&image, entry, stack)
+        .map_err(|stop| bad(&format!("C167 emulator initialization stopped: {stop:?}")))?;
+    machine.seed_ram(&ram)
+        .map_err(|stop| bad(&format!("C167 RAM initialization stopped: {stop:?}")))?;
+    let stop = if watchpoint.is_some() { machine.run_observed(steps, breakpoint, watchpoint) }
+        else { match breakpoint { Some(address) => machine.run_until(steps, Some(address)), None => machine.run(steps) } };
+    let registers = machine.registers.iter().enumerate()
+        .map(|(i, value)| format!("\"r{i}\":{value}"))
+        .collect::<Vec<_>>().join(",");
+    let dpp = machine.dpp.iter().enumerate()
+        .map(|(i, value)| format!("\"dpp{i}\":{value}"))
+        .collect::<Vec<_>>().join(",");
+    let trace = machine.trace().iter().map(|row| format!(
+        "{{\"pc\":{},\"bytes\":{},\"text\":{}}}", row.pc,
+        quoted(&row.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()), quoted(&row.text)))
+        .collect::<Vec<_>>().join(",");
+    let ram_preview = machine.ram_preview().iter()
+        .map(|(address, value)| format!("\"{address:06x}\":{value}"))
+        .collect::<Vec<_>>().join(",");
+    Ok(format!("{{\"protocol\":1,\"kind\":\"c167_emulation_result\",\"request_id\":{},\"pc\":{},\"sp\":{},\"cp\":{},\"csp\":{},\"mdh\":{},\"mdl\":{},\"steps\":{},\"stop\":{},\"flags\":{{\"carry\":{},\"zero\":{},\"negative\":{},\"overflow\":{}}},\"registers\":{{{registers}}},\"dpp\":{{{dpp}}},\"ram_seed_bytes\":{},\"ram_write_bytes\":{},\"ram_truncated\":{},\"ram\":{{{ram_preview}}},\"trace\":[{trace}]}}",
+        quoted(request_id), machine.pc, machine.sp, machine.cp, machine.csp, machine.mdh, machine.mdl,
+        machine.steps, quoted(&format!("{stop:?}")),
+        machine.flags.carry, machine.flags.zero, machine.flags.negative, machine.flags.overflow,
+        machine.ram_seed_bytes(), machine.ram_write_bytes(), machine.ram_truncated()))
+}
 const SCAN: usize = 4 * 1024 * 1024;
 const TEXT: usize = 60_000;
 fn bad(s: &str) -> io::Error {
@@ -49,8 +137,9 @@ impl Options {
             base: number(&args[2])?,
             offset: number(&args[3])?,
         };
-        if !["auto", "macho", "elf", "pe", "coff", "pdb", "sepos", "securerom", "iboot", "raw"].contains(&o.format.as_str())
-            || !["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
+        if !["auto", "macho", "elf", "pe", "coff", "pdb", "sepos", "securerom", "iboot", "raw", "ecu"]
+            .contains(&o.format.as_str())
+            || !["auto", "aarch64", "i386", "x86_64", "arm", "thumb", "c167"]
                 .contains(&o.architecture.as_str())
         {
             return Err(bad("Unsupported import configuration"));
@@ -74,6 +163,7 @@ enum Arch {
     X64 = 3,
     Arm = 4,
     Thumb = 5,
+    C167 = 6,
 }
 impl Arch {
     fn name(self) -> &'static str {
@@ -83,12 +173,13 @@ impl Arch {
             Self::X64 => "Intel x86_64",
             Self::Arm => "ARM32",
             Self::Thumb => "ARM32 Thumb-2",
+            Self::C167 => "Infineon C167",
         }
     }
     fn unit(self) -> u64 {
         match self {
             Self::A64 | Self::Arm => 4,
-            Self::Thumb => 2,
+            Self::Thumb | Self::C167 => 2,
             _ => 1,
         }
     }
@@ -106,6 +197,7 @@ impl Arch {
             "x86_64" => Some(Self::X64),
             "arm" => Some(Self::Arm),
             "thumb" => Some(Self::Thumb),
+            "c167" => Some(Self::C167),
             _ => None,
         }
     }
@@ -670,6 +762,9 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
     {
         return Err(bad("Encoded/compressed IMG4/IM4P firmware must be unpacked to a plaintext image before importing"));
     }
+    if o.format == "ecu" {
+        return ecu_container(file, o);
+    }
     let arch=Arch::option(&o.architecture).ok_or_else(||bad("Raw SecureROM/iBoot/firmware requires an explicit architecture and load address; encoded/encrypted containers must be unpacked first"))?;
     let length = size - o.offset;
     if o.base % arch.unit() != 0 || o.offset % arch.unit() != 0 || length % arch.unit() != 0 {
@@ -712,6 +807,259 @@ fn load(file: &mut File, o: &Options) -> io::Result<Image> {
         raw: true,
     })
 }
+
+/// ME7-class ECU container validation. Facts established here: flash-dump size class,
+/// C167 trap/interrupt vector table at offset 0 (consecutive `JMPA cc, caddr` instructions),
+/// tail padding bytes. Code/data boundaries and entry points beyond vector 0 remain unknown.
+fn ecu_container(file: &mut File, o: &Options) -> io::Result<Image> {
+    if o.offset != 0 {
+        return Err(bad(
+            "ECU firmware import expects image offset 0; import the full flash dump and map it with the load address",
+        ));
+    }
+    let arch = match o.architecture.as_str() {
+        "auto" | "c167" => Arch::C167,
+        _ => {
+            return Err(bad(
+                "ECU firmware import supports the Infineon C167 architecture (auto resolves to C167 after validation)",
+            ))
+        }
+    };
+    let size = file.metadata()?.len();
+    if size < 0x20000 || size > 0x200000 {
+        return Err(bad(
+            "ECU firmware import expects a 256 KiB to 2 MiB flash dump; use the raw format with an explicit architecture for other ECU memory maps",
+        ));
+    }
+    let head = read(file, 0, 0x200)?;
+    let mut vectors = 0usize;
+    while vectors < 0x200 / 4 {
+        let at = vectors * 4;
+        if head[at] != 0xEA || head[at + 1] & 0x0F != 0 {
+            break;
+        }
+        vectors += 1;
+    }
+    if vectors < 6 {
+        return Err(bad(
+            "ECU firmware import requires an ME7-class C167 vector table (consecutive JMPA instructions at offset 0); use the raw format with an explicit architecture for other ECU firmware",
+        ));
+    }
+    let tail = read(file, size.saturating_sub(16), 16)?;
+    let tail_note = if tail[10..] == [0x44, 0x44, 0x44, 0x44, 0x83, 0x83] {
+        "Tail padding ends 44 44 44 44 83 83 (full-flash dump)."
+    } else if tail.iter().all(|&b| b == 0x44) {
+        "Tail padding is 0x44 fill (logical dump without the final boot block)."
+    } else {
+        "Tail bytes are not a recognised ME7 padding pattern."
+    };
+    let entries: Vec<u64> = head
+        .chunks_exact(4)
+        .take(vectors)
+        .filter(|v| v[0] == 0xEA)
+        .map(|v| o.base + u16::from_le_bytes([v[2], v[3]]) as u64)
+        .take(128)
+        .collect();
+    Ok(Image {
+        format: "ME7",
+        entries,
+        foreign: FormatEvidence::default(),
+        arch,
+        origin: 0,
+        length: size,
+        bits: 16,
+        be: false,
+        cpu: 0,
+        subtype: 0,
+        filetype: 0,
+        flags: 0,
+        sections: vec![Section {
+            name: "ecu-code".into(),
+            segment: "analyst-mapping".into(),
+            address: o.base,
+            size,
+            offset: 0,
+            flags: 0,
+            reloc: 0,
+            nreloc: 0,
+            reserved1: 0,
+            reserved2: 0,
+            executable: true,
+            zero: false,
+        }],
+        commands: vec![],
+        code: Some(0),
+        encrypted: false,
+        inventory: format!(
+            "ME7-class ECU flash dump: {size} bytes, {vectors} consecutive JMPA vectors at offset 0. {tail_note} Code/data boundaries and entry points beyond the vector table are unknown and are reported as candidates only.\n"
+        ),
+        raw: true,
+    })
+}
+
+/// Bounded ME7 region analysis: vector inventory, checksum descriptor table at the
+/// fixed ME7-class offset 0x1F810, checksummed region candidates and identifier
+/// candidates. Lines are formatted for the existing Metadata evidence source.
+fn ecu_regions(file: &mut File, image: &Image) -> String {
+    let mut out = String::new();
+    let size = image.length;
+    if let Ok(head) = read(file, 0, 0x200) {
+        let mut reported = 0;
+        for (v, slot) in head.chunks_exact(4).enumerate().take(128) {
+            if slot[0] != 0xEA || slot[1] & 0x0F != 0 {
+                break;
+            }
+            let target = image.sections.first().map(|s| s.address).unwrap_or(0)
+                + u16::from_le_bytes([slot[2], slot[3]]) as u64;
+            push(
+                &mut out,
+                &format!(
+                    "0x{:016x} ecu vector {}: jmpa cc_UC -> 0x{target:x}\n",
+                    v * 4,
+                    v
+                ),
+            );
+            reported += 1;
+        }
+        push(
+            &mut out,
+            &format!("0x0000000000000000 ecu vector table: {reported} consecutive JMPA vectors decoded (candidate entry points; trap/interrupt layout is C166 family standard).\n"),
+        );
+    }
+    const TABLE: u64 = 0x1F810;
+    const ENTRIES: usize = 31;
+    if TABLE + (ENTRIES * 16) as u64 <= size {
+        if let Ok(table) = read(file, TABLE, ENTRIES * 16) {
+            let mut verified = 0;
+            let mut invalid = 0;
+            let mut budget = SCAN as u64;
+            for (i, entry) in table.chunks_exact(16).enumerate() {
+                let start = u32v(entry, false) as u64;
+                let end = u32v(entry[4..].try_into().unwrap(), false) as u64;
+                let stored = u32v(entry[8..].try_into().unwrap(), false);
+                let complement = u32v(entry[12..].try_into().unwrap(), false);
+                if start == 0 && end == 0 {
+                    continue;
+                }
+                let line_at = TABLE + (i * 16) as u64;
+                if stored ^ 0xFFFF_FFFF != complement {
+                    invalid += 1;
+                    push(
+                        &mut out,
+                        &format!("0x{line_at:016x} ecu checksum descriptor {i}: range 0x{start:x}-0x{end:x} INVALID complement\n"),
+                    );
+                    continue;
+                }
+                let length = end.checked_sub(start).and_then(|span| span.checked_add(1));
+                if length.is_none() || end >= size || length.unwrap() % 2 != 0 {
+                    invalid += 1;
+                    push(
+                        &mut out,
+                        &format!("0x{line_at:016x} ecu checksum descriptor {i}: range 0x{start:x}-0x{end:x} INVALID range\n"),
+                    );
+                    continue;
+                }
+                let length = length.unwrap();
+                if budget < length {
+                    push(
+                        &mut out,
+                        &format!("0x{line_at:016x} ecu checksum descriptor {i}: range 0x{start:x}-0x{end:x} not verified (scan budget)\n"),
+                    );
+                    continue;
+                }
+                budget -= length;
+                if let Ok(range) = read(file, start, length as usize) {
+                    let mut chk: u32 = 0;
+                    for pair in range.chunks_exact(2) {
+                        chk = chk.wrapping_add(u16::from_le_bytes([pair[0], pair[1]]) as u32);
+                    }
+                    if chk == stored {
+                        verified += 1;
+                        push(
+                            &mut out,
+                            &format!("0x{line_at:016x} ecu checksum descriptor {i}: range 0x{start:x}-0x{end:x} verified sum 0x{chk:08x}\n"),
+                        );
+                    } else {
+                        invalid += 1;
+                        push(
+                            &mut out,
+                            &format!("0x{line_at:016x} ecu checksum descriptor {i}: range 0x{start:x}-0x{end:x} INVALID stored 0x{stored:08x} computed 0x{chk:08x}\n"),
+                        );
+                    }
+                }
+                // The descriptor end address is inclusive. Stock tables use an odd
+                // end, so the final word is stored at end-1,end.
+                push(
+                    &mut out,
+                    &format!("0x{start:016x} ecu checksummed region candidate: 0x{start:x}-0x{end:x}\n"),
+                );
+            }
+            push(
+                &mut out,
+                &format!("0x{:016x} ecu checksum table: {verified} verified, {invalid} invalid, at fixed ME7-class offset 0x1f810.\n", TABLE),
+            );
+        }
+    } else {
+        push(
+            &mut out,
+            &format!("0x{:016x} ecu checksum table: not present at the ME7-class offset 0x1f810 for this image size.\n", TABLE),
+        );
+    }
+    if let Ok(window) = read(file, 0, (SCAN as u64).min(size) as usize) {
+        // Mask-free core of ME7RomTool's MIT-licensed multipoint checksum needle.
+        // Relocation-bearing operands begin after this sequence; keeping only these
+        // fixed instruction bytes prevents an address guess from becoming evidence.
+        const MULTIPOINT_SUM: [u8; 18] = [
+            0x98, 0x24, 0xA8, 0x34, 0x00, 0xA2, 0x10, 0xB3, 0x26,
+            0xFA, 0xFF, 0xFF, 0x36, 0xFB, 0xFF, 0xFF, 0x3D, 0x08,
+        ];
+        let mut signatures = 0;
+        for at in window.windows(MULTIPOINT_SUM.len()).enumerate()
+            .filter_map(|(at, bytes)| (bytes == MULTIPOINT_SUM).then_some(at))
+            .take(8)
+        {
+            let floor = at.saturating_sub(0x400);
+            let entry = (floor..at).rev().find_map(|candidate| {
+                (candidate % 2 == 0 && window.get(candidate..candidate + 2) == Some(&[0xDB, 0x00]))
+                    .then_some(candidate + 2)
+            });
+            let entry_text = entry.map_or_else(|| "unresolved".into(), |value| format!("0x{value:x}"));
+            push(&mut out, &format!(
+                "0x{at:016x} ecu multipoint checksum code signature: exact fixed-byte match; containing-function entry candidate {entry_text}.\n"
+            ));
+            signatures += 1;
+        }
+        push(&mut out, &format!(
+            "0x0000000000000000 ecu checksum code signatures: {signatures} exact multipoint match(es); entries are boundary candidates, not calling-convention proof.\n"
+        ));
+        if let Some(at) = window
+            .windows(5)
+            .position(|w| w == [0x99, 0x99, 0x99, 0x00, 0x0A])
+        {
+            let ident = &window[at + 5..(at + 12).min(window.len())];
+            let hex: String = ident[..5.min(ident.len())]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let ascii: String = ident
+                .iter()
+                .skip(5)
+                .map(|b| {
+                    if b.is_ascii_graphic() {
+                        *b as char
+                    } else {
+                        '?'
+                    }
+                })
+                .collect();
+            push(
+                &mut out,
+                &format!("0x{at:016x} ecu identifier candidate: {hex}{ascii} (ME7-class EPK marker 99 99 99 00 0A)\n"),
+            );
+        }
+    }
+    out
+}
 extern "C" {
     fn hs_decoder_new(arch: u32) -> *mut c_void;
     fn hs_decoder_instruction(
@@ -732,21 +1080,61 @@ extern "C" {
         cap: usize,
     ) -> i32;
 }
-struct Decoder(*mut c_void);
+struct Decoder(Option<*mut c_void>);
 impl Decoder {
     fn new(a: Arch) -> io::Result<Self> {
+        if a == Arch::C167 {
+            // The C166 core has no LLVM target; decoding is native and always available.
+            return Ok(Self(None));
+        }
         let p = unsafe { hs_decoder_new(a as u32) };
         if p.is_null() {
             Err(bad("LLVM disassembler unavailable for this architecture. Install Xcode, Command Line Tools or LLVM."))
         } else {
-            Ok(Self(p))
+            Ok(Self(Some(p)))
         }
     }
     fn instruction(&self, b: &[u8], pc: u64, a: Arch) -> (usize, String, bool) {
-        let mut out = [0 as c_char; 512];
-        let n = unsafe {
-            hs_decoder_instruction(self.0, b.as_ptr(), b.len(), pc, out.as_mut_ptr(), out.len())
+        if a == Arch::C167 {
+            return match c167::instruction(b, pc) {
+                Some((n, text)) => (n, text, true),
+                None => {
+                    let n = (a.unit() as usize).min(b.len());
+                    (
+                        n,
+                        format!(
+                            ".byte {} ; undecoded",
+                            b[..n]
+                                .iter()
+                                .map(|v| format!("0x{v:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        false,
+                    )
+                }
+            };
+        }
+        let p = match self.0 {
+            Some(p) => p,
+            None => {
+                let n = (a.unit() as usize).min(b.len());
+                return (
+                    n,
+                    format!(
+                        ".byte {} ; undecoded",
+                        b[..n]
+                            .iter()
+                            .map(|v| format!("0x{v:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    false,
+                );
+            }
         };
+        let mut out = [0 as c_char; 512];
+        let n = unsafe { hs_decoder_instruction(p, b.as_ptr(), b.len(), pc, out.as_mut_ptr(), out.len()) };
         if n == 0 {
             let n = (a.unit() as usize).min(b.len());
             (
@@ -776,7 +1164,9 @@ impl Decoder {
 }
 impl Drop for Decoder {
     fn drop(&mut self) {
-        unsafe { hs_decoder_free(self.0) }
+        if let Some(p) = self.0 {
+            unsafe { hs_decoder_free(p) }
+        }
     }
 }
 fn code_ready(image: &Image) -> io::Result<()> {
@@ -2003,6 +2393,9 @@ fn relative(pc: u64, delta: i64) -> Option<u64> {
     }
 }
 fn branch(a: Arch, b: &[u8], pc: u64) -> Option<(u64, &'static str)> {
+    if a == Arch::C167 {
+        return c167::flow(b, pc);
+    }
     let found = match a {
         Arch::A64 if b.len() == 4 => {
             let w = u32v(b, false);
@@ -2191,6 +2584,7 @@ fn data_reference(a: Arch, b: &[u8], pc: u64) -> Option<u64> {
 
 fn prologue(a: Arch, b: &[u8], text: &str) -> bool {
     match a {
+        Arch::C167 => false,
         Arch::X86 => b.starts_with(&[0x55, 0x89, 0xe5]) || b.starts_with(&[0x55, 0x8b, 0xec]),
         Arch::X64 => {
             b.starts_with(&[0x55, 0x48, 0x89, 0xe5]) || b.starts_with(&[0x55, 0x48, 0x8b, 0xec])
@@ -2208,6 +2602,7 @@ fn prologue(a: Arch, b: &[u8], text: &str) -> bool {
 }
 fn return_instruction(a: Arch, b: &[u8], text: &str) -> bool {
     match a {
+        Arch::C167 => c167::is_return(b, text),
         Arch::A64 => {
             text == "ret" || text.starts_with("ret ") || text == "retab" || text == "retaa"
         }
@@ -2238,6 +2633,28 @@ fn epilogue(a: Arch, bytes: &[u8], text: &str) -> bool {
 
 fn semantic_hint(a: Arch, bytes: &[u8], text: &str) -> Option<&'static str> {
     match a {
+        Arch::C167 => {
+            if text.starts_with("call") {
+                Some("direct-call")
+            } else if text.starts_with("jmpr")
+                || text.starts_with("jmps")
+                || text.starts_with("jmpa")
+            {
+                Some("control-flow")
+            } else if text.starts_with("jb ")
+                || text.starts_with("jnb ")
+                || text.starts_with("jbc ")
+                || text.starts_with("jnbs ")
+            {
+                Some("conditional-control-flow")
+            } else if return_instruction(a, bytes, text) {
+                Some("return")
+            } else if text.starts_with("mov") {
+                Some("data-movement")
+            } else {
+                None
+            }
+        }
         Arch::X86 | Arch::X64 => {
             if text.starts_with("call") {
                 if text.contains('*') || text.contains("indirect") {
@@ -2290,6 +2707,11 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     eprintln!(
         "VG_PROGRESS\t10\tmetadata\tWalking validated headers, sections and linkedit tables."
     );
+    let ecu_text = if image.raw && image.arch == Arch::C167 {
+        ecu_regions(&mut file, &image)
+    } else {
+        String::new()
+    };
     let symbols = symbols(&mut file, &image)?;
     let mut functions: BTreeMap<u64, (String, String)> = BTreeMap::new();
     let mut rejected_function_symbols = Vec::new();
@@ -2733,7 +3155,7 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     let mut intelligence = candidates;
     push(&mut intelligence, &name_guesses);
     push(&mut intelligence, &epilogues);
-    push(&mut intelligence,"Prologues, return instructions, direct-call targets, nearby kernel-name strings and pointer tables are candidates, not proof of function extent. Mixed ARM/Thumb mode requires a separate import with the correct mode.\n");
+    push(&mut intelligence,"Prologues, return instructions, direct-call targets, nearby strings and pointer tables are candidates, not proof of function extent. Decode mode and image bounds come from the selected import configuration.\n");
     let symbol_text = symbols
         .iter()
         .filter(|s| !s.name.is_empty())
@@ -2770,11 +3192,16 @@ pub fn analyze(path: &str, digest: &str, size: &str, id: &str, o: &Options) -> i
     let signature_symbols: Vec<(u64,String)> = symbols.iter().filter(|s| !s.name.is_empty()).map(|s| (s.address,s.name.clone())).collect();
     let signature_starts: Vec<u64> = functions.keys().copied().filter(|a| *a >= s.address && *a < scan_end).collect();
     let (signature_report,pseudocode) = super::signatures::recover(&signature_starts,&signature_symbols,"",&[],scan_end);
+    let pseudocode = pseudocode.replacen(
+        "Statements come from decoded AArch64 operations;",
+        "No instruction semantics are lifted by this structural backend;",
+        1,
+    );
     values.insert("call_values", signature_report);
     values.insert("semantic_preview", format!("Reconstructed pseudocode\n========================\n{pseudocode}"));
     let mut export_text = export_text;
     push(&mut export_text, &image.foreign.exports);
-    for (key,value) in [("functions",function_text),("metadata",metadata),("strings",strings),("relocations",relocation_text),("indirect_symbols",indirect),("export_trie",export_text),("pointer_slots",pointers.clone()),("data_references",code_references),("jump_tables",tables),("xrefs",direct),("call_graph",calls),("cfg",cfg),("annotated_disassembly",annotated),("function_intelligence",intelligence),("symbolication",symbol_text.clone()),("symbol_provenance",symbol_text),("dyld_imports",imports),("analysis_quality",quality),("analysis_insights","Review metadata-backed names first, then prologue/call/table candidates. Unresolved indirect transfers and mixed-mode firmware require analyst review.".into()),("summary",summary)]{values.insert(key,value);}
+    for (key,value) in [("functions",function_text),("metadata",if ecu_text.is_empty(){metadata}else{format!("{metadata}\n{ecu_text}")}),("strings",strings),("relocations",relocation_text),("indirect_symbols",indirect),("export_trie",export_text),("pointer_slots",pointers.clone()),("data_references",code_references),("jump_tables",tables),("xrefs",direct),("call_graph",calls),("cfg",cfg),("annotated_disassembly",annotated),("function_intelligence",intelligence),("symbolication",symbol_text.clone()),("symbol_provenance",symbol_text),("dyld_imports",imports),("analysis_quality",quality),("analysis_insights","Review metadata-backed names first, then prologue/call/table candidates. Unresolved indirect transfers and mixed-mode firmware require analyst review.".into()),("summary",summary)]{values.insert(key,value);}
     for key in [
         "ir",
         "ssa",
@@ -3056,5 +3483,50 @@ mod tests {
             semantic_hint(Arch::X64, &[0x8d], "leaq 0x10(%rax), %rcx"),
             Some("data-movement")
         );
+    }
+    #[test]
+    fn c167_options_and_flow() {
+        assert_eq!(Arch::option("c167"), Some(Arch::C167));
+        assert_eq!(Arch::C167.name(), "Infineon C167");
+        assert_eq!(Arch::C167.unit(), 2);
+        assert_eq!(Arch::C167.width(), 4);
+        // JMPA cc_UC, 0x0200 (the ME7 reset vector at file offset 0).
+        assert_eq!(
+            branch(Arch::C167, &[0xEA, 0x00, 0x00, 0x02], 0),
+            Some((0x200, "branch"))
+        );
+        // JMPR cc_UC (opcode 0x0D), +2 words.
+        assert_eq!(
+            branch(Arch::C167, &[0x0D, 0x02], 0x1000),
+            Some((0x1006, "branch"))
+        );
+        // JMPR cc_SLT (conditional), negative displacement wrapping in-segment.
+        assert_eq!(
+            branch(Arch::C167, &[0xBD, 0xFE], 0x1234),
+            Some((0x1236u64.wrapping_sub(4), "conditional"))
+        );
+        // CALLA cc_UC, 0x8044 (absolute within the current segment).
+        assert_eq!(
+            branch(Arch::C167, &[0xCA, 0x00, 0x44, 0x80], 0x10000),
+            Some((0x18044, "call"))
+        );
+        // CALLS seg 0x0C, caddr 0x9CF8 (far target on a flat dump).
+        assert_eq!(
+            branch(Arch::C167, &[0xDA, 0x0C, 0xF8, 0x9C], 0x1234),
+            Some((0xC9CF8, "call"))
+        );
+        // Undefined opcode and data barrier.
+        assert_eq!(branch(Arch::C167, &[0x44, 0x44], 0), None);
+        assert_eq!(branch(Arch::C167, &[0xCB, 0x00], 0), None);
+        assert!(return_instruction(Arch::C167, &[0xCB, 0x00], "ret"));
+        assert!(return_instruction(Arch::C167, &[0xDB, 0x00], "rets"));
+        assert!(!prologue(Arch::C167, &[0xCB, 0x00], "ret"));
+        assert_eq!(
+            semantic_hint(Arch::C167, &[0xCA], "calla cc_UC, 0x8044"),
+            Some("direct-call")
+        );
+        assert!(Options::parse(&["ecu", "auto", "0", "0"].map(String::from)).is_ok());
+        assert!(Options::parse(&["ecu", "c167", "0x0", "0x0"].map(String::from)).is_ok());
+        assert!(Options::parse(&["ecu", "riscv", "0", "0"].map(String::from)).is_err());
     }
 }

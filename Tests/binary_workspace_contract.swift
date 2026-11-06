@@ -17,6 +17,42 @@ struct BinaryWorkspaceContract {
         precondition((try? VGBinaryPatch.apply(input, offset: 1, expected: [0], replacement: [9])) == nil)
         precondition((try? VGBinaryPatch.apply(input, offset: UInt64.max, expected: [1], replacement: [9])) == nil)
         precondition((try? VGBinaryPatch.apply(input, offset: 0, expected: [0], replacement: [1, 2])) == nil)
+        var ecu = Data(repeating: 0, count: 0x20000)
+        ecu[0] = 1; ecu[1] = 2
+        func put32(_ value: UInt32, _ offset: Int) {
+            ecu[offset] = UInt8(value & 0xff); ecu[offset + 1] = UInt8((value >> 8) & 0xff)
+            ecu[offset + 2] = UInt8((value >> 16) & 0xff); ecu[offset + 3] = UInt8((value >> 24) & 0xff)
+        }
+        put32(0, 0x1F810); put32(1, 0x1F814)
+        put32(0, 0x1F818); put32(UInt32.max, 0x1F81C)
+        let ecuDescriptors = VGECUChecksums.descriptors(in: ecu)
+        precondition(ecuDescriptors.count == 1 && ecuDescriptors[0].computed == 0x0201)
+        precondition(ecuDescriptors[0].verdict == .invalid)
+        let repairs = VGECUChecksums.repairEdits(in: ecu, descriptors: ecuDescriptors)
+        precondition(repairs.count == 1)
+        let repairedECU = try! VGBinaryPatch.apply(ecu, edits: repairs)
+        precondition(VGECUChecksums.descriptors(in: repairedECU).allSatisfy { $0.verdict == .verified })
+        let xdf = Data("""
+        <?xml version="1.0"?><XDFFORMAT><XDFTABLE uniqueid="0x1"><title>KFZW</title>
+        <XDFAXIS id="z"><EMBEDDEDDATA mmedaddress="0x100"/></XDFAXIS></XDFTABLE></XDFFORMAT>
+        """.utf8)
+        let xdfDefinitions = try! VGXDFDefinitions.parse(xdf)
+        precondition(xdfDefinitions.count == 1 && xdfDefinitions[0].title == "KFZW" && xdfDefinitions[0].address == 0x100)
+        precondition(VGXDFDefinitions.evidence(for: xdfDefinitions[0], firmware: Data(repeating: 0, count: 0x80)).contains("not-found"))
+        let relocationXDF = Data("""
+        <?xml version="1.0"?><XDFFORMAT><XDFTABLE uniqueid="map"><title>Map</title>
+        <XDFAXIS id="x"><EMBEDDEDDATA mmedaddress="0x20"/></XDFAXIS>
+        <XDFAXIS id="y"><EMBEDDEDDATA mmedaddress="0x60"/></XDFAXIS>
+        <XDFAXIS id="z"><EMBEDDEDDATA mmedaddress="0xA0"/></XDFAXIS></XDFTABLE></XDFFORMAT>
+        """.utf8)
+        let relocationDefinitions = try! VGXDFDefinitions.parse(relocationXDF)
+        var reference = Data(repeating: 0, count: 0x200), target = Data(repeating: 0, count: 0x300)
+        for (ordinal, base) in [0x20, 0x60, 0xA0].enumerated() {
+            for byte in 0..<24 { reference[base + byte] = UInt8(ordinal * 40 + byte + 1) }
+            target.replaceSubrange((base + 0x40)..<(base + 0x40 + 24), with: reference[base..<(base + 24)])
+        }
+        let relocation = VGXDFDefinitions.relocate(relocationDefinitions, reference: reference, target: target)[0]
+        precondition(relocation.state == .verified && relocation.resolvedAddress == 0xE0 && relocation.matchedAnchors == 3)
         let functionsText = """
         0x0000000100001000  0x0000000100001010        16 bytes  _entry
         0x0000000100001010  0x0000000100001020        16 bytes  _helper

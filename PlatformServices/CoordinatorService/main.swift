@@ -379,6 +379,28 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             } catch { reply(AnalysisReply.encode(error: error.localizedDescription)) }
         }
     }
+    func emulateC167(_ recordID: String, entry: String, steps: String, stack: String, breakpoint: String, watchpoint: String, ram: String, requestID: String, withReply reply: @escaping (String) -> Void) {
+        queue.async { [self] in
+            do {
+                guard let current = store, UUID(uuidString: recordID) != nil, UUID(uuidString: requestID) != nil else {
+                    throw WorkbenchError("Invalid C167 emulator request or no open project.")
+                }
+                let source = try current.capturedSource(id: recordID)
+                guard source.options?.format == "ecu" || source.options?.architecture == "c167" else {
+                    throw WorkbenchError("C167 emulation is available only for captured ECU/C167 imports.")
+                }
+                let before = try VerifiedPageCache.stamp(source.path)
+                supervisor.emulateC167(path: source.path, entry: entry, steps: steps, stack: stack, breakpoint: breakpoint, watchpoint: watchpoint, ram: ram, id: requestID) { [self] result in
+                    do {
+                        guard store === current, try VerifiedPageCache.stamp(source.path) == before else {
+                            throw WorkbenchError("Captured ECU changed during bounded execution.")
+                        }
+                        reply(C167EmulationReply.encode(result: try result.get()))
+                    } catch { reply(C167EmulationReply.encode(error: error.localizedDescription)) }
+                }
+            } catch { reply(C167EmulationReply.encode(error: error.localizedDescription)) }
+        }
+    }
     func reconstructFunction(_ recordID: String, startAddress: String, endAddress: String, requestID: String, withReply reply: @escaping (String) -> Void) {
         queue.async { [self] in
             do {
@@ -602,6 +624,19 @@ final class CoordinatorService: NSObject, CoordinatorProtocol {
             do {
                 guard let store else { throw WorkbenchError("Create or open a project first.") }
                 reply(ProjectTypeCatalogReply.success(try store.addProjectTypeCandidate(candidate)).encoded)
+            } catch { reply(ProjectTypeCatalogReply.failure(error.localizedDescription).encoded) }
+        }
+    }
+    func addProjectTypeCandidates(_ catalogJSON: String, withReply reply: @escaping (String) -> Void) {
+        guard catalogJSON.utf8.count <= 8 * 1024 * 1024,
+              let catalog = try? JSONDecoder().decode(ProjectTypeCatalog.self, from: Data(catalogJSON.utf8)),
+              catalog.validated() != nil, !catalog.candidates.isEmpty else {
+            reply(ProjectTypeCatalogReply.failure("Project type catalog batch is malformed or oversized.").encoded); return
+        }
+        queue.async { [self] in
+            do {
+                guard let store else { throw WorkbenchError("Create or open a project first.") }
+                reply(ProjectTypeCatalogReply.success(try store.addProjectTypeCandidates(catalog.candidates)).encoded)
             } catch { reply(ProjectTypeCatalogReply.failure(error.localizedDescription).encoded) }
         }
     }

@@ -7,4 +7,4 @@ def test_runtime_pivots_keep_stop_context_visible():
     workspace = (ROOT / "App/RuntimeCorrelationWorkspace.swift").read_text()
     assert 'runtimePill("STOP", value: sample.event' in workspace
     assert 'Text(sample.reason)' in workspace
-    assert 'richer breakpoint-condition context remains open' in (ROOT / "docs/DEVELOPMENT_PLAN.md").read_text()
+    assert 'Improve qualified native-debugger correlation and stop-context workflows.' in (ROOT / "docs/MASTER_ROADMAP.md").read_text()

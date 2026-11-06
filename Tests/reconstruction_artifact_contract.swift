@@ -142,6 +142,38 @@ enum ReconstructionArtifactContract {
                 throw ReconstructionArtifact.Invalid(message: "Batch file identity differs from its bytes")
             }
         }
+        let orphanBatch = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("reconstruction-orphan-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: orphanBatch, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: orphanBatch) }
+        let orphan = files[0]
+        let orphanURL = orphanBatch.appendingPathComponent(orphan.path)
+        let orphanBytes = try Data(contentsOf: batch.appendingPathComponent(orphan.path))
+        try orphanBytes.write(to: orphanURL, options: .withoutOverwriting)
+        let orphanTime = try FileManager.default.attributesOfItem(atPath: orphanURL.path)[.modificationDate] as? Date
+        let resumedFiles = try accepted.writeBatchExport(to: orphanBatch, maximumBytes: 16 * 1024 * 1024,
+                                                         allowIdenticalExistingFiles: true)
+        let resumedPaths = resumedFiles.map { $0.path }
+        let expectedPaths = files.map { $0.path }
+        let resumedSizes = resumedFiles.map { $0.bytes }
+        let expectedSizes = files.map { $0.bytes }
+        let resumedHashes = resumedFiles.map { $0.sha256 }
+        let expectedHashes = files.map { $0.sha256 }
+        let reusedBytes = try Data(contentsOf: orphanURL)
+        let reusedTime = try FileManager.default.attributesOfItem(atPath: orphanURL.path)[.modificationDate] as? Date
+        let resumedNames = try FileManager.default.contentsOfDirectory(atPath: orphanBatch.path)
+        guard resumedPaths == expectedPaths, resumedSizes == expectedSizes, resumedHashes == expectedHashes,
+              reusedBytes == orphanBytes, reusedTime == orphanTime, resumedNames.count == files.count else {
+            throw ReconstructionArtifact.Invalid(message: "Resume did not preserve and complete matching orphan files")
+        }
+        let tamperedOrphan = Data("tampered orphan".utf8)
+        try tamperedOrphan.write(to: orphanURL, options: .atomic)
+        try mustReject({ _ = try accepted.writeBatchExport(to: orphanBatch, maximumBytes: 16 * 1024 * 1024,
+                                                            allowIdenticalExistingFiles: true) },
+                       "changed orphaned function file")
+        guard try Data(contentsOf: orphanURL) == tamperedOrphan else {
+            throw ReconstructionArtifact.Invalid(message: "Resume replaced a changed orphan output")
+        }
         try mustReject({ _ = try accepted.writeBatchExport(to: batch, maximumBytes: 16 * 1024 * 1024) },
                        "batch overwrite")
         let alias = batch.appendingPathExtension("link")
@@ -186,6 +218,30 @@ enum ReconstructionArtifactContract {
             try mustReject({ _ = try ReconstructionArtifact.verifiedBatchCheckpoint(at: batch, digest: digest,
                 worker: "test-worker", revision: "test-revision") }, "invalid saved dump intent")
         }
+        var retryCheckpoint = checkpoint
+        var retryEntries = retryCheckpoint["functions"] as! [[String: Any]]
+        retryEntries[0]["attempt_count"] = 2
+        retryEntries[0]["previous_errors"] = ["Coordinator connection ended before the response arrived."]
+        retryCheckpoint["functions"] = retryEntries
+        try JSONSerialization.data(withJSONObject: retryCheckpoint).write(to: batch.appendingPathComponent("checkpoint.json"))
+        _ = try ReconstructionArtifact.verifiedBatchCheckpoint(at: batch, digest: digest,
+            worker: "test-worker", revision: "test-revision")
+        for (key, value) in [("attempt_count", 0), ("attempt_count", 1_000_001)] {
+            var invalidRetry = checkpoint
+            var invalidEntries = invalidRetry["functions"] as! [[String: Any]]
+            invalidEntries[0][key] = value
+            invalidRetry["functions"] = invalidEntries
+            try JSONSerialization.data(withJSONObject: invalidRetry).write(to: batch.appendingPathComponent("checkpoint.json"))
+            try mustReject({ _ = try ReconstructionArtifact.verifiedBatchCheckpoint(at: batch, digest: digest,
+                worker: "test-worker", revision: "test-revision") }, "invalid retry attempt count")
+        }
+        var excessiveHistory = checkpoint
+        var historyEntries = excessiveHistory["functions"] as! [[String: Any]]
+        historyEntries[0]["previous_errors"] = Array(repeating: "retry failed", count: 9)
+        excessiveHistory["functions"] = historyEntries
+        try JSONSerialization.data(withJSONObject: excessiveHistory).write(to: batch.appendingPathComponent("checkpoint.json"))
+        try mustReject({ _ = try ReconstructionArtifact.verifiedBatchCheckpoint(at: batch, digest: digest,
+            worker: "test-worker", revision: "test-revision") }, "unbounded retry history")
         try checkpointData.write(to: batch.appendingPathComponent("checkpoint.json"))
         for format in ReconstructionExportFormat.allCases {
             let dump = batch.appendingPathComponent("dump-" + format.rawValue, isDirectory: true)

@@ -196,6 +196,19 @@ final class WorkerSupervisor {
             } })
         }
     }
+    func emulateC167(path: String, entry: String, steps: String, stack: String, breakpoint: String, watchpoint: String, ram: String, id: String,
+                     completion: @escaping (Result<C167EmulationResult, Error>) -> Void) {
+        run(path: path, arguments: ["--emulate-c167", path, entry, steps, stack, breakpoint, watchpoint, ram, id], id: id,
+            operation: "c167-emulation", deadlineSeconds: 30, admissionBytes: 16 * 1_048_576) { result in
+            completion(result.flatMap { data in Result {
+                let decoded = try JSONDecoder().decode(C167EmulationResult.self, from: data)
+                guard let validated = decoded.validated(requestID: id) else {
+                    throw WorkbenchError("C167 emulator result failed identity or bounds validation.")
+                }
+                return validated
+            } })
+        }
+    }
     func analyze(path: String, digest: String, size: String, id: String, options: BinaryImportOptions? = nil,
                  completion: @escaping (Result<(AnalysisReport, WorkerEvidenceBundle?), Error>) -> Void) {
         let evidenceBox = EvidenceBundleCapture()
@@ -264,7 +277,14 @@ final class WorkerSupervisor {
                     }
                     for candidate in validTypes {
                         let declaration = Data(candidate.declaration.utf8).map { String(format: "%02x", $0) }.joined()
-                        text += "# project_type\t\(digest)\t\(candidate.target)\t\(candidate.name)\t\(declaration)\n"
+                        let layout: String
+                        if let evidence = candidate.layoutEvidence,
+                           let data = try? JSONEncoder().encode(evidence) {
+                            layout = data.map { String(format: "%02x", $0) }.joined()
+                        } else {
+                            layout = "-"
+                        }
+                        text += "# project_type\t\(digest)\t\(candidate.target)\t\(candidate.name)\t\(declaration)\t\(layout)\n"
                     }
                     catalog = Data(text.utf8)
                 }

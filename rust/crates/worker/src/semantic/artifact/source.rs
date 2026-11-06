@@ -3,6 +3,7 @@
 //! every reachable return proves restored SP, LR and Darwin nonvolatile GPRs.
 use super::*;
 use crate::signatures::SourceSignature;
+use crate::reconstruction::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Declaration recovery does not depend on proving the implementation body.
@@ -44,12 +45,14 @@ pub(super) fn emit_header(builder: &mut Builder, s: &crate::signatures::SourceDe
     ]), array([]))?;
     builder.edge(declaration, &header, "types")?;
     for dependency in type_dependencies {
-        let evidence = builder.record("project-type-dependency", "analyst-assertion", object([
+        let evidence = builder.record("type", "analyst-assertion", object([
             ("name", dependency.name.clone().into()),
             ("declaration", dependency.declaration.clone().into()),
             ("target", dependency.target.clone().into()),
             ("source_sha256", dependency.source_sha256.clone().into()),
             ("abi_layout_claimed", false.into()),
+            ("compiler_layout_evidence", dependency.layout_evidence.clone().map(Value::String).unwrap_or(Value::Null)),
+            ("captured_type_identity_proven", false.into()),
         ]), array([]))?;
         builder.edge(&evidence, &header, "required-source-dependency")?;
     }
@@ -89,6 +92,7 @@ struct ExternalStore {
     bytes: u64,
     pc: u64,
     volatile: bool,
+    member: Option<AggregateMemberAccess>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExternalLoad {
@@ -98,7 +102,34 @@ struct ExternalLoad {
     bytes: u64,
     pc: u64,
     volatile: bool,
+    member: Option<AggregateMemberAccess>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AggregateAddress {
+    base: usize,
+    type_spelling: String,
+    layout: crate::reconstruction::ProjectTypeLayout,
+    offset_bytes: u64,
+    target: String,
+    source_sha256: String,
+    layout_evidence: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AggregateMemberAccess {
+    base: usize,
+    type_spelling: String,
+    record_name: String,
+    field_name: String,
+    field_declaration: String,
+    offset_bits: u64,
+    field_type: SourceType,
+    target: String,
+    source_sha256: String,
+    layout_evidence: String,
+}
+
 struct Expr {
     /// Proven bit pattern, retained through explicitly modeled width views.
     constant_value: Option<u64>,
@@ -118,6 +149,7 @@ struct Expr {
     /// expression to learn what a value means. `None` means the type is not
     /// proven and stays unresolved.
     source_type: Option<SourceType>,
+    aggregate_address: Option<AggregateAddress>,
 }
 
 /// A semantic type proven from a source declaration.
@@ -172,6 +204,83 @@ fn scalar_pointee_type(pointer: &SourceType) -> Option<SourceType> {
     Some(SourceType { spelling: base, bits, signed, pointer: false })
 }
 
+fn aggregate_layout_for_pointer(
+    spelling:&str,
+    project_types:&[crate::reconstruction::ProjectTypeDependency],
+)->Option<(String,crate::reconstruction::ProjectTypeLayout)> {
+    let (base,suffix)=spelling.rsplit_once('*')?;
+    if base.contains('*')||!suffix.split_whitespace().all(|word|matches!(word,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable")) {return None}
+    let type_spelling=base.split_whitespace().filter(|word|!matches!(*word,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"))
+        .collect::<Vec<_>>().join(" ");
+    let name=type_spelling.strip_prefix("struct ").or_else(||type_spelling.strip_prefix("union ")).unwrap_or(&type_spelling);
+    if name.is_empty()||name.split_whitespace().count()!=1{return None}
+    let candidate=project_types.iter().find(|candidate|candidate.name==name)?;
+    let layout=candidate.layout.as_ref()?.clone();
+    (layout.name==name&&layout.fields_complete).then_some((type_spelling,layout))
+}
+
+fn layout_field_extent_bits(field:&crate::reconstruction::ProjectTypeLayoutField)->Option<u64> {
+    if let Some(width)=field.bit_width{return (width>0).then_some(width)}
+    let mut parts=field.declaration.split_whitespace().collect::<Vec<_>>();
+    if parts.pop()?!=field.name||parts.is_empty()||field.declaration.contains('[')||field.declaration.contains('*')
+        ||field.declaration.split_whitespace().any(|part|matches!(part,"volatile"|"_Atomic")){return None}
+    let spelling=parts.join(" ");
+    let pointer=SourceType {spelling:format!("{spelling} *"),bits:64,signed:false,pointer:true};
+    let field_type=scalar_pointee_type(&pointer)?;
+    Some(u64::from(field_type.bits))
+}
+
+fn aggregate_member_at(address:&AggregateAddress,bytes:u64)->Option<AggregateMemberAccess> {
+    if address.layout.kind!="struct"||!address.layout.fields_complete{return None}
+    let offset_bits=address.offset_bytes.checked_mul(8)?;
+    let access_bits=bytes.checked_mul(8)?;
+    let access_end=offset_bits.checked_add(access_bits)?;
+    if access_end>address.layout.size.checked_mul(8)?{return None}
+    let mut candidates=address.layout.fields.iter().filter(|field|field.offset_bits==offset_bits&&field.bit_width.is_none());
+    let field=candidates.next()?; if candidates.next().is_some(){return None}
+    for other in &address.layout.fields {
+        if std::ptr::eq(other,field){continue}
+        let extent=layout_field_extent_bits(other)?;
+        let end=other.offset_bits.checked_add(extent)?;
+        if other.offset_bits<access_end&&offset_bits<end{return None}
+    }
+    let extent=layout_field_extent_bits(field)?;
+    if extent!=access_bits{return None}
+    let mut parts=field.declaration.split_whitespace().collect::<Vec<_>>();
+    if parts.pop()?!=field.name||parts.is_empty()||field.declaration.contains('[')||field.declaration.contains('*')
+        ||field.declaration.split_whitespace().any(|part|matches!(part,"volatile"|"_Atomic")){return None}
+    let spelling=parts.join(" ");
+    let pointer=SourceType {spelling:format!("{spelling} *"),bits:64,signed:false,pointer:true};
+    let field_type=scalar_pointee_type(&pointer)?;
+    Some(AggregateMemberAccess {base:address.base,type_spelling:address.type_spelling.clone(),record_name:address.layout.name.clone(),
+        field_name:field.name.clone(),field_declaration:field.declaration.clone(),offset_bits,field_type,
+        target:address.target.clone(),source_sha256:address.source_sha256.clone(),layout_evidence:address.layout_evidence.clone()})
+}
+
+fn render_external_load(load:&ExternalLoad,rendered:&BTreeMap<usize,String>,dag:&Dag)->String {
+    if let Some(member)=&load.member {
+        format!("((({} *)({}))->{} )",member.type_spelling,rendered[&member.base],member.field_name)
+    } else {
+        let helper=if load.volatile {
+            volatile_helper(false,load.bytes,dag.type_of(load.expression).expect("validated volatile pointee")).0
+        } else {format!("hs_load{}",load.bytes)};
+        format!("{helper}((uintptr_t)({}))",rendered[&load.address])
+    }
+}
+
+fn render_aggregate_member(member:&AggregateMemberAccess,rendered:&BTreeMap<usize,String>)->String {
+    format!("(({} *)({}))->{}",member.type_spelling,rendered[&member.base],member.field_name)
+}
+
+fn aggregate_member_layout_value(member:Option<&AggregateMemberAccess>)->V {
+    member.map(|member|object([
+        ("record",member.record_name.clone().into()),("field",member.field_name.clone().into()),
+        ("field_declaration",member.field_declaration.clone().into()),("offset_bits",member.offset_bits.into()),
+        ("target",member.target.clone().into()),("source_sha256",member.source_sha256.clone().into()),
+        ("compiler_layout_evidence",member.layout_evidence.clone().into()),("captured_type_identity_proven",false.into()),
+    ])).unwrap_or(V::Null)
+}
+
 fn pointee_qualified(pointer: &SourceType, qualifier: &str) -> bool {
     pointer.spelling.split_once('*').is_some_and(|(pointee, _)|
         pointee.split_whitespace().any(|word| word == qualifier))
@@ -216,6 +325,9 @@ impl Dag {
             origins.extend(self.nodes[*child].origins.iter().copied());
         }
         let id = self.nodes.len();
+        let aggregate_address = if matches!(kind, "source-copy" | "source-frame-reload" | "source-return") && children.len() == 1 {
+            self.nodes[children[0]].aggregate_address.clone()
+        } else { None };
         let boolean_value = kind == "source-condition"
             || (matches!(kind, "source-copy" | "source-cast" | "source-frame-reload" | "source-return")
                 && children.len() == 1 && self.nodes[children[0]].boolean_value)
@@ -235,6 +347,7 @@ impl Dag {
             origins,
             role,
             source_type: None,
+            aggregate_address,
         });
         Ok(id)
     }
@@ -401,23 +514,28 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 .ok_or_else(|| format!("external memory address is not a proven pointer (address={address:?}, type={:?})", dag.type_of(*address_id)))?;
             let volatile = pointee_qualified(&pointer_type, "volatile");
             let declared_pointee = scalar_pointee_type(&pointer_type).filter(|ty| u64::from(ty.bits) == bytes * 8);
+            let member = if volatile {None} else {dag.nodes[*address_id].aggregate_address.as_ref().and_then(|address|aggregate_member_at(address,bytes))};
             if volatile && declared_pointee.is_none() {
                 return Err("volatile reads require an exact fixed-width scalar pointee".into());
             }
-            let signed = declared_pointee.as_ref().map_or(flag(t, "signed") != 0, |ty| ty.signed);
+            let proven_pointee=member.as_ref().map(|member|member.field_type.clone()).or(declared_pointee);
+            let signed = proven_pointee.as_ref().map_or(flag(t, "signed") != 0, |ty| ty.signed);
             let load_helper = if volatile {
-                volatile_helper(false, bytes, declared_pointee.as_ref().expect("validated volatile pointee")).0
+                volatile_helper(false, bytes, proven_pointee.as_ref().expect("validated volatile pointee")).0
             } else {
                 format!("hs_load{bytes}")
             };
+            let (load_template,load_children)=if let Some(member)=&member {
+                (format!("((({} *)($0))->{} )",member.type_spelling,member.field_name),vec![member.base,*address_id])
+            } else {(format!("{load_helper}((uintptr_t)($0))"),vec![*address_id])};
             let loaded = dag.add_role(
-                "source-memory-load",
-                "loaded",
-                format!("{load_helper}((uintptr_t)($0))"),
-                vec![*address_id],
+                if member.is_some(){"source-member-load"}else{"source-memory-load"},
+                if member.is_some(){"member_load"}else{"loaded"},
+                load_template,
+                load_children,
                 pc,
             )?;
-            dag.nodes[loaded].source_type = Some(declared_pointee.unwrap_or(SourceType {
+            dag.nodes[loaded].source_type = Some(proven_pointee.unwrap_or(SourceType {
                 spelling: format!("{}{}_t", if signed { "int" } else { "uint" }, bytes * 8),
                 bits: (bytes * 8) as u8,
                 signed,
@@ -434,6 +552,7 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 bytes,
                 pc,
                 volatile,
+                member,
             });
             state.external_access_pcs.push(pc);
             let extended = dag.add_role(
@@ -550,6 +669,12 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
             // and retains the volatile event in the ordered access schedule.
             if pointer_type.as_ref().is_some_and(|ty| ty.pointer) {
                 let op = attribute(t, "operator");
+                let aggregate_address=dag.nodes[*pointer].aggregate_address.clone().and_then(|mut aggregate| {
+                    let displacement=dag.literal(&values[1])?;
+                    let offset=if op=="+" {aggregate.offset_bytes.checked_add(displacement)} else {aggregate.offset_bytes.checked_sub(displacement)}?;
+                    if offset>=aggregate.layout.size{return None}
+                    aggregate.offset_bytes=offset;Some(aggregate)
+                });
                 let (template, children) = if let Some(offset) = dag.literal(&values[1]) {
                     (
                         format!("((uintptr_t)($0) {op} UINT64_C(0x{offset:x}))"),
@@ -573,6 +698,7 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                     pc,
                 )?;
                 dag.type_node(id, pointer_type);
+                dag.nodes[id].aggregate_address=aggregate_address;
                 return Ok(Symbol::Value(id, 64));
             }
         }
@@ -702,6 +828,21 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 // usual arithmetic conversions. This also keeps declaration
                 // evidence attached to compiler-scaled dynamic array indices.
                 dag.type_of(children[0]).filter(|ty| !ty.pointer).cloned()
+            } else if matches!(op,"+"|"-") {
+                let left_is_base=dag.nodes[children[0]].aggregate_address.is_some();
+                let right_is_base=dag.nodes[children[1]].aggregate_address.is_some();
+                let left_is_constant=dag.nodes[children[0]].constant_value.is_some();
+                let right_is_constant=dag.nodes[children[1]].constant_value.is_some();
+                if left_is_base&&right_is_constant {dag.type_of(children[0]).cloned()}
+                else if op=="+"&&right_is_base&&left_is_constant {dag.type_of(children[1]).cloned()}
+                else {
+                    let left=dag.type_of(children[0]);
+                    let right=dag.type_of(children[1]);
+                    match (left,right) {
+                        (Some(left),Some(right)) if left==right&&!left.pointer=>Some(left.clone()),
+                        _=>None,
+                    }
+                }
             } else {
                 let left = dag.type_of(children[0]);
                 let right = dag.type_of(children[1]);
@@ -727,6 +868,22 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
         _ => None,
     };
     dag.type_node(id, propagated);
+    if t.kind=="binary"&&matches!(attribute(t,"operator"),"+"|"-") {
+        let op=attribute(t,"operator");
+        let left=dag.nodes[children[0]].aggregate_address.clone();
+        let right_constant=dag.nodes[children[1]].constant_value;
+        let right=dag.nodes[children[1]].aggregate_address.clone();
+        let left_constant=dag.nodes[children[0]].constant_value;
+        let adjusted=if let (Some(mut base),Some(displacement))=(left,right_constant) {
+            let offset=if op=="+" {base.offset_bytes.checked_add(displacement)} else {base.offset_bytes.checked_sub(displacement)};
+            offset.filter(|offset|*offset<base.layout.size).map(|offset|{base.offset_bytes=offset;base})
+        } else if op=="+" {
+            if let (Some(mut base),Some(displacement))=(right,left_constant) {
+                base.offset_bytes.checked_add(displacement).filter(|offset|*offset<base.layout.size).map(|offset|{base.offset_bytes=offset;base})
+            } else {None}
+        } else {None};
+        dag.nodes[id].aggregate_address=adjusted;
+    }
     Ok(Symbol::Value(id, 64))
 }
 fn frame_range(state: &State, offset: i64, bytes: u64) -> Result<(), String> {
@@ -789,9 +946,11 @@ fn store(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), Stri
         if !matches!(bytes, 1 | 2 | 4 | 8) {
             return Err("external memory write width is unsupported".into());
         }
+        let member=if volatile {None}else{dag.nodes[address].aggregate_address.as_ref().and_then(|address|aggregate_member_at(address,bytes))};
         let value = read(&t.children[1], state, dag, pc)?;
         let mut value = dag.value(value, 64, pc)?;
-        let pointee = scalar_pointee_type(&pointer).filter(|ty| u64::from(ty.bits) == bytes * 8);
+        let pointee = member.as_ref().map(|member|member.field_type.clone())
+            .or_else(||scalar_pointee_type(&pointer).filter(|ty| u64::from(ty.bits) == bytes * 8));
         if let Some(boolean) = pointee.as_ref().filter(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool")) {
             if !dag.nodes[value].boolean_value {
                 return Err("Boolean store representation is not proven canonical".into());
@@ -836,6 +995,7 @@ fn store(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), Stri
             bytes,
             pc,
             volatile,
+            member,
         });
         state.external_access_pcs.push(pc);
         return Ok(());
@@ -1395,6 +1555,16 @@ pub(super) fn recover_with_types(
                 pointer: parameter.pointer,
             }),
         );
+        if parameter.pointer {
+            if let Some((type_spelling,layout))=aggregate_layout_for_pointer(&parameter.spelling,project_types) {
+                if let Some(candidate)=project_types.iter().find(|candidate|candidate.name==layout.name&&candidate.layout.as_ref()==Some(&layout)) {
+                    if let Some(layout_evidence)=candidate.layout_evidence.clone() {
+                        dag.nodes[id].aggregate_address=Some(AggregateAddress {base:id,type_spelling,layout,offset_bytes:0,
+                            target:candidate.target.clone(),source_sha256:candidate.source_sha256.clone(),layout_evidence});
+                    }
+                }
+            }
+        }
         if matches!(parameter.spelling.as_str(), "bool" | "_Bool") {
             dag.nodes[id].boolean_value = true;
         }
@@ -1680,9 +1850,7 @@ impl Recovery {
         for effect in &self.external_stores {
             pending.extend([effect.address, effect.value, effect.guard]);
         }
-        if ordered_effect_schedule {
-            pending.extend(self.external_loads.iter().flat_map(|load| [load.expression, load.guard]));
-        }
+        pending.extend(self.external_loads.iter().flat_map(|load| [load.expression, load.address, load.guard]));
         if self.ordered_call_memory {
             pending.extend(self.calls.iter().flat_map(|call| [call.expression, call.guard]));
         }
@@ -1870,13 +2038,8 @@ impl Recovery {
             for event in body_events {
                 match event {
                     LoopBodyEvent::Load(load) => {
-                        let helper = if load.volatile {
-                            volatile_helper(false, load.bytes, self.dag.type_of(load.expression).expect("validated volatile pointee")).0
-                        } else {
-                            format!("hs_load{}", load.bytes)
-                        };
-                        let statement = format!("        hs_loaded_{} = {}((uintptr_t)({}));\n",
-                            load.expression, helper, rendered[&load.address]);
+                        let expression=render_external_load(&load,&rendered,&self.dag);
+                        let statement = format!("        hs_loaded_{} = {expression};\n",load.expression);
                         if self.dag.literal(&Symbol::Value(load.guard, 64)) == Some(1) {
                             loop_code.push_str(&statement);
                         } else {
@@ -1886,6 +2049,7 @@ impl Recovery {
                             .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                         evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
                         let ordering = "per-iteration instruction order under the recovered path guard";
+                        let member_layout=aggregate_member_layout_value(load.member.as_ref());
                         let ast = builder.ast_spans(
                             "source-memory-read",
                             None,
@@ -1896,7 +2060,8 @@ impl Recovery {
                                 ("bytes", load.bytes.into()),
                                 ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
                                 ("ordering", ordering.into()),
-                                ("template", format!("if ($2) {helper}((uintptr_t)($0))").into()),
+                                ("template", if load.member.is_some(){"if ($2) hs_loaded = $1".into()}else{format!("if ($2) hs_load{}((uintptr_t)($0))",load.bytes).into()}),
+                                ("member_layout",member_layout),
                             ]),
                         )?;
                         loop_children.push(ast);
@@ -1936,8 +2101,12 @@ impl Recovery {
                         } else {
                             (format!("hs_store{}", store.bytes), "declaration-proven ordinary pointer")
                         };
-                        let statement = format!("        {}((uintptr_t)({}), (uint64_t)({}));\n", helper,
-                            rendered[&store.address], rendered[&store.value]);
+                        let statement = if let Some(member)=&store.member {
+                            format!("        {} = {};\n",render_aggregate_member(member,&rendered),rendered[&store.value])
+                        } else {
+                            format!("        {}((uintptr_t)({}), (uint64_t)({}));\n", helper,
+                                rendered[&store.address], rendered[&store.value])
+                        };
                         if self.dag.literal(&Symbol::Value(store.guard, 64)) == Some(1) {
                             loop_code.push_str(&statement);
                         } else {
@@ -1958,7 +2127,10 @@ impl Recovery {
                                 ("bytes", store.bytes.into()),
                                 ("partition", partition.into()),
                                 ("ordering", ordering.into()),
-                                ("template", format!("if ($2) {helper}((uintptr_t)($0), (uint64_t)($1))").into()),
+                                ("template", if let Some(member)=&store.member {
+                                    format!("if ($2) (({} *)($0))->{} = $1",member.type_spelling,member.field_name).into()
+                                } else {format!("if ($2) {helper}((uintptr_t)($0), (uint64_t)($1))").into()}),
+                                ("member_layout",aggregate_member_layout_value(store.member.as_ref())),
                             ]),
                         )?;
                         loop_children.push(ast);
@@ -2027,12 +2199,27 @@ impl Recovery {
                 continue;
             }
             if event_kind == 0 {
-                if !ordered_effect_schedule { continue; }
                 let load = &self.external_loads[event_index];
-                let helper = if load.volatile {
-                    volatile_helper(false, load.bytes, self.dag.type_of(load.expression).expect("validated volatile pointee")).0
-                } else { format!("hs_load{}", load.bytes) };
-                let read = format!("    hs_loaded_{} = {}((uintptr_t)({}));\n", load.expression, helper, rendered[&load.address]);
+                if !ordered_effect_schedule {
+                    let mut evidence=ir.get(((load.pc-start)/4) as usize).into_iter().cloned()
+                        .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
+                    evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
+                    effect_asts.push(builder.ast_spans(
+                        "source-memory-read",None,
+                        vec![asts[&load.address].clone(),asts[&load.expression].clone(),asts[&load.guard].clone()],
+                        &evidence,array([object([("start",address(load.pc)),("end",address(load.pc+4))])]),
+                        object([
+                            ("bytes",load.bytes.into()),
+                            ("partition",if load.volatile {"declaration-proven volatile pointer"} else {"declaration-proven ordinary pointer"}.into()),
+                            ("ordering","instruction order under the recovered path guard".into()),
+                            ("template",if load.member.is_some(){"read $1".into()}else{format!("hs_load{}((uintptr_t)($0))",load.bytes).into()}),
+                            ("member_layout",aggregate_member_layout_value(load.member.as_ref())),
+                        ]),
+                    )?);
+                    continue;
+                }
+                let expression=render_external_load(load,&rendered,&self.dag);
+                let read = format!("    hs_loaded_{} = {expression};\n", load.expression);
                 if self.dag.literal(&Symbol::Value(load.guard, 64)) == Some(1) {
                     effects_code.push_str(&read);
                 } else {
@@ -2054,6 +2241,7 @@ impl Recovery {
                     .chain(std::iter::once(declaration.to_owned()))
                     .collect::<Vec<_>>();
                 evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
+                let member_layout=aggregate_member_layout_value(load.member.as_ref());
                 effect_asts.push(builder.ast_spans(
                     "source-memory-read",
                     None,
@@ -2064,7 +2252,8 @@ impl Recovery {
                         ("bytes", load.bytes.into()),
                         ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
                         ("ordering", "instruction order under the recovered path guard".into()),
-                        ("template", format!("if ($2) {helper}((uintptr_t)($0))").into()),
+                        ("template", if load.member.is_some(){"if ($2) hs_loaded = $1".into()}else{format!("if ($2) hs_load{}((uintptr_t)($0))",load.bytes).into()}),
+                        ("member_layout",member_layout),
                     ]),
                 )?);
                 continue;
@@ -2080,12 +2269,11 @@ impl Recovery {
                 (format!("hs_store{}", effect.bytes),
                  "declaration-proven ordinary pointer", "instruction order under the recovered path guard")
             };
-            let store = format!(
-                "    {}((uintptr_t)({}), (uint64_t)({}));\n",
-                store_helper,
-                rendered[&effect.address],
-                rendered[&effect.value],
-            );
+            let store = if let Some(member)=&effect.member {
+                format!("    {} = {};\n",render_aggregate_member(member,&rendered),rendered[&effect.value])
+            } else {
+                format!("    {}((uintptr_t)({}), (uint64_t)({}));\n",store_helper,rendered[&effect.address],rendered[&effect.value])
+            };
             let guard_is_true = self.dag.literal(&Symbol::Value(effect.guard, 64)) == Some(1);
             if guard_is_true {
                 effects_code.push_str(&store);
@@ -2109,7 +2297,10 @@ impl Recovery {
                     ("bytes", effect.bytes.into()),
                     ("partition", partition.into()),
                     ("ordering", ordering.into()),
-                    ("template", format!("if ($2) {store_helper}((uintptr_t)($0), (uint64_t)($1))").into()),
+                    ("template", if let Some(member)=&effect.member {
+                        format!("if ($2) (({} *)($0))->{} = $1",member.type_spelling,member.field_name).into()
+                    } else {format!("if ($2) {store_helper}((uintptr_t)($0), (uint64_t)($1))").into()}),
+                    ("member_layout",aggregate_member_layout_value(effect.member.as_ref())),
                 ]),
             )?;
             effect_asts.push(ast);
@@ -2218,12 +2409,14 @@ impl Recovery {
         });
         let node=builder.record("metadata","derived",object([("artifact_kind","recovered-source".into()),("source",output.into()),("status","generated-uncompiled".into()),("name",s.name.clone().into()),("ast_root",root.clone().into()),("declaration",s.signature.declaration.clone().into()),("contract","apple-aapcs64-lp64-reads-writes-calls-volatile-call-ordered-natural-loop-guarded-call-events-loop-memory-v14".into()),("observables","declared scalar result, bounded ordinary memory reads and ordered ordinary writes under supported path guards, exact-prototype scalar direct calls whose complete returning callee walk proves no memory reads, writes, or onward calls, supported exact self-recursion, ABI nonvolatile GPR/SP restoration, exact-width volatile accesses scheduled in instruction order with supported calls and path guards, and supported sequential single-entry scalar natural loops with per-iteration ordered external loads and stores; caller memory effects before or after proven calls are emitted in per-path instruction order for bounded acyclic control flow; call instructions still block strict machine-state C; fault/source-fidelity/formal-equivalence behavior is not claimed".into())]),array([]))?;
         for dependency in &self.project_types {
-            let evidence = builder.record("project-type-dependency", "analyst-assertion", object([
+            let evidence = builder.record("type", "analyst-assertion", object([
                 ("name", dependency.name.clone().into()),
                 ("declaration", dependency.declaration.clone().into()),
                 ("target", dependency.target.clone().into()),
                 ("source_sha256", dependency.source_sha256.clone().into()),
                 ("abi_layout_claimed", false.into()),
+                ("compiler_layout_evidence", dependency.layout_evidence.clone().map(Value::String).unwrap_or(Value::Null)),
+                ("captured_type_identity_proven", false.into()),
             ]), array([]))?;
             builder.edge(&evidence, &node, "required-source-dependency")?;
         }
@@ -2298,6 +2491,79 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_layout_selects_only_unique_exact_scalar_members() {
+        let layout=crate::reconstruction::ProjectTypeLayout {
+            name:"Point".into(),kind:"struct".into(),size:12,alignment:4,fields_complete:true,
+            fields:vec![
+                crate::reconstruction::ProjectTypeLayoutField{name:"x".into(),declaration:"int x".into(),offset_bits:0,bit_width:None},
+                crate::reconstruction::ProjectTypeLayoutField{name:"y".into(),declaration:"uint32_t y".into(),offset_bits:32,bit_width:None},
+                crate::reconstruction::ProjectTypeLayoutField{name:"tag".into(),declaration:"unsigned int tag".into(),offset_bits:64,bit_width:Some(3)},
+            ],
+        };
+        let address=AggregateAddress {base:7,type_spelling:"Point".into(),layout:layout.clone(),offset_bytes:0,
+            target:"arm64-apple-macos14.0".into(),source_sha256:"a".repeat(64),layout_evidence:"compiler-report".into()};
+        let x=aggregate_member_at(&address,4).unwrap();
+        assert_eq!((x.field_name.as_str(),x.field_type.spelling.as_str(),x.field_type.signed),("x","int",true));
+        let y=aggregate_member_at(&AggregateAddress{offset_bytes:4,..address.clone()},4).unwrap();
+        assert_eq!((y.field_name.as_str(),y.field_type.spelling.as_str(),y.field_type.signed),("y","uint32_t",false));
+        assert!(aggregate_member_at(&address,8).is_none(),"access width must match one scalar field");
+        assert!(aggregate_member_at(&AggregateAddress{offset_bytes:2,..address.clone()},4).is_none(),"interior offsets must remain raw memory accesses");
+        let union=AggregateAddress{layout:crate::reconstruction::ProjectTypeLayout{kind:"union".into(),..layout.clone()},..address.clone()};
+        assert!(aggregate_member_at(&union,4).is_none(),"active union member is unknown");
+        let ambiguous=AggregateAddress{layout:crate::reconstruction::ProjectTypeLayout{fields:vec![layout.fields[0].clone(),layout.fields[0].clone()],..layout.clone()},..address.clone()};
+        assert!(aggregate_member_at(&ambiguous,4).is_none(),"duplicate field identity must not select a name");
+        let overlap_layout=crate::reconstruction::ProjectTypeLayout{name:"Overlap".into(),kind:"struct".into(),size:8,alignment:4,fields_complete:true,
+            fields:vec![
+                crate::reconstruction::ProjectTypeLayoutField{name:"a".into(),declaration:"int a".into(),offset_bits:0,bit_width:None},
+                crate::reconstruction::ProjectTypeLayoutField{name:"b".into(),declaration:"int b".into(),offset_bits:16,bit_width:None},
+            ]};
+        let overlap=AggregateAddress{type_spelling:"Overlap".into(),layout:overlap_layout,offset_bytes:2,..address};
+        assert!(aggregate_member_at(&overlap,4).is_none(),"overlapping field ranges must not select a name");
+        let incomplete=AggregateAddress{layout:crate::reconstruction::ProjectTypeLayout{fields_complete:false,..overlap.layout.clone()},..overlap};
+        assert!(aggregate_member_at(&incomplete,4).is_none(),"incomplete layouts must not select a name");
+    }
+
+    #[test]
+    fn constant_offset_load_uses_the_unique_catalog_struct_field_and_retains_layout_provenance() {
+        let layout=crate::reconstruction::ProjectTypeLayout {
+            name:"Point".into(),kind:"struct".into(),size:8,alignment:4,fields_complete:true,
+            fields:vec![
+                crate::reconstruction::ProjectTypeLayoutField{name:"x".into(),declaration:"int x".into(),offset_bits:0,bit_width:None},
+                crate::reconstruction::ProjectTypeLayoutField{name:"y".into(),declaration:"int y".into(),offset_bits:32,bit_width:None},
+            ],
+        };
+        let evidence="{\"producer\":\"hindsight-apple-clang-record-layout-v1\"}".to_owned();
+        let mut dag=Dag{nodes:Vec::new()};
+        let truth=dag.constant(1,0x1000).unwrap();
+        let base=dag.add_role("source-parameter","parameter","((uint64_t)(uintptr_t)point)".into(),vec![],0x1000).unwrap();
+        dag.type_node(base,Some(SourceType{spelling:"Point *".into(),bits:64,signed:false,pointer:true}));
+        dag.nodes[base].aggregate_address=Some(AggregateAddress{base,type_spelling:"Point".into(),layout:layout.clone(),offset_bytes:0,
+            target:"arm64-apple-macos14.0".into(),source_sha256:"a".repeat(64),layout_evidence:evidence.clone()});
+        let mut state=State{registers:(0..32).map(Symbol::Unknown).collect(),flags:None,frame:BTreeMap::new(),external_loads:Vec::new(),
+            external_stores:Vec::new(),external_access_pcs:Vec::new(),path:truth,has_call:false,call_pcs:Vec::new(),calls:Vec::new()};
+        state.registers[0]=Symbol::Value(base,64);
+        state.registers[31]=Symbol::Frame(0);
+        let addr=tree("binary",Some("uint64_t".into()),object([("operator","+".into()),("bits",64u64.into())]),vec![
+            tree("register",Some("uint64_t".into()),object([("class","general".into()),("name","x0".into()),("bits",64u64.into())]),vec![]),
+            tree("constant",Some("uint64_t".into()),object([("bits",64u64.into()),("hex","4".into())]),vec![]),
+        ]);
+        let load=tree("memory-load",Some("uint32_t".into()),object([("bytes",4u64.into()),("signed",true.into())]),vec![addr]);
+        let Symbol::Value(expression,_)=read(&load,&mut state,&mut dag,0x1004).unwrap() else{panic!("load was not recovered")};
+        let address_id=state.external_loads[0].address;
+        assert!(state.external_loads[0].member.is_some(),"address type={:?}, aggregate={:?}, children={:?}",dag.type_of(address_id),dag.nodes[address_id].aggregate_address,
+            dag.nodes[address_id].children.iter().map(|child|(dag.nodes[*child].constant_value,dag.type_of(*child),dag.nodes[*child].aggregate_address.as_ref().map(|a|a.offset_bytes))).collect::<Vec<_>>());
+        let member_expression=dag.nodes[expression].children[0];
+        assert_eq!(dag.nodes[member_expression].kind,"source-member-load");
+        assert!(dag.nodes[member_expression].template.contains("->y"));
+        assert_eq!(dag.type_of(member_expression).unwrap().spelling,"int");
+        let member=state.external_loads[0].member.as_ref().unwrap();
+        assert_eq!((member.offset_bits,member.field_name.as_str()),(32,"y"));
+        assert_eq!(member.layout_evidence,evidence);
+        let rendered=BTreeMap::from([(base,"point".to_owned())]);
+        assert!(render_external_load(&state.external_loads[0],&rendered,&dag).contains("((Point *)(point))->y"));
+    }
+
+    #[test]
     fn project_type_dependencies_follow_types_not_parameter_or_function_names() {
         let signature = test_signature("_Widget", "int Widget(int Pair);");
         let identifiers = declared_type_identifiers(&signature);
@@ -2310,13 +2576,14 @@ mod tests {
     fn recovered_header_includes_only_signature_and_transitive_project_types() {
         let dependency = |name: &str, declaration: &str| crate::reconstruction::ProjectTypeDependency {
             name: name.into(), declaration: declaration.into(), target: "arm64-apple-macos14.0".into(),
-            source_sha256: "a".repeat(64),
+            source_sha256: "a".repeat(64), layout_evidence: None, layout: None,
         };
-        let dependencies = vec![
+        let mut dependencies = vec![
             dependency("Widget", "typedef Base Widget;"),
             dependency("Base", "typedef unsigned long Base;"),
             dependency("Unused", "typedef int Unused;"),
         ];
+        dependencies[0].layout_evidence = Some("{\"producer\":\"hindsight-apple-clang-record-layout-v1\"}".into());
         let declaration = crate::signatures::SourceDeclaration {
             signature: crate::signatures::Signature {
                 language: "C", declaration: "Widget * create(void);".into(), source: "project type test",
@@ -2350,6 +2617,10 @@ mod tests {
             assert_eq!(payload.get("source_sha256"), Some(&Value::from("a".repeat(64))));
             assert_eq!(payload.get("target"), Some(&Value::from("arm64-apple-macos14.0")));
             assert_eq!(payload.get("abi_layout_claimed"), Some(&Value::Bool(false)));
+            assert_eq!(payload.get("captured_type_identity_proven"), Some(&Value::Bool(false)));
+            if payload.get("name") == Some(&Value::from("Widget")) {
+                assert_eq!(payload.get("compiler_layout_evidence"), Some(&Value::from("{\"producer\":\"hindsight-apple-clang-record-layout-v1\"}")));
+            }
         }
     }
 
@@ -2395,13 +2666,18 @@ mod tests {
     }
 
     fn attempt(words: &[u32], declaration: &str) -> Result<Recovery, String> {
-        let signature = crate::signatures::source_signature(
+        attempt_with_project_types(words,declaration,&[])
+    }
+
+    fn attempt_with_project_types(words:&[u32],declaration:&str,project_types:&[crate::reconstruction::ProjectTypeDependency])->Result<Recovery,String>{
+        let signature = crate::signatures::source_signature_with_project_types(
             "_hs_test",
             &crate::signatures::Signature {
                 language: "C",
                 declaration: declaration.into(),
                 source: "test declaration",
             },
+            project_types,
         )
         .ok_or("bad test signature")?;
         let operations = words
@@ -2420,7 +2696,7 @@ mod tests {
                     .ok_or("unmodeled test instruction".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        recover(
+        recover_with_types(
             0x1000,
             &trees,
             &operations
@@ -2429,6 +2705,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             signature,
             &BTreeMap::new(),
+            project_types,
         )
     }
     #[test]
@@ -2528,6 +2805,88 @@ mod tests {
                 "role names are identifiers: {role}"
             );
         }
+    }
+
+    #[test]
+    fn project_layout_recovers_a_unique_constant_offset_field_read_in_a_function() {
+        let layout=crate::reconstruction::ProjectTypeLayout {
+            name:"Point".into(),kind:"struct".into(),size:8,alignment:4,fields_complete:true,
+            fields:vec![
+                crate::reconstruction::ProjectTypeLayoutField{name:"x".into(),declaration:"int x".into(),offset_bits:0,bit_width:None},
+                crate::reconstruction::ProjectTypeLayoutField{name:"y".into(),declaration:"int y".into(),offset_bits:32,bit_width:None},
+            ],
+        };
+        let dependency=crate::reconstruction::ProjectTypeDependency {
+            name:"Point".into(),declaration:"typedef struct Point { int x; int y; } Point;".into(),
+            target:"arm64-apple-macos14.0".into(),source_sha256:"a".repeat(64),
+            layout_evidence:Some("compiler-record-layout".into()),layout:Some(layout),
+        };
+        let recovery=attempt_with_project_types(&[0xb9400400,0xd65f03c0],"int hs_test(Point *point);",&[dependency])
+            .expect("exact catalog-backed Point pointer and matching member load recover");
+        let load=recovery.external_loads.iter().find(|load|load.member.is_some()).expect("member read recorded");
+        let member=load.member.as_ref().unwrap();
+        assert_eq!((member.field_name.as_str(),member.offset_bits),("y",32));
+        assert!(recovery.dag.nodes.iter().any(|node|node.kind=="source-member-load"&&node.template.contains("->y")));
+        assert_eq!(recovery.project_types.len(),1);
+        let mut builder=Builder::new(&"a".repeat(64),0x1000,0x1008,"arm64",Some("hs_test"),Value::Null).expect("artifact builder");
+        let ir=vec!["ldr w0, [x0, #4]".to_owned(),"ret".to_owned()];
+        recovery.emit(&mut builder,"int hs_test(Point *point);",&ir,&BTreeMap::new(),0x1000,None)
+            .expect("source and memory read AST emission");
+        let read_ast=builder.ast.values().find(|node|matches!(node,Value::Object(fields)
+            if fields.get("kind")==Some(&Value::from("source-memory-read")))).expect("serialized read AST");
+        let Value::Object(fields)=read_ast else {unreachable!()};
+        let Some(Value::Object(attributes))=fields.get("attributes") else {panic!("read AST attributes missing")};
+        let Some(Value::Object(layout))=attributes.get("member_layout") else {panic!("member layout provenance missing")};
+        assert_eq!(layout.get("field"),Some(&Value::from("y")));
+        assert_eq!(layout.get("source_sha256"),Some(&Value::from("a".repeat(64))));
+        assert_eq!(layout.get("captured_type_identity_proven"),Some(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn project_layout_recovers_a_unique_constant_offset_field_store_in_a_function() {
+        let layout=crate::reconstruction::ProjectTypeLayout {
+            name:"Point".into(),kind:"struct".into(),size:8,alignment:4,fields_complete:true,
+            fields:vec![
+                crate::reconstruction::ProjectTypeLayoutField{name:"x".into(),declaration:"int x".into(),offset_bits:0,bit_width:None},
+                crate::reconstruction::ProjectTypeLayoutField{name:"y".into(),declaration:"int y".into(),offset_bits:32,bit_width:None},
+            ],
+        };
+        let dependency=crate::reconstruction::ProjectTypeDependency {
+            name:"Point".into(),declaration:"typedef struct Point { int x; int y; } Point;".into(),
+            target:"arm64-apple-macos14.0".into(),source_sha256:"a".repeat(64),
+            layout_evidence:Some("compiler-record-layout".into()),layout:Some(layout),
+        };
+        let recovery=attempt_with_project_types(&[0xb9000401,0xd65f03c0],"void hs_test(Point *point, int value);",&[dependency])
+            .expect("exact catalog-backed Point pointer and matching member store recover");
+        let store=recovery.external_stores.iter().find(|store|store.member.is_some()).expect("member write recorded");
+        let member=store.member.as_ref().unwrap();
+        assert_eq!((member.field_name.as_str(),member.offset_bits),("y",32));
+        assert_eq!(recovery.dag.type_of(store.value).map(SourceType::spelling),Some("int"));
+        assert_eq!(render_aggregate_member(member,&BTreeMap::from([(member.base,"point".into())])),"((Point *)(point))->y");
+        assert_eq!(recovery.project_types.len(),1);
+        let mut builder=Builder::new(&"a".repeat(64),0x1000,0x1008,"arm64",Some("hs_test"),Value::Null).expect("artifact builder");
+        let ir=vec!["str w1, [x0, #4]".to_owned(),"ret".to_owned()];
+        recovery.emit(&mut builder,"void hs_test(Point *point, int value);",&ir,&BTreeMap::new(),0x1000,None)
+            .expect("source and memory AST emission");
+        let source=builder.nodes.values().find_map(|node|match node {
+            Value::Object(fields)=>fields.get("payload").and_then(|payload|match payload {
+                Value::Object(payload)=>match (payload.get("artifact_kind"),payload.get("source")) {
+                    (Some(Value::String(kind)),Some(Value::String(source))) if kind=="recovered-source"=>Some(source.as_str()),
+                    _=>None,
+                },
+                _=>None,
+            }),
+            _=>None,
+        }).expect("serialized recovered source");
+        assert!(source.contains("))->y ="),"{source}");
+        let store_ast=builder.ast.values().find(|node|matches!(node,Value::Object(fields)
+            if fields.get("kind")==Some(&Value::from("source-memory-store")))).expect("serialized store AST");
+        let Value::Object(fields)=store_ast else {unreachable!()};
+        let Some(Value::Object(attributes))=fields.get("attributes") else {panic!("store AST attributes missing")};
+        let Some(Value::Object(layout))=attributes.get("member_layout") else {panic!("member layout provenance missing")};
+        assert_eq!(layout.get("field"),Some(&Value::from("y")));
+        assert_eq!(layout.get("source_sha256"),Some(&Value::from("a".repeat(64))));
+        assert_eq!(layout.get("captured_type_identity_proven"),Some(&Value::Bool(false)));
     }
 
     #[test]

@@ -72,6 +72,9 @@ struct HindSightApp: App {
             CommandMenu("Workspace") {
                 Button("Investigation Home") { model.workspace = "Overview" }
                     .keyboardShortcut("1", modifiers: .command)
+                    .disabled(!model.profileAllows("Overview"))
+                Button("ECU Overview") { model.workspace = "ECU Overview" }
+                    .disabled(!model.profileAllows("ECU Overview"))
                 Button("Targets") { model.workspace = "Targets" }
                     .keyboardShortcut("2", modifiers: .command)
                 Button("Binary Workspace") { model.workspace = "Binary Workspace" }
@@ -90,10 +93,11 @@ struct HindSightApp: App {
                     .keyboardShortcut("3", modifiers: .command)
                 Button("Debugger") { model.workspace = "Debugger" }
                     .keyboardShortcut("4", modifiers: .command)
-                    .disabled(!VGHostPlatform.supportsArm64NativeDebugger)
+                    .disabled(!VGHostPlatform.supportsArm64NativeDebugger || !model.profileAllows("Debugger"))
                     .help(VGHostPlatform.supportsArm64NativeDebugger ? "Open the native ARM64 debugger." : VGHostPlatform.unavailableReason(for: "Native ARM64 debugging"))
                 Button("VectorEmu") { model.workspace = "VectorEmu Lab" }
                     .keyboardShortcut("5", modifiers: .command)
+                    .disabled(!model.profileAllows("VectorEmu Lab"))
                 Button("REA Agent") { model.workspace = "REA Agent" }
                 Button("Terminal") { model.workspace = "Terminal" }
                 Divider()
@@ -133,6 +137,11 @@ private struct HindSightSettingsView: View {
                     LabeledContent("Provider", value: "rea-agents")
                     settingsNote("REA support is designed to run as a separately versioned local process. HindSight will request an explicit target and preserve REA evidence provenance when the bridge is enabled.")
                     settingsNote("Upstream project: github.com/morluto/rea")
+                    TextField("REA executable (absolute path)", text: $model.reaExecutable)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Arguments (no shell expansion)", text: $model.reaArguments)
+                        .textFieldStyle(.roundedBorder)
+                    settingsNote("The default uses an already-installed rea-agents command. HindSight does not download packages when probing or analyzing.")
                     VGReadinessRow(label: "Probe", value: model.reaStatus)
                     Button("Probe local REA agent") { model.probeREAAgents() }
                         .disabled(!model.connected || model.busy)

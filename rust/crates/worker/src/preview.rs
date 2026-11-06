@@ -151,10 +151,10 @@ fn parse_metadata(file:&mut File,window:&[u8],map:&Mapping,size:u64)->io::Result
   else if cmd==0x2&&cs>=24{symtab=Some((le32(&window[at+8..at+12]) as u64,le32(&window[at+12..at+16]) as usize,le32(&window[at+16..at+20]) as u64,le32(&window[at+20..at+24]) as usize));}
   at+=cs;
  }
- let mut starts=Vec::new();let mut function_starts=Vec::new();
+ let mut starts=Vec::new();let mut function_starts=Vec::new();let map_end=map.address.checked_add(map.bytes);
  if let Some((off,len))=fstarts{if len<=8*1024*1024&&off<=size&&len as u64<=size-off{
   let data=read_exact_range(file,off,len)?;let mut i=0usize;let mut addr=text_vm;
-  while i<data.len()&&starts.len()<200_000{let mut shift=0u32;let mut delta=0u64;loop{if i>=data.len()||shift>=64{break}let b=data[i];i+=1;delta|=((b&0x7f)as u64)<<shift;if b&0x80==0{break}shift+=7;}if delta==0{break}addr=addr.saturating_add(delta);if addr>=map.address&&addr<map.address+map.bytes&&(addr-map.address)%4==0{starts.push(addr);function_starts.push(addr);}}
+  while i<data.len()&&starts.len()<200_000{let mut shift=0u32;let mut delta=0u64;loop{if i>=data.len()||shift>=64{break}let b=data[i];i+=1;delta|=((b&0x7f)as u64)<<shift;if b&0x80==0{break}shift+=7;}if delta==0{break}addr=addr.saturating_add(delta);if map_end.is_some_and(|end|addr>=map.address&&addr<end)&&(addr-map.address)%4==0{starts.push(addr);function_starts.push(addr);}}
  }}
  let mut symbols=Vec::new();
  if let Some((so,n,stro,strlen))=symtab{let n=n.min(200_000);let bytes=n.saturating_mul(16);if bytes<=16*1024*1024&&strlen<=16*1024*1024&&so<=size&&bytes as u64<=size-so&&stro<=size&&strlen as u64<=size-stro{
@@ -364,8 +364,9 @@ fn sections(window:&[u8])->Vec<SectionInfo>{
  let mut out=Vec::new();if window.len()<32||&window[..4]!=[0xcf,0xfa,0xed,0xfe]{return out}let ncmd=le32(&window[16..20]);let mut at=32usize;
  for _ in 0..ncmd{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8]) as usize;if cs<8||at+cs>window.len(){break}if cmd==0x19&&cs>=72{let nsects=le32(&window[at+64..at+68]) as usize;let mut sp=at+72;for _ in 0..nsects{if sp+80>at+cs{break}out.push(SectionInfo{sect:cstr16(&window[sp..sp+16]),seg:cstr16(&window[sp+16..sp+32]),addr:le64(&window[sp+32..sp+40]),size:le64(&window[sp+40..sp+48]),offset:le32(&window[sp+48..sp+52]) as u64,flags:le32(&window[sp+64..sp+68]),reserved1:le32(&window[sp+68..sp+72]),reserved2:le32(&window[sp+72..sp+76])});sp+=80;}}at+=cs;}out
 }
-fn section_for_va<'a>(sections:&'a [SectionInfo],va:u64)->Option<&'a SectionInfo>{sections.iter().find(|s|va>=s.addr&&va<s.addr.saturating_add(s.size))}
-fn read_cstr_at(file:&mut File,sec:&SectionInfo,va:u64,max:usize)->io::Result<Option<String>>{if va<sec.addr||va>=sec.addr.saturating_add(sec.size){return Ok(None)}let rel=va-sec.addr;let remain=sec.size-rel;let take=remain.min(max as u64) as usize;let data=read_exact_range(file,sec.offset+rel,take)?;let end=data.iter().position(|&b|b==0).unwrap_or(data.len());if end==0{return Ok(None)}let text=String::from_utf8_lossy(&data[..end]).into_owned();if text.chars().all(|c|!c.is_control()||c=='\t'){Ok(Some(text))}else{Ok(None)}}
+fn section_for_va<'a>(sections:&'a [SectionInfo],va:u64)->Option<&'a SectionInfo>{sections.iter().find(|s|s.addr.checked_add(s.size).is_some_and(|end|va>=s.addr&&va<end))}
+fn section_va_at(section:&SectionInfo,offset:u64)->Option<u64>{if offset>=section.size{return None}section.addr.checked_add(offset)}
+fn read_cstr_at(file:&mut File,sec:&SectionInfo,va:u64,max:usize)->io::Result<Option<String>>{let Some(section_end)=sec.addr.checked_add(sec.size)else{return Ok(None)};if va<sec.addr||va>=section_end{return Ok(None)}let rel=va-sec.addr;let remain=section_end-va;let take=remain.min(max as u64) as usize;let Some(offset)=sec.offset.checked_add(rel)else{return Ok(None)};let data=read_exact_range(file,offset,take)?;let end=data.iter().position(|&b|b==0).unwrap_or(data.len());if end==0{return Ok(None)}let text=String::from_utf8_lossy(&data[..end]).into_owned();if text.chars().all(|c|!c.is_control()||c=='\t'){Ok(Some(text))}else{Ok(None)}}
 /// Resolve a signed PC-relative field without wrapping on malformed inputs.
 fn resolve(site:u64,rel:i64)->Option<u64>{if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)}}
 /// Read a bounded string only when the virtual address is proven to lie in a parsed section.
@@ -375,8 +376,8 @@ fn string_at_va(file:&mut File,secs:&[SectionInfo],va:u64,max:usize)->io::Result
 }
 fn runtime_records(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
  let secs=sections(window);let mut out=String::new();let mut recovered=0usize;
- for sec in &secs{if !["__objc_classname","__objc_methname","__objc_methtype","__swift5_reflstr"].contains(&sec.sect.as_str()){continue}if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut start=0usize;for i in 0..=data.len(){if i==data.len()||data[i]==0{if i>start{let bytes=&data[start..i];if bytes.len()<=1024{let text=String::from_utf8_lossy(bytes).into_owned();if text.chars().all(|c|!c.is_control()||c=='\t'){out.push_str(&format!("{},{} {:#018x}  {}\n",sec.seg,sec.sect,sec.addr+start as u64,text));recovered+=1;if out.len()>45_000{return Ok(out)}}}}start=i+1;}}}
- for sec in &secs{if !["__objc_selrefs","__objc_classrefs","__objc_superrefs"].contains(&sec.sect.as_str()){continue}if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(10000){let target=le64(p);let site=sec.addr+i as u64*8;if target==0{continue}if let Some(target_sec)=section_for_va(&secs,target){let label=if ["__objc_classname","__objc_methname","__cstring","__swift5_reflstr"].contains(&target_sec.sect.as_str()){read_cstr_at(file,target_sec,target,1024)?.unwrap_or_else(||"<non-string>".into())}else{format!("{},{}",target_sec.seg,target_sec.sect)};out.push_str(&format!("{},{} {site:#018x} -> {target:#018x}  {label}\n",sec.seg,sec.sect));recovered+=1;if out.len()>60_000{return Ok(out)}}}}
+ for sec in &secs{if !["__objc_classname","__objc_methname","__objc_methtype","__swift5_reflstr"].contains(&sec.sect.as_str()){continue}if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut start=0usize;for i in 0..=data.len(){if i==data.len()||data[i]==0{if i>start{let bytes=&data[start..i];if bytes.len()<=1024{let text=String::from_utf8_lossy(bytes).into_owned();if text.chars().all(|c|!c.is_control()||c=='\t'){if let Some(va)=section_va_at(sec,start as u64){out.push_str(&format!("{},{} {va:#018x}  {}\n",sec.seg,sec.sect,text));recovered+=1;if out.len()>45_000{return Ok(out)}}}}}start=i+1;}}}
+ for sec in &secs{if !["__objc_selrefs","__objc_classrefs","__objc_superrefs"].contains(&sec.sect.as_str()){continue}if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(10000){let target=le64(p);let Some(offset)=(i as u64).checked_mul(8)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};if target==0{continue}if let Some(target_sec)=section_for_va(&secs,target){let label=if ["__objc_classname","__objc_methname","__cstring","__swift5_reflstr"].contains(&target_sec.sect.as_str()){read_cstr_at(file,target_sec,target,1024)?.unwrap_or_else(||"<non-string>".into())}else{format!("{},{}",target_sec.seg,target_sec.sect)};out.push_str(&format!("{},{} {site:#018x} -> {target:#018x}  {label}\n",sec.seg,sec.sect));recovered+=1;if out.len()>60_000{return Ok(out)}}}}
  if recovered==0{out.push_str("No directly recoverable Objective-C/Swift runtime string records or resolved pointer references were found in the bounded metadata pass.\n");}Ok(out)
 }
 
@@ -386,15 +387,15 @@ fn swift_nominal_types(file:&mut File,window:&[u8],size:u64)->io::Result<String>
   if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}
   let data=read_exact_range(file,sec.offset,sec.size as usize)?;
   for (i,p) in data.chunks_exact(4).enumerate().take(100_000){
-   let site=sec.addr+i as u64*4;let rel=i32::from_le_bytes(p.try_into().unwrap()) as i64;
+  let Some(offset)=(i as u64).checked_mul(4)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};let rel=i32::from_le_bytes(p.try_into().unwrap()) as i64;
    let target=if rel<0{site.checked_sub((-rel) as u64)}else{site.checked_add(rel as u64)};let Some(target)=target else{continue};
    let Some(desc_sec)=section_for_va(&secs,target) else{continue};
    let mut name=String::from("<validated descriptor target; name unresolved>");
-   let rel_in=target.saturating_sub(desc_sec.addr);if rel_in+12<=desc_sec.size&&desc_sec.offset+rel_in+12<=size{
-    let hdr=read_exact_range(file,desc_sec.offset+rel_in,12)?;let name_rel=i32::from_le_bytes(hdr[8..12].try_into().unwrap()) as i64;
-    let name_site=target+8;let name_va=if name_rel<0{name_site.checked_sub((-name_rel) as u64)}else{name_site.checked_add(name_rel as u64)};
+   let rel_in=target-desc_sec.addr;if rel_in.checked_add(12).is_some_and(|end|end<=desc_sec.size){if let Some(file_offset)=desc_sec.offset.checked_add(rel_in).filter(|offset|offset.checked_add(12).is_some_and(|end|end<=size)){
+    let hdr=read_exact_range(file,file_offset,12)?;let name_rel=i32::from_le_bytes(hdr[8..12].try_into().unwrap()) as i64;
+    let name_site=target.checked_add(8);let name_va=name_site.and_then(|site|if name_rel<0{site.checked_sub(name_rel.unsigned_abs())}else{site.checked_add(name_rel as u64)});
     if let Some(name_va)=name_va{if let Some(name_sec)=section_for_va(&secs,name_va){if let Some(text)=read_cstr_at(file,name_sec,name_va,512)?{name=text;}}}
-   }
+   }}
    out.push_str(&format!("{site:#018x} rel={rel:+#x} -> {target:#018x}  {},{}  {}\n",desc_sec.seg,desc_sec.sect,name));count+=1;if out.len()>60_000{return Ok(out)}
   }
  }
@@ -405,7 +406,7 @@ fn runtime_reference_graph(file:&mut File,window:&[u8],size:u64)->io::Result<Str
  let secs=sections(window);let mut out=String::new();let mut edges=0usize;
  for sec in secs.iter().filter(|s|["__objc_selrefs","__objc_classrefs","__objc_superrefs"].contains(&s.sect.as_str())){
   if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;
-  for (i,p) in data.chunks_exact(8).enumerate().take(20_000){let target=le64(p);if target==0{continue}let site=sec.addr+i as u64*8;let Some(ts)=section_for_va(&secs,target) else{continue};let label=read_cstr_at(file,ts,target,512)?.unwrap_or_else(||format!("{},{}",ts.seg,ts.sect));out.push_str(&format!("{},{} {site:#018x} -> {target:#018x}  {label}\n",sec.seg,sec.sect));edges+=1;if out.len()>60_000{return Ok(out)}}
+  for (i,p) in data.chunks_exact(8).enumerate().take(20_000){let target=le64(p);let Some(offset)=(i as u64).checked_mul(8)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};if target==0{continue}let Some(ts)=section_for_va(&secs,target) else{continue};let label=read_cstr_at(file,ts,target,512)?.unwrap_or_else(||format!("{},{}",ts.seg,ts.sect));out.push_str(&format!("{},{} {site:#018x} -> {target:#018x}  {label}\n",sec.seg,sec.sect));edges+=1;if out.len()>60_000{return Ok(out)}}
  }
  if edges==0{out.push_str("No validated Objective-C selector/class/super reference edges were recovered.\n");}Ok(out)
 }
@@ -480,7 +481,15 @@ fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
 
 
 fn read_va(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,len:usize)->io::Result<Option<Vec<u8>>>{
- let Some(sec)=section_for_va(secs,va) else{return Ok(None)};let rel=va-sec.addr;if rel.saturating_add(len as u64)>sec.size||sec.offset.saturating_add(rel).saturating_add(len as u64)>size{return Ok(None)}Ok(Some(read_exact_range(file,sec.offset+rel,len)?))
+ let Some(sec)=section_for_va(secs,va) else{return Ok(None)};
+ let Some(len)=u64::try_from(len).ok() else{return Ok(None)};
+ let rel=va-sec.addr;
+ let Some(rel_end)=rel.checked_add(len) else{return Ok(None)};
+ let Some(file_offset)=sec.offset.checked_add(rel) else{return Ok(None)};
+ let Some(file_end)=file_offset.checked_add(len) else{return Ok(None)};
+ if rel_end>sec.size||file_end>size{return Ok(None)}
+ let Ok(len)=usize::try_from(len) else{return Ok(None)};
+ Ok(Some(read_exact_range(file,file_offset,len)?))
 }
 fn objc_metadata_string(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,max:usize)->io::Result<Option<String>>{
  let Some(section)=section_for_va(secs,va)else{return Ok(None)};
@@ -508,7 +517,7 @@ fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,kind:&str
  let flags=le32(&h[..4]);let count=le32(&h[4..8]).min(4096) as usize;let relative=flags&0x8000_0000!=0;
  let entry_size=(flags&0xffff) as usize;let stride=if relative{entry_size.max(12)}else{entry_size.max(24)};
  if stride>256{return Ok(records)}
- for i in 0..count {let entry=va.saturating_add(8).saturating_add((i*stride) as u64);let need=if relative{12}else{24};let Some(m)=read_va(file,secs,size,entry,need)? else{break};
+ for i in 0..count {let Some(entry)=va.checked_add(8).and_then(|value|value.checked_add((i*stride) as u64))else{break};let need=if relative{12}else{24};let Some(m)=read_va(file,secs,size,entry,need)? else{break};
   let resolve_rel=|off:usize,raw:u32|->Option<u64>{let rel=(raw as i32) as i64;let site=entry.checked_add(off as u64)?;if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)}};
   let (sel,ty,imp)=if relative{
    let selector_word=le32(&m[0..4]);let selector_direct=selector_word&1!=0;
@@ -558,7 +567,7 @@ fn objc_ivar_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut St
 }
 fn objc_protocol_names(file:&mut File,secs:&[SectionInfo],size:u64,va:u64)->io::Result<Vec<String>> {
  let mut names=Vec::new();if va==0||section_for_va(secs,va).is_none(){return Ok(names)}let Some(h)=read_va(file,secs,size,va,8)?else{return Ok(names)};let count=le64(&h[..8]).min(128) as usize;
- for i in 0..count {let slot=va.saturating_add(8).saturating_add((i*8) as u64);let Some(pointer)=read_va(file,secs,size,slot,8)?else{break};let target=le64(&pointer);let Some(protocol)=read_va(file,secs,size,target,16)?else{continue};let name_va=le64(&protocol[8..16]);let Some(section)=section_for_va(secs,name_va)else{continue};let Some(name)=read_cstr_at(file,section,name_va,512)?else{continue};if !name.is_empty()&&name.len()<=256&&name.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'))&&!names.contains(&name){names.push(name)} }
+ for i in 0..count {let Some(slot)=va.checked_add(8).and_then(|value|value.checked_add((i*8) as u64))else{break};let Some(pointer)=read_va(file,secs,size,slot,8)?else{break};let target=le64(&pointer);let Some(protocol)=read_va(file,secs,size,target,16)?else{continue};let name_va=le64(&protocol[8..16]);let Some(section)=section_for_va(secs,name_va)else{continue};let Some(name)=read_cstr_at(file,section,name_va,512)?else{continue};if !name.is_empty()&&name.len()<=256&&name.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'))&&!names.contains(&name){names.push(name)} }
  Ok(names)
 }
 fn objc_class_name(file:&mut File,secs:&[SectionInfo],size:u64,class_va:u64)->io::Result<Option<String>> {
@@ -575,7 +584,7 @@ fn objc_protocol_object(file:&mut File,secs:&[SectionInfo],size:u64,pva:u64,out:
 }
 fn objc_protocol_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut String,limit:&mut usize)->io::Result<()> {
  if va==0||section_for_va(secs,va).is_none(){return Ok(())}let Some(h)=read_va(file,secs,size,va,8)? else{return Ok(())};let count=le64(&h[..8]).min(4096) as usize;
- for i in 0..count {let slot=va.saturating_add(8).saturating_add((i*8) as u64);let Some(p)=read_va(file,secs,size,slot,8)? else{break};objc_protocol_object(file,secs,size,le64(&p),out,limit)?;if out.len()>60_000{return Ok(())}}
+ for i in 0..count {let Some(slot)=va.checked_add(8).and_then(|value|value.checked_add((i*8) as u64))else{break};let Some(p)=read_va(file,secs,size,slot,8)? else{break};objc_protocol_object(file,secs,size,le64(&p),out,limit)?;if out.len()>60_000{return Ok(())}}
  Ok(())
 }
 fn objc_property_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::PropertyLayout>> {
@@ -666,8 +675,23 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<(String,Ve
 }
 fn swift_context_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
  let secs=sections(window);let mut out=String::new();let mut count=0usize;let kind_name=|k:u32|->&'static str{match k{0=>"module",1=>"extension",2=>"anonymous",3=>"protocol",16=>"class",17=>"struct",18=>"enum",_=>"other"}};
- for sec in secs.iter().filter(|s|s.sect=="__swift5_types") {if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;
-  for (i,p) in data.chunks_exact(4).enumerate().take(100_000){let site=sec.addr+i as u64*4;let rel=i32::from_le_bytes(p.try_into().unwrap()) as i64;let desc=if rel<0{site.checked_sub((-rel) as u64)}else{site.checked_add(rel as u64)};let Some(desc)=desc else{continue};let Some(h)=read_va(file,&secs,size,desc,12)? else{continue};let flags=le32(&h[..4]);let parent_rel=i32::from_le_bytes(h[4..8].try_into().unwrap()) as i64;let name_rel=i32::from_le_bytes(h[8..12].try_into().unwrap()) as i64;let parent_site=desc+4;let name_site=desc+8;let parent=if parent_rel==0{None}else if parent_rel<0{parent_site.checked_sub((-parent_rel) as u64)}else{parent_site.checked_add(parent_rel as u64)};let name_va=if name_rel<0{name_site.checked_sub((-name_rel) as u64)}else{name_site.checked_add(name_rel as u64)};let name=match name_va{Some(v)=>string_at_va(file,&secs,v,512)?.unwrap_or_else(||"<name unresolved>".into()),None=>"<name unresolved>".into()};let pk=flags&0x1f;let ptxt=match parent{Some(v) if section_for_va(&secs,v).is_some()=>format!("{v:#018x}"),Some(v)=>format!("{v:#018x} (unmapped)"),None=>"none".into()};out.push_str(&format!("descriptor {desc:#018x} kind={}({pk}) name={name} parent={ptxt} provenance=relative-pointer+mapped-cstring confidence=validated-record\n",kind_name(pk)));count+=1;if out.len()>60_000{return Ok(out)}}
+ let resolve=|site:u64,rel:i64|if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)};
+ for sec in secs.iter().filter(|s|s.sect=="__swift5_types") {
+  if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}
+  let data=read_exact_range(file,sec.offset,sec.size as usize)?;
+  for (i,p) in data.chunks_exact(4).enumerate().take(100_000){
+   let Some(offset)=(i as u64).checked_mul(4)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};
+   let rel=i32::from_le_bytes(p.try_into().unwrap()) as i64;let Some(desc)=resolve(site,rel)else{continue};
+   let Some(h)=read_va(file,&secs,size,desc,12)? else{continue};
+   let flags=le32(&h[..4]);let parent_rel=i32::from_le_bytes(h[4..8].try_into().unwrap()) as i64;
+   let name_rel=i32::from_le_bytes(h[8..12].try_into().unwrap()) as i64;
+   let parent_site=desc.checked_add(4);let name_site=desc.checked_add(8);
+   let parent=if parent_rel==0{None}else{parent_site.and_then(|site|resolve(site,parent_rel))};
+   let name_va=name_site.and_then(|site|resolve(site,name_rel));
+   let name=match name_va{Some(v)=>string_at_va(file,&secs,v,512)?.unwrap_or_else(||"<name unresolved>".into()),None=>"<name unresolved>".into()};
+   let pk=flags&0x1f;let ptxt=match parent{Some(v) if section_for_va(&secs,v).is_some()=>format!("{v:#018x}"),Some(v)=>format!("{v:#018x} (unmapped)"),None=>"none".into()};
+   out.push_str(&format!("descriptor {desc:#018x} kind={}({pk}) name={name} parent={ptxt} provenance=relative-pointer+mapped-cstring confidence=validated-record\n",kind_name(pk)));count+=1;if out.len()>60_000{return Ok(out)}
+  }
  }
  if count==0{out.push_str("No Swift context descriptors passed bounded relative-pointer validation.\n");}Ok(out)
 }
@@ -876,12 +900,88 @@ fn arm64_add_immediate(word:u32)->Option<(u32,u32,u64)>{
  Some((word&31,(word>>5)&31,immediate))
 }
 
-fn arm64_indexed_jump_load(word:u32)->Option<(u32,u32,u32,bool)>{
+fn arm64_indexed_jump_load(word:u32)->Option<(u32,u32,u32,bool,bool)>{
  if word&0x3f20_0c00!=0x3820_0800||word&(1<<12)==0{return None}
  let size=(word>>30)&3;let opc=(word>>22)&3;let option=(word>>13)&7;
  if option!=2&&option!=3{return None}
  let (width,signed)=match(size,opc){(3,1)=>(8,false),(2,2)=>(4,true),_=>return None};
- Some((word&31,(word>>5)&31,width,signed))
+ Some((word&31,(word>>5)&31,width,signed,option==2))
+}
+
+fn arm64_sub_immediate(word:u32)->Option<(u32,u32,u64,bool)>{
+ if word&0x7f00_0000!=0x5100_0000||word&(1<<29)!=0{return None}
+ let immediate=u64::from((word>>10)&0xfff) << (if word&(1<<22)!=0{12}else{0});
+ Some((word&31,(word>>5)&31,immediate,word>>31==0))
+}
+
+/// Admit only recognized address construction to preserve a candidate base
+/// register across a short backward slice. Unknown instructions may redefine
+/// the base, so they stop table promotion rather than being guessed through.
+fn address_setup_preserves(code:&[u8],base:u64,start:usize,end:usize,register:u32)->bool{
+ address_setup_preserves_registers(code,base,start,end,&[register])
+}
+
+fn address_setup_preserves_registers(code:&[u8],base:u64,start:usize,end:usize,registers:&[u32])->bool{
+ for index in start..end{
+  let Some(bytes)=code.get(index*4..index*4+4)else{return false};
+  let word=le32(bytes);
+  if word==0xd503_201f{continue}
+  let destination=arm64_address_value(word,base+index as u64*4).map(|value|value.0)
+   .or_else(||arm64_add_immediate(word).map(|value|value.0));
+  let Some(destination)=destination else{return false};
+  if registers.contains(&destination)||destination==31{return false}
+ }
+ true
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+struct UnsignedSwitchBound{
+ entries:usize,
+ guard:&'static str,
+ operator:&'static str,
+ maximum:u64,
+ /// (source register, subtract bias, is 32-bit arithmetic)
+ normalization:Option<(u32,u64,bool)>,
+}
+
+/// Bound a jump-table scan only for the common adjacent unsigned CMP/B.cond
+/// guard, with an unchanged index and a default edge outside the dispatch.
+fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_register:u32,index_is_32:bool,branch_pc:u64)->Option<UnsignedSwitchBound>{
+ let first=load_index.saturating_sub(8);
+ for branch_index in (first..load_index).rev(){
+  let branch=le32(code.get(branch_index*4..branch_index*4+4)?);
+  if branch&0xff00_0010!=0x5400_0000{continue}
+  let (kind,operator,extra)=match branch&15{8=> ("CMP/B.HI","<=",1u64),2=>("CMP/B.HS","<",0),_=>continue};
+  let Some(cmp_index)=branch_index.checked_sub(1)else{continue};
+  let cmp=le32(code.get(cmp_index*4..cmp_index*4+4)?);
+  if cmp&0x7f00_001f!=0x7100_001f || ((cmp>>5)&31)!=index_register || (cmp>>31==0)!=index_is_32 {continue}
+  let imm=u64::from((cmp>>10)&0xfff) << (if cmp&(1<<22)!=0{12}else{0});
+  let Some((target,_,_))=branch_target(branch,base+branch_index as u64*4)else{continue};
+  let branch_address=base+branch_index as u64*4;
+  if target>=branch_address && target<=branch_pc{continue}
+  // Between the guard and indexed load, admit only PC-relative and immediate
+  // address construction. Any other operation could alter the tested index.
+  let mut address_only=true;
+  for i in branch_index+1..load_index{
+   let word=le32(code.get(i*4..i*4+4)?);
+   let destination=arm64_address_value(word,base+i as u64*4).map(|v|v.0)
+    .or_else(||arm64_add_immediate(word).map(|v|v.0));
+   if destination!=Some(index_register){
+    if destination.is_none(){address_only=false;break}
+   }else{address_only=false;break}
+  }
+  if !address_only{continue}
+  let count=imm.checked_add(extra)?;
+  if count==0 {continue}
+  let normalization=cmp_index.checked_sub(1).and_then(|sub_index|{
+   let sub=le32(code.get(sub_index*4..sub_index*4+4)?);
+   let (destination,source,bias,is_32)=arm64_sub_immediate(sub)?;
+   (destination==index_register&&source!=31&&destination!=31&&is_32==index_is_32)
+    .then_some((source,bias,is_32))
+  });
+  return Some(UnsignedSwitchBound{entries:count as usize,guard:kind,operator,maximum:imm,normalization});
+ }
+ None
 }
 
 /// Recover a tightly bounded ARM64 indexed table only when a scaled indexed
@@ -889,34 +989,37 @@ fn arm64_indexed_jump_load(word:u32)->Option<(u32,u32,u32,bool)>{
 /// emitted target must land in the admitted executable mapping.
 fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],base:u64,pc:u64,branch_reg:u32,scan_end:u64)->io::Result<Option<String>>{
  let index=pc.saturating_sub(base)as usize/4;if index>=code.len()/4{return Ok(None)}
- let mut load_index=None;let mut relative_base=None;
+ let mut load_index=None;let mut relative_base=None;let mut relative_index_is_32=None;
  for candidate in (index.saturating_sub(4)..index).rev(){
   let word=le32(&code[candidate*4..candidate*4+4]);let Some((rd,rn,rm,wide))=shifted_add_register(word)else{continue};
-  if rd==branch_reg&&rn!=31&&rm!=31&&wide{
-   for load in (candidate.saturating_sub(3)..candidate).rev(){let Some((loaded,table_reg,width,signed))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&width==4&&signed{load_index=Some(load);relative_base=Some(table_reg);break}}
+  if rd==branch_reg&&rn!=31&&rm!=31&&wide&&address_setup_preserves_registers(code,base,candidate+1,index,&[branch_reg]){
+   for load in (candidate.saturating_sub(3)..candidate).rev(){let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&width==4&&signed&&address_setup_preserves_registers(code,base,load+1,candidate,&[rm,rn]){load_index=Some(load);relative_base=Some(table_reg);relative_index_is_32=Some(index_is_32);break}}
    if load_index.is_some(){break}
   }
  }
- let (load_index,table_reg,width,signed)=if let Some(load_index)=load_index{
-  (load_index,relative_base.unwrap(),4,true)
+ let (load_index,table_reg,width,signed,index_is_32)=if let Some(load_index)=load_index{
+  (load_index,relative_base.unwrap(),4,true,relative_index_is_32.unwrap())
  }else{
-  let mut found=None;for load in (index.saturating_sub(3)..index).rev(){if let Some((loaded,table_reg,width,signed))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4])){if loaded==branch_reg{found=Some((load,table_reg,width,signed));break}}}let Some(found)=found else{return Ok(None)};found
+  let mut found=None;for load in (index.saturating_sub(3)..index).rev(){if let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4])){if loaded==branch_reg&&width==8&&!signed&&address_setup_preserves_registers(code,base,load+1,index,&[branch_reg]){found=Some((load,table_reg,width,signed,index_is_32));break}}}let Some(found)=found else{return Ok(None)};found
  };
  let mut table_address=None;
  let search_start=load_index.saturating_sub(6);
  for add_index in (search_start..load_index).rev(){
-  let add_word=le32(&code[add_index*4..add_index*4+4]);let Some((rd,rn,immediate))=arm64_add_immediate(add_word)else{continue};if rd!=table_reg{continue}
-  for address_index in (add_index.saturating_sub(5)..add_index).rev(){let address_word=le32(&code[address_index*4..address_index*4+4]);let Some((dest,value))=arm64_address_value(address_word,base+address_index as u64*4)else{continue};if dest==rn{table_address=value.checked_add(immediate);break}}
+  let add_word=le32(&code[add_index*4..add_index*4+4]);let Some((rd,rn,immediate))=arm64_add_immediate(add_word)else{continue};if rd!=table_reg||!address_setup_preserves(code,base,add_index+1,load_index,table_reg){continue}
+  for address_index in (add_index.saturating_sub(5)..add_index).rev(){let address_word=le32(&code[address_index*4..address_index*4+4]);let Some((dest,value))=arm64_address_value(address_word,base+address_index as u64*4)else{continue};if dest==rn&&address_setup_preserves(code,base,address_index+1,add_index,rn){table_address=value.checked_add(immediate);break}}
   if table_address.is_some(){break}
  }
- if table_address.is_none(){for address_index in (search_start..load_index).rev(){let word=le32(&code[address_index*4..address_index*4+4]);if let Some((dest,value))=arm64_address_value(word,base+address_index as u64*4){if dest==table_reg{table_address=Some(value);break}}}}
+ if table_address.is_none(){for address_index in (search_start..load_index).rev(){let word=le32(&code[address_index*4..address_index*4+4]);if let Some((dest,value))=arm64_address_value(word,base+address_index as u64*4){if dest==table_reg&&address_setup_preserves(code,base,address_index+1,load_index,table_reg){table_address=Some(value);break}}}}
  let Some(table_address)=table_address else{return Ok(None)};
  let Some(section)=section_for_va(secs,table_address)else{return Ok(None)};if section.offset>size||section.size>size-section.offset{return Ok(None)}
  let table_offset=table_address.checked_sub(section.addr).and_then(|rel|section.offset.checked_add(rel));let Some(table_offset)=table_offset else{return Ok(None)};
  if table_offset>=size{return Ok(None)}
- let section_entries=((section.addr+section.size).saturating_sub(table_address)/(width as u64))as usize;let count=section_entries.min(32);
- if count==0{return Ok(None)}
+ let Some(section_end)=section.addr.checked_add(section.size)else{return Ok(None)};
+ let section_entries=(section_end.saturating_sub(table_address)/(width as u64))as usize;
  let index_register=(le32(&code[load_index*4..load_index*4+4])>>16)&31;
+ let proven_bound=unsigned_switch_case_bound(code,base,load_index,index_register,index_is_32,pc);
+ let count=section_entries.min(32).min(proven_bound.map_or(usize::MAX,|bound|bound.entries));
+ if count==0{return Ok(None)}
  let index_provenance = if index_register != 31 {
   // Check nearby loads for index register origin
   let mut origin = String::new();
@@ -931,13 +1034,17 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
   }
   if origin.is_empty() { "unknown".into() } else { origin }
 } else { "x31".into() };
- let mut out=format!("table={table_address:#018x} format={} entry_width={width} table_index=x{index_register} index-provenance={} scan_limit=32 confidence=candidate\n",index_provenance,if signed{"table-relative signed offsets"}else{"absolute pointers"});let mut valid=0usize;let mut stopped=None;
+ let bound_note=proven_bound.map(|bound|{
+  let normalization=bound.normalization.map(|(source,bias,is_32)|format!(" index-normalization={}{}=({}{}-{bias}) modulo 2^{}",if is_32{"w"}else{"x"},index_register,if is_32{"w"}else{"x"},source,if is_32{32}else{64})).unwrap_or_default();
+  format!(" case-range={} x{index_register}{}{} proven-entry-count={}{}",bound.guard,bound.operator,bound.maximum,bound.entries,normalization)
+ }).unwrap_or_default();
+ let mut out=format!("table={table_address:#018x} format={} entry_width={width} table_index=x{index_register} index-provenance={} scan_limit=32 confidence=candidate{bound_note}\n",if signed{"table-relative signed offsets"}else{"absolute pointers"},index_provenance);let mut valid=0usize;let mut stopped=None;
  for case in 0..count{let Some(offset)=table_offset.checked_add(case as u64*width as u64)else{stopped=Some((case,"file offset overflow"));break};if offset>size||width as u64>size-offset{stopped=Some((case,"entry exceeds file"));break}let entry=read_exact_range(file,offset,width as usize)?;let raw=if width==8{le64(&entry)}else{le32(&entry)as u64};let target=if signed{table_address.checked_add_signed((raw as u32 as i32)as i64)}else{Some(raw)};
-  let Some(target)=target.filter(|target|*target>=base&&*target<scan_end&&(*target-base)%4==0)else{stopped=Some((case,"entry target is outside admitted executable bytes or is unaligned"));break};valid+=1;out.push_str(&format!("  case-index={case} entry={offset:#x} target={target:#018x} validation=executable-aligned\n"));
+  let Some(target)=target.filter(|target|*target>=base&&*target<scan_end&&(*target-base)%4==0)else{stopped=Some((case,"entry target is outside admitted executable bytes or is unaligned"));break};valid+=1;let selector_case=proven_bound.and_then(|bound|bound.normalization).and_then(|(_,bias,is_32)|bias.checked_add(case as u64).map(|value|if is_32{value&u64::from(u32::MAX)}else{value}));let selector_note=selector_case.map(|value|format!(" selector-bits={value:#x}")).unwrap_or_default();out.push_str(&format!("  case-index={case}{selector_note} entry={offset:#x} target={target:#018x} validation=executable-aligned\n"));
  }
  if valid==0{return Ok(None)}
- if let Some((case,reason))=stopped{out.push_str(&format!("unresolved-entry case-index={case} reason={reason} index-provenance={}\n",index_provenance));}else if section_entries>32{out.push_str(&format!("unresolved-entry case-index=32 reason=32-entry analysis cap reached index-provenance={}\n",index_provenance));}else{out.push_str(&format!("enumeration stopped at containing-section boundary index-provenance={}\n",index_provenance));}
- out.push_str(&format!("validated_entries={valid}; table extent is bounded by its containing section and 32-entry scan cap; case mapping and original source switch remain unproven."));
+ if let Some((case,reason))=stopped{out.push_str(&format!("unresolved-entry case-index={case} reason={reason} index-provenance={}\n",index_provenance));}else if proven_bound.is_some_and(|bound|count==bound.entries){out.push_str(&format!("enumeration stopped at proven unsigned index bound index-provenance={}\n",index_provenance));}else if count==32 && section_entries>32{out.push_str(&format!("unresolved-entry case-index=32 reason=32-entry analysis cap reached index-provenance={}\n",index_provenance));}else{out.push_str(&format!("enumeration stopped at containing-section boundary index-provenance={}\n",index_provenance));}
+ out.push_str(&format!("validated_entries={valid}; table extent is bounded by its containing section, 32-entry scan cap, and proven unsigned index bound when available; case mapping and original source switch remain unproven."));
  Ok(Some(out))
 }
 
@@ -960,13 +1067,32 @@ fn objc_protocol_property_graph(file:&mut File,window:&[u8],size:u64)->io::Resul
  let secs=sections(window);let mut out=String::new();let mut count=0usize;let mut methods=0usize;let mut properties=0usize;
  for sec in secs.iter().filter(|s|s.sect=="__objc_protolist") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for p in bytes.chunks_exact(8).take(20_000){let target=le64(p);if target==0{continue}objc_protocol_object(file,&secs,size,target,&mut out,&mut count)?;}}
  // Protocol references are useful even when the referenced protocol object is in a dylib.
- for sec in secs.iter().filter(|s|s.sect=="__objc_protorefs") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let target=le64(p);if target==0{continue}let site=sec.addr+i as u64*8;if let Some(ts)=section_for_va(&secs,target){out.push_str(&format!("reference {},{} {site:#018x} -> {target:#018x} {},{} confidence=validated\n",sec.seg,sec.sect,ts.seg,ts.sect));count+=1;if out.len()>60_000{return Ok(out)}}}}
+ for sec in secs.iter().filter(|s|s.sect=="__objc_protorefs") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let target=le64(p);if target==0{continue}let Some(offset)=(i as u64).checked_mul(8)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};if let Some(ts)=section_for_va(&secs,target){out.push_str(&format!("reference {},{} {site:#018x} -> {target:#018x} {},{} confidence=validated\n",sec.seg,sec.sect,ts.seg,ts.sect));count+=1;if out.len()>60_000{return Ok(out)}}}}
  for sec in secs.iter().filter(|s|s.sect=="__objc_catlist") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let cat=le64(p);let Some(c)=read_va(file,&secs,size,cat,48)? else{continue};let name_va=le64(&c[..8]);let cls=le64(&c[8..16]);let name=if name_va!=0{if let Some(s)=section_for_va(&secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<category name unresolved>".into())}else{"<category name unresolved>".into()}}else{"<category name unresolved>".into()};let class_name=objc_class_name(file,&secs,size,cls)?;let protocols_va=le64(&c[32..40]);let conformances=objc_protocol_names(file,&secs,size,protocols_va)?;let resolved_class=class_name.map(|value|format!(" class_name={value}")).unwrap_or_default();let conforms=if conformances.is_empty(){String::new()}else{format!(" conforms={}",conformances.join(","))};out.push_str(&format!("category {cat:#018x} name={name} class={cls:#018x}{resolved_class}{conforms} confidence=validated\n"));count+=1;objc_method_list(file,&secs,size,le64(&c[16..24]),"category-instance",None,&[],&mut out,&mut methods)?;objc_method_list(file,&secs,size,le64(&c[24..32]),"category-class",None,&[],&mut out,&mut methods)?;objc_protocol_list(file,&secs,size,protocols_va,&mut out,&mut count)?;objc_property_list(file,&secs,size,le64(&c[40..48]),&mut out,&mut properties)?;if out.len()>60_000{return Ok(out)}let _=i;}}
  if count==0{out.push_str("No validated Objective-C protocol/category pointer edges were recovered in the bounded pass.\n");}else{out.push_str(&format!("\nValidated Objective-C protocol/category objects: {count}; category methods: {methods}; properties: {properties}.\n"));}Ok(out)
 }
 fn swift_field_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
  let secs=sections(window);let mut out=String::new();let mut count=0usize;
- for sec in secs.iter().filter(|s|s.sect=="__swift5_fieldmd"){if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut off=0usize;while off+16<=data.len()&&count<20_000{let base=sec.addr+off as u64;let mrel=i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as i64;let srel=i32::from_le_bytes(data[off+4..off+8].try_into().unwrap()) as i64;let kind=u16::from_le_bytes(data[off+8..off+10].try_into().unwrap());let recsz=u16::from_le_bytes(data[off+10..off+12].try_into().unwrap()) as usize;let fields=le32(&data[off+12..off+16]) as usize;let resolve=|site:u64,rel:i64|->Option<u64>{if rel<0{site.checked_sub((-rel) as u64)}else{site.checked_add(rel as u64)}};out.push_str(&format!("field_descriptor {base:#018x} kind={kind} records={fields} record_size={recsz} mangled_type={} superclass={}\n",resolve(base,mrel).map(|x|format!("{x:#x}")).unwrap_or_else(||"unresolved".into()),resolve(base+4,srel).map(|x|format!("{x:#x}")).unwrap_or_else(||"none/unresolved".into())));count+=1;let span=16usize.saturating_add(recsz.saturating_mul(fields));if span==0||off+span>data.len(){break}off+=span;if out.len()>60_000{return Ok(out)}}}
+ let resolve=|site:u64,rel:i64|if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)};
+ for sec in secs.iter().filter(|s|s.sect=="__swift5_fieldmd"){
+  if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}
+  let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut off=0usize;
+  while off.checked_add(16).is_some_and(|end|end<=data.len())&&count<20_000{
+   let Some(base)=section_va_at(sec,off as u64)else{break};
+   let mrel=i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as i64;
+   let srel=i32::from_le_bytes(data[off+4..off+8].try_into().unwrap()) as i64;
+   let kind=u16::from_le_bytes(data[off+8..off+10].try_into().unwrap());
+   let recsz=u16::from_le_bytes(data[off+10..off+12].try_into().unwrap()) as usize;
+   let fields=le32(&data[off+12..off+16]) as usize;
+   out.push_str(&format!("field_descriptor {base:#018x} kind={kind} records={fields} record_size={recsz} mangled_type={} superclass={}\n",
+    resolve(base,mrel).map(|x|format!("{x:#x}")).unwrap_or_else(||"unresolved".into()),
+    base.checked_add(4).and_then(|site|resolve(site,srel)).map(|x|format!("{x:#x}")).unwrap_or_else(||"none/unresolved".into())));
+   count+=1;let Some(records_len)=recsz.checked_mul(fields)else{break};
+   let Some(span)=16usize.checked_add(records_len)else{break};
+   let Some(end)=off.checked_add(span).filter(|end|*end<=data.len())else{break};
+   off=end;if out.len()>60_000{return Ok(out)}
+  }
+ }
  if count==0{out.push_str("No bounded Swift field descriptors were recovered from __swift5_fieldmd.\n");}Ok(out)
 }
 fn chained_page_starts(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
@@ -985,7 +1111,31 @@ fn chained_page_starts(file:&mut File,window:&[u8],size:u64)->io::Result<String>
 }
 fn swift_field_records(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
  let secs=sections(window);let mut out=String::new();let mut count=0usize;let resolve=|site:u64,rel:i64|->Option<u64>{if rel<0{site.checked_sub((-rel) as u64)}else{site.checked_add(rel as u64)}};
- for sec in secs.iter().filter(|s|s.sect=="__swift5_fieldmd"){if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut off=0usize;while off+16<=data.len()&&count<20_000{let base=sec.addr+off as u64;let recsz=u16::from_le_bytes(data[off+10..off+12].try_into().unwrap()) as usize;let fields=le32(&data[off+12..off+16]) as usize;if recsz<12{break}let records=off+16;if records.saturating_add(recsz.saturating_mul(fields))>data.len(){break}out.push_str(&format!("descriptor {base:#018x} fields={fields} record_size={recsz}\n"));for i in 0..fields.min(4096){let ro=records+i*recsz;let rva=sec.addr+ro as u64;let flags=le32(&data[ro..ro+4]);let trel=i32::from_le_bytes(data[ro+4..ro+8].try_into().unwrap()) as i64;let nrel=i32::from_le_bytes(data[ro+8..ro+12].try_into().unwrap()) as i64;let type_va=resolve(rva+4,trel);let name_va=resolve(rva+8,nrel);let type_name=if let Some(v)=type_va{if let Some(ss)=section_for_va(&secs,v){read_cstr_at(file,ss,v,512)?.unwrap_or_else(||format!("@{v:#x}"))}else{"<unmapped>".into()}}else{"<invalid>".into()};let field_name=if let Some(v)=name_va{if let Some(ss)=section_for_va(&secs,v){read_cstr_at(file,ss,v,512)?.unwrap_or_else(||format!("@{v:#x}"))}else{"<unmapped>".into()}}else{"<invalid>".into()};out.push_str(&format!("  field[{i}] {rva:#018x} flags={flags:#x} name={field_name} type={type_name}\n"));count+=1;if out.len()>60_000{return Ok(out)}}off=records+recsz*fields;}
+ for sec in secs.iter().filter(|s|s.sect=="__swift5_fieldmd"){
+  if sec.offset>size||sec.size>size-sec.offset||sec.size>4*1024*1024{continue}
+  let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut off=0usize;
+  while off.checked_add(16).is_some_and(|end|end<=data.len())&&count<20_000{
+   let Some(base)=section_va_at(sec,off as u64)else{break};
+   let recsz=u16::from_le_bytes(data[off+10..off+12].try_into().unwrap()) as usize;
+   let fields=le32(&data[off+12..off+16]) as usize;if recsz<12{break}
+   let Some(records)=off.checked_add(16)else{break};
+   let Some(records_len)=recsz.checked_mul(fields)else{break};
+   let Some(end)=records.checked_add(records_len).filter(|end|*end<=data.len())else{break};
+   out.push_str(&format!("descriptor {base:#018x} fields={fields} record_size={recsz}\n"));
+   for i in 0..fields.min(4096){
+    let Some(ro)=i.checked_mul(recsz).and_then(|delta|records.checked_add(delta))else{break};
+    let Some(rva)=section_va_at(sec,ro as u64)else{break};
+    let flags=le32(&data[ro..ro+4]);let trel=i32::from_le_bytes(data[ro+4..ro+8].try_into().unwrap()) as i64;
+    let nrel=i32::from_le_bytes(data[ro+8..ro+12].try_into().unwrap()) as i64;
+    let type_va=rva.checked_add(4).and_then(|site|resolve(site,trel));
+    let name_va=rva.checked_add(8).and_then(|site|resolve(site,nrel));
+    let type_name=if let Some(v)=type_va{if let Some(ss)=section_for_va(&secs,v){read_cstr_at(file,ss,v,512)?.unwrap_or_else(||format!("@{v:#x}"))}else{"<unmapped>".into()}}else{"<invalid>".into()};
+    let field_name=if let Some(v)=name_va{if let Some(ss)=section_for_va(&secs,v){read_cstr_at(file,ss,v,512)?.unwrap_or_else(||format!("@{v:#x}"))}else{"<unmapped>".into()}}else{"<invalid>".into()};
+    out.push_str(&format!("  field[{i}] {rva:#018x} flags={flags:#x} name={field_name} type={type_name}\n"));count+=1;
+    if out.len()>60_000{return Ok(out)}
+   }
+   off=end;
+  }
  }
  if count==0{out.push_str("No individually validated Swift field records were recovered.\n");}else{out.push_str(&format!("\nValidated Swift field variables: {count}. Names/types are sourced from bounded __swift5_fieldmd relative pointers and mapped C strings; storage layout, runtime offsets, and source-level declarations remain unresolved.\n"));}Ok(out)
 }
@@ -1116,7 +1266,33 @@ fn authenticated_bind_targets(file:&mut File,window:&[u8],size:u64)->io::Result<
 
 fn swift_field_ownership(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
  let secs=sections(window);let mut out=String::new();let mut count=0usize;
- for sec in secs.iter().filter(|s|s.sect=="__swift5_fieldmd"){if sec.offset>size||sec.size>size-sec.offset||sec.size>8*1024*1024{continue}let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut off=0usize;while off+16<=data.len(){let base=sec.addr+off as u64;let type_rel=i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as i64;let super_rel=i32::from_le_bytes(data[off+4..off+8].try_into().unwrap()) as i64;let kind=u16::from_le_bytes(data[off+8..off+10].try_into().unwrap());let recsz=u16::from_le_bytes(data[off+10..off+12].try_into().unwrap()) as usize;let fields=le32(&data[off+12..off+16]) as usize;if recsz<12||recsz>4096||fields>65535{break}let owner_va=resolve(base,type_rel);let super_va=resolve(base+4,super_rel);let owner=owner_va.and_then(|v|section_for_va(&secs,v).and_then(|ss|read_cstr_at(file,ss,v,1024).ok().flatten())).unwrap_or_else(||"<owner-unresolved>".into());let super_name=super_va.and_then(|v|section_for_va(&secs,v).and_then(|ss|read_cstr_at(file,ss,v,1024).ok().flatten())).unwrap_or_else(||"<none-or-unresolved>".into());out.push_str(&format!("descriptor {base:#018x} kind={kind} owner={owner} superclass={super_name} fields={fields}\n"));let records=off+16;if records+recsz.saturating_mul(fields)>data.len(){break}for i in 0..fields.min(4096){let ro=records+i*recsz;let rva=sec.addr+ro as u64;let nrel=i32::from_le_bytes(data[ro+8..ro+12].try_into().unwrap()) as i64;let name=resolve(rva+8,nrel).and_then(|v|section_for_va(&secs,v).and_then(|ss|read_cstr_at(file,ss,v,512).ok().flatten())).unwrap_or_else(||"<unresolved>".into());out.push_str(&format!("  owns field[{i}] {name} @ {rva:#018x}\n"));count+=1;if out.len()>60_000{return Ok(out)}}off=records+recsz*fields;}}
+ let resolve=|site:u64,rel:i64|if rel<0{site.checked_sub(rel.unsigned_abs())}else{site.checked_add(rel as u64)};
+ for sec in secs.iter().filter(|s|s.sect=="__swift5_fieldmd"){
+  if sec.offset>size||sec.size>size-sec.offset||sec.size>8*1024*1024{continue}
+  let data=read_exact_range(file,sec.offset,sec.size as usize)?;let mut off=0usize;
+  while off.checked_add(16).is_some_and(|end|end<=data.len()){
+   let Some(base)=section_va_at(sec,off as u64)else{break};
+   let type_rel=i32::from_le_bytes(data[off..off+4].try_into().unwrap()) as i64;
+   let super_rel=i32::from_le_bytes(data[off+4..off+8].try_into().unwrap()) as i64;
+   let kind=u16::from_le_bytes(data[off+8..off+10].try_into().unwrap());
+   let recsz=u16::from_le_bytes(data[off+10..off+12].try_into().unwrap()) as usize;
+   let fields=le32(&data[off+12..off+16]) as usize;if !(12..=4096).contains(&recsz)||fields>65535{break}
+   let owner_va=resolve(base,type_rel);let super_va=base.checked_add(4).and_then(|site|resolve(site,super_rel));
+   let owner=owner_va.and_then(|v|section_for_va(&secs,v).and_then(|ss|read_cstr_at(file,ss,v,1024).ok().flatten())).unwrap_or_else(||"<owner-unresolved>".into());
+   let super_name=super_va.and_then(|v|section_for_va(&secs,v).and_then(|ss|read_cstr_at(file,ss,v,1024).ok().flatten())).unwrap_or_else(||"<none-or-unresolved>".into());
+   out.push_str(&format!("descriptor {base:#018x} kind={kind} owner={owner} superclass={super_name} fields={fields}\n"));
+   let Some(records)=off.checked_add(16)else{break};let Some(records_len)=recsz.checked_mul(fields)else{break};
+   let Some(end)=records.checked_add(records_len).filter(|end|*end<=data.len())else{break};
+   for i in 0..fields.min(4096){
+    let Some(ro)=i.checked_mul(recsz).and_then(|delta|records.checked_add(delta))else{break};
+    let Some(rva)=section_va_at(sec,ro as u64)else{break};
+    let nrel=i32::from_le_bytes(data[ro+8..ro+12].try_into().unwrap()) as i64;
+    let name=rva.checked_add(8).and_then(|site|resolve(site,nrel)).and_then(|v|section_for_va(&secs,v).and_then(|ss|read_cstr_at(file,ss,v,512).ok().flatten())).unwrap_or_else(||"<unresolved>".into());
+    out.push_str(&format!("  owns field[{i}] {name} @ {rva:#018x}\n"));count+=1;if out.len()>60_000{return Ok(out)}
+   }
+   off=end;
+  }
+ }
  if count==0{out.push_str("No validated Swift field ownership relationships were recovered.\n");}Ok(out)
 }
 
@@ -1166,7 +1342,7 @@ fn indirect_symbol_data(file:&mut File,window:&[u8],size:u64)->io::Result<(Strin
  let Some((off,count))=table else{return Ok(("No LC_DYSYMTAB indirect-symbol table was found.\n".into(),"No lazy/non-lazy symbol pointer sections could be resolved without an indirect-symbol table.\n".into(),vec![]))};let count=count.min(2_000_000);let bytes=count.saturating_mul(4);if bytes>16*1024*1024||off>size||bytes as u64>size-off{return Ok(("LC_DYSYMTAB indirect-symbol table failed bounds validation.\n".into(),"Pointer-slot resolution unavailable because the indirect-symbol table failed bounds validation.\n".into(),vec![]))}
  let raw=read_exact_range(file,off,bytes)?;let mut indices=Vec::with_capacity(count);for p in raw.chunks_exact(4){indices.push(le32(p));}
  let mut indirect=String::new();let mut pointers=String::new();let mut facts=Vec::new();
- for sec in secs{let typ=sec.flags&0xff;let is_stub=typ==0x8;let is_ptr=matches!(typ,0x6|0x7|0x10);if !is_stub&&!is_ptr{continue}let width=if is_stub{sec.reserved2.max(1) as u64}else{8};let slots=(sec.size/width).min(200_000);for j in 0..slots{let ti=sec.reserved1 as usize+j as usize;if ti>=indices.len(){break}let si=indices[ti];let symbol=if si&0x8000_0000!=0{"<LOCAL>".to_string()}else if si&0x4000_0000!=0{"<ABS>".to_string()}else{names.get(si as usize).filter(|x|!x.is_empty()).cloned().unwrap_or_else(||format!("<sym:{}>",si))};let va=sec.addr+j*width;let kind=if is_stub{"stub"}else if typ==0x7||typ==0x10{"lazy-pointer"}else{"nonlazy-pointer"};let line=format!("{va:#018x}  {},{}  {kind}[{j}] -> {symbol}\n",sec.seg,sec.sect);if indirect.len()<60_000{indirect.push_str(&line)}if is_ptr&&pointers.len()<60_000{pointers.push_str(&line)}facts.push((symbol,kind.into(),va));if facts.len()>300_000{break}}}
+ for sec in secs{let typ=sec.flags&0xff;let is_stub=typ==0x8;let is_ptr=matches!(typ,0x6|0x7|0x10);if !is_stub&&!is_ptr{continue}let width=if is_stub{sec.reserved2.max(1) as u64}else{8};let slots=(sec.size/width).min(200_000);for j in 0..slots{let ti=sec.reserved1 as usize+j as usize;if ti>=indices.len(){break}let si=indices[ti];let symbol=if si&0x8000_0000!=0{"<LOCAL>".to_string()}else if si&0x4000_0000!=0{"<ABS>".to_string()}else{names.get(si as usize).filter(|x|!x.is_empty()).cloned().unwrap_or_else(||format!("<sym:{}>",si))};let Some(offset)=j.checked_mul(width).filter(|offset|*offset<sec.size)else{break};let Some(va)=sec.addr.checked_add(offset)else{continue};let kind=if is_stub{"stub"}else if typ==0x7||typ==0x10{"lazy-pointer"}else{"nonlazy-pointer"};let line=format!("{va:#018x}  {},{}  {kind}[{j}] -> {symbol}\n",sec.seg,sec.sect);if indirect.len()<60_000{indirect.push_str(&line)}if is_ptr&&pointers.len()<60_000{pointers.push_str(&line)}facts.push((symbol,kind.into(),va));if facts.len()>300_000{break}}}
  if indirect.is_empty(){indirect.push_str("No supported indirect-symbol sections were recovered.\n");}if pointers.is_empty(){pointers.push_str("No supported lazy/non-lazy symbol pointer slots were recovered.\n");}Ok((indirect,pointers,facts))
 }
 fn read_uleb(data:&[u8],p:&mut usize)->Option<u64>{let mut v=0u64;let mut shift=0u32;for _ in 0..10{if *p>=data.len(){return None}let b=data[*p];*p+=1;v|=((b&0x7f)as u64)<<shift;if b&0x80==0{return Some(v)}shift+=7;}None}
@@ -1959,7 +2135,7 @@ fn isolated_runtime_objc_classes(path: &str, image_base: u64) -> Option<Vec<Runt
             }
         }
         let output = reader.join().ok()?;
-        return parse_runtime_objc(&String::from_utf8_lossy(&output));
+        parse_runtime_objc(&String::from_utf8_lossy(&output))
     }
 }
 
@@ -2214,7 +2390,7 @@ fn macos_runtime_objc_classes(path: &str, image_base: u64) -> Option<Vec<Runtime
         let cls = unsafe { *classes.add(i as usize) };
         if cls.is_null() { continue; }
         let mut info = DlInfo { dli_fname: std::ptr::null(), dli_fbase: std::ptr::null_mut(), dli_sname: std::ptr::null(), dli_saddr: std::ptr::null_mut() };
-        if unsafe { dladdr(cls as *const std::ffi::c_void, &mut info) } == 0 || info.dli_fbase.is_null() { continue; }
+        if unsafe { dladdr(cls, &mut info) } == 0 || info.dli_fbase.is_null() { continue; }
         if text(info.dli_fname) != path { continue; }
         let slide = info.dli_fbase as i128 - image_base as i128;
         let Some(cls_addr) = unslide(cls as usize, slide) else { continue };
@@ -2230,13 +2406,13 @@ fn macos_runtime_objc_classes(path: &str, image_base: u64) -> Option<Vec<Runtime
         };
         let super_addr = if superclass.is_null() { 0 } else {
             let mut sinfo = DlInfo { dli_fname: std::ptr::null(), dli_fbase: std::ptr::null_mut(), dli_sname: std::ptr::null(), dli_saddr: std::ptr::null_mut() };
-            if unsafe { dladdr(superclass as *const std::ffi::c_void, &mut sinfo) } == 0 || sinfo.dli_fbase.is_null() { 0 }
+            if unsafe { dladdr(superclass, &mut sinfo) } == 0 || sinfo.dli_fbase.is_null() { 0 }
             else if text(sinfo.dli_fname) != path { 0 }
             else { unslide(superclass as usize, sinfo.dli_fbase as i128 - image_base as i128).unwrap_or(0) }
         };
         let instance_start = if superclass.is_null() { 8 } else { unsafe { class_getInstanceSize(superclass) }.min(u32::MAX as usize) as u32 };
         let instance_size = unsafe { class_getInstanceSize(cls) }.min(u32::MAX as usize) as u32;
-        let metaclass = unsafe { object_getClass(cls as *const std::ffi::c_void) };
+        let metaclass = unsafe { object_getClass(cls) };
         let mut block = String::new();
         let mut text_truncated = false;
         let mut methods = Vec::new();
@@ -2354,6 +2530,183 @@ fn macos_runtime_objc_classes(_path: &str, _image_base: u64) -> Option<Vec<Runti
 
 #[cfg(test)]
 mod tests {
+    fn words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn section_virtual_ranges_reject_overflow_and_exclude_the_end() {
+        let valid=super::SectionInfo{seg:"__TEXT".into(),sect:"__const".into(),addr:0x1000,size:0x20,
+            offset:0,flags:0,reserved1:0,reserved2:0};
+        assert!(super::section_for_va(std::slice::from_ref(&valid),0x1000).is_some());
+        assert!(super::section_for_va(std::slice::from_ref(&valid),0x101f).is_some());
+        assert!(super::section_for_va(std::slice::from_ref(&valid),0x1020).is_none());
+        let overflow=super::SectionInfo{addr:u64::MAX-3,size:8,..valid};
+        assert!(super::section_for_va(std::slice::from_ref(&overflow),u64::MAX-1).is_none());
+    }
+
+    #[test]
+    fn read_va_rejects_virtual_and_file_range_overflow() {
+        use std::io::Write as _;
+        let path=std::env::temp_dir().join(format!("hindsight-read-va-{}-{}.bin",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut created=std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        created.write_all(&[0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80]).unwrap();
+        drop(created);
+        let mut file=std::fs::File::open(&path).unwrap();
+        let section=super::SectionInfo{seg:"__DATA".into(),sect:"__const".into(),addr:0x1000,size:8,
+            offset:0,flags:0,reserved1:0,reserved2:0};
+        assert_eq!(super::read_va(&mut file,std::slice::from_ref(&section),8,0x1002,4).unwrap(),Some(vec![0x30,0x40,0x50,0x60]));
+        assert!(super::read_va(&mut file,std::slice::from_ref(&section),8,0x1006,4).unwrap().is_none(),
+            "a read extending beyond the virtual section must be rejected");
+        assert!(super::read_va(&mut file,std::slice::from_ref(&section),6,0x1002,8).unwrap().is_none(),
+            "a read extending beyond the captured file must be rejected");
+        let file_offset_overflow=super::SectionInfo{offset:u64::MAX-2,..section.clone()};
+        assert!(super::read_va(&mut file,std::slice::from_ref(&file_offset_overflow),u64::MAX,0x1000,8).unwrap().is_none(),
+            "file offset addition must reject overflow before attempting IO");
+        let virtual_range_overflow=super::SectionInfo{addr:u64::MAX-3,size:8,..section};
+        assert!(super::read_va(&mut file,std::slice::from_ref(&virtual_range_overflow),8,u64::MAX-2,4).unwrap().is_none(),
+            "an overflowing virtual section must not be considered mapped");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unsigned_switch_bounds_require_adjacent_compare_and_out_of_range_edge() {
+        let base = 0x1000;
+        let adrp_x9 = 0x9000_0009;
+        let add_x9_x9 = 0x9100_0129;
+        let branch_hi_to_default = 0x5400_01e8; // b.hi 0x1040
+        let hi = words(&[0x7100_081f, branch_hi_to_default, adrp_x9, add_x9_x9, 0]);
+        assert_eq!(super::unsigned_switch_case_bound(&hi, base, 4, 0, true, 0x1010),
+            Some(super::UnsignedSwitchBound { entries: 3, guard: "CMP/B.HI", operator: "<=", maximum: 2, normalization: None }));
+
+        let branch_hs_to_default = (branch_hi_to_default & !15) | 2;
+        let hs = words(&[0x7100_081f, branch_hs_to_default, adrp_x9, add_x9_x9, 0]);
+        assert_eq!(super::unsigned_switch_case_bound(&hs, base, 4, 0, true, 0x1010),
+            Some(super::UnsignedSwitchBound { entries: 2, guard: "CMP/B.HS", operator: "<", maximum: 2, normalization: None }));
+
+        let sub_w8_w0_5 = 0x5100_1408;
+        let normalized = words(&[sub_w8_w0_5, 0x7100_0d1f, branch_hi_to_default, adrp_x9, add_x9_x9, 0]);
+        assert_eq!(super::unsigned_switch_case_bound(&normalized, base, 5, 8, true, 0x1014),
+            Some(super::UnsignedSwitchBound { entries: 4, guard: "CMP/B.HI", operator: "<=", maximum: 3, normalization: Some((0, 5, true)) }));
+
+        let sub_x21_x2_4096 = 0xd140_0455;
+        let cmp_x21_4096 = 0xf140_06bf;
+        assert_eq!(super::arm64_indexed_jump_load(0xb8b5_794b), Some((11, 10, 4, true, false)));
+        assert_eq!(super::arm64_sub_immediate(sub_x21_x2_4096), Some((21, 2, 4096, false)));
+        let wide_normalized = words(&[sub_x21_x2_4096, cmp_x21_4096,
+            (branch_hi_to_default & !15) | 2, adrp_x9, add_x9_x9, 0]);
+        assert_eq!(super::unsigned_switch_case_bound(&wide_normalized, base, 5, 21, false, 0x101c),
+            Some(super::UnsignedSwitchBound { entries: 4096, guard: "CMP/B.HS", operator: "<", maximum: 4096, normalization: Some((2, 4096, false)) }));
+
+        let signed_condition = words(&[0x7100_081f, (branch_hi_to_default & !15) | 11, adrp_x9, add_x9_x9, 0]);
+        assert!(super::unsigned_switch_case_bound(&signed_condition, base, 4, 0, true, 0x1010).is_none());
+        let wrong_index = words(&[0x7100_083f, branch_hi_to_default, adrp_x9, add_x9_x9, 0]);
+        assert!(super::unsigned_switch_case_bound(&wrong_index, base, 4, 0, true, 0x1010).is_none());
+        let changed_index = words(&[0x7100_081f, branch_hi_to_default, 0x9100_0000, add_x9_x9, 0]);
+        assert!(super::unsigned_switch_case_bound(&changed_index, base, 4, 0, true, 0x1010).is_none());
+        let branch_into_dispatch = words(&[0x7100_081f, 0x5400_0008, adrp_x9, add_x9_x9, 0]);
+        assert!(super::unsigned_switch_case_bound(&branch_into_dispatch, base, 4, 0, true, 0x1010).is_none());
+        let wrong_width = words(&[0xf100_081f, branch_hi_to_default, adrp_x9, add_x9_x9, 0]);
+        assert!(super::unsigned_switch_case_bound(&wrong_width, base, 4, 0, true, 0x1010).is_none());
+    }
+
+    #[test]
+    fn bounded_switch_range_limits_real_file_backed_table_entries() {
+        use std::io::Write as _;
+        let code_words = [
+            0x5100_1408, // sub w8,w0,#5
+            0x7100_0d1f, // cmp w8,#3
+            0x5400_01c8, // b.hi 0x1040
+            0xb000_000a, // adrp x10,0x2000
+            0x9100_014a, // add x10,x10,#0
+            0xb8a8_594b, // ldrsw x11,[x10,w8,uxtw #2]
+            0x8b0b_014c, // add x12,x10,x11
+            0xd61f_0180, // br x12
+        ];
+        assert_eq!(super::arm64_address_value(code_words[3], 0x100c), Some((10, 0x2000)));
+        assert_eq!(super::arm64_indexed_jump_load(code_words[5]), Some((11, 10, 4, true, true)));
+        assert_eq!(super::shifted_add_register(code_words[6]), Some((12, 10, 11, true)));
+        let code = words(&code_words);
+        let table = (0..8u64).flat_map(|case| {
+            let target = 0x101cu64 + case * 4;
+            ((target as i64 - 0x2000i64) as i32).to_le_bytes()
+        }).collect::<Vec<_>>();
+        let path = std::env::temp_dir().join(format!(
+            "hindsight-jump-table-{}-{}.bin", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut created = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        created.write_all(&table).unwrap();
+        drop(created);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let section = super::SectionInfo {
+            seg: "__DATA".into(), sect: "__const".into(), addr: 0x2000,
+            size: table.len() as u64, offset: 0, flags: 0, reserved1: 0, reserved2: 0,
+        };
+        let report = super::jump_table_entries(&mut file, &[section.clone()], table.len() as u64,
+            &code, 0x1000, 0x101c, 12, 0x1100).unwrap().expect("bounded table candidate");
+        assert!(report.contains("case-range=CMP/B.HI x8<=3 proven-entry-count=4"), "{report}");
+        assert!(report.contains("format=table-relative signed offsets"), "{report}");
+        assert!(report.contains("index-provenance=unknown"), "{report}");
+        assert!(report.contains("index-normalization=w8=(w0-5) modulo 2^32"), "{report}");
+        assert!(report.contains("validated_entries=4"), "{report}");
+        assert!(report.contains("case-index=0 selector-bits=0x5"), "{report}");
+        assert!(report.contains("case-index=3 selector-bits=0x8"), "{report}");
+        assert!(!report.contains("case-index=4"), "{report}");
+
+        let mut clobbered_words=code_words.to_vec();
+        clobbered_words.insert(5,0x9100_01aa); // add x10,x13,#0 overwrites the table base
+        let clobbered=words(&clobbered_words);
+        assert!(super::jump_table_entries(&mut file, &[section.clone()], table.len() as u64,
+            &clobbered, 0x1000, 0x1020, 12, 0x1100).unwrap().is_none(),
+            "a base overwrite between setup and indexed load must block table recovery");
+        let mut offset_clobbered_words=code_words.to_vec();
+        offset_clobbered_words.insert(6,0x9100_01ab); // add x11,x13,#0 overwrites the loaded relative offset
+        let offset_clobbered=words(&offset_clobbered_words);
+        assert!(super::jump_table_entries(&mut file, &[section], table.len() as u64,
+            &offset_clobbered, 0x1000, 0x1020, 12, 0x1100).unwrap().is_none(),
+            "an offset overwrite before the relative ADD must block table recovery");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn direct_switch_tables_require_absolute_64_bit_pointer_entries() {
+        use std::io::Write as _;
+        let code_words=[
+            0xb000_000a, // adrp x10,0x2000
+            0x9100_014a, // add x10,x10,#0
+            0xf868_794c, // ldr x12,[x10,x8,lsl #3]
+            0xd61f_0180, // br x12
+        ];
+        assert_eq!(super::arm64_indexed_jump_load(code_words[2]),Some((12,10,8,false,false)));
+        let code=words(&code_words);
+        let table=(0..8u64).flat_map(|_|0x1000u64.to_le_bytes()).collect::<Vec<_>>();
+        let path=std::env::temp_dir().join(format!(
+            "hindsight-pointer-jump-table-{}-{}.bin",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let mut created=std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        created.write_all(&table).unwrap();
+        drop(created);
+        let mut file=std::fs::File::open(&path).unwrap();
+        let section=super::SectionInfo{seg:"__DATA".into(),sect:"__const".into(),addr:0x2000,
+            size:table.len() as u64,offset:0,flags:0,reserved1:0,reserved2:0};
+        let report=super::jump_table_entries(&mut file,&[section.clone()],table.len() as u64,
+            &code,0x1000,0x100c,12,0x1100).unwrap().expect("absolute pointer table candidate");
+        assert!(report.contains("format=absolute pointers"),"{report}");
+        assert!(report.contains("validated_entries=8"),"{report}");
+        assert!(!report.contains("case-range="),"{report}");
+
+        let mut signed_words=code_words;
+        signed_words[2]=0xb8a8_594c; // ldrsw x12,[x10,w8,uxtw #2]
+        assert_eq!(super::arm64_indexed_jump_load(signed_words[2]),Some((12,10,4,true,true)));
+        assert!(super::jump_table_entries(&mut file,&[section],table.len() as u64,
+            &words(&signed_words),0x1000,0x100c,12,0x1100).unwrap().is_none(),
+            "signed relative entries cannot be treated as direct absolute pointers");
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn native_decoder_displays_mixed_integer_float_conversions() {
         for (word, expected) in [(0x1e78_0009, "fcvtzs w9, d0"), (0x9e02_ec20, "scvtf s0, x1, #5"),

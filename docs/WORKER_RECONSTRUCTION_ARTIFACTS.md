@@ -1,7 +1,9 @@
 # Worker reconstruction artifacts: first transport slice
 
 The current identity is `arm64-analysis-v125-schema130`, reconstruction pass
-`arm64-reconstruction-84`. Tail-call candidates now use the same typed constant
+`arm64-reconstruction-85`. Catalog-layout-backed aggregate member reads and
+writes advance the reconstruction identity so artifacts generated under the
+earlier source rules are not reused. Tail-call candidates now use the same typed constant
 argument rendering and instruction provenance as ordinary calls. Outgoing scalar GPR/SIMD pair stores recover each
 known lane independently. Unknown pair lanes invalidate overlapping evidence;
 SIMD pair writeback invalidates stack-pointer copies and old stack slots.
@@ -36,6 +38,20 @@ cv and reference qualifiers without inferring the hidden receiver's ABI location
 the earlier pass added review-only scalar integer/FP
 conversion trees; FPCR/FPSR effects still block strict export. Previous cached
 analysis and reconstruction artifacts require regeneration for these semantics.
+
+Project-type record layouts now qualify a bounded aggregate memory case in the
+source artifact: a constant-offset read or write through a catalog-backed
+single-level `struct *` becomes a named member access only when one non-bitfield
+scalar field exactly matches both byte offset and access width. The memory AST
+retains the field declaration, bit offset, compiler layout report, target and
+captured-source digest, and explicitly leaves captured type identity unproven.
+Unions, ambiguous or overlapping fields, bitfields, volatile aggregate access,
+wrong widths and nonconstant offsets remain unresolved. This does not qualify
+general aggregate values, nested records, arrays or binary type identity. The
+native source gate compiles and differentially compares catalog-backed `Point`
+member reads and writes at `-O0/-O1/-O2/-Os`, with symbols and after stripping,
+and checks both memory AST provenance records. The expanded gate passes 560
+function/configuration pairs and 101,744 native comparisons.
 
 The app now exposes **Reconstruction** in the main menu, with explicit
 **Dump C (.c)**, **Dump Objective-C (.m)**, **Dump headers (.h)** and **Dump native

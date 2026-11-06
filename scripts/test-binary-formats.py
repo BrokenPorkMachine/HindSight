@@ -23,6 +23,15 @@ def invoke(command, path, *, options=('macho','auto','0','0'), start=0, destinat
         assert reply['source_sha256']==hashlib.sha256(data).hexdigest()
     return reply
 
+def emulate_c167(path, entry=0, steps=4, stack=0x10000, breakpoint='none', watchpoint='none', ram='none'):
+    identity=str(uuid.uuid4())
+    result=subprocess.run([str(WORKER),'--emulate-c167',str(path),str(entry),str(steps),str(stack),str(breakpoint),str(watchpoint),ram,identity],capture_output=True,timeout=120,check=True)
+    length=struct.unpack('>I',result.stdout[:4])[0]
+    assert len(result.stdout)==length+4,result.stderr
+    reply=json.loads(result.stdout[4:])
+    assert reply['kind']=='c167_emulation_result' and reply['request_id']==identity
+    return reply
+
 def image(cpu=7, code=b'\x55\x89\xe5\xc3', *, be=False, extra=b'', thumb_symbol=False):
     wide=cpu in (0x01000007,0x0100000c); bits=64 if wide else 32
     endian='>' if be else '<'; header=32 if wide else 28
@@ -157,6 +166,89 @@ with tempfile.TemporaryDirectory() as directory:
             and 'ASN.1 structure was not accepted' in container['structure']),container
     assert container['disassembly_status']=='unavailable' and 'plaintext payload' in container['disassembly'],container
     assert invoke('page',path,options=('auto','auto','0','0'))['kind']=='error'
+    # ECU firmware: ME7-class containers validate through their C167 vector table,
+    # the checksum descriptor table is parsed and verified at the fixed offset, and
+    # non-ME7 dumps are rejected with an actionable error instead of being decoded
+    # as anonymous raw code.
+    def ecu_image(size=0x20000, vectors=8, bad_entry=False, tail=bytes([0x44]*4+[0x83,0x83])):
+        data=bytearray(size)
+        for v in range(vectors):
+            data[4*v:4*v+4]=struct.pack('<BBH',0xEA,0x00,0x0200+8*v)
+        data[0x200:0x204]=struct.pack('<BBH',0xCA,0x00,0x0300)
+        data[0x204:0x208]=struct.pack('<BBH',0xEA,0x00,0x0200)
+        data[0x208:0x20A]=b'\xCB\x00'
+        data[0x2FE:0x300]=b'\xDB\x00'
+        data[0x300:0x312]=bytes.fromhex('98 24 a8 34 00 a2 10 b3 26 fa ff ff 36 fb ff ff 3d 08')
+        def wordsum(lo,hi):
+            total=0
+            for a in range(lo,hi,2):
+                total+=data[a]|(data[a+1]<<8)
+            return total&0xFFFFFFFF
+        entries=[(0x0000,0x01FF)]+([(0x0200,0x027F)] if bad_entry else [])
+        for i,(lo,hi) in enumerate(entries):
+            total=wordsum(lo,hi)
+            stored=total if not (bad_entry and i==1) else total^0xFF
+            # Keep the descriptor pair internally consistent so this fixture
+            # reaches the stored-vs-computed checksum validation path.
+            struct.pack_into('<IIII',data,0x1F810+16*i,lo,hi,stored,~stored&0xFFFFFFFF)
+        data[0x0F000:0x0F00C]=bytes([0x99,0x99,0x99,0x00,0x0A,0x50,0x57,0x52,0x48,0x4A,0x31,0x32])
+        data[size-6:]=tail
+        return bytes(data)
+    ecu_path=root/'ecu';ecu_path.write_bytes(ecu_image())
+    emu_path=root/'c167-emu';emu_path.write_bytes(bytes([0xE0,0x51,0x08,0x13,0xF0,0x21,0x44,0x00]))
+    emu=emulate_c167(emu_path,steps=3)
+    assert emu['stop']=='Budget' and emu['registers']['r1']==8 and emu['registers']['r2']==8 and len(emu['trace'])==3,emu
+    stopped=emulate_c167(emu_path,steps=10,breakpoint=2)
+    assert stopped['stop']=='Breakpoint(2)' and stopped['pc']==2 and stopped['steps']==1,stopped
+    watch_path=root/'c167-watch';watch_path.write_bytes(bytes([0xE0,0x51,0xF6,0xF1,0x20,0x00])+bytes(0x3A))
+    watched=emulate_c167(watch_path,steps=10,watchpoint=0x21)
+    assert watched['stop']=='Watchpoint { address: 33, access: Write }' and watched['steps']==2,watched
+    sfr_path=root/'c167-sfr';sfr_path.write_bytes(bytes([
+        0xE6,0x08,0x34,0xF9,0xE6,0x09,0x80,0x00,
+        0xE6,0x06,0x34,0x12,0xE6,0x07,0x78,0x56]))
+    sfr=emulate_c167(sfr_path,steps=4,stack=0x100)
+    assert (sfr['cp'],sfr['sp'],sfr['mdh'],sfr['mdl'])==(0xF800,0x80,0x1234,0x5678),sfr
+    md_path=root/'c167-md';md_path.write_bytes(bytes([
+        0xE6,0xF1,0x03,0x00,0xE6,0xF2,0x04,0x00,0x1B,0x12,
+        0xE6,0xF3,0x02,0x00,0x7B,0x33]))
+    md=emulate_c167(md_path,steps=5,stack=0x100)
+    assert (md['mdh'],md['mdl'],md['steps'])==(0,6,5),md
+    fault_path=root/'c167-div-zero';fault_path.write_bytes(bytes([0x5B,0x11]))
+    fault=emulate_c167(fault_path,steps=1,stack=0x100)
+    assert fault['stop']=='ArithmeticFault { pc: 0, reason: "division by zero" }' and fault['steps']==0,fault
+    ram_path=root/'c167-ram';ram_path.write_bytes(bytes([
+        0xF2,0xF1,0x40,0x00,0x08,0x11,0xF6,0xF1,0x42,0x00,0xF2,0xF2,0x42,0x00])+bytes(0x40))
+    ram=emulate_c167(ram_path,steps=4,stack=0x100,ram='0x40=3412')
+    assert ram['registers']['r2']==0x1235 and ram['ram_seed_bytes']==2 and ram['ram_write_bytes']==2,ram
+    assert ram['ram']['000040']==0x34 and ram['ram']['000042']==0x35,ram
+    captured_ecu=root/'ecu.capture'
+    ecu_capture=invoke('capture',ecu_path,options=('ecu','auto','0','0'),destination=captured_ecu)
+    assert ecu_capture['kind']=='header_result',ecu_capture
+    assert ecu_capture['file_kind']=='ecu raw image',ecu_capture
+    assert 'ME7-class ECU flash dump' in ecu_capture['structure'] and '8 consecutive JMPA vectors' in ecu_capture['structure'],ecu_capture
+    ecu_page=invoke('page',ecu_path,options=('ecu','auto','0','0'))
+    assert ecu_page['kind']=='page_result' and ecu_page['unit_bytes']==2 and 'jmpa cc_UC' in ecu_page['text'],ecu_page
+    ecu_analysis=invoke('analyze',ecu_path,options=('ecu','auto','0','0'))
+    assert ecu_analysis['kind']=='analysis_result' and set(ecu_analysis)==REPORT_FIELDS
+    assert 'ecu vector table: 8 consecutive JMPA vectors' in ecu_analysis['metadata'],ecu_analysis
+    assert 'direct-call candidate' in ecu_analysis['functions'],ecu_analysis
+    assert 'verified sum' in ecu_analysis['metadata'] and 'INVALID stored' not in ecu_analysis['metadata'],ecu_analysis
+    assert 'ecu checksummed region candidate' in ecu_analysis['metadata'],ecu_analysis
+    assert 'ecu multipoint checksum code signature: exact fixed-byte match' in ecu_analysis['metadata'],ecu_analysis
+    assert 'containing-function entry candidate 0x300' in ecu_analysis['metadata'],ecu_analysis
+    assert 'ecu identifier candidate: 505752484a12' in ecu_analysis['metadata'],ecu_analysis
+    ecu_bad=root/'ecu-bad';ecu_bad.write_bytes(ecu_image(bad_entry=True))
+    ecu_bad_analysis=invoke('analyze',ecu_bad,options=('ecu','auto','0','0'))
+    assert 'INVALID stored' in ecu_bad_analysis['metadata'] and '1 invalid' in ecu_bad_analysis['metadata'],ecu_bad_analysis
+    ecu_logical=root/'ecu-logical';ecu_logical.write_bytes(ecu_image(tail=b'\x44'*16))
+    ecu_logical_analysis=invoke('analyze',ecu_logical,options=('ecu','auto','0','0'))
+    assert '0x44 fill' in ecu_logical_analysis['metadata'],ecu_logical_analysis
+    ecu_short=root/'ecu-short';ecu_short.write_bytes(bytes(0x10000))
+    assert invoke('analyze',ecu_short,options=('ecu','auto','0','0'))['kind']=='error'
+    ecu_plain=root/'ecu-plain';ecu_plain.write_bytes(bytes(0x20000))
+    assert invoke('analyze',ecu_plain,options=('ecu','auto','0','0'))['kind']=='error'
+    assert invoke('analyze',ecu_path,options=('ecu','auto','0','0x100'))['kind']=='error'
+    assert invoke('analyze',ecu_path,options=('ecu','x86_64','0','0'))['kind']=='error'
     # Valid universal FAT32/FAT64, plus overlapping slices rejected before selection.
     one,_=image(7);two,_=image(0x01000007,b'\x55\x48\x89\xe5\xc3')
     for wide in [False,True]:

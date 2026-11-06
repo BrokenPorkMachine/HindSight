@@ -40,7 +40,7 @@ fn inspect(path:&str,id:&str)->io::Result<String>{
  while count<header.len(){let n=file.read(&mut header[count..])?;if n==0{break;}count+=n;}
  let after=file.metadata()?;
  if before.len()!=after.len()||before.modified().ok()!=after.modified().ok(){return Err(io::Error::new(io::ErrorKind::InvalidData,"Source changed during inspection"));}
- let kind=if count<4{"Unknown or raw bytes"}else{match &header[..4]{
+ let kind=if count>=6 && header[..6]==[0xea,0x00,0x00,0x02,0xea,0x00]{"C167 ECU vector table (ME7-class) candidate"}else if count<4{"Unknown or raw bytes"}else{match &header[..4]{
  [0xce,0xfa,0xed,0xfe]=>"Mach-O 32 little-endian",[0xfe,0xed,0xfa,0xce]=>"Mach-O 32 big-endian",
  [0xcf,0xfa,0xed,0xfe]=>"Mach-O 64 little-endian",[0xfe,0xed,0xfa,0xcf]=>"Mach-O 64 big-endian",
  [0xca,0xfe,0xba,0xbe]|[0xca,0xfe,0xba,0xbf]=>"Universal Mach-O candidate",[0x7f,b'E',b'L',b'F']=>"ELF candidate",_=>"Unknown or raw bytes"}};
@@ -112,6 +112,7 @@ fn run()->io::Result<()>{
  else if args.len()==10 && args[1]=="--analyze-image"{binary::Options::parse(&args[6..]).and_then(|o|if binary::legacy_arm64(&args[2],&o){preview::analyze(&args[2],&args[3],&args[4],&args[5])}else{binary::analyze(&args[2],&args[3],&args[4],&args[5],&o)})}
  else if args.len()==8 && args[1]=="--reconstruct"{preview::reconstruct(&args[2],&args[3],&args[4],&args[5],&args[6],&args[7])}
  else if args.len()==9 && args[1]=="--interpret"{preview::interpret(&args[2],&args[3],&args[4],&args[5],&args[6],&args[7],&args[8])}
+ else if args.len()==10 && args[1]=="--emulate-c167"{binary::emulate_c167(&args[2],&args[3],&args[4],&args[5],&args[6],&args[7],&args[8],&args[9])}
  else if is_analysis{preview::analyze(&args[2],&args[3],&args[4],&args[5])}
  else if args.len()==4 && args[1]=="--inspect-header"{inspect(&args[2],&args[3])}
  else{return Err(io::Error::new(io::ErrorKind::InvalidInput,"Invalid worker arguments"));};

@@ -1,7 +1,7 @@
 //! Versioned reconstruction records. No dependency on report/pseudocode parsing.
 use std::{collections::BTreeMap, io};
 
-pub const PASS: &str = "arm64-reconstruction-84";
+pub const PASS: &str = "arm64-reconstruction-85";
 pub const ENGINE: &str = "arm64-analysis-v125-schema130";
 
 /// Native type/image evidence collected from the target runtime.
@@ -53,6 +53,29 @@ pub struct ProjectTypeDependency {
     pub declaration: String,
     pub target: String,
     pub source_sha256: String,
+    /// Apple Clang layout report, retained only when it is bound to this exact
+    /// declaration and target. It does not prove the captured image uses it.
+    pub layout_evidence: Option<String>,
+    /// Parsed layout facts used by bounded field recovery when available.
+    pub layout: Option<ProjectTypeLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTypeLayout {
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub alignment: u64,
+    pub fields_complete: bool,
+    pub fields: Vec<ProjectTypeLayoutField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectTypeLayoutField {
+    pub name: String,
+    pub declaration: String,
+    pub offset_bits: u64,
+    pub bit_width: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +207,13 @@ impl Value {
 
 extern "C" {
     fn re_sha256_bytes(data: *const u8, size: usize, digest: *mut u8) -> i32;
+}
+pub fn sha256_hex_bytes(bytes: &[u8]) -> io::Result<String> {
+    let mut hash = [0u8; 65];
+    if unsafe { re_sha256_bytes(bytes.as_ptr(), bytes.len(), hash.as_mut_ptr()) } != 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "SHA-256 provider failed"));
+    }
+    Ok(hash[..64].iter().map(|byte| *byte as char).collect())
 }
 pub fn digest(value: &Value) -> io::Result<String> {
     let bytes = value.canonical();

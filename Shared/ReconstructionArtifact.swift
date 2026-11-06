@@ -224,7 +224,7 @@ struct DarwinSDKDeclarationCatalogReference: Codable, Equatable, Sendable {
 /// identities and graph integrity; it does not certify arbitrary C semantics,
 /// execute generated source, or promote compilation to equivalence.
 struct ReconstructionArtifact: Sendable {
-    static let passVersion = "arm64-reconstruction-84"
+    static let passVersion = "arm64-reconstruction-85"
     static let maxBytes = 4 * 1024 * 1024
     let json: String
     let digest: String
@@ -666,7 +666,8 @@ struct ReconstructionArtifact: Sendable {
 
     /// Export exactly this validated function. Preflight the entire output set
     /// before writing so name collisions and byte limits preserve prior work.
-    func writeBatchExport(to directory: URL, maximumBytes: Int) throws -> [ReconstructionExportFile] {
+    func writeBatchExport(to directory: URL, maximumBytes: Int,
+                          allowIdenticalExistingFiles: Bool = false) throws -> [ReconstructionExportFile] {
         let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         try Self.require(values.isDirectory == true && values.isSymbolicLink != true,
                          "Batch output must be a real directory.")
@@ -688,18 +689,69 @@ struct ReconstructionArtifact: Sendable {
         let bytes = outputs.reduce(0) { $0 + $1.1.count }
         try Self.require(Set(outputs.map(\.0)).count == outputs.count, "Competing source representations have the same output path.")
         try Self.require(maximumBytes >= 0 && bytes <= maximumBytes, "Batch output byte budget exhausted.")
-        for (filename, _) in outputs {
+        var alreadyPublished = Set<String>()
+        for (filename, data) in outputs {
             let target = directory.appendingPathComponent(filename)
-            let link = try? target.resourceValues(forKeys: [.isSymbolicLinkKey])
-            try Self.require(!FileManager.default.fileExists(atPath: target.path) && link?.isSymbolicLink != true,
-                             "Batch output already exists; prior evidence was preserved.")
+            let metadata = try? target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            if metadata?.isSymbolicLink == true {
+                throw Invalid(message: "Batch output path is a symbolic link.")
+            }
+            if metadata?.isRegularFile == true {
+                try Self.require(allowIdenticalExistingFiles,
+                                 "Batch output already exists; prior evidence was preserved.")
+                let prior = try Self.readBatchBytes(at: target, maximum: data.count)
+                try Self.require(prior == data,
+                                 "Uncheckpointed batch output differs from regenerated content.")
+                alreadyPublished.insert(filename)
+            } else {
+                try Self.require(!FileManager.default.fileExists(atPath: target.path),
+                                 "Batch output path is not a regular file.")
+            }
         }
         var files: [ReconstructionExportFile] = []
         for (filename, data) in outputs {
-            try data.write(to: directory.appendingPathComponent(filename), options: .withoutOverwriting)
+            if !alreadyPublished.contains(filename) {
+                try Self.publishBatchFile(data, named: filename, in: directory)
+            }
             files.append(ReconstructionExportFile(path: filename, bytes: data.count, sha256: Self.hash(data)))
         }
         return files
+    }
+
+    private static func publishBatchFile(_ data: Data, named name: String, in directory: URL) throws {
+        let directoryFD = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        try require(directoryFD >= 0, "Batch output directory could not be opened safely.")
+        defer { Darwin.close(directoryFD) }
+        let temporaryName = ".hindsight-\(UUID().uuidString).tmp"
+        let descriptor = temporaryName.withCString {
+            Darwin.openat(directoryFD, $0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                          mode_t(S_IRUSR | S_IWUSR))
+        }
+        try require(descriptor >= 0, "Temporary batch output could not be created.")
+        defer { Darwin.close(descriptor) }
+        let wroteAll = data.withUnsafeBytes { buffer -> Bool in
+            guard let base = buffer.baseAddress else { return data.isEmpty }
+            var offset = 0
+            while offset < buffer.count {
+                let count = Darwin.write(descriptor, base.advanced(by: offset), buffer.count - offset)
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                if count == 0 { return false }
+                offset += count
+            }
+            return true
+        }
+        try require(wroteAll && Darwin.fsync(descriptor) == 0,
+                    "Batch output could not be written and synchronized.")
+        let linked = temporaryName.withCString { temporary in
+            name.withCString { target in Darwin.linkat(directoryFD, temporary, directoryFD, target, 0) }
+        }
+        try require(linked == 0, "Batch output could not be published without overwriting existing evidence.")
+        let removed = temporaryName.withCString { Darwin.unlinkat(directoryFD, $0, 0) }
+        try require(removed == 0 && Darwin.fsync(directoryFD) == 0,
+                    "Batch output directory could not be synchronized.")
     }
 
     private struct VerifiedBatchEntry {
@@ -804,6 +856,17 @@ struct ReconstructionArtifact: Sendable {
         for entry in entries {
             try require(["recovered", "review-only", "failed"].contains(entry["state"] as? String ?? ""),
                         "Invalid checkpoint state.")
+            if let attemptValue = entry["attempt_count"] {
+                guard let attempts = attemptValue as? Int, (1...1_000_000).contains(attempts) else {
+                    throw Invalid(message: "Invalid checkpoint attempt count.")
+                }
+            }
+            if let historyValue = entry["previous_errors"] {
+                guard let history = historyValue as? [String], history.count <= 8,
+                      history.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 4096 }) else {
+                    throw Invalid(message: "Invalid checkpoint failure history.")
+                }
+            }
             let catalogHash = entry["sdk_catalog_sha256"] as? String
             if entry["sdk_catalog_sha256"] != nil {
                 try require(catalogHash?.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil,

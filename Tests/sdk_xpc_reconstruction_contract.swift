@@ -4,7 +4,7 @@ import CryptoKit
 @main
 enum SDKXPCContract {
     static func main() throws {
-        guard CommandLine.arguments.count == 3 else { fatalError("binary and project paths required") }
+        guard CommandLine.arguments.count == 4 else { fatalError("binary, fresh project, and legacy project paths required") }
         let connection = NSXPCConnection(serviceName: ServiceIdentity.coordinator)
         connection.remoteObjectInterface = NSXPCInterface(with: CoordinatorProtocol.self)
         connection.resume()
@@ -105,6 +105,68 @@ enum SDKXPCContract {
               }) else {
             throw NSError(domain: "SDKXPC", code: 8, userInfo: [NSLocalizedDescriptionKey: String(describing: recovered)])
         }
+        func typeCandidate(_ name: String, _ declaration: String, _ sourceSHA256: String) -> [String: Any] {
+            ["name": name, "declaration": declaration, "target": "arm64-apple-macos14.0",
+             "source": "analyst", "sourceSHA256": sourceSHA256]
+        }
+        let rollbackBatch: [String: Any] = ["schema": 1, "candidates": [
+            typeCandidate("AtomicImport", "typedef unsigned long AtomicImport;", digest),
+            typeCandidate("InvalidSource", "typedef unsigned int InvalidSource;", String(repeating: "b", count: 64))
+        ]]
+        let rollbackJSON = String(data: try JSONSerialization.data(withJSONObject: rollbackBatch), encoding: .utf8)!
+        let rollback = try call { $0.addProjectTypeCandidates(rollbackJSON, withReply: $1) }
+        guard rollback["ok"] as? Bool == false else {
+            throw NSError(domain: "SDKXPC", code: 15, userInfo: [NSLocalizedDescriptionKey: "Invalid type batch unexpectedly committed."])
+        }
+        let afterRollback = try call { $0.projectTypeCatalog(withReply: $1) }
+        guard (((afterRollback["catalog"] as? [String: Any])?["candidates"] as? [Any])?.isEmpty == true) else {
+            throw NSError(domain: "SDKXPC", code: 16, userInfo: [NSLocalizedDescriptionKey: "Failed type batch left partial project data."])
+        }
+        let conflictBatch: [String: Any] = ["schema": 1, "candidates": [
+            typeCandidate("ImportedConflict", "typedef unsigned long ImportedConflict;", digest),
+            typeCandidate("ImportedConflict", "typedef unsigned int ImportedConflict;", digest)
+        ]]
+        var typeCandidates = conflictBatch["candidates"] as! [[String: Any]]
+        let pointDeclaration = "struct Point { int x; int y; };"
+        let pointDeclarationDigest = SHA256.hash(data: Data(pointDeclaration.utf8)).map { String(format: "%02x", $0) }.joined()
+        var point = typeCandidate("Point", pointDeclaration, digest)
+        point["layoutEvidence"] = [
+            "schema": 1, "producer": "hindsight-apple-clang-record-layout-v1", "sdk": "macosx",
+            "sdkPath": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+            "sdkBuild": "26A425", "target": "arm64-apple-macos14.0", "compiler": "Apple clang version 21.0.0",
+            "declarationsSHA256": pointDeclarationDigest,
+            "record": ["name": "Point", "kind": "struct", "size": 8, "alignment": 4, "fieldOffsetsComplete": true,
+                "fields": [["name": "x", "declaration": "int x", "offsetBits": 0],
+                           ["name": "y", "declaration": "int y", "offsetBits": 32]]]
+        ] as [String: Any]
+        typeCandidates.append(point)
+        let conflictJSON = String(data: try JSONSerialization.data(withJSONObject: ["schema": 1, "candidates": typeCandidates]), encoding: .utf8)!
+        let importedTypes = try call { $0.addProjectTypeCandidates(conflictJSON, withReply: $1) }
+        let persistedCandidates = (importedTypes["catalog"] as? [String: Any])?["candidates"] as? [[String: Any]] ?? []
+        let persistedLayout = persistedCandidates.first(where: { $0["name"] as? String == "Point" })?["layoutEvidence"] as? [String: Any]
+        guard importedTypes["ok"] as? Bool == true,
+              persistedCandidates.count == 3,
+              persistedLayout?["declarationsSHA256"] as? String == pointDeclarationDigest else {
+            throw NSError(domain: "SDKXPC", code: 17, userInfo: [NSLocalizedDescriptionKey: "Valid type conflicts or compiler layout evidence were not retained."])
+        }
+        let afterLayoutImport = try call {
+            $0.reconstructFunction(recordID, startAddress: String(start), endAddress: String(end),
+                                   requestID: UUID().uuidString, withReply: $1)
+        }
+        guard afterLayoutImport["artifactJSON"] is String else {
+            throw NSError(domain: "SDKXPC", code: 18, userInfo: [NSLocalizedDescriptionKey: "Worker rejected the project catalog after a valid compiler layout import: \(afterLayoutImport)"])
+        }
         print("App/XPC SDK lookup cancellation and declaration-to-artifact reconstruction passed.")
+        let migrated = try call { $0.openProject(CommandLine.arguments[3], create: false, withReply: $1) }
+        guard migrated["ok"] as? Bool == true else {
+            throw NSError(domain: "SDKXPC", code: 13, userInfo: [NSLocalizedDescriptionKey: String(describing: migrated)])
+        }
+        let catalog = try call { $0.projectTypeCatalog(withReply: $1) }
+        guard catalog["ok"] as? Bool == true,
+              let catalogBody = catalog["catalog"] as? [String: Any],
+              (catalogBody["candidates"] as? [Any])?.isEmpty == true else {
+            throw NSError(domain: "SDKXPC", code: 14, userInfo: [NSLocalizedDescriptionKey: String(describing: catalog)])
+        }
+        print("CoordinatorService opened the schema-v1 project, migrated it, and queried the v3 type catalog.")
     }
 }

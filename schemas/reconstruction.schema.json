@@ -136,7 +136,8 @@
             "backs-frame-object-version",
             "synchronizes-memory", "synchronizes-instructions", "clears-exclusive-monitor",
             "accesses-memory", "program-order-before-event", "program-order-after-event",
-            "renders-as", "validates", "alternative-to", "overrides"
+            "renders-as", "validates", "alternative-to", "overrides",
+            "required-source-dependency"
           ]
         },
         "producer": { "type": "string", "minLength": 1, "maxLength": 128 },

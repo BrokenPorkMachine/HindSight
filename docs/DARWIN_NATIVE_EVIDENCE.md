@@ -1,6 +1,6 @@
 # Darwin native evidence for reconstruction
 
-The native reconstruction tools collect libobjc/dyld observations and import C function declarations with Apple Clang. The worker now joins structured, target-local property/ivar layouts to AArch64 pseudocode, qualified against those native observations. These support C00N in the [Chimera completion roadmap](CHIMERA_COMPLETION_ROADMAP.md). General runtime object/type inference and arbitrary aggregate ingestion remain open.
+The native reconstruction tools collect libobjc/dyld observations and import C function declarations with Apple Clang. The worker now joins structured, target-local property/ivar layouts to AArch64 pseudocode, qualified against those native observations. These support the reconstruction track in the [master roadmap](MASTER_ROADMAP.md). General runtime object/type inference and arbitrary aggregate ingestion remain open.
 
 ## Native runtime catalog
 
@@ -39,15 +39,49 @@ python3 scripts/collect-darwin-sdk.py --header /absolute/path/project.h --functi
 python3 scripts/collect-darwin-sdk.py --sdk iphoneos --target arm64-apple-ios16.0 --function malloc
 ```
 
-An SDK/target mismatch is rejected. Filtered AST output is spooled and bounded to 4 MiB per requested function; at most 128 distinct functions are admitted. Unsupported callback/array/function-pointer declarators retain their structured type evidence and are not reduced to fabricated scalar prototypes. Complete record/bitfield layout ingestion and calling-convention attribute handling remain part of the project type-library work.
+An SDK/target mismatch is rejected. Filtered AST output is spooled and bounded to 4 MiB per requested function; at most 128 distinct functions are admitted. Unsupported callback/array/function-pointer declarators retain their structured type evidence and are not reduced to fabricated scalar prototypes. Calling-convention attribute handling and feeding layouts into the project type library remain open.
+
+Named C `struct` and `union` layout can be qualified directly for a recorded Apple target:
+
+```sh
+python3 scripts/collect-darwin-record-layouts.py /absolute/path/types.h \
+  --record HSPoint --record HSRect --target arm64-apple-macos14.0
+```
+
+The collector uses Apple Clang's record-layout dump and returns record size,
+alignment, direct field bit offsets, and named bitfield widths. It excludes
+indented child-record rows from a parent's direct field list; the nested-record
+fixture also checks that capture-bound catalog export preserves the full
+declaration context. Its JSON binds
+those results to the exact declaration-context SHA-256, compiler, SDK build and
+target triple. It rejects incomplete or ambiguously named layouts. The artifact
+does not prove that the declarations match a captured image or that a machine
+access corresponds to a source field. With the capture hash option below, the
+layout is retained on the matching project type candidate. A bounded worker
+case now uses that layout for a read or write through a catalog-backed
+`struct *` at an exact constant byte offset, provided one non-bitfield scalar
+field uniquely matches both offset and access width. The emitted member access
+retains the layout report and capture binding, while captured type identity
+remains unproven; unions and ambiguous or mismatched accesses stay unresolved.
+
+For a single named `struct` or `union`, add
+`--project-source-sha256 <captured SHA-256>`. The declaration context may
+include helper records, such as a nested struct definition; the selected
+record's compiler layout and the full context are retained in the candidate.
+The command emits a one-candidate catalog JSON that can be imported from
+Binary Workspace. The coordinator stores the compiler report as analyst-linked
+evidence and rechecks its target and declaration hash; the worker independently
+accepts the source-bound nested declaration context and selected record layout.
+Neither check treats the report as proof that the binary contains an instance
+of that type.
 
 ## Analyst project type catalog
 
-The workspace's Project Type Catalog stores bounded analyst declarations (`typedef`, `struct`, `union` or `enum`) alongside a target label and the SHA-256 identity of a source already captured in that project. The coordinator checks that the declared architecture matches the captured source's inspected architecture, validates the declaration shape, and groups conflicting declarations for review. Catalog records are project-local and persist with the project database.
+The workspace's Project Type Catalog stores bounded analyst declarations (`typedef`, `struct`, `union` or `enum`) alongside a target label and the SHA-256 identity of a source already captured in that project. The coordinator checks that the declared architecture matches the captured source's inspected architecture, validates the declaration shape, and groups conflicting declarations for review. Catalog records are project-local and persist with the project database. Conflict-free declarations with exact source and target matches can be attached to recovered source as analyst-provided dependencies; they are explicitly not ABI-layout evidence.
 
-These candidates are reviewable evidence only. They are not yet sent to the reconstruction worker, used to infer layouts, or treated as SDK/runtime facts. Feeding conflict-free declarations into reconstruction with provenance attached remains open; adding SDK producer/image/version provenance and complete arbitrary aggregate layouts remains part of the broader type-library work.
+These candidates remain analyst assertions. They do not establish runtime identity. A unique matching catalog declaration can qualify a single-level pointer spelling in an exact C signature; by-value custom aggregates and nested pointers remain unsupported. Compiler layout evidence is attached and persisted when its target and declaration hash match. When a declaration is required by a recovered signature, its bounded layout JSON is passed through the worker request; the worker parses the record and fields, checks top-level producer, declaration hash and target, and rejects duplicate names or out-of-record offsets/widths. The artifact retains that checked report while marking captured type identity unproven. For catalog-backed `struct *` values, constant-offset loads and stores are rendered as member accesses only when one non-bitfield scalar field matches the exact offset and access width. This narrow path carries layout provenance into the memory-effect artifact; it does not prove the captured image uses the declared type or generalize to unions, ambiguous fields, arrays, pointers, bitfields or nonconstant offsets.
 
-Use **Export JSON** in the Project Type Catalog workspace to write a bounded, validated catalog for review or handoff. The export preserves the candidate rows, analyst source label, target and captured-source SHA-256. Its SHA-256 is reported in the workspace after writing. It is an evidence interchange file; importing it into another project's trusted catalog and feeding declarations to reconstruction are not implemented.
+Use **Export JSON** in the Project Type Catalog workspace to write a bounded, validated catalog for review or handoff. **Import JSON** accepts only candidates bound to the selected capture digest and matching architecture, then persists them through a transaction. Conflicts remain visible and are withheld from source dependencies. The export preserves candidate rows, analyst source label, target and captured-source SHA-256; its SHA-256 is reported after writing. A declaration can be a source dependency while its separate layout record remains compiler-qualified review evidence; the worker does not yet consume layout records.
 
 ## Feed declarations to AArch64 pseudocode
 

@@ -1,7 +1,10 @@
 # HindSight 0.5.15 Status
 
-Current release candidate: `v0.5.15-rc.1`, with engine
-`arm64-analysis-v125-schema130` and reconstruction pass 84. Tail-call candidates now share typed register and stack constant recovery with ordinary calls. Outgoing GPR/SIMD pair stores recover independent argument values and invalidate overwritten slots. Proven scalar FP stack stores now supply float/double call literals. Call summaries distinguish
+Released candidate baseline: `v0.5.15-rc.1`, with engine
+`arm64-analysis-v125-schema130` and reconstruction pass 84. The unreleased
+worktree advances to reconstruction pass 85 for catalog-layout-backed aggregate
+member reads and writes. Tail-call candidates share typed register and stack
+constant recovery with ordinary calls. Outgoing GPR/SIMD pair stores recover independent argument values and invalidate overwritten slots. Proven scalar FP stack stores now supply float/double call literals. Call summaries distinguish
 reserved x18, volatile LR, and partially preserved vector registers. Chained import names
 require bounded, terminated UTF-8 without control characters. Objective-C selector
 stubs require an unambiguous indirect-symbol or completed legacy dyld bind for

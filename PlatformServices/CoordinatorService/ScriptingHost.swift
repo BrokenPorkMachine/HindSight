@@ -407,7 +407,16 @@ except BaseException:
         applicationSupportRoot().appendingPathComponent("VectorGlass/PluginData", isDirectory: true).appendingPathComponent(id, isDirectory: true)
     }
     private func validID(_ s:String)->Bool { !s.isEmpty && s.utf8.count<=128 && s.range(of:"^[A-Za-z0-9._-]+$",options:.regularExpression) != nil }
-    private func pluginRoots(projectPath:String?)->[(String,URL)] { var r:[(String,URL)]=[]; if let p=projectPath,!p.isEmpty { r.append(("project",URL(fileURLWithPath:p).appendingPathComponent("Plugins",isDirectory:true))) }; r.append(("user",userPluginRoot())); r.append(("legacy-user",legacyUserPluginRoot())); return r }
+    private func pluginRoots(projectPath:String?)->[(String,URL)] {
+        var roots:[(String,URL)]=[]
+        if let path=projectPath,!path.isEmpty { roots.append(("project",URL(fileURLWithPath:path).appendingPathComponent("Plugins",isDirectory:true))) }
+        roots.append(("user",userPluginRoot()))
+        roots.append(("legacy-user",legacyUserPluginRoot()))
+        // Bundled extensions are immutable fallbacks. Earlier roots win by ID,
+        // allowing an analyst or project to install an explicitly reviewed update.
+        if let resources=Bundle.main.resourceURL { roots.append(("bundled",resources.appendingPathComponent("BundledPlugins",isDirectory:true))) }
+        return roots
+    }
     private func applicationSupportRoot() -> URL {
         if let root = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first { return root }
         return fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)

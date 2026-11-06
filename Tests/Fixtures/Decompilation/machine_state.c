@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <string.h>
 #include "machine_state.h"
+__attribute__((noinline)) int hs_point_read(struct Point *point) { return point->y; }
+__attribute__((noinline)) void hs_point_write(struct Point *point, int value) { point->y=value; }
 __attribute__((noinline)) uint64_t hs_c_mix(uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e) {
     return ((a ^ b) + c*3) ^ (d >> (e&63));
 }

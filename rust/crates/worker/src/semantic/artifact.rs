@@ -1316,7 +1316,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // which also proves the prototype of a self-recursive call target.
     let self_prototype = if signatures.len() == 1 {
         let (name, signature) = &signatures[0];
-        crate::signatures::source_signature(name, signature)
+        crate::signatures::source_signature_with_project_types(name, signature, &project_types)
     } else {
         None
     };
@@ -1336,7 +1336,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         candidates.dedup_by(|left, right| left.0 == right.0 && left.1.declaration == right.1.declaration);
         if candidates.len() == 1 {
             let (symbol, prototype) = &candidates[0];
-            if let Some(prototype) = crate::signatures::source_signature(symbol, prototype) {
+            if let Some(prototype) = crate::signatures::source_signature_with_project_types(symbol, prototype, &project_types) {
                 call_prototypes.insert(target, prototype);
             }
         }
@@ -2041,7 +2041,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // recovery. Do not fabricate one from observations or conflicting types.
     let source_declaration = if signatures.len() == 1 {
         let (name, signature) = &signatures[0];
-        if let Some(source_signature) = crate::signatures::source_declaration(name, signature) {
+        if let Some(source_signature) = crate::signatures::source_declaration_with_project_types(name, signature, &project_types) {
             let declaration = builder.record("type",
                 if signature.source.contains("analyst") { "analyst-assertion" } else { "derived" },
                 object([("declaration", signature.declaration.clone().into()),
@@ -2054,7 +2054,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     if !source_blocked {
         let recovery = if signatures.len() == 1 {
             let (name, signature) = &signatures[0];
-            crate::signatures::source_signature(name, signature)
+            crate::signatures::source_signature_with_project_types(name, signature, &project_types)
                 .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
                 .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types))
         } else {

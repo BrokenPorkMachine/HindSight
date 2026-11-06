@@ -127,12 +127,22 @@ final class WorkbenchModel: ObservableObject {
     @Published var selectedID: String? {
         didSet {
             if oldValue != selectedID {
+                let previousProfile = artifactProfile(forRecordID: oldValue)
+                if VGWorkspaceCatalog.allows(workspace, profile: previousProfile) {
+                    workspaceByProfile[previousProfile.rawValue] = workspace
+                }
                 selectedEvidenceAnnotation = nil
+                resetC167Emulator()
                 annotationDraft = ""
                 annotationTagsText = ""
                 annotationConfidence = .unclassified
                 instructionPage = nil; pageStarts.removeAll(); traversingPreviousPage = false; analysisReport = nil; pageRecordID = nil; analysisRecordID = nil; evidenceIndexTask?.cancel(); analysisEvidenceIndex = nil; evidenceIndexRecordID = nil; analysisEvidenceIndexing = false; analysisEvidenceStatus = "Evidence index unavailable."; navigationGeneration = UUID(); resetWorkspaceHistory(); analysisHistoryCursor = -1; refreshAnalysisContinuityProjection()
                 if !suppressLedgerRecording, let selected { recordLedger(kind: .recordSelected, provenance: .observed, detail: "Selected artifact \(selected.name).") }
+                if let restored = workspaceByProfile[artifactProfile.rawValue], profileAllows(restored) {
+                    workspace = restored
+                } else {
+                    workspace = profileHome
+                }
                 persistLaunchSessionIfPossible()
             }
         }
@@ -166,6 +176,7 @@ final class WorkbenchModel: ObservableObject {
             if !suppressLedgerRecording {
                 recordLedger(kind: .workspaceVisited, provenance: .asserted, detail: "Opened \(workspace).")
             }
+            if profileAllows(workspace) { workspaceByProfile[artifactProfile.rawValue] = workspace }
             persistLaunchSessionIfPossible()
         }
     }
@@ -241,6 +252,14 @@ final class WorkbenchModel: ObservableObject {
     @Published var diffBaselineID = ""
     @Published var diffCandidateID = ""
     @Published var diffStatus = "Choose two captured artifacts, then analyze the pair."
+    @Published var c167Entry = "0x200"
+    @Published var c167Steps = "1000"
+    @Published var c167Stack = "0x10000"
+    @Published var c167Breakpoint = ""
+    @Published var c167Watchpoint = ""
+    @Published var c167RAMSeed = ""
+    @Published private(set) var c167Emulation: C167EmulationResult?
+    @Published private(set) var c167EmulationStatus = "Configure a bounded entry point and step budget."
     @Published var analysisReportsByRecordID: [String: AnalysisReport] = [:]
     private var analysisReportLRU: [String] = []
     private static let maxResidentAnalysisReports = 8
@@ -349,6 +368,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published var vectorEmuDisassembly = ""
     @Published var vectorEmuTrace = ""
     @Published private(set) var reaStatus = "REA agents not probed."
+    @Published var reaExecutable = "/usr/bin/env" {
+        didSet { UserDefaults.standard.set(reaExecutable, forKey: "HindSight.rea-executable.v1") }
+    }
+    @Published var reaArguments = "rea-agents mcp" {
+        didSet { UserDefaults.standard.set(reaArguments, forKey: "HindSight.rea-arguments.v1") }
+    }
     @Published var reaTargetPath = ""
     @Published var reaOperation = "binary_overview"
     @Published var reaProvider = "auto"
@@ -472,6 +497,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         let projectPath: String
         let selectedRecordID: String?
         let workspace: String
+        let workspaceByProfile: [String: String]?
         let layoutPreset: String
         let addressText: String?
         let cfgFocus: String?
@@ -484,6 +510,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private static let maxRecentProjects = 8
     private static let maxLaunchSessionBytes = 32 * 1024
     private var savedLaunchSession: LaunchSession?
+    private var workspaceByProfile: [String: String] = [:]
     private var applyingLaunchSession = false
     private let client = CoordinatorClient()
     @Published var remoteCertificateLabel = ""
@@ -860,6 +887,60 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                   !busy, activeRequest == nil, !reconstructionBatchRunning else {
                 throw ReconstructionArtifact.Invalid(message: "App/XPC reconstruction batch or cleanup failed.")
             }
+            // Convert a completed one-function checkpoint into a structurally
+            // valid persisted failure while leaving its files as orphaned
+            // publications. Resume must retry through XPC and reuse those
+            // byte-identical files without rewriting them.
+            let retryDirectory = URL(fileURLWithPath: reconstructionOutput + ".batch-retry", isDirectory: true)
+            try FileManager.default.createDirectory(at: retryDirectory, withIntermediateDirectories: false)
+            reconstructionBatchRunning = true; reconstructionBatchCancelled = false; busy = true
+            await runReconstructionBatch(functions: Array(batchFunctions.prefix(1)), record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "whole",
+                directory: retryDirectory, generation: navigationGeneration)
+            let checkpointURL = retryDirectory.appendingPathComponent("checkpoint.json")
+            guard var retryCheckpoint = try JSONSerialization.jsonObject(with: Data(contentsOf: checkpointURL)) as? [String: Any],
+                  var retryEntries = retryCheckpoint["functions"] as? [[String: Any]], retryEntries.count == 1,
+                  let orphanFiles = retryEntries[0]["files"] as? [[String: Any]] else {
+                throw ReconstructionArtifact.Invalid(message: "Could not prepare the persisted retry fixture.")
+            }
+            let orphanBytes = orphanFiles.reduce(0) { $0 + ($1["bytes"] as? Int ?? 0) }
+            let orphanDates = try Dictionary(uniqueKeysWithValues: orphanFiles.compactMap { file -> (String, Date)? in
+                guard let name = file["path"] as? String else { return nil }
+                let date = try retryDirectory.appendingPathComponent(name)
+                    .resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+                return date.map { (name, $0) }
+            })
+            retryEntries[0]["state"] = "failed"
+            retryEntries[0]["error"] = "injected transient coordinator failure"
+            retryEntries[0]["files"] = []
+            retryCheckpoint["functions"] = retryEntries
+            retryCheckpoint["output_bytes"] = (retryCheckpoint["output_bytes"] as? Int ?? 0) - orphanBytes
+            retryCheckpoint["batch_status"] = "completed-with-failures"
+            retryCheckpoint["recovered_functions"] = 0
+            retryCheckpoint["review_only_functions"] = 0
+            retryCheckpoint["failed_functions"] = 1
+            try JSONSerialization.data(withJSONObject: retryCheckpoint, options: [.prettyPrinted, .sortedKeys])
+                .write(to: checkpointURL, options: .atomic)
+            reconstructionBatchRunning = true; reconstructionBatchCancelled = false; busy = true
+            await runReconstructionBatch(functions: Array(batchFunctions.prefix(1)), record: record, digest: digest,
+                projectPath: importedProject.path, analysis: analysis, scope: "resume",
+                directory: retryDirectory, generation: navigationGeneration, resume: true)
+            let retriedData = try Data(contentsOf: retryDirectory.appendingPathComponent("manifest.json"))
+            guard let retried = try JSONSerialization.jsonObject(with: retriedData) as? [String: Any],
+                  let retriedEntries = retried["functions"] as? [[String: Any]], retriedEntries.count == 1,
+                  let retriedEntry = retriedEntries.first,
+                  retriedEntry["state"] as? String != "failed",
+                  retriedEntry["attempt_count"] as? Int == 2,
+                  (retriedEntry["previous_errors"] as? [String])?.contains("injected transient coordinator failure") == true,
+                  retried["failed_functions"] as? Int == 0, !busy, activeRequest == nil else {
+                throw ReconstructionArtifact.Invalid(message: "Persisted function failure did not retry cleanly through XPC.")
+            }
+            for (name, date) in orphanDates {
+                guard try retryDirectory.appendingPathComponent(name)
+                    .resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate == date else {
+                    throw ReconstructionArtifact.Invalid(message: "Retry rewrote a byte-identical orphaned output.")
+                }
+            }
             for format in [ReconstructionExportFormat.c, .objc, .header, .native] {
                 let output = batchDirectory.appendingPathComponent("dump-" + format.fileExtension, isDirectory: true)
                 await dumpReconstructionBatch(from: batchDirectory, to: output, format: format, digest: digest)
@@ -1039,6 +1120,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             preferredLayoutPreset = saved
             layoutPreset = saved
         }
+        if let saved = UserDefaults.standard.string(forKey: "HindSight.rea-executable.v1"), saved.hasPrefix("/") {
+            reaExecutable = saved
+        }
+        if let saved = UserDefaults.standard.string(forKey: "HindSight.rea-arguments.v1"), !saved.isEmpty {
+            reaArguments = saved
+        }
         savedLaunchSession = Self.readSavedLaunchSession()
         savedLaunchSessionAvailable = savedLaunchSession != nil
         savedLaunchProjectName = savedLaunchSession.map { URL(fileURLWithPath: $0.projectPath, isDirectory: true).lastPathComponent } ?? ""
@@ -1069,10 +1156,13 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard let data = defaults.data(forKey: launchSessionDefaultsKey) else { return nil }
         guard !data.isEmpty, data.count <= maxLaunchSessionBytes,
               let session = try? JSONDecoder().decode(LaunchSession.self, from: data),
-              [1, 2].contains(session.schema),
+              [1, 2, 3].contains(session.schema),
               !session.projectPath.isEmpty, session.projectPath.utf8.count <= 4096, session.projectPath.hasPrefix("/"),
               URL(fileURLWithPath: session.projectPath, isDirectory: true).standardizedFileURL.path == session.projectPath,
               session.workspace.utf8.count <= 128, VGWorkspaceCatalog.allNames.contains(session.workspace),
+              (session.workspaceByProfile ?? [:]).allSatisfy({ entry in
+                  VGArtifactProfile(rawValue: entry.key) != nil && entry.value.utf8.count <= 128 && VGWorkspaceCatalog.allNames.contains(entry.value)
+              }),
               session.layoutPreset.utf8.count <= 128, VGWorkspaceCatalog.layouts.contains(session.layoutPreset),
               (session.selectedRecordID?.utf8.count ?? 0) <= 256,
               (session.addressText?.utf8.count ?? 0) <= 128, (session.cfgFocus?.utf8.count ?? 0) <= 128,
@@ -1116,10 +1206,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     private func writeLaunchSessionNow() {
         guard !applyingLaunchSession, let project else { return }
         let session = LaunchSession(
-            schema: 2,
+            schema: 3,
             projectPath: URL(fileURLWithPath: project.path, isDirectory: true).standardizedFileURL.path,
             selectedRecordID: selectedID,
             workspace: VGWorkspaceCatalog.allNames.contains(workspace) ? workspace : "Overview",
+            workspaceByProfile: workspaceByProfile,
             layoutPreset: VGWorkspaceCatalog.layouts.contains(layoutPreset) ? layoutPreset : "Explore",
             addressText: String(addressText.prefix(128)),
             cfgFocus: String(cfgFocus.prefix(128)),
@@ -1139,7 +1230,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         suppressLedgerRecording = true
         restoringNavigation = true
         layoutPreset = VGWorkspaceCatalog.layouts.contains(session.layoutPreset) ? session.layoutPreset : "Explore"
-        workspace = VGWorkspaceCatalog.allNames.contains(session.workspace) ? session.workspace : "Overview"
+        workspaceByProfile = (session.workspaceByProfile ?? [:]).filter { entry in
+            guard let profile = VGArtifactProfile(rawValue: entry.key) else { return false }
+            return VGWorkspaceCatalog.allNames.contains(entry.value) && VGWorkspaceCatalog.allows(entry.value, profile: profile)
+        }
+        let restoredWorkspace = workspaceByProfile[artifactProfile.rawValue] ?? session.workspace
+        workspace = profileAllows(restoredWorkspace) ? restoredWorkspace : profileHome
         addressText = session.addressText ?? ""
         cfgFocus = session.cfgFocus ?? ""
         analysisSearch = session.analysisSearch ?? ""
@@ -1212,6 +1308,75 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     }
 
     var selected: ProjectRecord? { project?.records.first { $0.id == selectedID } }
+    private func artifactProfile(forRecordID id: String?) -> VGArtifactProfile {
+        VGArtifactProfile.derive(from: project?.records.first { $0.id == id })
+    }
+    var artifactProfile: VGArtifactProfile { VGArtifactProfile.derive(from: selected) }
+    var profileHome: String { artifactProfile == .ecu ? "ECU Overview" : "Overview" }
+    func profileAllows(_ name: String) -> Bool { VGWorkspaceCatalog.allows(name, profile: artifactProfile) }
+    func runC167Emulator() {
+        guard let budget = Self.c167Number(c167Steps), (1...1_000_000).contains(budget) else {
+            c167EmulationStatus = "Enter a step budget from 1 through 1,000,000."
+            return
+        }
+        executeC167Emulator(to: budget)
+    }
+    func stepC167Emulator() {
+        let target = min((c167Emulation?.steps ?? 0) + 1, 1_000_000)
+        guard target > (c167Emulation?.steps ?? 0) else {
+            c167EmulationStatus = "The 1,000,000-step execution limit has been reached."
+            return
+        }
+        executeC167Emulator(to: target)
+    }
+    func continueC167Emulator() {
+        guard let increment = Self.c167Number(c167Steps), (1...1_000_000).contains(increment) else {
+            c167EmulationStatus = "Enter a continuation budget from 1 through 1,000,000."
+            return
+        }
+        let current = c167Emulation?.steps ?? 0
+        executeC167Emulator(to: min(current + increment, 1_000_000))
+    }
+    func resetC167Emulator() {
+        c167Emulation = nil
+        c167EmulationStatus = "Configure a bounded entry point and step budget."
+    }
+    private static func c167Number(_ text: String) -> UInt64? {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.lowercased().hasPrefix("0x") { return UInt64(value.dropFirst(2), radix: 16) }
+        return UInt64(value)
+    }
+    private func executeC167Emulator(to budget: UInt64) {
+        guard !busy, projectServiceReady, let selected, artifactProfile == .ecu else {
+            c167EmulationStatus = "Select a captured ECU artifact while the Coordinator is online."
+            return
+        }
+        let requestID = UUID().uuidString
+        busy = true; c167EmulationStatus = "Running bounded C167 execution…"
+        client.request(timeout: 35, operation: {
+            $0.emulateC167(selected.id, entry: self.c167Entry, steps: String(budget),
+                           stack: self.c167Stack, breakpoint: self.c167Breakpoint.isEmpty ? "none" : self.c167Breakpoint,
+                           watchpoint: self.c167Watchpoint.isEmpty ? "none" : self.c167Watchpoint,
+                           ram: self.c167RAMSeed.isEmpty ? "none" : self.c167RAMSeed,
+                           requestID: requestID, withReply: $1)
+        }) { [weak self] result in
+            guard let self else { return }
+            self.busy = false
+            do {
+                let text = try result.get()
+                let reply = try JSONDecoder().decode(C167EmulationReply.self, from: Data(text.utf8))
+                guard reply.ok, let value = reply.result?.validated(requestID: requestID) else {
+                    throw NSError(domain: "C167Emulator", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: reply.message])
+                }
+                self.c167Emulation = value
+                self.c167EmulationStatus = "Stopped: \(value.stop) after \(value.steps) step(s)."
+            } catch {
+                self.c167Emulation = nil
+                self.c167EmulationStatus = "C167 execution failed: \(error.localizedDescription)"
+            }
+        }
+    }
     var projectServiceReady: Bool { connected && projectSessionReady }
     var canImportBinary: Bool { projectServiceReady && project != nil && !busy }
     var coordinatorStateLabel: String {
@@ -1350,8 +1515,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             reaStatus = connected ? "Wait for the current operation to finish." : "Connect the Coordinator before probing REA."
             return
         }
-        let request = REAProbeRequest(executable: "/usr/bin/env",
-                                      arguments: ["npx", "-y", "rea-agents@6.4.0", "mcp"],
+        guard let command = reaCommand() else {
+            reaStatus = "Set a local REA executable and arguments before probing."
+            return
+        }
+        let request = REAProbeRequest(executable: command.executable,
+                                      arguments: command.arguments,
                                       timeout_ms: 10_000)
         guard let data = try? JSONEncoder().encode(request), let payload = String(data: data, encoding: .utf8) else {
             reaStatus = "Could not encode the REA probe request."
@@ -1382,8 +1551,12 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             reaStatus = connected ? "Wait for the current operation to finish." : "Connect the Coordinator before running REA."
             return
         }
-        let request = REAOperationRequest(executable: "/usr/bin/env",
-                                          arguments: ["npx", "-y", "rea-agents@6.4.0", "mcp"],
+        guard let command = reaCommand() else {
+            reaStatus = "Set a local REA executable and arguments before running an operation."
+            return
+        }
+        let request = REAOperationRequest(executable: command.executable,
+                                          arguments: command.arguments,
                                           target_path: reaTargetPath,
                                           provider_id: reaProvider,
                                           tool: reaOperation,
@@ -1413,6 +1586,16 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 self.recordOperationError(operation: "rea.\(self.reaOperation)", code: "rea_operation_failed", message: error.localizedDescription, recovery: "Check the selected target, provider readiness, and capability report before retrying.", retryable: true)
             }
         }
+    }
+
+    private func reaCommand() -> (executable: String, arguments: [String])? {
+        let executable = reaExecutable.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Arguments are intentionally whitespace-delimited rather than shell-parsed: the
+        // Coordinator launches Process directly, so metacharacters never gain shell meaning.
+        let arguments = reaArguments.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !executable.isEmpty, executable.hasPrefix("/"), arguments.count <= 32,
+              arguments.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 4096 }) else { return nil }
+        return (executable, arguments)
     }
 
     private func startREAProgressPolling(requestID: String) {
@@ -1589,11 +1772,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         alert.informativeText = "Mach-O, ELF and PE use validated header addresses. Raw firmware needs an explicit architecture and load address. For composite SEPI, choose an image offset; Auto selects the first validated embedded Mach-O."
         alert.addButton(withTitle: "Import"); alert.addButton(withTitle: "Cancel")
         let format = NSPopUpButton(frame: .zero, pullsDown: false)
-        let formats = ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw"]
-        format.addItems(withTitles: ["Auto / composite", "Mach-O", "ELF (static)", "PE/COFF image (static)", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary"])
+        let formats = ["auto", "macho", "elf", "pe", "sepos", "securerom", "iboot", "raw", "ecu"]
+        format.addItems(withTitles: ["Auto / composite", "Mach-O", "ELF (static)", "PE/COFF image (static)", "SEPOS / SEPI", "SecureROM (raw)", "iBoot (raw)", "Raw binary", "ECU firmware (ME7-class)"])
         let architecture = NSPopUpButton(frame: .zero, pullsDown: false)
-        let architectures = ["auto", "aarch64", "i386", "x86_64", "arm", "thumb"]
-        architecture.addItems(withTitles: ["From header (ARM32 defaults to Thumb-2)", "AArch64", "Intel 32-bit", "Intel 64-bit", "ARM32", "Thumb-2"])
+        let architectures = ["auto", "aarch64", "i386", "x86_64", "arm", "thumb", "c167"]
+        architecture.addItems(withTitles: ["From header (ARM32 defaults to Thumb-2; ECU auto-detects C167)", "AArch64", "Intel 32-bit", "Intel 64-bit", "ARM32", "Thumb-2", "Infineon C167"])
         let address = NSTextField(string: "0x0")
         let offset = NSTextField(string: "0x0")
         let stack = NSStackView(views: [NSTextField(labelWithString: "Image format"), format,
@@ -1746,6 +1929,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard !busy, projectServiceReady, let record = selected, let digest = record.result.source_sha256,
               let projectPath = project?.path, let analysis = currentAnalysis else { return }
         let id = UUID().uuidString, generation = navigationGeneration
+        let typeCatalogGeneration = projectTypeCatalogGeneration
         activeRequest = id; reconstructionRequestID = id; busy = true
         reconstructionStatus = "Reconstructing the selected function…"
         startAnalysisMonitor(requestID: id)
@@ -1769,7 +1953,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 }.value
                 guard let self, self.activeRequest == id else { return }
                 self.busy = false; self.activeRequest = nil; self.reconstructionRequestID = nil
-                guard self.navigationGeneration == generation, self.selectedID == record.id, self.project?.path == projectPath,
+                guard self.navigationGeneration == generation, self.projectTypeCatalogGeneration == typeCatalogGeneration,
+                      self.selectedID == record.id, self.project?.path == projectPath,
                       self.currentAnalysis?.request_id == analysis.request_id else { self.reconstructionStatus = "Discarded reconstruction for an earlier project, artifact or analysis revision."; return }
                 switch decoded {
                 case .success(let reconstruction):
@@ -1787,6 +1972,52 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 }
             }
         }
+    }
+
+    func importFunctionNameExchange() {
+        guard let record = selected, let digest = record.result.source_sha256,
+              let analysis = currentAnalysis, analysis.request_id.count > 0 else {
+            reconstructionStatus = "Analyze the selected captured binary before importing function names."
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Import Hash-Bound Function Names"
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true,
+                  let size = values.fileSize, size <= 16 * 1024 * 1024 else {
+                throw ReconstructionArtifact.Invalid(message: "Function-name exchange must be a regular JSON file no larger than 16 MiB.")
+            }
+            let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard data.count <= 16 * 1024 * 1024 else { throw ReconstructionArtifact.Invalid(message: "Function-name exchange exceeds its 16 MiB limit.") }
+            let exchange = try JSONDecoder().decode(FunctionNameExchange.self, from: data)
+            let known = Set(VGGraphParser.functions(analysis.functions, symbolResolver: analysis.symbol_resolver,
+                                                    objcClasses: analysis.objc_classes).map(\.start))
+            guard let resolved = exchange.resolved(sourceSHA256: digest, knownStarts: known), !resolved.matches.isEmpty else {
+                throw ReconstructionArtifact.Invalid(message: "Exchange schema, source hash, offsets, names or matched function boundaries are invalid.")
+            }
+            let existing = decompilerFunctionOverrides(for: record.id)
+            let replacementCount = resolved.matches.filter { existing[$0.0]?.analystName != nil }.count
+            let alert = NSAlert()
+            alert.messageText = "Import function-name suggestions?"
+            alert.informativeText = "\(resolved.matches.count) names match this captured source and its discovered function boundaries. \(replacementCount) existing overrides will receive a new revision. \(resolved.unmatched) rows do not match a discovered function and will be skipped. Names remain analyst/tool assertions; worker evidence is unchanged."
+            alert.addButton(withTitle: "Import Names")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            for (address, name, provenance) in resolved.matches {
+                let prior = existing[address]
+                let sourceNote = "Imported from \(exchange.producer): \(provenance) (source SHA-256 \(digest))."
+                let note = [prior?.note, sourceNote].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+                saveDecompilerFunctionOverride(recordID: record.id, address: address,
+                    analystName: name, signatureHypothesis: prior?.signatureHypothesis ?? "",
+                    note: String(note.suffix(1024)), confidence: prior?.confidence ?? .unclassified)
+            }
+            reconstructionStatus = "Imported \(resolved.matches.count) hash-bound function-name assertion(s) from \(exchange.producer); \(resolved.unmatched) unmatched row(s) skipped."
+        } catch { reconstructionStatus = "Function-name import failed: \(error.localizedDescription)" }
     }
     func cancelReconstruction() {
         if reconstructionBatchRunning { reconstructionBatchCancelled = true }
@@ -2101,7 +2332,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             do { try checkpointData().write(to: directory.appendingPathComponent("checkpoint.json"), options: .atomic) }
             catch { reconstructionStatus = error.localizedDescription; return nil }
             for (index, function) in functions.enumerated() {
-                if index < retainedCount { continue }
+                let priorEntry = index < entries.count ? entries[index] : nil
+                let retryingFailure = priorEntry?["state"] as? String == "failed"
+                if priorEntry != nil && !retryingFailure { continue }
                 guard !self.reconstructionBatchCancelled, self.projectServiceReady, self.navigationGeneration == generation,
                       self.project?.path == projectPath, self.selectedID == record.id,
                       self.currentAnalysis?.request_id == analysis.request_id else { break }
@@ -2109,10 +2342,18 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 lastRequestID = id
                 self.activeRequest = id
                 self.reconstructionRequestID = id
+                let priorAttempts = priorEntry?["attempt_count"] as? Int ?? 1
                 self.reconstructionStatus = "Reconstructing \(index + 1)/\(functions.count): \(function.name)"
+                    + (retryingFailure ? " (retry \(priorAttempts + 1))" : "")
                 self.startAnalysisMonitor(requestID: id)
                 var entry: [String: Any] = ["start": function.startText,
-                                            "end": String(format: "0x%016llx", function.end), "name": function.name]
+                                            "end": String(format: "0x%016llx", function.end), "name": function.name,
+                                            "attempt_count": retryingFailure ? priorAttempts + 1 : 1]
+                var priorErrors = priorEntry?["previous_errors"] as? [String] ?? []
+                if let previousError = priorEntry?["error"] as? String, !previousError.isEmpty {
+                    priorErrors.append(String(previousError.suffix(4096)))
+                }
+                if !priorErrors.isEmpty { entry["previous_errors"] = Array(priorErrors.suffix(8)) }
                 do {
                     let text: String = try await withCheckedThrowingContinuation { continuation in
                         self.client.request(timeout: 140, maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
@@ -2177,7 +2418,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     }
                     let remaining = 256 * 1024 * 1024 - bytes
                     let files = try await Task.detached(priority: .utility) {
-                        try artifact.writeBatchExport(to: directory, maximumBytes: remaining)
+                        try artifact.writeBatchExport(to: directory, maximumBytes: remaining,
+                                                      allowIdenticalExistingFiles: resume)
                     }.value
                     bytes += files.reduce(0) { $0 + $1.bytes }
                     entry["files"] = files.map { ["path": $0.path, "bytes": $0.bytes, "sha256": $0.sha256] as [String: Any] }
@@ -2185,9 +2427,10 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     entry["blockers"] = artifact.blockers
                 } catch {
                     entry["state"] = "failed"
-                    entry["error"] = error.localizedDescription
+                    entry["error"] = String(error.localizedDescription.suffix(4096))
                 }
-                entries.append(entry)
+                if index < entries.count { entries[index] = entry }
+                else { entries.append(entry) }
                 do { try checkpointData().write(to: directory.appendingPathComponent("checkpoint.json"), options: .atomic) }
                 catch { reconstructionStatus = error.localizedDescription; return nil }
                 afterPublication?()
@@ -3105,7 +3348,22 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         }
         var debugger: [String: Any] = ["attached": debugAttached, "event": debugEvent]
         if let d = debugSnapshot { debugger["pid"] = d.pid; debugger["pc"] = d.pc; debugger["sp"] = d.sp; debugger["fp"] = d.fp; debugger["lr"] = d.lr; debugger["stopped"] = d.stopped; debugger["selected_thread_id"] = d.selected_thread_id ?? ""; debugger["registers"] = d.registers }
-        let root: [String: Any] = ["api_version": 2, "selection": selection, "analysis": analysis, "debugger": debugger]
+        let retainedREA: [[String: Any]] = reaEvidence.suffix(2).map { evidence in
+            var item: [String: Any] = [
+                "id": evidence.id,
+                "captured_at": ISO8601DateFormatter().string(from: evidence.capturedAt),
+                "operation": evidence.operation,
+                "provider": evidence.provider,
+                "response_sha256": evidence.responseSHA256,
+                "response": String(evidence.response.prefix(32 * 1024))
+            ]
+            if let value = evidence.evidenceID { item["evidence_id"] = value }
+            if let value = evidence.targetSHA256 { item["target_sha256"] = value }
+            if let value = evidence.analysisProfileDigest { item["analysis_profile_digest"] = value }
+            return item
+        }
+        let root: [String: Any] = ["api_version": 2, "selection": selection, "analysis": analysis,
+                                   "debugger": debugger, "rea_evidence": retainedREA]
         guard let data = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]), data.count <= 1024 * 1024 else { return "{\"api_version\":2}" }
         return String(decoding: data, as: UTF8.self)
     }
@@ -3127,7 +3385,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard !selectedPluginID.isEmpty else { status = "Select a plugin first."; return }
         busy = true; status = "Running plugin \(selectedPluginID)…"; pythonOutput = ""; pythonError = ""; pythonResult = ""
         let context = scriptingContextJSON()
-        client.request(timeout: UInt64(max(2, min(35, pythonTimeoutMS / 1000 + 3))), operation: { $0.pluginRun(self.selectedPluginID, contextJSON: context, timeoutMS: self.pythonTimeoutMS, interpreter: self.pythonInterpreter, withReply: $1) }) { [weak self] result in
+        let timeoutMS = pluginTimeoutMS(selectedPluginID)
+        client.request(timeout: UInt64(max(2, min(35, timeoutMS / 1000 + 3))), operation: { $0.pluginRun(self.selectedPluginID, contextJSON: context, timeoutMS: timeoutMS, interpreter: self.pythonInterpreter, withReply: $1) }) { [weak self] result in
             guard let self else { return }; self.busy = false
             do { let reply = try JSONDecoder().decode(ScriptRunReply.self, from: Data(try result.get().utf8)); self.pythonOutput = reply.stdout; self.pythonError = reply.stderr; self.pythonResult = reply.result ?? ""; self.applyScriptActions(reply.actions ?? []); self.status = "\(reply.message) \(reply.duration_ms) ms • \(reply.actions?.count ?? 0) action(s)" } catch { self.status = error.localizedDescription }
         }
@@ -3182,7 +3441,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
 
     func runPluginEvent(_ pluginID: String, event: String) {
         let context = scriptingContextJSON()
-        client.request(timeout: UInt64(max(2, min(35, pythonTimeoutMS / 1000 + 3))), operation: { $0.pluginRunEvent(pluginID, event: event, contextJSON: context, timeoutMS: self.pythonTimeoutMS, interpreter: self.pythonInterpreter, withReply: $1) }) { [weak self] result in
+        let timeoutMS = pluginTimeoutMS(pluginID)
+        client.request(timeout: UInt64(max(2, min(35, timeoutMS / 1000 + 3))), operation: { $0.pluginRunEvent(pluginID, event: event, contextJSON: context, timeoutMS: timeoutMS, interpreter: self.pythonInterpreter, withReply: $1) }) { [weak self] result in
             guard let self else { return }
             do { let reply = try JSONDecoder().decode(ScriptRunReply.self, from: Data(try result.get().utf8)); if reply.ok { self.pythonOutput = reply.stdout; self.pythonError = reply.stderr; self.pythonResult = reply.result ?? ""; self.applyScriptActions(reply.actions ?? []) } } catch { self.pluginStatus = error.localizedDescription }
         }
@@ -3202,7 +3462,8 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         guard !selectedPluginID.isEmpty else { return }
         activePluginPanelTitle = panel.title; activePluginPanelDock = panel.dock ?? "inspector"
         let context = scriptingContextJSON(); let event = panel.event ?? "panel.\(panel.id)"
-        client.request(timeout: UInt64(max(2, min(35, pythonTimeoutMS / 1000 + 3))), operation: { $0.pluginRunEvent(self.selectedPluginID, event: event, contextJSON: context, timeoutMS: self.pythonTimeoutMS, interpreter: self.pythonInterpreter, withReply: $1) }) { [weak self] result in
+        let timeoutMS = pluginTimeoutMS(selectedPluginID)
+        client.request(timeout: UInt64(max(2, min(35, timeoutMS / 1000 + 3))), operation: { $0.pluginRunEvent(self.selectedPluginID, event: event, contextJSON: context, timeoutMS: timeoutMS, interpreter: self.pythonInterpreter, withReply: $1) }) { [weak self] result in
             guard let self else { return }
             do {
                 let reply = try JSONDecoder().decode(ScriptRunReply.self, from: Data(try result.get().utf8))
@@ -3213,6 +3474,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         }
     }
     func closePluginPanel() { activePluginPanelTitle = ""; activePluginPanelOutput = "" }
+    private func pluginTimeoutMS(_ pluginID: String) -> Int {
+        pluginID == "com.brokenporkmachine.hindsight.warhead" ? 30_000 : pythonTimeoutMS
+    }
     func applyScriptActions(_ actions: [ScriptAction]) {
         for action in actions.prefix(128) {
             switch action.kind {
@@ -3295,6 +3559,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     return
                 }
                 self.projectTypeCatalog = catalog
+                self.projectTypeCatalogGeneration &+= 1
+                self.reconstructionArtifact = nil
+                self.reconstructionContext = nil
                 self.projectTypeCatalogStatus = catalog.conflicts.isEmpty
                     ? "\(catalog.candidates.count) project type evidence candidate(s)."
                     : "\(catalog.conflicts.count) type name(s) have conflicting declarations and are withheld."
@@ -3326,6 +3593,74 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             projectTypeCatalogStatus = "Exported \(catalog.candidates.count) type evidence candidate(s) (SHA-256 \(digest))."
         } catch { projectTypeCatalogStatus = error.localizedDescription }
     }
+    func importProjectTypeCatalog() {
+        guard projectServiceReady, let record = selected,
+              let digest = record.result.source_sha256?.lowercased(),
+              digest.range(of: #"^[0-9a-f]{64}$"#, options: .regularExpression) != nil else {
+            projectTypeCatalogStatus = "Select a captured source with a verified SHA-256 before importing type evidence."
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Import Project Type Evidence"
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.message = "Only candidates matching the selected source digest and architecture will be imported. Conflicts are retained and withheld from reconstruction."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true,
+                  let size = values.fileSize, size <= 8 * 1024 * 1024 else {
+                throw ReconstructionArtifact.Invalid(message: "Type catalog must be a regular, non-symlink JSON file no larger than 8 MiB.")
+            }
+            let importedData = try Data(contentsOf: url, options: [.mappedIfSafe])
+            guard importedData.count <= 8 * 1024 * 1024 else {
+                throw ReconstructionArtifact.Invalid(message: "Type catalog exceeds its 8 MiB import limit.")
+            }
+            let imported = try JSONDecoder().decode(ProjectTypeCatalog.self, from: importedData)
+            guard imported.validated() != nil else {
+                throw ReconstructionArtifact.Invalid(message: "Imported type catalog failed schema or declaration validation.")
+            }
+            let matching = imported.candidates(sourceSHA256: digest, architecture: record.result.architecture)
+            guard !matching.isEmpty else {
+                throw ReconstructionArtifact.Invalid(message: "No candidates match the selected capture digest and architecture.")
+            }
+            let existingIDs = Set(projectTypeCatalog.candidates.map(\.id))
+            let additions = matching.filter { !existingIDs.contains($0.id) }
+            guard !additions.isEmpty else {
+                projectTypeCatalogStatus = "All \(matching.count) matching candidate(s) already exist."
+                return
+            }
+            let mergedConflicts = ProjectTypeCatalog(candidates: projectTypeCatalog.candidates + additions).conflicts.count
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let batch = try encoder.encode(ProjectTypeCatalog(candidates: additions))
+            guard batch.count <= 8 * 1024 * 1024 else {
+                throw ReconstructionArtifact.Invalid(message: "Matching type evidence exceeds the 8 MiB import limit.")
+            }
+            let json = String(decoding: batch, as: UTF8.self)
+            guard let requestedProjectPath = project?.path else { return }
+            projectTypeCatalogGeneration &+= 1
+            let generation = projectTypeCatalogGeneration
+            client.request(maxReplyBytes: WorkbenchProtocolLimits.analysisXPCReplyBytes,
+                operation: { $0.addProjectTypeCandidates(json, withReply: $1) }) { [weak self] result in
+                guard let self, self.project?.path == requestedProjectPath,
+                      self.projectTypeCatalogGeneration == generation else { return }
+                do {
+                    let payload = try result.get()
+                    let reply = try JSONDecoder().decode(ProjectTypeCatalogReply.self, from: Data(payload.utf8))
+                    guard reply.ok, let catalog = reply.catalog, catalog.validated() != nil else {
+                        self.projectTypeCatalogStatus = reply.message.isEmpty ? "Type catalog import failed validation." : reply.message
+                        return
+                    }
+                    self.projectTypeCatalog = catalog
+                    self.projectTypeCatalogGeneration &+= 1
+                    self.reconstructionArtifact = nil
+                    self.reconstructionContext = nil
+                    self.projectTypeCatalogStatus = "Imported \(additions.count) of \(matching.count) matching candidate(s); \(mergedConflicts) conflicting type name(s) remain withheld."
+                } catch { self.projectTypeCatalogStatus = error.localizedDescription }
+            }
+        } catch { projectTypeCatalogStatus = error.localizedDescription }
+    }
     func addProjectTypeCandidate(_ candidate: ProjectTypeCandidate) {
         guard projectServiceReady, candidate.validated != nil,
               let data = try? JSONEncoder().encode(candidate), data.count <= 40 * 1024 else {
@@ -3348,6 +3683,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     return
                 }
                 self.projectTypeCatalog = catalog
+                self.projectTypeCatalogGeneration &+= 1
+                self.reconstructionArtifact = nil
+                self.reconstructionContext = nil
                 self.projectTypeCatalogStatus = catalog.conflicts(for: candidate.target).contains(candidate.name)
                     ? "Conflicting declarations for \(candidate.name) are retained and withheld."
                     : "Added type evidence for \(candidate.name)."
@@ -3376,6 +3714,9 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                     return
                 }
                 self.projectTypeCatalog = catalog
+                self.projectTypeCatalogGeneration &+= 1
+                self.reconstructionArtifact = nil
+                self.reconstructionContext = nil
                 self.projectTypeCatalogStatus = catalog.conflicts(for: candidate.target).contains(candidate.name)
                     ? "Conflicting declarations for \(candidate.name) remain withheld."
                     : "Removed the selected declaration candidate for \(candidate.name)."
