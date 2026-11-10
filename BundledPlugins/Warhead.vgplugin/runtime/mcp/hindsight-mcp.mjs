@@ -110,6 +110,7 @@ async function handle(message) {
   const { id, method, params = {} } = message;
   if (method === 'notifications/initialized' || method === 'notifications/cancelled' || method === 'exit') return null;
   if (method === 'initialize') return { jsonrpc: '2.0', id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'hindsight', version: VERSION } } };
+  if (method === 'ping') return { jsonrpc: '2.0', id, result: {} };
   if (method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools: tools.map(({ run, ...tool }) => tool) } };
   if (method === 'tools/call') {
     const tool = tools.find(item => item.name === params.name);
