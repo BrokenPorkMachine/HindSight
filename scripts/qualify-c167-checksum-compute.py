@@ -86,15 +86,25 @@ def emulate_range(worker, path, data, prim, start, end):
     b0, b1 = prim['block_start'], prim['block_end'] - 1
     if end < b0 or start > b1:
         return emulate_once(worker, path, prim, start, end)
+    # Primitive processes 4 bytes (2 words) per iteration; split boundaries must
+    # be 4-byte aligned. Expand to cover the full param block with original bytes.
+    s0 = b0 & ~3
+    s1 = (b1 + 4) & ~3  # exclusive aligned end
+    if s0 < start: s0 = start
+    if s1 > end + 1: s1 = end + 1
+    # ensure ranges remain 4-byte aligned for emulation
+    if (s0 - start) % 4 != 0:
+        s0 = start + ((s0 - start) & ~3)
+    if (end + 1 - s1) % 4 != 0:
+        s1 = end + 1 - ((end + 1 - s1) % 4)
     total = 0; steps = 0
-    if start < b0:
-        r = emulate_once(worker, path, prim, start, b0 - 1)
+    if s0 > start:
+        r = emulate_once(worker, path, prim, start, s0 - 1)
         if not r.get('ok'): return r
         total = (total + r['sum']) & 0xffffffff; steps += r.get('steps', 0)
-    os_ = max(start, b0); oe_ = min(end, b1)
-    total = (total + static_sum(data, os_, oe_)) & 0xffffffff
-    if end > b1:
-        r = emulate_once(worker, path, prim, b1 + 1, end)
+    total = (total + static_sum(data, s0, s1 - 1)) & 0xffffffff
+    if s1 <= end:
+        r = emulate_once(worker, path, prim, s1, end)
         if not r.get('ok'): return r
         total = (total + r['sum']) & 0xffffffff; steps += r.get('steps', 0)
     return {'ok': True, 'sum': total, 'steps': steps, 'split': True}
