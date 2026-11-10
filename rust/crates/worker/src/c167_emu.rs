@@ -407,6 +407,118 @@ impl Machine {
                     _ => self.flags.zero = set,
                 }
             }
+            0xCC if raw[1] == 0x00 => {}
+            0xEB if raw[1] >= 0xF0 => {
+                let Some(return_pc) = self.pop16() else { return Some(Stop::StackFault); };
+                let value = self.registers[(raw[1] & 0x0f) as usize];
+                self.sp = u32::from(value.max(2));
+                self.pc = (self.pc & 0x00ff_0000) | u32::from(return_pc);
+                self.finish_step(override_was_active);
+                return None;
+            }
+            0x81 => {
+                let index = usize::from(raw[1] >> 4);
+                let value = self.registers[index];
+                let result = 0u16.wrapping_sub(value);
+                self.registers[index] = result;
+                self.flags = Flags { carry: value != 0, zero: result == 0, negative: result & 0x8000 != 0,
+                    overflow: value == 0x8000 };
+            }
+            0x91 => {
+                let index = usize::from(raw[1] >> 4);
+                let result = !self.registers[index];
+                self.registers[index] = result;
+                self.unary_word_flags(result);
+            }
+            0xA1 => {
+                let reg = raw[1] >> 4;
+                let value = self.byte_register(reg);
+                let result = 0u8.wrapping_sub(value);
+                self.set_byte_register(reg, result);
+                self.flags = Flags { carry: value != 0, zero: result == 0, negative: result & 0x80 != 0,
+                    overflow: value == 0x80 };
+            }
+            0xB1 => {
+                let reg = raw[1] >> 4;
+                let result = !self.byte_register(reg);
+                self.set_byte_register(reg, result);
+                self.unary_byte_flags(result);
+            }
+            0xC0 => {
+                let source = self.byte_register(raw[1] & 0x0f);
+                self.registers[usize::from(raw[1] >> 4)] = u16::from(source);
+            }
+            0xD0 => {
+                let source = self.byte_register(raw[1] & 0x0f);
+                self.registers[usize::from(raw[1] >> 4)] = source as i8 as i16 as u16;
+            }
+            // SCXT requires sign-extended byte propagation semantics not yet admitted here.
+            0x2B => {
+                let source = self.registers[usize::from(raw[1] & 0x0f)];
+                let value = if source == 0 { 0 } else { 15 - source.leading_zeros() as u16 };
+                self.registers[usize::from(raw[1] >> 4)] = value;
+                self.flags = Flags { carry: false, zero: source == 0, negative: false, overflow: false };
+            }
+            0x0A => {
+                // BFLDL reg, #mask, #data
+                let mask = u16::from(raw[2]);
+                let data = u16::from(raw[3]) & 0x00ff;
+                let current = if raw[1] >= 0xf0 { self.registers[usize::from(raw[1] & 0x0f)] }
+                    else { match self.read_word(0xfe00 + 2 * u16::from(raw[1])) { Some(v) => v, None => return Some(Stop::OutOfBounds(0xfe00 + 2 * u32::from(raw[1]))) } };
+                let result = (current & !mask) | (data & mask);
+                if raw[1] >= 0xf0 { self.registers[usize::from(raw[1] & 0x0f)] = result; }
+                else if self.write_word(0xfe00 + 2 * u16::from(raw[1]), result).is_none() { return Some(Stop::OutOfBounds(0xfe00 + 2 * u32::from(raw[1]))); }
+            }
+            0x1A => {
+                let mask = u16::from(raw[3]) << 8;
+                let data = u16::from(raw[2]) << 8;
+                let current = if raw[1] >= 0xf0 { self.registers[usize::from(raw[1] & 0x0f)] }
+                    else { match self.read_word(0xfe00 + 2 * u16::from(raw[1])) { Some(v) => v, None => return Some(Stop::OutOfBounds(0xfe00 + 2 * u32::from(raw[1]))) } };
+                let result = (current & !mask) | (data & mask);
+                if raw[1] >= 0xf0 { self.registers[usize::from(raw[1] & 0x0f)] = result; }
+                else if self.write_word(0xfe00 + 2 * u16::from(raw[1]), result).is_none() { return Some(Stop::OutOfBounds(0xfe00 + 2 * u32::from(raw[1]))); }
+            }
+            op if op & 0x0f == 0x0e => {
+                let bit = op >> 4;
+                if self.set_bit_value(raw[1], bit, false).is_none() {
+                    return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(raw[1]))));
+                }
+            }
+            op if op & 0x0f == 0x0f => {
+                let bit = op >> 4;
+                if self.set_bit_value(raw[1], bit, true).is_none() {
+                    return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(raw[1]))));
+                }
+            }
+            0x8A | 0x9A | 0xAA | 0xBA if raw.len() == 4 && raw[3] & 0x0f == 0 => {
+                let bit = raw[3] >> 4;
+                let Some(value) = self.test_bit(raw[1], bit) else {
+                    return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(raw[1]))));
+                };
+                let (jump, clear) = match op {
+                    0x8A => (value, false),
+                    0x9A => (!value, false),
+                    0xAA => (value, true),
+                    _ => (!value, true),
+                };
+                if clear && self.set_bit_value(raw[1], bit, false).is_none() {
+                    return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(raw[1]))));
+                }
+                if jump {
+                    let target = (i64::from(self.pc) + 4 + 2 * i64::from(raw[2] as i8)) as u32;
+                    self.pc = (self.pc & 0x00ff_0000) | (target & 0xffff);
+                } else {
+                    self.pc = next;
+                }
+                self.finish_step(override_was_active);
+                return None;
+            }
+            // Bounded modeled system-control sequences. Watchdog/service/init have no
+            // peripheral model here and are treated as no-ops; halt/reset remain explicit.
+            _ if matches!(text.as_str(), "diswdt" | "srvwdt" | "einit") => {}
+            _ if matches!(text.as_str(), "idle" | "pwrdn" | "srst") => {
+                return Some(Stop::Unsupported { pc: self.pc, text });
+            }
             // RETS/RETI require segment/interrupt state not admitted by this slice.
             _ => return Some(Stop::Unsupported { pc: self.pc, text }),
         }
@@ -783,6 +895,53 @@ impl Machine {
         if csp > 0xff { return None; }
         self.sp = self.sp.checked_add(4)?;
         Some((csp as u8, ip))
+    }
+
+    fn bit_word_logical(&self, q: u8) -> u16 {
+        if q >= 0xf0 {
+            return self.registers[usize::from(q & 0x0f)];
+        }
+        if q >= 0x80 {
+            0xff00 + 2 * u16::from(q - 0x80)
+        } else {
+            0xfd00 + 2 * u16::from(q)
+        }
+    }
+
+    fn read_bit_word(&mut self, q: u8) -> Option<u16> {
+        if q >= 0xf0 {
+            Some(self.registers[usize::from(q & 0x0f)])
+        } else {
+            self.read_word(self.bit_word_logical(q))
+        }
+    }
+
+    fn write_bit_word(&mut self, q: u8, value: u16) -> Option<()> {
+        if q >= 0xf0 {
+            self.registers[usize::from(q & 0x0f)] = value;
+            Some(())
+        } else {
+            self.write_word(self.bit_word_logical(q), value)
+        }
+    }
+
+    fn test_bit(&mut self, q: u8, bit: u8) -> Option<bool> {
+        self.read_bit_word(q).map(|word| (word >> bit) & 1 != 0)
+    }
+
+    fn set_bit_value(&mut self, q: u8, bit: u8, value: bool) -> Option<()> {
+        let word = self.read_bit_word(q)?;
+        let mask = 1u16 << bit;
+        let updated = if value { word | mask } else { word & !mask };
+        self.write_bit_word(q, updated)
+    }
+
+    fn unary_word_flags(&mut self, result: u16) {
+        self.flags = Flags { carry: false, zero: result == 0, negative: result & 0x8000 != 0, overflow: false };
+    }
+
+    fn unary_byte_flags(&mut self, result: u8) {
+        self.flags = Flags { carry: false, zero: result == 0, negative: result & 0x80 != 0, overflow: false };
     }
 }
 
@@ -1183,5 +1342,148 @@ mod tests {
         assert_eq!(machine.run(1), Stop::Budget);
         assert_eq!(machine.registers[1], 0xffff);
         assert!(!machine.flags.zero && !machine.flags.carry && !machine.flags.negative);
+    }
+
+    #[test]
+    fn nop_and_bounded_system_noops_advance_without_state_change() {
+        // nop; diswdt; srvwdt; einit
+        let image = [0xCC, 0x00, 0xA5, 0x5A, 0xA5, 0xA5, 0xA7, 0x58, 0xA7, 0xA7, 0xB5, 0x4A, 0xB5, 0xB5];
+        let mut machine = Machine::new(&image, 0, 0x40).unwrap();
+        let before = (machine.registers, machine.flags, machine.dpp, machine.cp, machine.sp, machine.mdh, machine.mdl);
+        assert_eq!(machine.run(4), Stop::Budget);
+        assert_eq!(machine.pc, 14);
+        assert_eq!((machine.registers, machine.flags, machine.dpp, machine.cp, machine.sp, machine.mdh, machine.mdl), before);
+    }
+
+    #[test]
+    fn halt_and_reset_system_controls_stop_as_explicit_unsupported() {
+        for (bytes, text) in [
+            (&[0x87u8, 0x78, 0x87, 0x87][..], "idle"),
+            (&[0x97, 0x68, 0x97, 0x97][..], "pwrdn"),
+            (&[0xB7, 0x48, 0xB7, 0xB7][..], "srst"),
+        ] {
+            let mut machine = Machine::new(bytes, 0, 0x20).unwrap();
+            assert_eq!(machine.step(), Some(Stop::Unsupported { pc: 0, text: text.into() }));
+            assert_eq!((machine.pc, machine.steps), (0, 0));
+        }
+    }
+
+    #[test]
+    fn bit_set_clear_and_bit_jumps_operate_on_gprs_and_psw() {
+        // bset r1.0; bclr r1.0
+        let image = [0x0F, 0xF1, 0x0E, 0xF1];
+        let mut machine = Machine::new(&image, 0, 0x20).unwrap();
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1], 0x0001);
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1], 0x0000);
+
+        // jb PSW.3 (Z), rel +2 -> skip next 2-byte instruction and land on the following one
+        let mut image = vec![0; 0x1010];
+        image[0x1000..0x1004].copy_from_slice(&[0x8A, 0x88, 0x02, 0x30]);
+        image[0x1004..0x1006].copy_from_slice(&[0x0F, 0xF1]); // skipped
+        image[0x1008..0x100A].copy_from_slice(&[0x1F, 0xF1]); // executed
+        let mut machine = Machine::new(&image, 0x1000, 0x40).unwrap();
+        machine.flags.zero = true;
+        assert_eq!(machine.run(2), Stop::Budget);
+        assert_eq!(machine.registers[1], 0x0002);
+
+        // jnb PSW.3 when clear falls through
+        let mut image = vec![0; 0x1010];
+        image[0x1000..0x1004].copy_from_slice(&[0x9A, 0x88, 0x02, 0x30]);
+        image[0x1004..0x1006].copy_from_slice(&[0x0F, 0xF1]);
+        image[0x1008..0x100A].copy_from_slice(&[0x1F, 0xF1]);
+        let mut machine = Machine::new(&image, 0x1000, 0x40).unwrap();
+        machine.flags.zero = true;
+        assert_eq!(machine.run(2), Stop::Budget);
+        assert_eq!(machine.registers[1], 0x0001);
+    }
+
+    #[test]
+    fn jbc_clears_tested_bit_when_taken() {
+        let mut image = vec![0; 0x20];
+        // jbc r2.1, rel 0x01 => target 0 + 4 + 2 = 6
+        image[0..4].copy_from_slice(&[0xAA, 0xF2, 0x01, 0x10]);
+        image[4..6].copy_from_slice(&[0x0F, 0xF1]); // skipped if taken
+        image[6..8].copy_from_slice(&[0x1F, 0xF1]);
+        let mut machine = Machine::new(&image, 0, 0x20).unwrap();
+        machine.registers[2] = 0x0002;
+        assert_eq!(machine.run(2), Stop::Budget);
+        assert_eq!(machine.registers[2], 0x0000);
+        assert_eq!(machine.registers[1], 0x0002);
+    }
+
+    #[test]
+    fn unary_extend_prior_retp_and_bfld_execute() {
+        // neg r1
+        let mut machine = Machine::new(&[0x81, 0x10], 0, 0x20).unwrap();
+        machine.registers[1] = 1;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1], 0xffff);
+        assert!(machine.flags.carry && machine.flags.negative && !machine.flags.zero && !machine.flags.overflow);
+
+        // cpl r2
+        let mut machine = Machine::new(&[0x91, 0x20], 0, 0x20).unwrap();
+        machine.registers[2] = 0x00ff;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[2], 0xff00);
+
+        // negb rh0 (0xA1,0x10)
+        let mut machine = Machine::new(&[0xA1, 0x10], 0, 0x20).unwrap();
+        machine.set_byte_register(1, 0x01);
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.byte_register(1), 0xff);
+
+        // cplb rl1 (0xB1,0x20)
+        let mut machine = Machine::new(&[0xB1, 0x20], 0, 0x20).unwrap();
+        machine.set_byte_register(2, 0x0f);
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.byte_register(2), 0xf0);
+
+        // movbz r2, rh0 (0xC0,0x21)
+        let mut machine = Machine::new(&[0xC0, 0x21], 0, 0x20).unwrap();
+        machine.set_byte_register(1, 0x80);
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[2], 0x0080);
+
+        // movbs r2, rh0 (0xD0,0x21)
+        let mut machine = Machine::new(&[0xD0, 0x21], 0, 0x20).unwrap();
+        machine.set_byte_register(1, 0x80);
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[2], 0xff80);
+
+        // prior r2,r1
+        let mut machine = Machine::new(&[0x2B, 0x21], 0, 0x20).unwrap();
+        machine.registers[1] = 0x0010;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[2], 4);
+
+        // scxt remains unsupported until sign-extend semantics are admitted.
+        let mut machine = Machine::new(&[0xC6, 0xF1, 0xFF, 0x00], 0, 0x20).unwrap();
+        machine.registers[1] = 0x0001;
+        assert_eq!(machine.step(), Some(Stop::Unsupported { pc: 0, text: "scxt r1, #0x00ff".into() }));
+        assert_eq!((machine.pc, machine.registers[1]), (0, 0x0001));
+
+        // bfldl r1,#0x0f,#0x05
+        let mut machine = Machine::new(&[0x0A, 0xF1, 0x0F, 0x05], 0, 0x20).unwrap();
+        machine.registers[1] = 0xfff0;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1], 0xfff5);
+
+        // bfldh r1,#0x05,#0x0f -> high-byte mask 0x0500, data 0x0f00
+        let mut machine = Machine::new(&[0x1A, 0xF1, 0x0F, 0x05], 0, 0x20).unwrap();
+        machine.registers[1] = 0xf0ff;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1], 0xf5ff);
+
+        // retp r4
+        let mut image = vec![0; 0x40];
+        image[0..2].copy_from_slice(&[0xBB, 0x01]); // callr to 4
+        image[4..8].copy_from_slice(&[0xE6, 0xF4, 0x30, 0x00]); // mov r4,#0x30
+        image[8..10].copy_from_slice(&[0xEB, 0xF4]); // retp r4
+        let mut machine = Machine::new(&image, 0, 0x20).unwrap();
+        assert_eq!(machine.run(3), Stop::Budget);
+        assert_eq!(machine.pc, 2);
+        assert_eq!(machine.sp, 0x30);
     }
 }
