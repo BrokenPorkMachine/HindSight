@@ -478,6 +478,47 @@ impl Machine {
                 if raw[1] >= 0xf0 { self.registers[usize::from(raw[1] & 0x0f)] = result; }
                 else if self.write_word(0xfe00 + 2 * u16::from(raw[1]), result).is_none() { return Some(Stop::OutOfBounds(0xfe00 + 2 * u32::from(raw[1]))); }
             }
+            0x2A | 0x3A | 0x4A | 0x5A | 0x6A | 0x7A => {
+                let src_q = raw[1];
+                let dst_q = raw[2];
+                let src_bit = raw[3] >> 4;
+                let dst_bit = raw[3] & 0x0f;
+                let Some(src) = self.test_bit(src_q, src_bit) else {
+                    return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(src_q))));
+                };
+                match op {
+                    0x2A => {
+                        let Some(dst) = self.test_bit(dst_q, dst_bit) else {
+                            return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(dst_q))));
+                        };
+                        self.flags.zero = src == dst;
+                    }
+                    0x3A => {
+                        if self.set_bit_value(dst_q, dst_bit, !src).is_none() {
+                            return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(dst_q))));
+                        }
+                    }
+                    0x4A => {
+                        if self.set_bit_value(dst_q, dst_bit, src).is_none() {
+                            return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(dst_q))));
+                        }
+                    }
+                    0x5A | 0x6A | 0x7A => {
+                        let Some(dst) = self.test_bit(dst_q, dst_bit) else {
+                            return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(dst_q))));
+                        };
+                        let value = match op {
+                            0x5A => dst | src,
+                            0x6A => dst & src,
+                            _ => dst ^ src,
+                        };
+                        if self.set_bit_value(dst_q, dst_bit, value).is_none() {
+                            return Some(Stop::OutOfBounds(u32::from(self.bit_word_logical(dst_q))));
+                        }
+                    }
+                    _ => {}
+                }
+            }
             op if op & 0x0f == 0x0e => {
                 let bit = op >> 4;
                 if self.set_bit_value(raw[1], bit, false).is_none() {
@@ -1485,5 +1526,58 @@ mod tests {
         assert_eq!(machine.run(3), Stop::Budget);
         assert_eq!(machine.pc, 2);
         assert_eq!(machine.sp, 0x30);
+    }
+
+    #[test]
+    fn bit_to_bit_operations_move_compare_and_combine() {
+        // bmov r1.0, r2.1  => dst q=0xF1 bit 0, src q=0xF2 bit 1, op 0x4A, b3=(1<<4)|0
+        let mut machine = Machine::new(&[0x4A, 0xF2, 0xF1, 0x10], 0, 0x20).unwrap();
+        machine.registers[2] = 0x0002;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1] & 1, 1);
+
+        // bmovn r1.0, r2.1 (src=1 -> dst 0)
+        let mut machine = Machine::new(&[0x3A, 0xF2, 0xF1, 0x10], 0, 0x20).unwrap();
+        machine.registers[1] = 1;
+        machine.registers[2] = 0x0002;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1] & 1, 0);
+
+        // band r1.0, r2.0 (1&0 -> 0)
+        let mut machine = Machine::new(&[0x6A, 0xF2, 0xF1, 0x00], 0, 0x20).unwrap();
+        machine.registers[1] = 1;
+        machine.registers[2] = 0;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1] & 1, 0);
+
+        // bor r1.0, r2.0 (0|1 -> 1)
+        let mut machine = Machine::new(&[0x5A, 0xF2, 0xF1, 0x00], 0, 0x20).unwrap();
+        machine.registers[1] = 0;
+        machine.registers[2] = 1;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1] & 1, 1);
+
+        // bxor r1.0, r2.0 (1^1 -> 0)
+        let mut machine = Machine::new(&[0x7A, 0xF2, 0xF1, 0x00], 0, 0x20).unwrap();
+        machine.registers[1] = 1;
+        machine.registers[2] = 1;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert_eq!(machine.registers[1] & 1, 0);
+
+        // bcmp r1.0, r2.0 equal -> Z set
+        let mut machine = Machine::new(&[0x2A, 0xF2, 0xF1, 0x00], 0, 0x20).unwrap();
+        machine.registers[1] = 1;
+        machine.registers[2] = 1;
+        machine.flags.zero = false;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert!(machine.flags.zero);
+
+        // bcmp not equal -> Z cleared
+        let mut machine = Machine::new(&[0x2A, 0xF2, 0xF1, 0x00], 0, 0x20).unwrap();
+        machine.registers[1] = 0;
+        machine.registers[2] = 1;
+        machine.flags.zero = true;
+        assert_eq!(machine.run(1), Stop::Budget);
+        assert!(!machine.flags.zero);
     }
 }
