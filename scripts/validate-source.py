@@ -980,6 +980,7 @@ env=dict(os.environ,PYTHONPATH=str(R/'python'),PYTHONDONTWRITEBYTECODE='1')
 test_python=env.get('HINDSIGHT_PYTHON',sys.executable)
 subprocess.run([test_python,'-m','pytest','python/tests/','-v','--ignore=python/tests/test_darwin_catalog.py'],env=env,check=True)
 print('PYTHON TESTS DONE')
+subprocess.run(['node', str(R/'scripts/test-hindsight-mcp-protocol.mjs')], cwd=R, check=True)
 # Portable Swift validation when a Swift compiler is available. Parsing catches syntax
 # drift across the complete Swift surface; the target-model contract is Foundation-only
 # and therefore runs on non-macOS CI as well.
