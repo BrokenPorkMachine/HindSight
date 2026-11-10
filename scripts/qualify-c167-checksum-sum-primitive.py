@@ -39,6 +39,31 @@ def run(worker, path, entry, start, end):
     r1 = obj["registers"]["r1"]; r2 = obj["registers"]["r2"]
     return {"ok": True, "sum": (r2 << 16) | r1, "steps": obj.get("steps"), "stop": stop}
 
+def run_range(worker, path, data, entry, start, end):
+    # Primitive uses fixed param block at 0xa9d0..0xa9df; summing over a range that
+    # overlaps it would read seeded params instead of image bytes. Preserve original
+    # image bytes for the overlap via static contribution and emulate the rest.
+    p0, p1 = 0xa9d0, 0xa9df
+    def static_sum(s, e):
+        return sum(struct.unpack_from("<H", data, a)[0] for a in range(s, e + 1, 2)) & 0xffffffff
+    if end < p0 or start > p1:
+        return run(worker, path, entry, start, end)
+    total = 0
+    steps = 0
+    if start < p0:
+        r = run(worker, path, entry, start, p0 - 1)
+        if not r.get("ok"): return r
+        total = (total + r["sum"]) & 0xffffffff
+        steps += r.get("steps", 0)
+    os = max(start, p0); oe = min(end, p1)
+    total = (total + static_sum(os, oe)) & 0xffffffff
+    if end > p1:
+        r = run(worker, path, entry, p1 + 1, end)
+        if not r.get("ok"): return r
+        total = (total + r["sum"]) & 0xffffffff
+        steps += r.get("steps", 0)
+    return {"ok": True, "sum": total, "steps": steps, "stop": "Breakpoint(split)", "split": True}
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -63,7 +88,7 @@ def main():
             if end < start or end >= len(data) or ((end-start+1) & 1): rec["skip"] += 1; continue
             expected = sum(struct.unpack_from("<H", data, a)[0] for a in range(start, end+1, 2)) & 0xffffffff
             if expected != stored: rec["skip"] += 1; continue
-            res = run(worker, path, off, start, end)
+            res = run_range(worker, path, data, off, start, end)
             if res.get("ok") and res["sum"] == expected:
                 rec["ok"] += 1
                 rec["entries"].append({"index": i, "start": start, "end": end, "sum": expected, "match": True, "steps": res["steps"]})
