@@ -45,9 +45,25 @@ subprocess.run(["node", "--check", str(mcp_server)], check=True, capture_output=
 for tool in ["hindsight_capabilities", "hindsight_project", "hindsight_analysis_submit",
              "hindsight_analysis_status", "hindsight_analysis_result", "hindsight_analysis_cancel"]:
     assert tool in mcp_source
+assert "HINDSIGHT_CERT_SHA256" in mcp_source and "checkServerIdentity" in mcp_source
+assert "HINDSIGHT_CA_PEM" in mcp_source
 for setup in [bundle / "setup/setup-warhead-mcp-macos.sh", bundle / "setup/setup-warhead-mcp-linux.sh"]:
     assert 'runtime/mcp/hindsight-mcp.mjs' in setup.read_text()
 assert 'runtime/mcp/hindsight-mcp.mjs' in (bundle / "setup/setup-warhead-mcp-windows.ps1").read_text()
+
+hindsight_client = bundle / "runtime/rea/hindsight-mcp-client.js"
+assert hindsight_client.is_file()
+hindsight_client_source = hindsight_client.read_text()
+assert "Library', 'Caches', 'HindSight', 'local-gateway.sock'" in hindsight_client_source
+assert '{"action":"ensure"}' in hindsight_client_source
+assert "HINDSIGHT_CA_PEM" in hindsight_client_source and "HINDSIGHT_CERT_SHA256" in hindsight_client_source
+assert "HINDSIGHT_URL" in hindsight_client_source and "HINDSIGHT_TOKEN" in hindsight_client_source
+assert "certificateSHA256" in hindsight_client_source and "BEGIN CERTIFICATE" in hindsight_client_source
+repl_source = (bundle / "runtime/cli/repl.js").read_text()
+assert "HindsightMcpClient" in repl_source and "HindSight MCP" in repl_source
+assert "hindsightMcp?.close" in repl_source
+extension_source = (bundle / "runtime/cli/extension.js").read_text()
+assert "hindsight-mcp-client.js" in extension_source or "hindsightStatus" in extension_source or "HindSight" in extension_source
 
 runtime = bundle / "runtime"
 javascript = sorted(runtime.rglob("*.js"))
