@@ -21,7 +21,9 @@ const requests = [
   { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'test', version: '1' } } },
   { jsonrpc: '2.0', method: 'notifications/initialized' },
   { jsonrpc: '2.0', id: 2, method: 'ping', params: {} },
-  { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} },
+  { jsonrpc: '2.0', id: 3, method: 'resources/list', params: {} },
+  { jsonrpc: '2.0', id: 4, method: 'prompts/list', params: {} },
+  { jsonrpc: '2.0', id: 5, method: 'tools/list', params: {} },
 ];
 
 for (const request of requests) child.stdin.write(`${JSON.stringify(request)}\n`);
@@ -52,7 +54,9 @@ child.on('close', code => {
   }
   const init = messages.find(message => message.id === 1);
   const ping = messages.find(message => message.id === 2);
-  const list = messages.find(message => message.id === 3);
+  const resources = messages.find(message => message.id === 3);
+  const prompts = messages.find(message => message.id === 4);
+  const list = messages.find(message => message.id === 5);
   const names = (list?.result?.tools ?? []).map(tool => tool.name).sort();
   const expected = [
     'hindsight_analysis_cancel',
@@ -73,6 +77,14 @@ child.on('close', code => {
   }
   if (!ping || typeof ping.result !== 'object' || ping.result === null || Array.isArray(ping.result) || Object.keys(ping.result).length !== 0) {
     console.error('Missing or invalid ping response');
+    process.exit(1);
+  }
+  if (!Array.isArray(resources?.result?.resources) || resources.result.resources.length !== 0) {
+    console.error('Missing or invalid resources/list response');
+    process.exit(1);
+  }
+  if (!Array.isArray(prompts?.result?.prompts) || prompts.result.prompts.length !== 0) {
+    console.error('Missing or invalid prompts/list response');
     process.exit(1);
   }
   if (JSON.stringify(names) !== JSON.stringify(expected)) {

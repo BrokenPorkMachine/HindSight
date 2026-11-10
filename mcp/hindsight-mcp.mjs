@@ -112,6 +112,8 @@ async function handle(message) {
   if (method === 'initialize') return { jsonrpc: '2.0', id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'hindsight', version: VERSION } } };
   if (method === 'ping') return { jsonrpc: '2.0', id, result: {} };
   if (method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools: tools.map(({ run, ...tool }) => tool) } };
+  if (method === 'resources/list') return { jsonrpc: '2.0', id, result: { resources: [] } };
+  if (method === 'prompts/list') return { jsonrpc: '2.0', id, result: { prompts: [] } };
   if (method === 'tools/call') {
     const tool = tools.find(item => item.name === params.name);
     if (!tool) return { jsonrpc: '2.0', id, result: toolResult({ error: `Unknown tool: ${params.name}` }, true) };
