@@ -181,7 +181,7 @@ impl Machine {
                     return Some(Stop::OutOfBounds(self.physical(address)));
                 }
             }
-            op if op & 0x0f == 6 && op >> 4 <= 7 && raw[1] >= 0xF0 => {
+            op if op & 0x0f == 6 && op >> 4 <= 7 => {
                 let source = u16::from_le_bytes([raw[2], raw[3]]);
                 self.alu_word(op >> 4, (raw[1] & 0x0f) as usize, source);
             }
@@ -389,12 +389,12 @@ impl Machine {
                 self.finish_step(override_was_active);
                 return None;
             }
-            0xEC if raw[1] >= 0xF0 => {
+            0xEC => {
                 if self.push16(self.registers[(raw[1] & 0x0f) as usize]).is_err() {
                     return Some(Stop::StackFault);
                 }
             }
-            0xFC if raw[1] >= 0xF0 => {
+            0xFC => {
                 let Some(value) = self.pop16() else { return Some(Stop::StackFault); };
                 self.registers[(raw[1] & 0x0f) as usize] = value;
             }
@@ -408,7 +408,7 @@ impl Machine {
                 }
             }
             0xCC if raw[1] == 0x00 => {}
-            0xEB if raw[1] >= 0xF0 => {
+            0xEB => {
                 let Some(return_pc) = self.pop16() else { return Some(Stop::StackFault); };
                 let value = self.registers[(raw[1] & 0x0f) as usize];
                 self.sp = u32::from(value.max(2));
