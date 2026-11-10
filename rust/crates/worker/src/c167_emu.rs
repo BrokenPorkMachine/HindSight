@@ -159,27 +159,25 @@ impl Machine {
                 else if raw[1] == 9 && value >= 2 { self.sp = u32::from(value); }
                 else { return Some(Stop::Unsupported { pc: self.pc, text }); }
             }
-            0xF2 if raw[1] >= 0xF0 => {
+            0xF2 => {
                 let address = u16::from_le_bytes([raw[2], raw[3]]);
                 let Some(value) = self.read_word(address) else { return Some(Stop::OutOfBounds(self.physical(address))); };
-                self.registers[(raw[1] & 0x0f) as usize] = value;
+                if self.write_reg_word(raw[1], value).is_none() { return Some(Stop::OutOfBounds(self.physical(address))); }
             }
-            0xF3 if raw[1] >= 0xF0 => {
+            0xF3 => {
                 let address = u16::from_le_bytes([raw[2], raw[3]]);
                 let Some(value) = self.read_byte(address) else { return Some(Stop::OutOfBounds(self.physical(address))); };
-                self.set_byte_register(raw[1] & 0x0f, value);
+                if self.write_reg_byte(raw[1], value).is_none() { return Some(Stop::OutOfBounds(self.physical(address))); }
             }
-            0xF6 if raw[1] >= 0xF0 => {
+            0xF6 => {
                 let address = u16::from_le_bytes([raw[2], raw[3]]);
-                if self.write_word(address, self.registers[(raw[1] & 0x0f) as usize]).is_none() {
-                    return Some(Stop::OutOfBounds(self.physical(address)));
-                }
+                let Some(value) = self.read_reg_word(raw[1]) else { return Some(Stop::OutOfBounds(self.physical(address))); };
+                if self.write_word(address, value).is_none() { return Some(Stop::OutOfBounds(self.physical(address))); }
             }
-            0xF7 if raw[1] >= 0xF0 => {
+            0xF7 => {
                 let address = u16::from_le_bytes([raw[2], raw[3]]);
-                if self.write_byte(address, self.byte_register(raw[1] & 0x0f)).is_none() {
-                    return Some(Stop::OutOfBounds(self.physical(address)));
-                }
+                let Some(value) = self.read_reg_byte(raw[1]) else { return Some(Stop::OutOfBounds(self.physical(address))); };
+                if self.write_byte(address, value).is_none() { return Some(Stop::OutOfBounds(self.physical(address))); }
             }
             op if op & 0x0f == 6 && op >> 4 <= 7 => {
                 let source = u16::from_le_bytes([raw[2], raw[3]]);
@@ -697,6 +695,8 @@ impl Machine {
             0xfe10 => Some(self.cp),
             0xfe12 => u16::try_from(self.sp).ok(),
             0xff10 => Some(self.psw()),
+            0xff1c => Some(0x0000), // ZEROS
+            0xff1e => Some(0xffff), // ONES
             _ => None,
         }
     }
@@ -710,6 +710,7 @@ impl Machine {
             0xfe10 => self.set_cp(value),
             0xfe12 if value >= 2 => self.sp = u32::from(value),
             0xff10 => self.set_psw(value),
+            0xff1c | 0xff1e => {} // read-only constant registers in this bounded model
             _ => return false,
         }
         true
@@ -963,6 +964,34 @@ impl Machine {
             Some(())
         } else {
             self.write_word(self.bit_word_logical(q), value)
+        }
+    }
+
+    fn read_reg_word(&mut self, reg: u8) -> Option<u16> {
+        if reg >= 0xf0 { Some(self.registers[usize::from(reg & 0x0f)]) }
+        else { self.read_word(0xfe00 + 2 * u16::from(reg)) }
+    }
+
+    fn write_reg_word(&mut self, reg: u8, value: u16) -> Option<()> {
+        if reg >= 0xf0 { self.registers[usize::from(reg & 0x0f)] = value; Some(()) }
+        else { self.write_word(0xfe00 + 2 * u16::from(reg), value) }
+    }
+
+    fn read_reg_byte(&mut self, reg: u8) -> Option<u8> {
+        if reg >= 0xf0 { Some(self.byte_register(reg)) }
+        else {
+            let word = self.read_word(0xfe00 + 2 * u16::from(reg))?;
+            Some(if reg & 1 == 0 { word as u8 } else { (word >> 8) as u8 })
+        }
+    }
+
+    fn write_reg_byte(&mut self, reg: u8, value: u8) -> Option<()> {
+        if reg >= 0xf0 { self.set_byte_register(reg, value); Some(()) }
+        else {
+            let addr = 0xfe00 + 2 * u16::from(reg);
+            let current = self.read_word(addr)?;
+            let updated = if reg & 1 == 0 { (current & 0xff00) | u16::from(value) } else { (current & 0x00ff) | (u16::from(value) << 8) };
+            self.write_word(addr, updated)
         }
     }
 
