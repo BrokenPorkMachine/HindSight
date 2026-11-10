@@ -151,13 +151,15 @@ impl Machine {
             }
             0xE6 => {
                 let value = u16::from_le_bytes([raw[2], raw[3]]);
-                if raw[1] >= 0xF0 { self.registers[(raw[1] & 0x0f) as usize] = value; }
-                else if raw[1] < 4 { self.dpp[raw[1] as usize] = value & 0x03ff; }
-                else if raw[1] == 6 { self.mdh = value; }
-                else if raw[1] == 7 { self.mdl = value; }
-                else if raw[1] == 8 { self.set_cp(value); }
-                else if raw[1] == 9 && value >= 2 { self.sp = u32::from(value); }
-                else { return Some(Stop::Unsupported { pc: self.pc, text }); }
+                if self.write_reg_word(raw[1], value).is_none() {
+                    return Some(Stop::OutOfBounds(self.physical(0xfe00 + 2 * u16::from(raw[1]))));
+                }
+            }
+            0xE7 => {
+                let value = raw[2];
+                if self.write_reg_byte(raw[1], value).is_none() {
+                    return Some(Stop::OutOfBounds(self.physical(0xfe00 + 2 * u16::from(raw[1]))));
+                }
             }
             0xF2 => {
                 let address = u16::from_le_bytes([raw[2], raw[3]]);
@@ -323,13 +325,61 @@ impl Machine {
                 };
                 self.alu_byte(op >> 4, destination, source);
             }
-            0xD7 if raw[1] >> 6 == 1 && raw[1] & 0x0f == 0 => {
-                self.override_page = Some((u16::from(raw[3] & 3) << 8) | u16::from(raw[2]));
+            0xD1 => {
+                let sub = raw[1] >> 6;
+                if raw[1] & 0x0f != 0 || (sub != 0 && sub != 2) {
+                    return Some(Stop::Unsupported { pc: self.pc, text: text.to_string() });
+                }
+                // ATOMIC/EXTR: accept as bounded instruction-count window.
+                // Address-space effects (ESFR/interruptibility) are not modeled.
                 self.override_instructions = ((raw[1] >> 4) & 3) + 1;
+                self.override_page = None;
             }
-            0xDC if raw[1] >> 6 == 1 => {
-                self.override_page = Some(self.registers[(raw[1] & 0x0f) as usize] & 0x03ff);
-                self.override_instructions = ((raw[1] >> 4) & 3) + 1;
+            0xD7 if raw[1] & 0x0f == 0 => {
+                let sub = raw[1] >> 6;
+                let n = ((raw[1] >> 4) & 3) + 1;
+                match sub {
+                    1 => {
+                        if raw[3] & 0xFC != 0 {
+                            return Some(Stop::Unsupported { pc: self.pc, text: text.to_string() });
+                        }
+                        self.override_page = Some((u16::from(raw[3] & 3) << 8) | u16::from(raw[2]));
+                        self.override_instructions = n;
+                    }
+                    3 => {
+                        if raw[3] & 0xFC != 0 {
+                            return Some(Stop::Unsupported { pc: self.pc, text: text.to_string() });
+                        }
+                        // EXTPR: segment/page override not modeled; accept window.
+                        self.override_page = None;
+                        self.override_instructions = n;
+                    }
+                    0 | 2 => {
+                        if raw[3] != 0 {
+                            return Some(Stop::Unsupported { pc: self.pc, text: text.to_string() });
+                        }
+                        // EXTS/EXTSR: segment override not modeled; accept window.
+                        self.override_page = None;
+                        self.override_instructions = n;
+                    }
+                    _ => return Some(Stop::Unsupported { pc: self.pc, text: text.to_string() }),
+                }
+            }
+            0xDC => {
+                let sub = raw[1] >> 6;
+                let n = ((raw[1] >> 4) & 3) + 1;
+                match sub {
+                    1 => {
+                        self.override_page = Some(self.registers[(raw[1] & 0x0f) as usize] & 0x03ff);
+                        self.override_instructions = n;
+                    }
+                    0 | 2 | 3 => {
+                        // EXTS/EXTSR/EXTPR register forms: window accepted, segment/page remap not modeled.
+                        self.override_page = None;
+                        self.override_instructions = n;
+                    }
+                    _ => return Some(Stop::Unsupported { pc: self.pc, text: text.to_string() }),
+                }
             }
             op if op & 0x0f == 0x0d => {
                 if self.condition(op >> 4) {
