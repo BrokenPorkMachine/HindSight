@@ -32,10 +32,11 @@ import { activeProvider, addProvider, applyConfiguredProvider, describeProvider,
 import { Registry } from '../tools/registry.js';
 import { createTodoStore, render as renderTodos } from '../tools/todo.js';
 import { runTurn, toHistory, describeStop, callSignature } from '../agent/loop.js';
-import { Gate } from '../perm/gate.js';
+import { Gate, describeApprovalMode } from '../perm/gate.js';
 import { conversationChars, approxTokens } from '../context/compact.js';
 import { Transcript, transcriptBytes, evictTranscripts, clearTranscripts, humanBytes } from '../context/transcript.js';
 import { ReaMcpClient } from '../rea/mcp-client.js';
+import { HindsightMcpClient } from '../rea/hindsight-mcp-client.js';
 import { RemoteMcpHost } from '../mcp/remote.js';
 import { closeNativeRuntime } from '../model/native-runtime.js';
 function actionableError(message) {
@@ -81,7 +82,7 @@ async function askApproval(askLine, req) {
     }
     out(`${YELLOW}╰${'─'.repeat(Math.max(1, width - 1))}╯${RESET}`);
     for (;;) {
-        const raw = await askLine(`  ${BOLD}[y]es / [n]o / [a]lways / [o]nce: ${RESET}`);
+        const raw = await askLine(`  ${BOLD}[y]es / [n]o / [a]llow this session / [o]nce: ${RESET}`);
         if (raw === null)
             return 'input_closed';
         const a = raw.trim().toLowerCase();
@@ -295,6 +296,25 @@ async function main() {
             `${RESET}\n`);
     }
     const registry = new Registry();
+    let hindsightMcp = null;
+    if (process.platform === 'darwin' || process.env['WARHEAD_HINDSIGHT_MCP_SERVER']) {
+        try {
+            hindsightMcp = await HindsightMcpClient.start();
+            if (hindsightMcp) {
+                const hindsightTools = await hindsightMcp.tools();
+                for (const tool of hindsightTools)
+                    registry.register(tool);
+                out(`${DIM}HindSight MCP: ${hindsightTools.length} tool(s) available${RESET}`);
+            }
+            else
+                out(`${DIM}HindSight MCP: unavailable (local HindSight gateway not detected)${RESET}`);
+        }
+        catch (err) {
+            await hindsightMcp?.close().catch(() => { });
+            hindsightMcp = null;
+            out(`${DIM}HindSight MCP: unavailable (${err instanceof Error ? err.message : String(err)})${RESET}`);
+        }
+    }
     let reaClient = null;
     try {
         reaClient = await ReaMcpClient.start();
@@ -359,6 +379,7 @@ async function main() {
     let activeRl = null;
     const shutdownAll = async () => {
         await mcpHost?.close();
+        await hindsightMcp?.close();
         await reaClient?.close();
         await shutdownVllm();
         await closeNativeRuntime();
@@ -1054,6 +1075,7 @@ async function main() {
         if (raw === null) {
             transcript.close();
             await mcpHost?.close();
+            await hindsightMcp?.close();
             await reaClient?.close();
             await shutdownVllm();
             await closeNativeRuntime();
@@ -1085,6 +1107,7 @@ async function main() {
                 case 'quit':
                     transcript.close();
                     await mcpHost?.close();
+                    await hindsightMcp?.close();
                     await reaClient?.close();
                     await shutdownVllm();
                     await closeNativeRuntime();
@@ -1370,6 +1393,11 @@ async function main() {
                 case 'status':
                     out(`model: ${BOLD}${model ?? '(none — unavailable)'}${RESET} · provider: ${describeProvider(activeProvider())}`);
                     out(teamSummary(cfg));
+                    {
+                        const session = gate.sessionState();
+                        const grants = session.allow.length + session.commandCount;
+                        out(`permissions: ${BOLD}${cfg.permissions.approvalMode}${RESET} (${describeApprovalMode(cfg.permissions.approvalMode)}) · bash ${cfg.permissions.bash} · session grants ${grants} · session denials ${session.deny.length}`);
+                    }
                     if (recovery.enabled)
                         out(`recovery: ${recovery.file}`);
                     out(`history: ${history.length} messages · context: ~${approxTokens(lastContextChars)} tokens · transcripts: ${cfg.transcripts.enabled ? 'on' : 'off'}`);
@@ -1855,7 +1883,18 @@ async function main() {
                 }
                 case 'permissions': {
                     const sub = rest[0];
-                    if (sub === 'bash') {
+                    if (sub === 'mode') {
+                        const mode = rest[1];
+                        if (mode === 'strict' || mode === 'balanced' || mode === 'relaxed') {
+                            cfg.permissions.approvalMode = mode;
+                            saveConfig(cfg);
+                            out(`${GREEN}approval mode ->${RESET} ${mode}`);
+                        }
+                        else {
+                            out('usage: /permissions mode strict|balanced|relaxed');
+                        }
+                    }
+                    else if (sub === 'bash') {
                         const level = rest[1];
                         if (level === 'ask' || level === 'allow' || level === 'allowlist') {
                             cfg.permissions.bash = level;
@@ -1884,6 +1923,7 @@ async function main() {
                         }
                     }
                     else {
+                        out(`${BOLD}mode${RESET}        ${cfg.permissions.approvalMode} ${DIM}(${describeApprovalMode(cfg.permissions.approvalMode)})${RESET}`);
                         out(`${BOLD}bash${RESET}        ${cfg.permissions.bash}`);
                         out(`${BOLD}alwaysAllow${RESET} ${cfg.permissions.alwaysAllow.join(', ')}`);
                         const perTool = Object.entries(cfg.permissions.tools);
@@ -1895,9 +1935,11 @@ async function main() {
                         const s = gate.sessionState();
                         if (s.allow.length > 0)
                             out(`${BOLD}session allow${RESET} ${s.allow.join(', ')}`);
+                        if (s.commandCount > 0)
+                            out(`${BOLD}session bash${RESET}  ${s.commandCount} command grant(s)`);
                         if (s.deny.length > 0)
                             out(`${BOLD}session deny${RESET}  ${s.deny.join(', ')}`);
-                        out(`${DIM}/permissions bash ask|allow|allowlist · allow|deny <tool> · reset${RESET}`);
+                        out(`${DIM}/permissions mode strict|balanced|relaxed · bash ask|allow|allowlist · allow|deny <tool> · reset${RESET}`);
                     }
                     break;
                 }

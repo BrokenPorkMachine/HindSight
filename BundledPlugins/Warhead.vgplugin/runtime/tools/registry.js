@@ -140,7 +140,11 @@ export class Registry {
         // 1️⃣ Read‑only cache lookup (only for tools that are NOT mutating)
         // -------------------------------------------------------------
         // Filesystem observations must not be reused across workspaces or external edits.
-        const isReadOnly = !tool.mutates && !['hindsight_context', 'fast_search', 'grep', 'glob', 'read_file'].includes(name);
+        // The process-wide cache is safe only for Warhead-owned built-ins with
+        // known result semantics. Custom registry tools can be scoped to a
+        // workspace/task or observe external state, so their name and arguments
+        // alone are not a sufficient cache key.
+        const isReadOnly = ENABLED.includes(tool) && !tool.mutates && !['hindsight_context', 'fast_search', 'grep', 'glob', 'read_file'].includes(name);
         if (isReadOnly) {
             const cached = toolCache.get(name, args);
             if (cached) {

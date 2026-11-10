@@ -521,6 +521,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
     @Published private(set) var remoteEnrollmentToken = ""
     @Published private(set) var remoteToken = ""
     @Published private(set) var remoteStatus = "Off"
+    private var activeGatewayBindAddress: String?
     private lazy var remoteUsers: RemoteUserRegistry = {
         // The Application Support directory is the private per-user location
         // for the identity store. The temporary directory is only a fallback
@@ -656,9 +657,25 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
             if value.hasPrefix("Gateway failed:") {
                 self.remoteToken = ""
                 self.remoteEnrollmentToken = ""
+                self.activeGatewayBindAddress = nil
             }
         }
     }, userRegistry: remoteUsers)
+    private lazy var localGatewayControl = LocalGatewayControl { [weak self] request, reply in
+        Task { @MainActor in
+            guard let self else { reply(Self.localControlError("HindSight is shutting down.")); return }
+            guard let object = try? JSONSerialization.jsonObject(with: request) as? [String: Any],
+                  object["action"] as? String == "ensure" else {
+                reply(Self.localControlError("Unsupported local gateway request.")); return
+            }
+            do {
+                let session = try self.ensureLocalGatewaySession()
+                reply((try? JSONSerialization.data(withJSONObject: session)) ?? Self.localControlError("Could not encode gateway response."))
+            } catch {
+                reply(Self.localControlError(error.localizedDescription))
+            }
+        }
+    }
     func startRemoteGateway() {
         guard remoteUsers.persistenceError == nil else {
             remoteStatus = "Remote access registry unavailable: \(remoteUsers.persistenceError ?? "storage error")"
@@ -683,9 +700,11 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 return
             }
             remoteToken = token
+            activeGatewayBindAddress = remoteBindAddress
             remoteStatus = "Starting…"
         } catch {
             remoteToken = ""
+            activeGatewayBindAddress = nil
             remoteStatus = error.localizedDescription
         }
     }
@@ -705,8 +724,44 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
         remoteUsers.flush()
         remoteGateway.stop()
         remoteToken = ""
+        activeGatewayBindAddress = nil
         remoteEnrollmentToken = ""
         remoteTransactions.stop()
+    }
+
+    private static func localControlError(_ message: String) -> Data {
+        (try? JSONSerialization.data(withJSONObject: ["error": message])) ?? Data("{\"error\":\"gateway unavailable\"}".utf8)
+    }
+
+    private func ensureLocalGatewaySession() throws -> [String: String] {
+        guard project != nil, connected, projectSessionReady else {
+            throw NSError(domain: "HindSightLocalGateway", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Open a project and wait for its session to be ready in HindSight."])
+        }
+        if !remoteToken.isEmpty {
+            guard activeGatewayBindAddress == "127.0.0.1" else {
+                throw NSError(domain: "HindSightLocalGateway", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "The gateway is already configured for a non-local network. Stop it before connecting Warhead."])
+            }
+        } else {
+            let savedAddress = remoteBindAddress
+            let savedOrigin = remoteAllowedOrigin
+            remoteBindAddress = "127.0.0.1"
+            remoteAllowedOrigin = ""
+            startRemoteGateway()
+            remoteBindAddress = savedAddress
+            remoteAllowedOrigin = savedOrigin
+        }
+        guard !remoteToken.isEmpty, let port = UInt16(remotePort), port > 0 else {
+            throw NSError(domain: "HindSightLocalGateway", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not start the local HTTPS gateway: \(remoteStatus)"])
+        }
+        guard let trust = remoteGateway.localTrustMaterial() else {
+            throw NSError(domain: "HindSightLocalGateway", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback gateway certificate is not ready."])
+        }
+        return ["url": "https://127.0.0.1:\(port)/v1", "token": remoteToken,
+                "ca": trust.certificatePEM, "certificateSHA256": trust.sha256]
     }
     private func handleRemoteRequest(_ request: RemoteRequest, reply: @escaping (RemoteResponse) -> Void) {
         remoteTransactions.handle(request, project: project, ready: projectSessionReady, reply: reply)
@@ -1150,6 +1205,7 @@ result = {"address": vg.selection.get("address"), "capabilities": sorted(vg.capa
                 ? "Coordinator disconnected. Reconnect to continue."
                 : "Coordinator disconnected. Reconnect to restore the open project session."
         }
+        try? localGatewayControl.start()
     }
     private static func readSavedLaunchSession() -> LaunchSession? {
         let defaults = UserDefaults.standard

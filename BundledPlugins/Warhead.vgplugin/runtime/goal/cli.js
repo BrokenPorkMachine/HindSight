@@ -224,7 +224,7 @@ class Approvals {
         log(`${C.yellow}${C.bold}approval required${C.reset} ${request.summary}`);
         for (const line of request.detail.split('\n').slice(0, 24))
             log(`${C.dim}  ${short(line, 180)}${C.reset}`);
-        const answer = await this.ask('  [y]es / [n]o / [a]lways / [o]nce: ');
+        const answer = await this.ask('  [y]es / [n]o / [a]llow this session / [o]nce: ');
         const choice = (answer ?? '').trim().toLowerCase();
         if (choice === 'y' || choice === 'yes' || choice === 'o' || choice === 'once')
             return true;

@@ -55,6 +55,7 @@ ${BOLD}  mcp${RESET}
 ${BOLD}  permissions${RESET}
   /goal <text>          set a persistent goal the model works toward
   /permissions            show permission policy
+  /permissions mode …     set default asking: strict | balanced | relaxed
   /permissions bash …     set bash policy to ask | allow | allowlist
   /permissions allow|deny <tool>
   /permissions reset      clear session-scoped grants

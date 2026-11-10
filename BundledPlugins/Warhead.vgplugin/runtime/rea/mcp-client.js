@@ -1,4 +1,5 @@
-/** Warhead-owned connection to an explicitly installed REA MCP server. */
+/** Warhead-owned connection to an installed REA MCP server. REA is launched as
+ * a child of the CLI and is stopped with the CLI. */
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 function asObject(value) {

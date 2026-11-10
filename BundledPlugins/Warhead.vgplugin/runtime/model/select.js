@@ -45,41 +45,12 @@ async function discoverModel(cfg, deps) {
     })));
     const choices = new Map();
     const results = [];
-    // A machine with downloaded Ollama GGUF weights must work even if the
-    // daemon is stopped. Probe native references independently of HTTP hosts.
-    const local = listLocalOllamaModels();
-    if (local.length) {
-        const scan = await scanForToolCapable(local);
-        for (const result of [...scan.capable, ...scan.rejected]) {
-            const label = `${result.model} @ native (offline)`;
-            results.push({ ...result, model: label });
-            deps.report?.({ ...result, model: label });
-            if (result.status === 'ok')
-                choices.set(label, { model: result.model });
-        }
-    }
-    // Loose native weights (Warhead's pull store, Hugging Face cache) are a
-    // second tier: probing every multi-GB checkpoint is slow, so only reach for
-    // them when the Ollama store produced no tool-capable model at all.
-    if (!choices.size) {
-        const native = listLocalNativeModels();
-        if (native.length) {
-            const scan = await scanForToolCapable(native);
-            for (const result of [...scan.capable, ...scan.rejected]) {
-                const label = `${result.model} @ native (offline)`;
-                results.push({ ...result, model: label });
-                deps.report?.({ ...result, model: label });
-                if (result.status === 'ok')
-                    choices.set(label, { model: result.model });
-            }
-        }
-    }
     try {
         for (const { provider, models } of listings) {
             setActiveProvider(provider);
             // listInstalled also includes the same local manifest references: do not
             // probe them once for every configured network provider.
-            const scan = await scanForToolCapable(models.map(m => m.name).filter(name => !name.startsWith('ollama:')));
+            const scan = await scanForToolCapable(models.map(m => m.name).filter(name => !name.startsWith('ollama:') && !name.startsWith('gguf:') && !name.startsWith('mlx:')));
             for (const result of [...scan.capable, ...scan.rejected]) {
                 const label = `${result.model} @ ${provider.name} (${provider.host})`;
                 const displayed = { ...result, model: label };
@@ -92,6 +63,34 @@ async function discoverModel(cfg, deps) {
     }
     finally {
         applyConfiguredProvider(cfg);
+    }
+    // Local runtimes are the offline fallback. Avoid initializing large local
+    // checkpoints when a configured Ollama endpoint already offers a usable model.
+    if (!choices.size) {
+        const local = listLocalOllamaModels();
+        if (local.length) {
+            const scan = await scanForToolCapable(local);
+            for (const result of [...scan.capable, ...scan.rejected]) {
+                const label = `${result.model} @ native (offline)`;
+                results.push({ ...result, model: label });
+                deps.report?.({ ...result, model: label });
+                if (result.status === 'ok')
+                    choices.set(label, { model: result.model });
+            }
+        }
+        if (!choices.size) {
+            const native = listLocalNativeModels();
+            if (native.length) {
+                const scan = await scanForToolCapable(native);
+                for (const result of [...scan.capable, ...scan.rejected]) {
+                    const label = `${result.model} @ native (offline)`;
+                    results.push({ ...result, model: label });
+                    deps.report?.({ ...result, model: label });
+                    if (result.status === 'ok')
+                        choices.set(label, { model: result.model });
+                }
+            }
+        }
     }
     const capable = results.filter(r => r.status === 'ok');
     if (!capable.length)

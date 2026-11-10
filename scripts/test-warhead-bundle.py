@@ -24,15 +24,30 @@ assert {"selection.read", "analysis.read", "settings.read", "state.read", "state
 
 main_source = (bundle / manifest["entry"]).read_text()
 compile(main_source, str(bundle / manifest["entry"]), "exec")
-assert 'studio.context.get("rea_evidence", [])' in main_source
-assert "supported_node" in main_source
+assert '"snapshot": {"selection": studio.selection, "analysis": studio.analysis}' in main_source
+assert "supported_node" not in main_source
 host_source = (root / "PlatformServices/CoordinatorService/ScriptingHost.swift").read_text()
 project_source = (root / "scripts/generate-project.py").read_text()
 assert 'resources.appendingPathComponent("BundledPlugins"' in host_source
 assert "bundled_plugins_build" in project_source
 extension_source = (bundle / "runtime/cli/extension.js").read_text()
-assert "new Registry([])" in extension_source
-assert "BEGIN_HINDSIGHT_EVIDENCE" in extension_source
+assert "hindsight_context" in extension_source
+assert "new Registry([snapshot, todo])" in extension_source
+assert "BEGIN_HINDSIGHT_EVIDENCE" not in extension_source
+
+# The packaged setup helpers must resolve the MCP server within the bundle,
+# rather than relying on a source-checkout-only path.
+mcp_server = bundle / "runtime/mcp/hindsight-mcp.mjs"
+assert mcp_server.is_file()
+mcp_source = mcp_server.read_text()
+assert mcp_source == (root / "mcp/hindsight-mcp.mjs").read_text(), "bundled MCP server drifted from source"
+subprocess.run(["node", "--check", str(mcp_server)], check=True, capture_output=True, text=True)
+for tool in ["hindsight_capabilities", "hindsight_project", "hindsight_analysis_submit",
+             "hindsight_analysis_status", "hindsight_analysis_result", "hindsight_analysis_cancel"]:
+    assert tool in mcp_source
+for setup in [bundle / "setup/setup-warhead-mcp-macos.sh", bundle / "setup/setup-warhead-mcp-linux.sh"]:
+    assert 'runtime/mcp/hindsight-mcp.mjs' in setup.read_text()
+assert 'runtime/mcp/hindsight-mcp.mjs' in (bundle / "setup/setup-warhead-mcp-windows.ps1").read_text()
 
 runtime = bundle / "runtime"
 javascript = sorted(runtime.rglob("*.js"))

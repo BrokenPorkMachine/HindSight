@@ -5,7 +5,7 @@ const EXTRAS = [
     { match: /\b(?:bulk edit|multiple edits|multi.edit|edit multiple files|rename across files|refactor|mass change)\b/i,
         names: ['multi_edit'] },
     { match: /\b(?:reverse\.?engineer|binary analy|disassembl|decompil|debug|trace|exploitat|vuln|poc|shellcode|rop|heap|stack|overflow|format string|hindsight|firmware|patch|crack|unpack)\b/i,
-        names: ['hindsight_context'] },
+        names: ['hindsight_context', 'hindsight_capabilities', 'hindsight_project', 'hindsight_analysis_submit', 'hindsight_analysis_status', 'hindsight_analysis_result', 'hindsight_analysis_cancel'] },
     { match: /\b(?:compress|archive|zip|shrink|pack|unpack)\b/i,
         names: ['compress_file'] },
     { match: /\b(?:fast\.?search|codebase search|semantic search|find symbol|find definition|find usage|call graph|xref|cross reference)\b/i,

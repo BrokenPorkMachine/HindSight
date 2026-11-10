@@ -17,6 +17,14 @@
  *    the session that granted it. Persisting requires an explicit
  *    `/permissions` edit, which is itself a deliberate act.
  */
+/** A concise, stable explanation for interactive status surfaces. */
+export function describeApprovalMode(mode) {
+    switch (mode) {
+        case 'strict': return 'ask unless explicitly allowed';
+        case 'balanced': return 'allow workspace edits; ask for external actions';
+        case 'relaxed': return 'allow unless explicitly denied';
+    }
+}
 /** Shell metacharacters that chain or detach independent commands. A command
  *  containing any of these is split, and EVERY segment must independently
  *  satisfy the allowlist. Without this, `git status; rm -rf ~` would pass a
@@ -228,19 +236,22 @@ export class Gate {
             return 'allow';
         if (policy === 'ask')
             return 'ask';
-        // Mutating tools default to asking. Anything not explicitly allowlisted is
-        // treated as needing consent.
-        // Be more permissive for common engineering tools in general execution flows
-        if (tool.mutates) {
-            // Allow common read-modify tools more freely unless explicitly denied
-            const name = tool.def.name;
-            if (name === 'edit' || name === 'multi_edit' || name === 'write')
-                return 'ask';
-            if (name === 'bash')
-                return 'ask';
-            return 'ask';
-        }
-        return 'allow';
+        return this.defaultVerdict(name, tool.mutates, cfg.permissions.approvalMode);
+    }
+    /**
+     * Baseline policy for tools without a durable exception. `balanced` is
+     * intentionally limited to the file-edit primitives: their workspace and
+     * symlink checks remain enforced by Registry.dispatch. It never broadens
+     * shell, MCP, REA, or other external-capability authority.
+     */
+    defaultVerdict(name, mutates, mode) {
+        if (mode === 'relaxed')
+            return 'allow';
+        if (!mutates)
+            return mode === 'strict' ? 'ask' : 'allow';
+        if (mode === 'balanced' && isWorkspaceEdit(name))
+            return 'allow';
+        return 'ask';
     }
     evaluateBash(cmd, policy, allowlist) {
         if (policy === 'allow')
@@ -284,8 +295,13 @@ export class Gate {
         this.sessionDenied.clear();
     }
     sessionState() {
-        return { allow: [...this.sessionTools], deny: [...this.sessionDenied] };
+        // Shell arguments can contain sensitive paths or values, so show a count
+        // rather than re-rendering them in an ordinary status screen.
+        return { allow: [...this.sessionTools], commandCount: this.sessionCommands.size, deny: [...this.sessionDenied] };
     }
+}
+function isWorkspaceEdit(name) {
+    return name === 'write' || name === 'create' || name === 'edit' || name === 'str_replace' || name === 'multi_edit';
 }
 function sessionScopeFor(toolName, args) {
     // The generic REA dispatcher represents hundreds of distinct operations.

@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path';
 import { DEFAULT_GOAL_BUDGETS } from './types.js';
 const SCHEMA_VERSION = 4;
 const MIGRATIONS = [
-    `
+    (db) => db.exec(`
   CREATE TABLE goals (
     id TEXT PRIMARY KEY,
     workspace TEXT NOT NULL,
@@ -178,8 +178,8 @@ const MIGRATIONS = [
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
-  `,
-    `
+  `),
+    (db) => db.exec(`
   CREATE TABLE goal_leases (
     goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
     token TEXT NOT NULL,
@@ -190,16 +190,32 @@ const MIGRATIONS = [
     renewed_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL
   );
-  `,
-    `
-  CREATE TABLE workspace_claims (
+  `),
+    (db) => {
+        // These fields were introduced at schema v3.  Keep the v1 table definition
+        // historical: otherwise a fresh ledger creates them here and immediately
+        // attempts to add them again in this migration. Some early ledger snapshots
+        // already contain a subset despite their recorded schema version, so inspect
+        // the table rather than treating SQLite's duplicate-column error as success.
+        const existing = new Set(db.prepare('PRAGMA table_info(evidence)').all().map(column => column.name));
+        for (const [column, sql] of [
+            ['artifact_sha256', 'ALTER TABLE evidence ADD COLUMN artifact_sha256 TEXT;'],
+            ['workspace_revision', 'ALTER TABLE evidence ADD COLUMN workspace_revision TEXT;'],
+            ['provenance', "ALTER TABLE evidence ADD COLUMN provenance TEXT NOT NULL DEFAULT '{}';"],
+        ]) {
+            if (existing.has(column))
+                continue;
+            db.exec(sql);
+        }
+        db.exec(`
+  CREATE TABLE IF NOT EXISTS workspace_claims (
     workspace_key TEXT PRIMARY KEY,
     goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
     token TEXT NOT NULL,
     acquired_at_ms INTEGER NOT NULL
   );
-  CREATE UNIQUE INDEX workspace_claims_goal ON workspace_claims(goal_id);
-  CREATE TABLE task_assignments (
+  CREATE UNIQUE INDEX IF NOT EXISTS workspace_claims_goal ON workspace_claims(goal_id);
+  CREATE TABLE IF NOT EXISTS task_assignments (
     goal_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     assignee TEXT NOT NULL,
@@ -210,8 +226,9 @@ const MIGRATIONS = [
     PRIMARY KEY (goal_id, task_id),
     FOREIGN KEY (goal_id, task_id) REFERENCES tasks(goal_id, id) ON DELETE CASCADE
   );
-  `,
-    `
+  `);
+    },
+    (db) => db.exec(`
   CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     goal_id TEXT,
@@ -392,7 +409,7 @@ const MIGRATIONS = [
   );
   CREATE INDEX IF NOT EXISTS dream_feed_scope ON dream_feed(scope_id);
   CREATE INDEX IF NOT EXISTS dream_feed_cursor ON dream_feed(scope_id, delivery_cursor);
-  `,
+  `),
 ];
 function now() {
     return new Date().toISOString();
@@ -477,11 +494,11 @@ export class GoalLedger {
             throw new Error(`goal ledger schema ${current} is newer than this Warhead build (${SCHEMA_VERSION})`);
         }
         for (let version = current; version < SCHEMA_VERSION; version++) {
-            const statement = MIGRATIONS[version];
-            if (!statement)
+            const migration = MIGRATIONS[version];
+            if (!migration)
                 throw new Error(`missing goal ledger migration ${version + 1}`);
             this.transaction(() => {
-                this.db.exec(statement);
+                migration(this.db);
                 this.db.exec(`PRAGMA user_version = ${version + 1}`);
             });
         }
@@ -852,10 +869,10 @@ export class GoalLedger {
             id: id('ev'), createdAt: input.createdAt ?? now(),
         };
         this.db.prepare(`INSERT INTO evidence
-      (id, goal_id, task_id, attempt_id, kind, label, detail, exit_code, log_path, created_at,
-       artifact_sha256, workspace_revision, provenance)
+      (id, goal_id, task_id, attempt_id, kind, label, detail, exit_code, log_path,
+       artifact_sha256, workspace_revision, provenance, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-            .run(evidence.id, evidence.goalId, evidence.taskId, evidence.attemptId, evidence.kind, evidence.label, evidence.detail, evidence.exitCode, evidence.logPath, evidence.createdAt, evidence.artifactSha256, evidence.workspaceRevision, JSON.stringify(evidence.provenance));
+            .run(evidence.id, evidence.goalId, evidence.taskId, evidence.attemptId, evidence.kind, evidence.label, evidence.detail, evidence.exitCode, evidence.logPath, evidence.artifactSha256, evidence.workspaceRevision, JSON.stringify(evidence.provenance), evidence.createdAt);
         this.appendEvent(evidence.goalId, evidence.taskId, evidence.attemptId, 'evidence.added', {
             evidenceId: evidence.id, kind: evidence.kind, label: evidence.label, exitCode: evidence.exitCode,
         });
@@ -865,12 +882,12 @@ export class GoalLedger {
         const limit = options.limit ?? 200;
         if (options.all) {
             return (options.taskId
-                ? this.db.prepare('SELECT * FROM evidence WHERE goal_id = ? AND task_id = ? ORDER BY created_at DESC').all(goalId, options.taskId)
-                : this.db.prepare('SELECT * FROM evidence WHERE goal_id = ? ORDER BY created_at DESC').all(goalId)).map(rowToEvidence);
+                ? this.db.prepare('SELECT id, goal_id, task_id, attempt_id, kind, label, detail, exit_code, log_path, artifact_sha256, workspace_revision, provenance, created_at FROM evidence WHERE goal_id = ? AND task_id = ? ORDER BY created_at DESC').all(goalId, options.taskId)
+                : this.db.prepare('SELECT id, goal_id, task_id, attempt_id, kind, label, detail, exit_code, log_path, artifact_sha256, workspace_revision, provenance, created_at FROM evidence WHERE goal_id = ? ORDER BY created_at DESC').all(goalId)).map(rowToEvidence);
         }
         return (options.taskId
-            ? this.db.prepare('SELECT * FROM evidence WHERE goal_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT ?').all(goalId, options.taskId, limit)
-            : this.db.prepare('SELECT * FROM evidence WHERE goal_id = ? ORDER BY created_at DESC LIMIT ?').all(goalId, limit)).map(rowToEvidence);
+            ? this.db.prepare('SELECT id, goal_id, task_id, attempt_id, kind, label, detail, exit_code, log_path, artifact_sha256, workspace_revision, provenance, created_at FROM evidence WHERE goal_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT ?').all(goalId, options.taskId, limit)
+            : this.db.prepare('SELECT id, goal_id, task_id, attempt_id, kind, label, detail, exit_code, log_path, artifact_sha256, workspace_revision, provenance, created_at FROM evidence WHERE goal_id = ? ORDER BY created_at DESC LIMIT ?').all(goalId, limit)).map(rowToEvidence);
     }
     countEvidence(goalId, kind) {
         const row = kind

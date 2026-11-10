@@ -20,7 +20,10 @@ export const DEFAULT_CONFIG = {
         known: {},
     },
     permissions: {
-        bash: 'ask',
+        // Common inspection/test commands should not interrupt an engineering turn.
+        // Anything outside this list remains an explicit decision.
+        bash: 'allowlist',
+        approvalMode: 'balanced',
         // Allowlist prefixes match any further arguments, so each entry should be a
         // command whose argument space is harmless. `cat` was removed: with no
         // restriction it also permits `cat ~/.ssh/id_rsa`. Use `head`/`tail`, which
@@ -31,13 +34,9 @@ export const DEFAULT_CONFIG = {
             'npm test', 'npm run', 'pytest', 'cargo test', 'go test',
         ],
         alwaysAllow: ['read_file', 'glob', 'grep', 'todo'],
-        tools: {
-            // Mutating tools default to `ask`; set explicitly so the policy is
-            // visible in the config file rather than implied by tool metadata.
-            write: 'ask',
-            edit: 'ask',
-            multi_edit: 'ask',
-        },
+        // Deliberately empty: approvalMode is the visible default. Add a tool here
+        // when it needs a durable exception (for example, { "bash": "deny" }).
+        tools: {},
     },
     transcripts: {
         enabled: true,
@@ -203,6 +202,7 @@ function validateConfigInput(raw) {
         check('limits', field, v => integer(v) && (!field.endsWith('Ms') || v <= 2_147_483_647), 'a positive integer within the supported range');
     }
     check('permissions', 'bash', v => ['ask', 'allow', 'allowlist'].includes(v), 'ask, allow, or allowlist');
+    check('permissions', 'approvalMode', v => ['strict', 'balanced', 'relaxed'].includes(v), 'strict, balanced, or relaxed');
     for (const field of ['bashAllowlist', 'alwaysAllow'])
         check('permissions', field, strings, 'an array of nonempty strings');
     const records = [

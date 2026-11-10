@@ -1,6 +1,88 @@
 import Foundation
 import Network
 import Security
+import CryptoKit
+
+/// Same-user control channel used by the Warhead CLI to request a loopback
+/// gateway session. The socket lives in a private per-user cache directory;
+/// only the `ensure` operation is accepted and the token is never persisted.
+final class LocalGatewayControl {
+    private let queue = DispatchQueue(label: "ca.zensoftware.hindsight.local-control")
+    private let handle: (Data, @escaping (Data) -> Void) -> Void
+    private var listener: NWListener?
+    private var socketURL: URL?
+
+    init(handle: @escaping (Data, @escaping (Data) -> Void) -> Void) { self.handle = handle }
+
+    func start() throws {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let directory = caches.appendingPathComponent("HindSight", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let directoryAttributes = try FileManager.default.attributesOfItem(atPath: directory.path)
+        guard (directoryAttributes[.type] as? FileAttributeType) == .typeDirectory,
+              (directoryAttributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else {
+            throw GatewayError.invalidConfiguration
+        }
+        _ = chmod(directory.path, mode_t(0o700))
+        let socket = directory.appendingPathComponent("local-gateway.sock")
+        guard socket.path.utf8.count < 100 else { throw GatewayError.invalidConfiguration }
+        if FileManager.default.fileExists(atPath: socket.path) {
+            let attrs = try FileManager.default.attributesOfItem(atPath: socket.path)
+            guard (attrs[.type] as? FileAttributeType) == .typeSocket,
+                  (attrs[.ownerAccountID] as? NSNumber)?.uint32Value == getuid() else {
+                throw GatewayError.invalidConfiguration
+            }
+            try FileManager.default.removeItem(at: socket)
+        }
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .unix(path: socket.path)
+        let newListener = try NWListener(using: parameters)
+        socketURL = socket
+        listener = newListener
+        newListener.stateUpdateHandler = { [weak self, weak newListener] state in
+            guard let self, let newListener, self.listener === newListener else { return }
+            if case .ready = state { _ = chmod(socket.path, mode_t(0o600)) }
+            if case .failed = state { self.stop() }
+        }
+        newListener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+        newListener.start(queue: queue)
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        if let socketURL { try? FileManager.default.removeItem(at: socketURL) }
+        socketURL = nil
+    }
+
+    private func accept(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { [weak self] state in
+            if case .ready = state { self?.receive(connection, accumulated: Data()) }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func receive(_ connection: NWConnection, accumulated: Data) {
+        guard accumulated.count <= 4096 else { connection.cancel(); return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, complete, error in
+            guard let self, error == nil else { connection.cancel(); return }
+            var buffer = accumulated
+            if let data { buffer.append(data) }
+            if let newline = buffer.firstIndex(of: 0x0A) {
+                let request = Data(buffer[..<newline])
+                self.handle(request, { response in
+                    connection.send(content: response + Data([0x0A]), completion: .contentProcessed { _ in connection.cancel() })
+                })
+            } else if complete {
+                connection.cancel()
+            } else {
+                self.receive(connection, accumulated: buffer)
+            }
+        }
+    }
+}
 
 struct RemoteRequest {
     let method: String
@@ -66,6 +148,8 @@ final class RemoteGateway {
     private var boundAddress = "127.0.0.1"
     private var allowedOrigin = ""
     private var corsConnections: Set<UUID> = []
+    private var localCertificatePEM: String?
+    private var localCertificateSHA256: String?
     private let handle: (RemoteRequest, @escaping (RemoteResponse) -> Void) -> Void
     private let status: (String) -> Void
     private let userRegistry: RemoteUserRegistry
@@ -115,6 +199,14 @@ final class RemoteGateway {
             throw GatewayError.invalidConfiguration
         }
         guard let secIdentity = sec_identity_create(identity) else { throw GatewayError.invalidConfiguration }
+        var certificate: SecCertificate?
+        guard SecIdentityCopyCertificate(identity, &certificate) == errSecSuccess, let certificate else {
+            throw GatewayError.invalidConfiguration
+        }
+        let certificateDER = SecCertificateCopyData(certificate) as Data
+        let encodedCertificate = certificateDER.base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed])
+        let pem = "-----BEGIN CERTIFICATE-----\n\(encodedCertificate)\n-----END CERTIFICATE-----\n"
+        let fingerprint = SHA256.hash(data: certificateDER).map { String(format: "%02x", $0) }.joined()
         let tls = NWProtocolTLS.Options()
         sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
         sec_protocol_options_set_local_identity(tls.securityProtocolOptions, secIdentity)
@@ -131,6 +223,8 @@ final class RemoteGateway {
             self.allowedOrigin = allowedOrigin
             corsConnections.removeAll()
             listener = newListener
+            localCertificatePEM = pem
+            localCertificateSHA256 = fingerprint
             newListener.stateUpdateHandler = { [weak self] state in
                 guard let self, self.listener === newListener else { return }
                 switch state {
@@ -156,6 +250,13 @@ final class RemoteGateway {
         queue.sync { stopOnQueue(status: "Off") }
     }
 
+    func localTrustMaterial() -> (certificatePEM: String, sha256: String)? {
+        queue.sync {
+            guard boundAddress == "127.0.0.1", let localCertificatePEM, let localCertificateSHA256 else { return nil }
+            return (localCertificatePEM, localCertificateSHA256)
+        }
+    }
+
     private func stopOnQueue(status value: String) {
         listener?.cancel()
         listener = nil
@@ -163,6 +264,8 @@ final class RemoteGateway {
         connections.values.forEach { $0.cancel() }
         connections.removeAll()
         boundPort = 0
+        localCertificatePEM = nil
+        localCertificateSHA256 = nil
         allowedOrigin = ""
         corsConnections.removeAll()
         status(value)
