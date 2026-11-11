@@ -2019,16 +2019,41 @@ fn natural_loop(
             && target_index(number(&trees[index], "target")) == Some(header)
     }).collect::<Vec<_>>();
     let find_backedge_before_exit = |exit: usize, target_header: usize, want_kind: &str| -> Option<usize> {
-        if exit == 0 { return None; }
-        let mut idx = exit - 1;
-        let mut skipped = 0usize;
-        while trees.get(idx).is_some_and(|t| t.kind == "no-op") {
-            if idx == 0 || skipped >= 4 { return None; }
-            idx -= 1;
-            skipped += 1;
+        if exit == 0 || exit <= target_header + 1 { return None; }
+        // Prefer a backedge immediately before exit (skipping bounded untargeted no-ops),
+        // but also accept an earlier backedge when all instructions between it and exit
+        // are untargeted no-ops (unconditional backedge) or the gap is valid for a
+        // conditional backedge fallthrough to exit.
+        let trailing_untargeted_noop = |noop_index: usize| -> bool {
+            trees.get(noop_index).is_some_and(|t| t.kind == "no-op")
+                && !trees.iter().enumerate().any(|(i, tree)| {
+                    matches!(tree.kind, "goto" | "conditional-goto")
+                        && target_index(number(tree, "target")) == Some(noop_index)
+                })
+        };
+        for idx in (target_header + 1..exit).rev() {
+            let Some(tree) = trees.get(idx) else { continue; };
+            if tree.kind != want_kind || target_index(number(tree, "target")) != Some(target_header) {
+                continue;
+            }
+            if want_kind == "goto" {
+                // Unconditional backedge: instructions between tail and exit must be
+                // untargeted no-ops only (dead padding before exit), bounded.
+                if exit > idx + 1 + 4 { continue; }
+                if (idx + 1..exit).all(trailing_untargeted_noop) {
+                    return Some(idx);
+                }
+            } else {
+                // Conditional backedge: fallthrough reaches exit, so gap must be
+                // empty or bounded untargeted no-ops immediately before exit.
+                if exit == idx + 1 { return Some(idx); }
+                if exit > idx + 1 + 4 { continue; }
+                if (idx + 1..exit).all(trailing_untargeted_noop) {
+                    return Some(idx);
+                }
+            }
         }
-        if idx >= exit { return None; }
-        trees.get(idx).filter(|tree| tree.kind == want_kind && target_index(number(tree, "target")) == Some(target_header)).map(|_| idx)
+        None
     };
     let (tail, unconditional_backedge) = if conditional_backedges.len() == 1 && unconditional_backedges.is_empty() {
         (conditional_backedges[0], false)
