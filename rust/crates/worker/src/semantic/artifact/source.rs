@@ -2856,15 +2856,20 @@ pub(super) fn recover_with_types(
                         return Err("resolved indirect dispatch has no recoverable in-function continuation".into());
                     }
                     // Bounded join: if every in-function dispatch target reaches the same
-                    // continuation through a chain of unconditional gotos, treat as a single
-                    // continuation without forking. Chains are followed only while targets
-                    // remain unconditional gotos within the function and no cycle/ambiguity
-                    // is introduced.
+                    // continuation through a chain of unconditional gotos (skipping no-ops),
+                    // treat as a single continuation without forking. Chains are followed only
+                    // while targets remain unconditional gotos/no-ops within the function and
+                    // no cycle/ambiguity is introduced.
                     let follow_goto_chain = |mut idx: usize| -> Option<usize> {
                         let mut steps = 0usize;
                         loop {
-                            if steps > 8 { return None; }
+                            if steps > 12 { return None; }
                             let tgt_tree = trees.get(idx)?;
+                            if tgt_tree.kind == "no-op" {
+                                idx = idx.checked_add(1)?;
+                                steps += 1;
+                                continue;
+                            }
                             if tgt_tree.kind != "goto" { return Some(idx); }
                             let tgt = number(tgt_tree, "target");
                             let delta = tgt.checked_sub(start)?;
