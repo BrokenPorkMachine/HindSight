@@ -1468,38 +1468,62 @@ struct ZeroTest {
 }
 
 fn zero_test(t: &Tree) -> Option<ZeroTest> {
-    if t.kind != "binary" || !matches!(attribute(t, "operator"), "==" | "!=") || t.children.len() != 2 {
-        return None;
-    }
-    let (lhs, rhs) = if t.children[0].kind == "constant" {
-        (&t.children[1], &t.children[0])
-    } else {
-        (&t.children[0], &t.children[1])
-    };
-    if rhs.kind != "constant" || number(rhs, "hex") != 0 {
-        return None;
-    }
-    let zero_means_true = attribute(t, "operator") == "==";
-    if lhs.kind == "register" {
-        let (register, _) = register(lhs).ok()?;
-        return Some(ZeroTest { register, zero_means_true, mask: None });
-    }
-    // Bit test form: ((reg & mask_const) == 0) / != 0 (e.g. TBZ/TBNZ).
-    if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
-        let (reg_tree, mask_tree) = if lhs.children[0].kind == "register" {
-            (&lhs.children[0], &lhs.children[1])
-        } else if lhs.children[1].kind == "register" {
-            (&lhs.children[1], &lhs.children[0])
+    // Binary zero/bit-test form: (reg == 0), (reg != 0), ((reg & mask) ==/!= 0).
+    if t.kind == "binary" && matches!(attribute(t, "operator"), "==" | "!=") && t.children.len() == 2 {
+        let (lhs, rhs) = if t.children[0].kind == "constant" {
+            (&t.children[1], &t.children[0])
         } else {
-            return None;
+            (&t.children[0], &t.children[1])
         };
-        if mask_tree.kind != "constant" { return None; }
-        let mask = number(mask_tree, "hex");
-        if mask == 0 { return None; }
-        let (register, _) = register(reg_tree).ok()?;
-        return Some(ZeroTest { register, zero_means_true, mask: Some(mask) });
+        if rhs.kind == "constant" && number(rhs, "hex") == 0 {
+            let zero_means_true = attribute(t, "operator") == "==";
+            if lhs.kind == "register" {
+                let (register, _) = register(lhs).ok()?;
+                return Some(ZeroTest { register, zero_means_true, mask: None });
+            }
+            // Bit test form: ((reg & mask_const) == 0) / != 0 (e.g. TBZ/TBNZ).
+            if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
+                let (reg_tree, mask_tree) = if lhs.children[0].kind == "register" {
+                    (&lhs.children[0], &lhs.children[1])
+                } else if lhs.children[1].kind == "register" {
+                    (&lhs.children[1], &lhs.children[0])
+                } else {
+                    return None;
+                };
+                if mask_tree.kind == "constant" {
+                    let mask = number(mask_tree, "hex");
+                    if mask != 0 {
+                        let (register, _) = register(reg_tree).ok()?;
+                        return Some(ZeroTest { register, zero_means_true, mask: Some(mask) });
+                    }
+                }
+            }
+        }
     }
     None
+}
+
+/// Recognize a flag-condition eq/ne branch produced by `CMP reg, #0` immediately
+/// before `branch_index` as an equivalent zero-test. This is a bounded form for
+/// common loops that test a register against zero via flags.
+fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize, trees: &[Tree]) -> Option<(ZeroTest, usize)> {
+    if condition.kind != "flag-condition" { return None; }
+    let predicate = attribute(condition, "predicate");
+    let zero_means_true = match predicate {
+        "eq" => true,
+        "ne" => false,
+        _ => return None,
+    };
+    if branch_index == 0 || branch_index <= header { return None; }
+    let cmp_index = branch_index - 1;
+    let cmp_tree = trees.get(cmp_index)?;
+    if cmp_tree.kind != "flags-compare" || attribute(cmp_tree, "operator") != "cmp" || cmp_tree.children.len() != 2 {
+        return None;
+    }
+    let rhs = &cmp_tree.children[1];
+    if rhs.kind != "constant" || number(rhs, "hex") != 0 { return None; }
+    let (register, _) = register(&cmp_tree.children[0]).ok()?;
+    Some((ZeroTest { register, zero_means_true, mask: None }, cmp_index))
 }
 
 struct LoopVariable {
@@ -1559,8 +1583,13 @@ fn natural_loop_backedge(
     if tail < header { return Ok(None); }
     let exit = tail + 1;
     if exit > trees.len() { return Ok(None); }
-    // Require the backedge test to be a zero/nonzero test on a register.
-    let Some(test) = zero_test(&tail_tree.children[0]) else {
+    // Require the backedge test to be a zero/nonzero test on a register,
+    // or an equivalent flag-condition from CMP reg,#0 immediately before tail.
+    let (test, loop_cmp_index) = if let Some(test) = zero_test(&tail_tree.children[0]) {
+        (test, None)
+    } else if let Some((test, cmp_index)) = zero_test_from_flag_cmp(&tail_tree.children[0], tail, header, trees) {
+        (test, Some(cmp_index))
+    } else {
         return Ok(None);
     };
     let test_register = test.register;
@@ -1581,8 +1610,12 @@ fn natural_loop_backedge(
         return Ok(None);
     }
     let mut written = BTreeSet::new();
-    for tree in &trees[header..tail] {
+    for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
         if tree.kind == "no-op" { continue; }
+        if loop_cmp_index == Some(index) {
+            // Bounded loop-test compare (flags-compare CMP reg,#0) is allowed.
+            continue;
+        }
         if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
         if tree.kind == "memory-store" { continue; }
         let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
@@ -1590,7 +1623,14 @@ fn natural_loop_backedge(
         if register == 29 || register == 30 || register >= 31 { return Ok(None); }
         written.insert(register);
     }
-    if !written.contains(&test_register) { return Ok(None); }
+    // For flag-cmp-based zero tests, the compared register must be a loop-carried value
+    // (written in body) so the condition can vary; otherwise the loop is not recoverable
+    // as a bounded natural loop in this model.
+    if loop_cmp_index.is_some() {
+        if !written.contains(&test_register) { return Ok(None); }
+    } else if !written.contains(&test_register) {
+        return Ok(None);
+    }
 
     let mut state = header_entry.clone();
     let mut variables = Vec::new();
@@ -1651,6 +1691,14 @@ fn natural_loop_backedge(
             return Err("loop instruction has an unsupported number of memory reads".into());
         }
         loads.extend(body_loads);
+        if loop_cmp_index == Some(index) {
+            // Bounded loop-test compare: sets flags for the backedge condition and
+            // does not produce a loop-carried assignment or memory store.
+            if state.external_stores.len() != before_stores {
+                return Err("loop test compare unexpectedly produced a memory store".into());
+            }
+            continue;
+        }
         match register {
             Some(register) => {
                 if state.external_stores.len() != before_stores {
