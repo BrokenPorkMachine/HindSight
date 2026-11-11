@@ -1459,17 +1459,72 @@ fn frame_objects(state: &State) -> BTreeMap<(i64, u64), u64> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ZeroTest {
+enum LoopCmp {
+    Eq,
+    Ne,
+    /// Signed comparisons (CMP semantics).
+    Slt,
+    Sle,
+    Sgt,
+    Sge,
+    /// Unsigned comparisons (CMP semantics).
+    Ult,
+    Ule,
+    Ugt,
+    Uge,
+}
+
+impl LoopCmp {
+    fn complement(self) -> Self {
+        match self {
+            LoopCmp::Eq => LoopCmp::Ne,
+            LoopCmp::Ne => LoopCmp::Eq,
+            LoopCmp::Slt => LoopCmp::Sge,
+            LoopCmp::Sle => LoopCmp::Sgt,
+            LoopCmp::Sgt => LoopCmp::Sle,
+            LoopCmp::Sge => LoopCmp::Slt,
+            LoopCmp::Ult => LoopCmp::Uge,
+            LoopCmp::Ule => LoopCmp::Ugt,
+            LoopCmp::Ugt => LoopCmp::Ule,
+            LoopCmp::Uge => LoopCmp::Ult,
+        }
+    }
+}
+
+fn loop_condition_template(cmp: LoopCmp, compare_value: u64, mask: Option<u64>) -> Option<String> {
+    if let Some(mask) = mask {
+        // Masked comparisons are only supported for equality/inequality.
+        return Some(match cmp {
+            LoopCmp::Eq => format!("((($0) & UINT64_C({mask:#x})) == UINT64_C({compare_value}))"),
+            LoopCmp::Ne => format!("((($0) & UINT64_C({mask:#x})) != UINT64_C({compare_value}))"),
+            _ => return None,
+        });
+    }
+    Some(match cmp {
+        LoopCmp::Eq => format!("(($0) == UINT64_C({compare_value}))"),
+        LoopCmp::Ne => format!("(($0) != UINT64_C({compare_value}))"),
+        LoopCmp::Slt => format!("(((int64_t)($0)) < (int64_t)UINT64_C({compare_value}))"),
+        LoopCmp::Sle => format!("(((int64_t)($0)) <= (int64_t)UINT64_C({compare_value}))"),
+        LoopCmp::Sgt => format!("(((int64_t)($0)) > (int64_t)UINT64_C({compare_value}))"),
+        LoopCmp::Sge => format!("(((int64_t)($0)) >= (int64_t)UINT64_C({compare_value}))"),
+        LoopCmp::Ult => format!("(($0) < UINT64_C({compare_value}))"),
+        LoopCmp::Ule => format!("(($0) <= UINT64_C({compare_value}))"),
+        LoopCmp::Ugt => format!("(($0) > UINT64_C({compare_value}))"),
+        LoopCmp::Uge => format!("(($0) >= UINT64_C({compare_value}))"),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoopTest {
     register: usize,
-    /// true if the condition is satisfied when the comparison is equal.
-    equals: bool,
-    /// Compared constant value (0 for zero/bit tests).
+    cmp: LoopCmp,
+    /// Compared constant value (used for direct comparisons; for masked equality it is the RHS).
     compare_value: u64,
-    /// If Some(mask), the test is ((value & mask) ==/!= compare_value).
+    /// If Some(mask), comparison is on (value & mask) and only Eq/Ne are valid.
     mask: Option<u64>,
 }
 
-fn zero_test(t: &Tree) -> Option<ZeroTest> {
+fn zero_test(t: &Tree) -> Option<LoopTest> {
     // Binary comparison form: (reg == K), (reg != K), ((reg & mask) ==/!= K).
     if t.kind == "binary" && matches!(attribute(t, "operator"), "==" | "!=") && t.children.len() == 2 {
         let (lhs, rhs) = if t.children[0].kind == "constant" {
@@ -1479,12 +1534,12 @@ fn zero_test(t: &Tree) -> Option<ZeroTest> {
         };
         if rhs.kind == "constant" {
             let compare_value = number(rhs, "hex");
-            let equals = attribute(t, "operator") == "==";
+            let cmp = if attribute(t, "operator") == "==" { LoopCmp::Eq } else { LoopCmp::Ne };
             if lhs.kind == "register" {
                 let (register, _) = register(lhs).ok()?;
-                return Some(ZeroTest { register, equals, compare_value, mask: None });
+                return Some(LoopTest { register, cmp, compare_value, mask: None });
             }
-            // Bit test form: ((reg & mask_const) ==/!= K).
+            // Bit test/masked equality form: ((reg & mask_const) ==/!= K).
             if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
                 let (reg_tree, mask_tree) = if lhs.children[0].kind == "register" {
                     (&lhs.children[0], &lhs.children[1])
@@ -1497,7 +1552,7 @@ fn zero_test(t: &Tree) -> Option<ZeroTest> {
                     let mask = number(mask_tree, "hex");
                     if mask != 0 {
                         let (register, _) = register(reg_tree).ok()?;
-                        return Some(ZeroTest { register, equals, compare_value, mask: Some(mask) });
+                        return Some(LoopTest { register, cmp, compare_value, mask: Some(mask) });
                     }
                 }
             }
@@ -1506,15 +1561,22 @@ fn zero_test(t: &Tree) -> Option<ZeroTest> {
     None
 }
 
-/// Recognize a flag-condition eq/ne branch produced by `CMP reg, #imm` immediately
-/// before `branch_index` as an equivalent equality test. This is a bounded form for
-/// common loops that test a register against a constant via flags.
-fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize, trees: &[Tree]) -> Option<(ZeroTest, usize)> {
+/// Recognize a flag-condition branch produced by `CMP reg, #imm` immediately
+/// before `branch_index` as an equivalent register-vs-constant comparison.
+/// Supports eq/ne and signed/unsigned ordering predicates (bounded, conservative).
+fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize, trees: &[Tree]) -> Option<(LoopTest, usize)> {
     if condition.kind != "flag-condition" { return None; }
-    let predicate = attribute(condition, "predicate");
-    let equals = match predicate {
-        "eq" => true,
-        "ne" => false,
+    let cmp = match attribute(condition, "predicate") {
+        "eq" => LoopCmp::Eq,
+        "ne" => LoopCmp::Ne,
+        "lt" => LoopCmp::Slt,
+        "le" => LoopCmp::Sle,
+        "gt" => LoopCmp::Sgt,
+        "ge" => LoopCmp::Sge,
+        "lo" => LoopCmp::Ult, // unsigned <
+        "ls" => LoopCmp::Ule, // unsigned <=
+        "hi" => LoopCmp::Ugt, // unsigned >
+        "hs" => LoopCmp::Uge, // unsigned >=
         _ => return None,
     };
     if branch_index == 0 || branch_index <= header { return None; }
@@ -1527,7 +1589,7 @@ fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize,
     if rhs.kind != "constant" { return None; }
     let compare_value = number(rhs, "hex");
     let (register, _) = register(&cmp_tree.children[0]).ok()?;
-    Some((ZeroTest { register, equals, compare_value, mask: None }, cmp_index))
+    Some((LoopTest { register, cmp, compare_value, mask: None }, cmp_index))
 }
 
 struct LoopVariable {
@@ -1597,7 +1659,6 @@ fn natural_loop_backedge(
         return Ok(None);
     };
     let test_register = test.register;
-    let continues_when_true = test.equals;
     // Single-entry region: no other control transfer may target inside the loop
     // except the recognized backedge.
     for (index, tree) in trees.iter().enumerate() {
@@ -1654,17 +1715,8 @@ fn natural_loop_backedge(
     }
     // Bottom-tested: continue when condition holds at backedge.
     let test_value = variable_by_register[&test_register].0;
-    let cmp_value = test.compare_value;
-    let condition_template = if let Some(mask) = test.mask {
-        if continues_when_true {
-            format!("((($0) & UINT64_C({mask:#x})) == UINT64_C({cmp_value}))")
-        } else {
-            format!("((($0) & UINT64_C({mask:#x})) != UINT64_C({cmp_value}))")
-        }
-    } else if continues_when_true {
-        format!("(($0) == UINT64_C({cmp_value}))")
-    } else {
-        format!("(($0) != UINT64_C({cmp_value}))")
+    let Some(condition_template) = loop_condition_template(test.cmp, test.compare_value, test.mask) else {
+        return Ok(None);
     };
     let condition = dag.add_role(
         "source-loop-condition", "condition", condition_template, vec![test_value], start + tail as u64 * 4
@@ -1825,7 +1877,6 @@ fn natural_loop(
     }
     let Some(header_test) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
     let test_register = header_test.register;
-    let exits_when_equals = header_test.equals;
     let mut loop_cmp_index: Option<usize> = None;
     if unconditional_backedge {
         // Header-tested while loop: test conditionally exits, tail jumps back
@@ -1844,7 +1895,7 @@ fn natural_loop(
         if tail_test.register != test_register
             || tail_test.mask != header_test.mask
             || tail_test.compare_value != header_test.compare_value
-            || exits_when_equals == tail_test.equals
+            || tail_test.cmp != header_test.cmp.complement()
         {
             return Ok(None);
         }
@@ -1899,18 +1950,9 @@ fn natural_loop(
         state.registers[register] = Symbol::Value(value, known);
     }
     let test_value = variable_by_register[&test_register].0;
-    let cmp_value = header_test.compare_value;
-    let condition_template = if let Some(mask) = header_test.mask {
-        // Continue loop when header test does NOT take the exit.
-        if exits_when_equals {
-            format!("((($0) & UINT64_C({mask:#x})) != UINT64_C({cmp_value}))")
-        } else {
-            format!("((($0) & UINT64_C({mask:#x})) == UINT64_C({cmp_value}))")
-        }
-    } else if exits_when_equals {
-        format!("(($0) != UINT64_C({cmp_value}))")
-    } else {
-        format!("(($0) == UINT64_C({cmp_value}))")
+    // Continue loop when header test does NOT take the exit.
+    let Some(condition_template) = loop_condition_template(header_test.cmp.complement(), header_test.compare_value, header_test.mask) else {
+        return Ok(None);
     };
     let condition = dag.add_role(
         "source-loop-condition", "condition", condition_template, vec![test_value], start + header as u64 * 4
