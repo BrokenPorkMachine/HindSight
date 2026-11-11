@@ -3123,15 +3123,28 @@ pub(super) fn recover_with_types(
             if seen.contains_key(&index) {
                 let pc = start + index as u64 * 4;
                 let saved = seen[&index].clone();
-                // Bounded phi recovery: attempt to merge current path state
-                // with saved state. Create phi nodes for differing registers.
+                // Bounded phi recovery: merge current path with saved state only
+                // when unhandled state components are identical and differing
+                // registers/frame values can be joined by evidence-backed phis.
                 let mut can_merge = true;
-                if saved.registers.len() != state.registers.len() { can_merge = false; }
-                if saved.frame.len() != state.frame.len() { can_merge = false; }
-                if saved.external_loads.len() != state.external_loads.len() { can_merge = false; }
-                if saved.external_stores.len() != state.external_stores.len() { can_merge = false; }
-                if saved.fp_scalars.len() != state.fp_scalars.len() { can_merge = false; }
-                if saved.q_blobs.len() != state.q_blobs.len() { can_merge = false; }
+                if saved.external_loads != state.external_loads
+                    || saved.external_stores != state.external_stores
+                    || saved.external_access_pcs != state.external_access_pcs
+                    || saved.fp_scalars != state.fp_scalars
+                    || saved.q_blobs != state.q_blobs
+                    || saved.flags != state.flags
+                    || saved.has_call != state.has_call
+                    || saved.call_pcs != state.call_pcs
+                    || saved.calls != state.calls
+                    || saved.incoming_stack_end != state.incoming_stack_end
+                    || saved.registers.len() != state.registers.len()
+                    || saved.frame.len() != state.frame.len()
+                {
+                    can_merge = false;
+                }
+                if can_merge && saved.frame.keys().ne(state.frame.keys()) {
+                    can_merge = false;
+                }
                 let mut any_diff = false;
                 let mut merged_regs = state.registers.clone();
                 if can_merge {
@@ -3141,13 +3154,12 @@ pub(super) fn recover_with_types(
                         if ss != cs {
                             match (&ss, &cs) {
                                 (Symbol::Value(sid, sbits), Symbol::Value(cid, cbits)) if sbits == cbits => {
-                                    match dag.add("source-phi", "($0 ? $1 : $2)".to_string(),
+                                    if let Ok(phi_id) = dag.add("source-phi", "($0 ? $1 : $2)".to_string(),
                                                   vec![saved.path, *sid, *cid], pc) {
-                                        Ok(phi_id) => {
-                                            merged_regs[reg] = Symbol::Value(phi_id, *sbits);
-                                            any_diff = true;
-                                        }
-                                        Err(_) => { can_merge = false; break; }
+                                        merged_regs[reg] = Symbol::Value(phi_id, *sbits);
+                                        any_diff = true;
+                                    } else {
+                                        can_merge = false; break;
                                     }
                                 }
                                 _ => { can_merge = false; break; }
@@ -3155,45 +3167,47 @@ pub(super) fn recover_with_types(
                         }
                     }
                 }
-                if can_merge && any_diff {
-                    // Merge frame values.
-                    let mut merged_frame = state.frame.clone();
+                let mut merged_frame = state.frame.clone();
+                if can_merge {
                     for key in saved.frame.keys().cloned().collect::<Vec<_>>() {
                         let sv = saved.frame[&key].0.clone();
                         let cv = state.frame[&key].0.clone();
                         if sv != cv {
+                            any_diff = true;
                             match (&sv, &cv) {
                                 (Symbol::Value(sid, sbits), Symbol::Value(cid, cbits)) if sbits == cbits => {
-                                    match dag.add("source-phi", "($0 ? $1 : $2)".to_string(),
+                                    if let Ok(phi_id) = dag.add("source-phi", "($0 ? $1 : $2)".to_string(),
                                                   vec![saved.path, *sid, *cid], pc) {
-                                        Ok(phi_id) => {
-                                            merged_frame.get_mut(&key).unwrap().0 = Symbol::Value(phi_id, *sbits);
+                                        if let Some(entry) = merged_frame.get_mut(&key) {
+                                            entry.0 = Symbol::Value(phi_id, *sbits);
+                                        } else {
+                                            can_merge = false; break;
                                         }
-                                        Err(_) => { can_merge = false; break; }
+                                    } else {
+                                        can_merge = false; break;
                                     }
                                 }
                                 _ => { can_merge = false; break; }
                             }
+                        } else if saved.frame[&key].1 != state.frame[&key].1 {
+                            can_merge = false; break;
                         }
                     }
-                    if can_merge {
-                        let mut merged = state.clone();
-                        merged.registers = merged_regs;
-                        merged.frame = merged_frame;
-                        merged.path = dag.add("source-path", "(($0) || ($1))".to_string(),
-                                             vec![saved.path, state.path], pc)?;
-                        seen.remove(&index);
-                        seen.insert(index, merged.clone());
-                        state = merged;
-                        // Fall through to process instruction.
-                    } else {
-                        return Err(format!("loop region requires canonical loop/phi recovery at index {index} (pc {pc:#x})"));
-                    }
-                } else if can_merge && !any_diff {
-                    // Identical states; reuse saved.
+                }
+                // If no differences were found in mergeable components and all
+                // unhandled components matched, this is a fixed-point join.
+                if can_merge && any_diff {
+                    let mut merged = state.clone();
+                    merged.registers = merged_regs;
+                    merged.frame = merged_frame;
+                    merged.path = dag.add("source-path", "(($0) || ($1))".to_string(),
+                                         vec![saved.path, state.path], pc)?;
                     seen.remove(&index);
-                    seen.insert(index, saved.clone());
-                    state = saved;
+                    seen.insert(index, merged.clone());
+                    state = merged;
+                    // Fall through to process instruction with joined state.
+                } else if can_merge && !any_diff {
+                    break;
                 } else {
                     return Err(format!("loop region requires canonical loop/phi recovery at index {index} (pc {pc:#x})"));
                 }
