@@ -3202,7 +3202,6 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 Button(action: toggleNavigationDock) {
                     Image(systemName: "sidebar.left")
-                        .symbolVariant(navigationDockIsVisible ? .fill : .none)
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut("\\", modifiers: .command)
