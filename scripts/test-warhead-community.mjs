@@ -8,7 +8,6 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { Registry } from '../BundledPlugins/Warhead.vgplugin/runtime/tools/registry.js';
 import { createTodoStore } from '../BundledPlugins/Warhead.vgplugin/runtime/tools/todo.js';
 import { sensitiveCommunityPath } from '../BundledPlugins/Warhead.vgplugin/runtime/community/guardrails.js';
@@ -25,7 +24,7 @@ const makeCtx = root => ({
 test('community registry does not advertise shell, writes, web, or external tools', () => {
   const reg = new Registry();
   const names = reg.names();
-  assert.deepEqual(names.sort(), ['read_file', 'todo'].sort());
+  assert.deepEqual(names.sort(), ['read_file', 'todo', 'hindsight_context'].sort());
   assert.deepEqual(reg.definitions().map(x => x.name).sort(), names.sort());
 });
 
@@ -71,7 +70,8 @@ test('sensitive workspace files are excluded', async () => {
     const safe = await reg.dispatch('read_file', { path: 'ok.txt', limit: 10 }, ctx);
     assert.equal(safe.ok, true);
     assert.match(safe.output, /safe text/);
-    for (const path of ['.env', '.ssh/id_rsa', '../out-of-bounds', '/etc/hosts']) {
+    symlinkSync('/etc/hosts', join(root, 'linked-hosts'));
+    for (const path of ['.env', '.ssh/id_rsa', '../out-of-bounds', '/etc/hosts', 'linked-hosts']) {
       const result = await reg.dispatch('read_file', { path }, ctx);
       assert.equal(result.ok, false, path);
     }
