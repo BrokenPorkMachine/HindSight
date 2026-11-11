@@ -1545,36 +1545,77 @@ fn loop_condition_template(cmp: LoopCmp, compare: LoopCompareOperand, mask: Opti
 }
 
 fn zero_test(t: &Tree) -> Option<LoopTest> {
-    // Binary comparison form: (reg == K), (reg != K), ((reg & mask) ==/!= K).
-    if t.kind == "binary" && matches!(attribute(t, "operator"), "==" | "!=") && t.children.len() == 2 {
-        let (lhs, rhs) = if t.children[0].kind == "constant" {
-            (&t.children[1], &t.children[0])
-        } else {
-            (&t.children[0], &t.children[1])
-        };
-        if rhs.kind == "constant" {
-            let compare_value = number(rhs, "hex");
-            let cmp = if attribute(t, "operator") == "==" { LoopCmp::Eq } else { LoopCmp::Ne };
-            if lhs.kind == "register" {
-                let (register, _) = register(lhs).ok()?;
-                return Some(LoopTest { register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: None });
+    if t.kind != "binary" || t.children.len() != 2 { return None; }
+    let op = attribute(t, "operator");
+
+    // Ordering comparisons: reg < K, reg > K, reg <= K, reg >= K (signed),
+    // and register-vs-register forms reg < reg2, etc.
+    if matches!(op, "<" | ">" | "<=" | ">=") {
+        let (lhs, rhs) = (&t.children[0], &t.children[1]);
+        if lhs.kind == "register" {
+            let (lhs_register, _) = register(lhs).ok()?;
+            let cmp = match op {
+                "<" => LoopCmp::Slt,
+                ">" => LoopCmp::Sgt,
+                "<=" => LoopCmp::Sle,
+                ">=" => LoopCmp::Sge,
+                _ => return None,
+            };
+            if rhs.kind == "constant" {
+                let compare_value = number(rhs, "hex");
+                return Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: None });
             }
-            // Bit test/masked equality form: ((reg & mask_const) ==/!= K).
-            if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
-                let (reg_tree, mask_tree) = if lhs.children[0].kind == "register" {
-                    (&lhs.children[0], &lhs.children[1])
-                } else if lhs.children[1].kind == "register" {
-                    (&lhs.children[1], &lhs.children[0])
-                } else {
+            if rhs.kind == "register" {
+                let (rhs_register, _) = register(rhs).ok()?;
+                if rhs_register == lhs_register || rhs_register == 29 || rhs_register == 30 || rhs_register >= 31 {
                     return None;
-                };
-                if mask_tree.kind == "constant" {
-                    let mask = number(mask_tree, "hex");
-                    if mask != 0 {
-                        let (register, _) = register(reg_tree).ok()?;
-                        return Some(LoopTest { register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: Some(mask) });
-                    }
                 }
+                return Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Register(rhs_register), mask: None });
+            }
+        }
+        return None;
+    }
+
+    // Equality/inequality: (reg == K), (reg != K), ((reg & mask) ==/!= K).
+    if !matches!(op, "==" | "!=") { return None; }
+    let (lhs, rhs) = if t.children[0].kind == "constant" {
+        (&t.children[1], &t.children[0])
+    } else {
+        (&t.children[0], &t.children[1])
+    };
+    if rhs.kind != "constant" {
+        // Register-vs-register equality/inequality.
+        if lhs.kind == "register" && rhs.kind == "register" {
+            let (lhs_register, _) = register(lhs).ok()?;
+            let (rhs_register, _) = register(rhs).ok()?;
+            if rhs_register == lhs_register || rhs_register == 29 || rhs_register == 30 || rhs_register >= 31 {
+                return None;
+            }
+            let cmp = if op == "==" { LoopCmp::Eq } else { LoopCmp::Ne };
+            return Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Register(rhs_register), mask: None });
+        }
+        return None;
+    }
+    let compare_value = number(rhs, "hex");
+    let cmp = if op == "==" { LoopCmp::Eq } else { LoopCmp::Ne };
+    if lhs.kind == "register" {
+        let (lhs_register, _) = register(lhs).ok()?;
+        return Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: None });
+    }
+    // Bit test/masked equality form: ((reg & mask_const) ==/!= K).
+    if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
+        let (reg_tree, mask_tree) = if lhs.children[0].kind == "register" {
+            (&lhs.children[0], &lhs.children[1])
+        } else if lhs.children[1].kind == "register" {
+            (&lhs.children[1], &lhs.children[0])
+        } else {
+            return None;
+        };
+        if mask_tree.kind == "constant" {
+            let mask = number(mask_tree, "hex");
+            if mask != 0 {
+                let (reg, _) = register(reg_tree).ok()?;
+                return Some(LoopTest { register: reg, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: Some(mask) });
             }
         }
     }
