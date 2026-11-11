@@ -1596,6 +1596,16 @@ fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize,
             };
             Some((LoopTest { register, cmp, compare_value: imm, mask: None }, cmp_index))
         }
+        "cmn" => {
+            // CMN sets flags from (reg + imm); eq/ne correspond to reg == -imm / != -imm.
+            let cmp = match predicate {
+                "eq" => LoopCmp::Eq,
+                "ne" => LoopCmp::Ne,
+                _ => return None,
+            };
+            let compare_value = imm.wrapping_neg();
+            Some((LoopTest { register, cmp, compare_value, mask: None }, cmp_index))
+        }
         "tst" | "test" => {
             // TST sets Z based on (left & right); eq => zero, ne => nonzero.
             let cmp = match predicate {
