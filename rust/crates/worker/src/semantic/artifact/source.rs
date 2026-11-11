@@ -735,23 +735,32 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                     }
                 }
             }
-            // Bounded: extract low N bytes from a larger scalar slot at the same offset.
-            if offset == slot && matches!(bytes, 1 | 2 | 4) && matches!(size, 2 | 4 | 8) && (bytes as u64) < size {
-                let signed = flag(t, "signed") != 0;
-                let src = dag.value(value.clone(), 64, pc)?;
-                let (template, spelling, ty_signed) = match (bytes, signed) {
-                    (1, false) => ("((uint64_t)(uint8_t)((uint64_t)($0)))".to_owned(), "uint8_t".to_owned(), false),
-                    (1, true) => ("((uint64_t)(int64_t)(int8_t)((uint64_t)($0)))".to_owned(), "int8_t".to_owned(), true),
-                    (2, false) => ("((uint64_t)(uint16_t)((uint64_t)($0)))".to_owned(), "uint16_t".to_owned(), false),
-                    (2, true) => ("((uint64_t)(int64_t)(int16_t)((uint64_t)($0)))".to_owned(), "int16_t".to_owned(), true),
-                    (4, false) => ("((uint64_t)(uint32_t)((uint64_t)($0)))".to_owned(), "uint32_t".to_owned(), false),
-                    (4, true) => ("((uint64_t)(int64_t)(int32_t)((uint64_t)($0)))".to_owned(), "int32_t".to_owned(), true),
-                    _ => return Err("external memory read width is unsupported".into()),
-                };
-                let id = dag.add_role("source-frame-reload", "slot", template, vec![src], pc)?;
-                dag.nodes[id].origins.extend(origins);
-                dag.type_node(id, Some(SourceType { spelling, bits: (bytes * 8) as u8, signed: ty_signed, pointer: false }));
-                return Ok(Symbol::Value(id, 64));
+            // Bounded: extract N bytes from a larger scalar slot at a byte-aligned offset within it.
+            if matches!(bytes, 1 | 2 | 4) && matches!(size, 2 | 4 | 8) && (bytes as u64) < size {
+                let inner_offset = offset - slot;
+                if inner_offset >= 0 && (inner_offset as u64 + bytes) <= size && (inner_offset % bytes as i64 == 0 || inner_offset == 0) {
+                    let signed = flag(t, "signed") != 0;
+                    let src = dag.value(value.clone(), 64, pc)?;
+                    let shift = (inner_offset as u64) * 8;
+                    let shifted = if shift == 0 {
+                        "((uint64_t)($0))".to_owned()
+                    } else {
+                        format!("(((uint64_t)($0)) >> {shift})")
+                    };
+                    let (template, spelling, ty_signed) = match (bytes, signed) {
+                        (1, false) => (format!("((uint64_t)(uint8_t){shifted})"), "uint8_t".to_owned(), false),
+                        (1, true) => (format!("((uint64_t)(int64_t)(int8_t){shifted})"), "int8_t".to_owned(), true),
+                        (2, false) => (format!("((uint64_t)(uint16_t){shifted})"), "uint16_t".to_owned(), false),
+                        (2, true) => (format!("((uint64_t)(int64_t)(int16_t){shifted})"), "int16_t".to_owned(), true),
+                        (4, false) => (format!("((uint64_t)(uint32_t){shifted})"), "uint32_t".to_owned(), false),
+                        (4, true) => (format!("((uint64_t)(int64_t)(int32_t){shifted})"), "int32_t".to_owned(), true),
+                        _ => return Err("external memory read width is unsupported".into()),
+                    };
+                    let id = dag.add_role("source-frame-reload", "slot", template, vec![src], pc)?;
+                    dag.nodes[id].origins.extend(origins);
+                    dag.type_node(id, Some(SourceType { spelling, bits: (bytes * 8) as u8, signed: ty_signed, pointer: false }));
+                    return Ok(Symbol::Value(id, 64));
+                }
             }
             let _ = (origins,);
             return Err("external memory read width is unsupported".into());
