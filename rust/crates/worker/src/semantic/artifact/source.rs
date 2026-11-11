@@ -1875,7 +1875,15 @@ fn natural_loop(
     } else {
         if tail <= header || tail + 1 != exit { return Ok(None); }
     }
-    let Some(header_test) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
+    let header_test = if let Some(test) = zero_test(&preheader_tree.children[0]) {
+        test
+    } else if let Some((test, _cmp_index)) = zero_test_from_flag_cmp(&preheader_tree.children[0], preheader, 0, trees) {
+        // Bounded: header/entry test may be a flag-condition set by CMP reg,#imm
+        // immediately before the loop header test (outside the loop body).
+        test
+    } else {
+        return Ok(None);
+    };
     let test_register = header_test.register;
     let mut loop_cmp_index: Option<usize> = None;
     if unconditional_backedge {
