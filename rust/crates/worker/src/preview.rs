@@ -1033,9 +1033,12 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
   if count==0 {continue}
   let normalization=cmp_index.checked_sub(1).and_then(|mut sub_index|{
    let mut sub=le32(code.get(sub_index*4..sub_index*4+4)?);
-   if sub==0xd503_201f {
+   let mut skipped=0usize;
+   while sub==0xd503_201f {
+    if skipped>=4 { return None; }
     sub_index=sub_index.checked_sub(1)?;
     sub=le32(code.get(sub_index*4..sub_index*4+4)?);
+    skipped+=1;
    }
    let (destination,source,bias,is_32)=arm64_sub_immediate(sub)?;
    (destination==index_register&&source!=31&&destination!=31&&is_32==index_is_32)
