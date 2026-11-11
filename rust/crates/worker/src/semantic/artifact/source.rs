@@ -1754,7 +1754,7 @@ fn is_noop_tree(tree: &Tree) -> bool {
 
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
-        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" | "call" => Ok(()),
+        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" | "conditional-goto" | "call" => Ok(()),
         "memory-store" | "memory-store-pair" | "memory-load-pair" => {
             if tree.kind == "memory-store" && tree.children.len() != 2 { return Err(()); }
             if tree.kind.ends_with("-pair") && tree.children.len() < 2 { return Err(()); }
@@ -1786,6 +1786,9 @@ fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<()
                         // Bounded: calls in sequences are accepted (same as
                         // top-level calls). They set registers to Unknown, so
                         // loop-carried registers in 0-18 would be invalidated.
+                    }
+                    "conditional-goto" | "goto" => {
+                        // Bounded: redundant fallthrough-equivalent jump in sequence.
                     }
                     "sequence" => collect_loop_written(child, written)?,
                     _ => return Err(()),
@@ -1867,11 +1870,15 @@ fn natural_loop_backedge(
         }
     }
     // Disallow nested/other internal control flow in the body.
-    // A goto targeting the immediately following instruction is a redundant
-    // fallthrough-equivalent jump and does not create internal control flow.
+    // A goto or conditional-goto targeting the immediately following instruction
+    // is a redundant fallthrough-equivalent jump and does not create internal
+    // control flow.
     for (offset, tree) in trees[header..tail].iter().enumerate() {
         let index = header + offset;
-        if tree.kind == "conditional-goto" { return Ok(None); }
+        if tree.kind == "conditional-goto" {
+            if target_index(number(tree, "target")) != Some(index + 1) { return Ok(None); }
+            continue;
+        }
         if tree.kind == "goto" {
             if target_index(number(tree, "target")) != Some(index + 1) { return Ok(None); }
         }
@@ -2024,9 +2031,10 @@ fn natural_loop_backedge(
                     if state.external_stores.len() != before_stores {
                         return Err("loop sequence unexpectedly produced a memory store".into());
                     }
-                } else if tree.kind == "goto" {
-                    // Bounded: redundant fallthrough-equivalent goto (validated as
-                    // targeting the next sequential instruction in this loop body).
+                } else if tree.kind == "goto" || tree.kind == "conditional-goto" {
+                    // Bounded: redundant fallthrough-equivalent goto/conditional-goto
+                    // (validated as targeting the next sequential instruction in
+                    // this loop body). No state effects.
                     if state.external_stores.len() != before_stores {
                         return Err("loop goto unexpectedly produced a memory store".into());
                     }
@@ -2430,9 +2438,10 @@ fn natural_loop(
                     if state.external_stores.len() != before_stores {
                         return Err("loop sequence unexpectedly produced a memory store".into());
                     }
-                } else if tree.kind == "goto" {
-                    // Bounded: redundant fallthrough-equivalent goto (validated as
-                    // targeting the next sequential instruction in this loop body).
+                } else if tree.kind == "goto" || tree.kind == "conditional-goto" {
+                    // Bounded: redundant fallthrough-equivalent goto/conditional-goto
+                    // (validated as targeting the next sequential instruction in
+                    // this loop body). No state effects.
                     if state.external_stores.len() != before_stores {
                         return Err("loop goto unexpectedly produced a memory store".into());
                     }
