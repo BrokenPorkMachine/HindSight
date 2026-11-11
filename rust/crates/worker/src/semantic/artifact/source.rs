@@ -1762,18 +1762,21 @@ fn natural_loop_backedge(
     if tail < header { return Ok(None); }
     let mut exit = tail + 1;
     if exit > trees.len() { return Ok(None); }
-    // Tolerate a single trailing no-op between backedge and exit, but only
-    // when no control transfer targets that no-op (so skipping it is sound).
-    if exit < trees.len() && trees.get(exit).is_some_and(|t| t.kind == "no-op") {
+    // Tolerate bounded trailing no-ops between backedge and exit, but only
+    // when no control transfer targets those no-ops (so skipping them is sound).
+    let mut skipped = 0usize;
+    while exit < trees.len() && skipped < 4 && trees.get(exit).is_some_and(|t| t.kind == "no-op") {
         let noop_index = exit;
         let targeted = trees.iter().enumerate().any(|(i, tree)| {
             matches!(tree.kind, "goto" | "conditional-goto")
                 && target_index(number(tree, "target")) == Some(noop_index)
                 && i != tail
         });
-        if !targeted {
-            exit += 1;
+        if targeted {
+            break;
         }
+        exit += 1;
+        skipped += 1;
     }
     if exit > trees.len() { return Ok(None); }
     // Require the backedge test to be a zero/nonzero test on a register,
@@ -2012,9 +2015,11 @@ fn natural_loop(
     let find_backedge_before_exit = |exit: usize, target_header: usize, want_kind: &str| -> Option<usize> {
         if exit == 0 { return None; }
         let mut idx = exit - 1;
-        if trees.get(idx).is_some_and(|t| t.kind == "no-op") {
-            if idx == 0 { return None; }
-            idx = idx.saturating_sub(1);
+        let mut skipped = 0usize;
+        while trees.get(idx).is_some_and(|t| t.kind == "no-op") {
+            if idx == 0 || skipped >= 4 { return None; }
+            idx -= 1;
+            skipped += 1;
         }
         if idx >= exit { return None; }
         trees.get(idx).filter(|tree| tree.kind == want_kind && target_index(number(tree, "target")) == Some(target_header)).map(|_| idx)
@@ -2043,24 +2048,25 @@ fn natural_loop(
     } else {
         return Ok(None);
     };
-    let trailing_noop_safe = |noop_index: usize, tail: usize| -> bool {
-        trees.get(noop_index).is_some_and(|t| t.kind == "no-op")
-            && !trees.iter().enumerate().any(|(i, tree)| {
+    let trailing_noops_safe = |tail: usize, exit: usize| -> bool {
+        if tail + 1 == exit { return true; }
+        if exit <= tail + 1 || exit > tail + 5 { return false; }
+        for noop_index in (tail + 1)..exit {
+            if !trees.get(noop_index).is_some_and(|t| t.kind == "no-op") {
+                return false;
+            }
+            let targeted = trees.iter().enumerate().any(|(i, tree)| {
                 matches!(tree.kind, "goto" | "conditional-goto")
                     && target_index(number(tree, "target")) == Some(noop_index)
                     && i != tail
-            })
+            });
+            if targeted { return false; }
+        }
+        true
     };
-    if !test_at_header {
-        // Pattern A: tolerate a single trailing no-op between tail and exit.
-        if tail <= header || !(tail + 1 == exit || (tail + 2 == exit && trailing_noop_safe(tail + 1, tail))) {
-            return Ok(None);
-        }
-    } else {
-        // Pattern B: tolerate a single trailing no-op between tail and exit.
-        if tail <= header || !(tail + 1 == exit || (tail + 2 == exit && trailing_noop_safe(tail + 1, tail))) {
-            return Ok(None);
-        }
+    // Tolerate bounded untargeted no-ops between tail and exit.
+    if tail <= header || !trailing_noops_safe(tail, exit) {
+        return Ok(None);
     }
     let header_test = if let Some(test) = zero_test(&preheader_tree.children[0]) {
         test
