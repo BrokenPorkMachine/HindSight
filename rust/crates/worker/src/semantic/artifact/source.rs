@@ -1702,7 +1702,7 @@ struct SourceLoop {
 
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
-        "no-op" | "flags-compare" | "flags-arithmetic" => Ok(()),
+        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" => Ok(()),
         "memory-store" => {
             if tree.children.len() != 2 { return Err(()); }
             Ok(())
@@ -1792,8 +1792,14 @@ fn natural_loop_backedge(
         }
     }
     // Disallow nested/other internal control flow in the body.
-    for tree in &trees[header..tail] {
-        if matches!(tree.kind, "goto" | "conditional-goto") { return Ok(None); }
+    // A goto targeting the immediately following instruction is a redundant
+    // fallthrough-equivalent jump and does not create internal control flow.
+    for (offset, tree) in trees[header..tail].iter().enumerate() {
+        let index = header + offset;
+        if tree.kind == "conditional-goto" { return Ok(None); }
+        if tree.kind == "goto" {
+            if target_index(number(tree, "target")) != Some(index + 1) { return Ok(None); }
+        }
     }
     if !header_entry.external_loads.is_empty() || !header_entry.external_stores.is_empty() || header_entry.has_call {
         return Ok(None);
@@ -1937,6 +1943,12 @@ fn natural_loop_backedge(
                     // Bounded: accepted sequences contain only flag/no-op effects.
                     if state.external_stores.len() != before_stores {
                         return Err("loop sequence unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "goto" {
+                    // Bounded: redundant fallthrough-equivalent goto (validated as
+                    // targeting the next sequential instruction in this loop body).
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop goto unexpectedly produced a memory store".into());
                     }
                 } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
                     stores.push(state.external_stores.pop().expect("store count checked"));
@@ -2143,11 +2155,17 @@ fn natural_loop(
         }
     }
     // The loop must be a single-entry region. The exit edge and backedge are
-    // its only control-flow edges; all other body operations are assignments.
+    // its only recognized control-flow edges. A goto targeting the immediately
+    // following instruction is a redundant fallthrough-equivalent jump.
+    let body_start = if test_at_header { header + 1 } else { header };
     for (index, tree) in trees.iter().enumerate() {
         if !matches!(tree.kind, "goto" | "conditional-goto") || index == preheader || index == tail { continue; }
         if test_at_header && index == header { continue; }
-        if target_index(number(tree, "target")).is_some_and(|target| (header..=tail).contains(&target)) {
+        let Some(target) = target_index(number(tree, "target")) else { continue; };
+        if tree.kind == "goto" && (body_start..tail).contains(&index) && target == index + 1 {
+            continue;
+        }
+        if (header..=tail).contains(&target) {
             return Ok(None);
         }
     }
@@ -2155,7 +2173,6 @@ fn natural_loop(
         return Ok(None);
     }
     let mut written = BTreeSet::new();
-    let body_start = if test_at_header { header + 1 } else { header };
     for (index, tree) in trees.iter().enumerate().take(tail).skip(body_start) {
         if loop_cmp_index == Some(index) {
             continue;
@@ -2284,6 +2301,12 @@ fn natural_loop(
                 } else if tree.kind == "sequence" {
                     if state.external_stores.len() != before_stores {
                         return Err("loop sequence unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "goto" {
+                    // Bounded: redundant fallthrough-equivalent goto (validated as
+                    // targeting the next sequential instruction in this loop body).
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop goto unexpectedly produced a memory store".into());
                     }
                 } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
                     stores.push(state.external_stores.pop().expect("store count checked"));
