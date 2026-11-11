@@ -1005,10 +1005,14 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
   let branch=le32(code.get(branch_index*4..branch_index*4+4)?);
   if branch&0xff00_0010!=0x5400_0000{continue}
   let (kind,operator,extra)=match branch&15{8=> ("CMP/B.HI","<=",1u64),2=>("CMP/B.HS","<",0),_=>continue};
-  // Allow a single NOP between CMP and conditional branch.
+  // Allow bounded NOPs between CMP and conditional branch (flags unaffected).
   let mut cmp_index = branch_index.checked_sub(1)?;
-  if le32(code.get(cmp_index*4..cmp_index*4+4)?) == 0xd503_201f {
-   cmp_index = cmp_index.checked_sub(1)?;
+  let mut skipped_cmp_nops = 0usize;
+  while le32(code.get(cmp_index*4..cmp_index*4+4)?) == 0xd503_201f {
+   if skipped_cmp_nops >= 4 { break; }
+   skipped_cmp_nops += 1;
+   let Some(prev) = cmp_index.checked_sub(1) else { break; };
+   cmp_index = prev;
   }
   let cmp=le32(code.get(cmp_index*4..cmp_index*4+4)?);
   if cmp&0x7f00_001f!=0x7100_001f || ((cmp>>5)&31)!=index_register || (cmp>>31==0)!=index_is_32 {continue}
