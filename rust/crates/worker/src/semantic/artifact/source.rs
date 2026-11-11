@@ -3287,12 +3287,19 @@ pub(super) fn recover_with_types(
                     // treat as a single continuation without forking. Chains are followed only
                     // while targets remain unconditional gotos/no-ops within the function and
                     // no cycle/ambiguity is introduced.
+                    fn tree_is_noop_only(tree: &Tree) -> bool {
+                        match tree.kind {
+                            "no-op" => true,
+                            "sequence" => !tree.children.is_empty() && tree.children.iter().all(tree_is_noop_only),
+                            _ => false,
+                        }
+                    }
                     let follow_goto_chain = |mut idx: usize| -> Option<usize> {
                         let mut steps = 0usize;
                         loop {
                             if steps > 32 { return None; }
                             let tgt_tree = trees.get(idx)?;
-                            if tgt_tree.kind == "no-op" {
+                            if tree_is_noop_only(tgt_tree) {
                                 idx = idx.checked_add(1)?;
                                 steps += 1;
                                 continue;
