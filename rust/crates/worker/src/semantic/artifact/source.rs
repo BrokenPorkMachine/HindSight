@@ -3079,7 +3079,13 @@ pub(super) fn recover_with_types(
                                 });
                             let is_autorelease_tail = helper.is_some_and(|n| {
                                 let b = n.strip_prefix('_').unwrap_or(n);
-                                matches!(b, "objc_autoreleaseReturnValue" | "objc_retainAutoreleaseReturnValue" | "objc_retainAutoreleasedReturnValue")
+                                matches!(
+                                    b,
+                                    "objc_autoreleaseReturnValue"
+                                        | "objc_retainAutoreleaseReturnValue"
+                                        | "objc_retainAutoreleasedReturnValue"
+                                        | "objc_unsafeClaimAutoreleasedReturnValue"
+                                )
                             });
                             if is_autorelease_tail {
                                 // model as tail call/return of x0 through helper
