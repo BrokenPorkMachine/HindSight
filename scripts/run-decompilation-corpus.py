@@ -36,10 +36,15 @@ def read_analysis_frame(data: bytes) -> dict:
 
 
 def compile_fixture(source_type: str, source: pathlib.Path, output: pathlib.Path, optimization: str) -> None:
-    compiler = shutil.which(CASES[source_type][1])
-    if compiler is None:
-        raise RuntimeError(f"required compiler is unavailable: {CASES[source_type][1]}")
-    command = [compiler, "-target", "arm64-apple-macos14.0", optimization, "-g", "-Wl,-no_fixup_chains", "-o", str(output), str(source)]
+    tool = CASES[source_type][1]
+    if sys.platform == "darwin":
+        command = ["xcrun", tool]
+    else:
+        compiler = shutil.which(tool)
+        if compiler is None:
+            raise RuntimeError(f"required compiler is unavailable: {tool}")
+        command = [compiler]
+    command += ["-target", "arm64-apple-macos14.0", optimization, "-g", "-Wl,-no_fixup_chains", "-o", str(output), str(source)]
     if source_type in {"objective-c", "objective-cpp"}:
         command.extend(["-fobjc-arc", "-framework", "Foundation"])
     subprocess.run(command, check=True, capture_output=True, text=True)
