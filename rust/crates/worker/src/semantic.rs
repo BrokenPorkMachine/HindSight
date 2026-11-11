@@ -8981,6 +8981,16 @@ pub fn render_with_resolved_indirects(
                         .unwrap_or_else(|| instruction.operation.render(&mut flow, instruction.address))
                 };
                 out.push_str(&format!("  {:#018x}  {statement} // word={:08x}\n", instruction.address, instruction.word));
+                if let IrOperation::IndirectBranch { .. } = instruction.portable {
+                    if let Some(targets) = resolved_indirect_targets.get(&p) {
+                        let target_list = if targets.is_empty() {
+                            "none (all proven external exits)".to_string()
+                        } else {
+                            targets.iter().map(|target| format!("{target:#x}")).collect::<Vec<_>>().join(", ")
+                        };
+                        ssa_budget.emit(&mut out, &format!("  // resolved-indirect-targets pc={p:#x} targets=[{target_list}]\n"));
+                    }
+                }
                 if let Some(values) = ssa.instructions.get(&p) {
                     if values.barrier {
                         ssa_budget.emit(&mut out, &format!("  // ssa {p:#x} barrier=all_gprs; prior value identities invalidated\n"));
