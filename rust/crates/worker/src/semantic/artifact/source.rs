@@ -1491,37 +1491,57 @@ impl LoopCmp {
     }
 }
 
-fn loop_condition_template(cmp: LoopCmp, compare_value: u64, mask: Option<u64>) -> Option<String> {
-    if let Some(mask) = mask {
-        // Masked comparisons are only supported for equality/inequality.
-        return Some(match cmp {
-            LoopCmp::Eq => format!("((($0) & UINT64_C({mask:#x})) == UINT64_C({compare_value}))"),
-            LoopCmp::Ne => format!("((($0) & UINT64_C({mask:#x})) != UINT64_C({compare_value}))"),
-            _ => return None,
-        });
-    }
-    Some(match cmp {
-        LoopCmp::Eq => format!("(($0) == UINT64_C({compare_value}))"),
-        LoopCmp::Ne => format!("(($0) != UINT64_C({compare_value}))"),
-        LoopCmp::Slt => format!("(((int64_t)($0)) < (int64_t)UINT64_C({compare_value}))"),
-        LoopCmp::Sle => format!("(((int64_t)($0)) <= (int64_t)UINT64_C({compare_value}))"),
-        LoopCmp::Sgt => format!("(((int64_t)($0)) > (int64_t)UINT64_C({compare_value}))"),
-        LoopCmp::Sge => format!("(((int64_t)($0)) >= (int64_t)UINT64_C({compare_value}))"),
-        LoopCmp::Ult => format!("(($0) < UINT64_C({compare_value}))"),
-        LoopCmp::Ule => format!("(($0) <= UINT64_C({compare_value}))"),
-        LoopCmp::Ugt => format!("(($0) > UINT64_C({compare_value}))"),
-        LoopCmp::Uge => format!("(($0) >= UINT64_C({compare_value}))"),
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopCompareOperand {
+    Constant(u64),
+    /// Loop-invariant register (must not be written in the loop body).
+    Register(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LoopTest {
     register: usize,
     cmp: LoopCmp,
-    /// Compared constant value (used for direct comparisons; for masked equality it is the RHS).
-    compare_value: u64,
-    /// If Some(mask), comparison is on (value & mask) and only Eq/Ne are valid.
+    /// Compared-against operand: constant, or a loop-invariant register.
+    compare: LoopCompareOperand,
+    /// If Some(mask), comparison is on (value & mask) and only Eq/Ne against a constant are valid.
     mask: Option<u64>,
+}
+
+fn loop_condition_template(cmp: LoopCmp, compare: LoopCompareOperand, mask: Option<u64>) -> Option<String> {
+    let rhs = |s: &str| match compare {
+        LoopCompareOperand::Constant(v) => format!("UINT64_C({v})"),
+        LoopCompareOperand::Register(_) => s.to_string(),
+    };
+    if let Some(mask) = mask {
+        // Masked comparisons are only supported for equality/inequality against a constant.
+        let LoopCompareOperand::Constant(compare_value) = compare else { return None; };
+        return Some(match cmp {
+            LoopCmp::Eq => format!("((($0) & UINT64_C({mask:#x})) == UINT64_C({compare_value}))"),
+            LoopCmp::Ne => format!("((($0) & UINT64_C({mask:#x})) != UINT64_C({compare_value}))"),
+            _ => return None,
+        });
+    }
+    Some(match (cmp, compare) {
+        (LoopCmp::Eq, _) => format!("(($0) == {})", rhs("$1")),
+        (LoopCmp::Ne, _) => format!("(($0) != {})", rhs("$1")),
+        (LoopCmp::Slt, LoopCompareOperand::Constant(v)) => format!("(((int64_t)($0)) < (int64_t)UINT64_C({v}))"),
+        (LoopCmp::Sle, LoopCompareOperand::Constant(v)) => format!("(((int64_t)($0)) <= (int64_t)UINT64_C({v}))"),
+        (LoopCmp::Sgt, LoopCompareOperand::Constant(v)) => format!("(((int64_t)($0)) > (int64_t)UINT64_C({v}))"),
+        (LoopCmp::Sge, LoopCompareOperand::Constant(v)) => format!("(((int64_t)($0)) >= (int64_t)UINT64_C({v}))"),
+        (LoopCmp::Ult, LoopCompareOperand::Constant(v)) => format!("(($0) < UINT64_C({v}))"),
+        (LoopCmp::Ule, LoopCompareOperand::Constant(v)) => format!("(($0) <= UINT64_C({v}))"),
+        (LoopCmp::Ugt, LoopCompareOperand::Constant(v)) => format!("(($0) > UINT64_C({v}))"),
+        (LoopCmp::Uge, LoopCompareOperand::Constant(v)) => format!("(($0) >= UINT64_C({v}))"),
+        (LoopCmp::Slt, LoopCompareOperand::Register(_)) => "(((int64_t)($0)) < (int64_t)($1))".to_string(),
+        (LoopCmp::Sle, LoopCompareOperand::Register(_)) => "(((int64_t)($0)) <= (int64_t)($1))".to_string(),
+        (LoopCmp::Sgt, LoopCompareOperand::Register(_)) => "(((int64_t)($0)) > (int64_t)($1))".to_string(),
+        (LoopCmp::Sge, LoopCompareOperand::Register(_)) => "(((int64_t)($0)) >= (int64_t)($1))".to_string(),
+        (LoopCmp::Ult, LoopCompareOperand::Register(_)) => "(($0) < ($1))".to_string(),
+        (LoopCmp::Ule, LoopCompareOperand::Register(_)) => "(($0) <= ($1))".to_string(),
+        (LoopCmp::Ugt, LoopCompareOperand::Register(_)) => "(($0) > ($1))".to_string(),
+        (LoopCmp::Uge, LoopCompareOperand::Register(_)) => "(($0) >= ($1))".to_string(),
+    })
 }
 
 fn zero_test(t: &Tree) -> Option<LoopTest> {
@@ -1537,7 +1557,7 @@ fn zero_test(t: &Tree) -> Option<LoopTest> {
             let cmp = if attribute(t, "operator") == "==" { LoopCmp::Eq } else { LoopCmp::Ne };
             if lhs.kind == "register" {
                 let (register, _) = register(lhs).ok()?;
-                return Some(LoopTest { register, cmp, compare_value, mask: None });
+                return Some(LoopTest { register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: None });
             }
             // Bit test/masked equality form: ((reg & mask_const) ==/!= K).
             if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
@@ -1552,7 +1572,7 @@ fn zero_test(t: &Tree) -> Option<LoopTest> {
                     let mask = number(mask_tree, "hex");
                     if mask != 0 {
                         let (register, _) = register(reg_tree).ok()?;
-                        return Some(LoopTest { register, cmp, compare_value, mask: Some(mask) });
+                        return Some(LoopTest { register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: Some(mask) });
                     }
                 }
             }
@@ -1561,8 +1581,10 @@ fn zero_test(t: &Tree) -> Option<LoopTest> {
     None
 }
 
-/// Recognize a flag-condition branch produced by `CMP reg, #imm` or `TST reg, #imm`
+/// Recognize a flag-condition branch produced by `CMP/CMN reg, #imm` or `TST reg, #imm`
 /// immediately before `branch_index` as an equivalent register-vs-constant comparison.
+/// Also recognizes bounded register-vs-register `CMP reg, reg` when the RHS is a
+/// loop-invariant register (validated by callers against the loop's written set).
 /// CMP supports eq/ne and signed/unsigned ordering predicates; TST supports eq/ne
 /// as a masked zero test (bounded, conservative).
 fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize, trees: &[Tree]) -> Option<(LoopTest, usize)> {
@@ -1581,47 +1603,71 @@ fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize,
     }
     let op = attribute(cmp_tree, "operator");
     let rhs = &cmp_tree.children[1];
-    if rhs.kind != "constant" { return None; }
-    let imm = number(rhs, "hex");
-    let (register, _) = register(&cmp_tree.children[0]).ok()?;
-    match op {
-        "cmp" => {
-            let cmp = match predicate {
-                "eq" => LoopCmp::Eq,
-                "ne" => LoopCmp::Ne,
-                "lt" => LoopCmp::Slt,
-                "le" => LoopCmp::Sle,
-                "gt" => LoopCmp::Sgt,
-                "ge" => LoopCmp::Sge,
-                "lo" => LoopCmp::Ult, // unsigned <
-                "ls" => LoopCmp::Ule, // unsigned <=
-                "hi" => LoopCmp::Ugt, // unsigned >
-                "hs" => LoopCmp::Uge, // unsigned >=
-                _ => return None,
-            };
-            Some((LoopTest { register, cmp, compare_value: imm, mask: None }, cmp_index))
+    let (lhs_register, _) = register(&cmp_tree.children[0]).ok()?;
+    if rhs.kind == "constant" {
+        let imm = number(rhs, "hex");
+        match op {
+            "cmp" => {
+                let cmp = match predicate {
+                    "eq" => LoopCmp::Eq,
+                    "ne" => LoopCmp::Ne,
+                    "lt" => LoopCmp::Slt,
+                    "le" => LoopCmp::Sle,
+                    "gt" => LoopCmp::Sgt,
+                    "ge" => LoopCmp::Sge,
+                    "lo" => LoopCmp::Ult, // unsigned <
+                    "ls" => LoopCmp::Ule, // unsigned <=
+                    "hi" => LoopCmp::Ugt, // unsigned >
+                    "hs" => LoopCmp::Uge, // unsigned >=
+                    _ => return None,
+                };
+                Some((LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(imm), mask: None }, cmp_index))
+            }
+            "cmn" => {
+                // CMN sets flags from (reg + imm); eq/ne correspond to reg == -imm / != -imm.
+                let cmp = match predicate {
+                    "eq" => LoopCmp::Eq,
+                    "ne" => LoopCmp::Ne,
+                    _ => return None,
+                };
+                let compare_value = imm.wrapping_neg();
+                Some((LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(compare_value), mask: None }, cmp_index))
+            }
+            "tst" | "test" => {
+                // TST sets Z based on (left & right); eq => zero, ne => nonzero.
+                let cmp = match predicate {
+                    "eq" => LoopCmp::Eq,
+                    "ne" => LoopCmp::Ne,
+                    _ => return None,
+                };
+                if imm == 0 { return None; }
+                Some((LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(0), mask: Some(imm) }, cmp_index))
+            }
+            _ => None,
         }
-        "cmn" => {
-            // CMN sets flags from (reg + imm); eq/ne correspond to reg == -imm / != -imm.
-            let cmp = match predicate {
-                "eq" => LoopCmp::Eq,
-                "ne" => LoopCmp::Ne,
-                _ => return None,
-            };
-            let compare_value = imm.wrapping_neg();
-            Some((LoopTest { register, cmp, compare_value, mask: None }, cmp_index))
+    } else if rhs.kind == "register" && op == "cmp" {
+        // Register-vs-register comparison: sound only when the RHS is loop-invariant
+        // (not written in the loop body). Callers validate invariance against `written`.
+        let (rhs_register, _) = register(rhs).ok()?;
+        if rhs_register == lhs_register || rhs_register == 29 || rhs_register == 30 || rhs_register >= 31 {
+            return None;
         }
-        "tst" | "test" => {
-            // TST sets Z based on (left & right); eq => zero, ne => nonzero.
-            let cmp = match predicate {
-                "eq" => LoopCmp::Eq,
-                "ne" => LoopCmp::Ne,
-                _ => return None,
-            };
-            if imm == 0 { return None; }
-            Some((LoopTest { register, cmp, compare_value: 0, mask: Some(imm) }, cmp_index))
-        }
-        _ => None,
+        let cmp = match predicate {
+            "eq" => LoopCmp::Eq,
+            "ne" => LoopCmp::Ne,
+            "lt" => LoopCmp::Slt,
+            "le" => LoopCmp::Sle,
+            "gt" => LoopCmp::Sgt,
+            "ge" => LoopCmp::Sge,
+            "lo" => LoopCmp::Ult,
+            "ls" => LoopCmp::Ule,
+            "hi" => LoopCmp::Ugt,
+            "hs" => LoopCmp::Uge,
+            _ => return None,
+        };
+        Some((LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Register(rhs_register), mask: None }, cmp_index))
+    } else {
+        None
     }
 }
 
@@ -1753,8 +1799,21 @@ fn natural_loop_backedge(
     } else if !written.contains(&test_register) {
         return Ok(None);
     }
+    // Register compare operands must be loop-invariant (not written in body).
+    let compare_register = match test.compare {
+        LoopCompareOperand::Register(reg) => {
+            if written.contains(&reg) || reg == 29 || reg == 30 || reg >= 31 { return Ok(None); }
+            Some(reg)
+        }
+        LoopCompareOperand::Constant(_) => None,
+    };
 
     let mut state = header_entry.clone();
+    let compare_value_id = if let Some(reg) = compare_register {
+        Some(dag.value(state.registers[reg].clone(), 64, start + header as u64 * 4)?)
+    } else {
+        None
+    };
     let mut variables = Vec::new();
     let mut variable_by_register = BTreeMap::new();
     for register in written.iter().copied() {
@@ -1773,11 +1832,16 @@ fn natural_loop_backedge(
     }
     // Bottom-tested: continue when condition holds at backedge.
     let test_value = variable_by_register[&test_register].0;
-    let Some(condition_template) = loop_condition_template(test.cmp, test.compare_value, test.mask) else {
+    let Some(condition_template) = loop_condition_template(test.cmp, test.compare, test.mask) else {
         return Ok(None);
     };
+    let condition_children = if let Some(cmp_id) = compare_value_id {
+        vec![test_value, cmp_id]
+    } else {
+        vec![test_value]
+    };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template, vec![test_value], start + tail as u64 * 4
+        "source-loop-condition", "condition", condition_template, condition_children, start + tail as u64 * 4
     )?;
     dag.type_node(condition, None);
 
@@ -1966,32 +2030,51 @@ fn natural_loop(
                 if ct.kind != "flags-compare" || ct.children.len() != 2 { return None; }
                 let op = attribute(ct, "operator");
                 let rhs = ct.children.get(1)?;
-                if rhs.kind != "constant" { return None; }
-                let imm = number(rhs, "hex");
-                let (register, _) = register(&ct.children[0]).ok()?;
+                let (lhs_register, _) = register(&ct.children[0]).ok()?;
                 let predicate = attribute(cond, "predicate");
-                match op {
-                    "cmp" => {
-                        let cmp = match predicate {
-                            "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne,
-                            "lt" => LoopCmp::Slt, "le" => LoopCmp::Sle,
-                            "gt" => LoopCmp::Sgt, "ge" => LoopCmp::Sge,
-                            "lo" => LoopCmp::Ult, "ls" => LoopCmp::Ule,
-                            "hi" => LoopCmp::Ugt, "hs" => LoopCmp::Uge,
-                            _ => return None,
-                        };
-                        Some(LoopTest { register, cmp, compare_value: imm, mask: None })
+                if rhs.kind == "constant" {
+                    let imm = number(rhs, "hex");
+                    match op {
+                        "cmp" => {
+                            let cmp = match predicate {
+                                "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne,
+                                "lt" => LoopCmp::Slt, "le" => LoopCmp::Sle,
+                                "gt" => LoopCmp::Sgt, "ge" => LoopCmp::Sge,
+                                "lo" => LoopCmp::Ult, "ls" => LoopCmp::Ule,
+                                "hi" => LoopCmp::Ugt, "hs" => LoopCmp::Uge,
+                                _ => return None,
+                            };
+                            Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(imm), mask: None })
+                        }
+                        "cmn" => {
+                            let cmp = match predicate { "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne, _ => return None };
+                            Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(imm.wrapping_neg()), mask: None })
+                        }
+                        "tst" | "test" => {
+                            let cmp = match predicate { "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne, _ => return None };
+                            if imm == 0 { return None; }
+                            Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Constant(0), mask: Some(imm) })
+                        }
+                        _ => None,
                     }
-                    "cmn" => {
-                        let cmp = match predicate { "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne, _ => return None };
-                        Some(LoopTest { register, cmp, compare_value: imm.wrapping_neg(), mask: None })
+                } else if rhs.kind == "register" && op == "cmp" {
+                    // Bounded: register-vs-register entry guard. The compared
+                    // register must be loop-invariant (validated after written-set scan).
+                    let (rhs_register, _) = register(rhs).ok()?;
+                    if rhs_register == lhs_register || rhs_register == 29 || rhs_register == 30 || rhs_register >= 31 {
+                        return None;
                     }
-                    "tst" | "test" => {
-                        let cmp = match predicate { "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne, _ => return None };
-                        if imm == 0 { return None; }
-                        Some(LoopTest { register, cmp, compare_value: 0, mask: Some(imm) })
-                    }
-                    _ => None,
+                    let cmp = match predicate {
+                        "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne,
+                        "lt" => LoopCmp::Slt, "le" => LoopCmp::Sle,
+                        "gt" => LoopCmp::Sgt, "ge" => LoopCmp::Sge,
+                        "lo" => LoopCmp::Ult, "ls" => LoopCmp::Ule,
+                        "hi" => LoopCmp::Ugt, "hs" => LoopCmp::Uge,
+                        _ => return None,
+                    };
+                    Some(LoopTest { register: lhs_register, cmp, compare: LoopCompareOperand::Register(rhs_register), mask: None })
+                } else {
+                    None
                 }
             });
             match parsed { Some(t) => t, None => return Ok(None) }
@@ -2019,7 +2102,7 @@ fn natural_loop(
         };
         if tail_test.register != test_register
             || tail_test.mask != header_test.mask
-            || tail_test.compare_value != header_test.compare_value
+            || tail_test.compare != header_test.compare
             || tail_test.cmp != header_test.cmp.complement()
         {
             return Ok(None);
@@ -2046,6 +2129,19 @@ fn natural_loop(
         if collect_loop_written(tree, &mut written).is_err() { return Ok(None); }
     }
     if !written.contains(&test_register) { return Ok(None); }
+    let compare_register = match header_test.compare {
+        LoopCompareOperand::Register(reg) => {
+            // Compare register must be loop-invariant for a sound re-evaluated/entry condition.
+            if written.contains(&reg) || reg == 29 || reg == 30 || reg >= 31 { return Ok(None); }
+            Some(reg)
+        }
+        LoopCompareOperand::Constant(_) => None,
+    };
+    let compare_value_id = if let Some(reg) = compare_register {
+        Some(dag.value(state.registers[reg].clone(), 64, start + header as u64 * 4)?)
+    } else {
+        None
+    };
 
     let mut variables = Vec::new();
     let mut variable_by_register = BTreeMap::new();
@@ -2068,11 +2164,16 @@ fn natural_loop(
     }
     let test_value = variable_by_register[&test_register].0;
     // Continue loop when header test does NOT take the exit.
-    let Some(condition_template) = loop_condition_template(header_test.cmp.complement(), header_test.compare_value, header_test.mask) else {
+    let Some(condition_template) = loop_condition_template(header_test.cmp.complement(), header_test.compare, header_test.mask) else {
         return Ok(None);
     };
+    let condition_children = if let Some(cmp_id) = compare_value_id {
+        vec![test_value, cmp_id]
+    } else {
+        vec![test_value]
+    };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template, vec![test_value], start + header as u64 * 4
+        "source-loop-condition", "condition", condition_template, condition_children, start + header as u64 * 4
     )?;
     dag.type_node(condition, None);
 
