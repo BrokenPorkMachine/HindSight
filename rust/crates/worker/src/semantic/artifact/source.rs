@@ -1586,7 +1586,8 @@ fn natural_loop_backedge(
         if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
         if tree.kind == "memory-store" { continue; }
         let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
-        if register > 17 { return Ok(None); }
+        // Allow general-purpose loop-carried registers (excluding FP/LR/SP).
+        if register == 29 || register == 30 || register >= 31 { return Ok(None); }
         written.insert(register);
     }
     if !written.contains(&test_register) { return Ok(None); }
@@ -1797,9 +1798,10 @@ fn natural_loop(
         if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
         if tree.kind == "memory-store" { continue; }
         let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
-        // x18 through x30, SP and the zero register cannot become loop locals
-        // in this source slice because their ABI restoration rules differ.
-        if register > 17 { return Ok(None); }
+        // Allow general-purpose loop-carried registers; exclude FP/LR/SP (29-31).
+        // x18-x28 may be callee-saved or platform-specific but can be modeled as
+        // loop-carried values when their updates are fully recovered in this loop.
+        if register == 29 || register == 30 || register >= 31 { return Ok(None); }
         written.insert(register);
     }
     if !written.contains(&test_register) { return Ok(None); }
