@@ -1013,6 +1013,7 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
   let mut address_only=true;
   for i in branch_index+1..load_index{
    let word=le32(code.get(i*4..i*4+4)?);
+   if word==0xd503_201f{continue}
    let destination=arm64_address_value(word,base+i as u64*4).map(|v|v.0)
     .or_else(||arm64_add_immediate(word).map(|v|v.0));
    if destination!=Some(index_register){
