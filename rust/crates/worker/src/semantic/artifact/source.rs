@@ -1782,6 +1782,11 @@ fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<()
                         if register == 29 || register == 30 || register >= 31 { return Err(()); }
                         written.insert(register);
                     }
+                    "call" => {
+                        // Bounded: calls in sequences are accepted (same as
+                        // top-level calls). They set registers to Unknown, so
+                        // loop-carried registers in 0-18 would be invalidated.
+                    }
                     "sequence" => collect_loop_written(child, written)?,
                     _ => return Err(()),
                 }
