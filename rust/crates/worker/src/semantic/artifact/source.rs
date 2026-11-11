@@ -2025,6 +2025,13 @@ fn natural_loop_backedge(
                     if state.external_stores.len() != before_stores {
                         return Err("loop goto unexpectedly produced a memory store".into());
                     }
+                } else if tree.kind == "call" {
+                    // Bounded: call with a known prototype. No external store
+                    // is tracked by statement() for calls, so store count must
+                    // be unchanged.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop call unexpectedly produced a memory store".into());
+                    }
                 } else if matches!(tree.kind, "memory-store-pair" | "memory-load-pair") {
                     // Bounded: frame (stack) pair operations; no external memory
                     // effect is produced, so external store count must be unchanged.
@@ -2423,6 +2430,13 @@ fn natural_loop(
                     // targeting the next sequential instruction in this loop body).
                     if state.external_stores.len() != before_stores {
                         return Err("loop goto unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "call" {
+                    // Bounded: call with a known prototype. No external store
+                    // is tracked by statement() for calls, so store count must
+                    // be unchanged.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop call unexpectedly produced a memory store".into());
                     }
                 } else if matches!(tree.kind, "memory-store-pair" | "memory-load-pair") {
                     // Bounded: frame (stack) pair operations; no external memory
