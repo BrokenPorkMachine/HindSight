@@ -1389,20 +1389,48 @@ fn frame_objects(state: &State) -> BTreeMap<(i64, u64), u64> {
         .collect()
 }
 
-fn zero_test(t: &Tree) -> Option<(usize, bool)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ZeroTest {
+    register: usize,
+    /// true if the condition is satisfied when the tested value/expression is zero.
+    zero_means_true: bool,
+    /// If Some(mask), the test is ((value & mask) ==/!= 0) instead of (value ==/!= 0).
+    mask: Option<u64>,
+}
+
+fn zero_test(t: &Tree) -> Option<ZeroTest> {
     if t.kind != "binary" || !matches!(attribute(t, "operator"), "==" | "!=") || t.children.len() != 2 {
         return None;
     }
-    let (register_tree, constant_tree) = if t.children[0].kind == "register" {
-        (&t.children[0], &t.children[1])
-    } else {
+    let (lhs, rhs) = if t.children[0].kind == "constant" {
         (&t.children[1], &t.children[0])
+    } else {
+        (&t.children[0], &t.children[1])
     };
-    if constant_tree.kind != "constant" || number(constant_tree, "hex") != 0 {
+    if rhs.kind != "constant" || number(rhs, "hex") != 0 {
         return None;
     }
-    let (register, _) = register(register_tree).ok()?;
-    Some((register, attribute(t, "operator") == "=="))
+    let zero_means_true = attribute(t, "operator") == "==";
+    if lhs.kind == "register" {
+        let (register, _) = register(lhs).ok()?;
+        return Some(ZeroTest { register, zero_means_true, mask: None });
+    }
+    // Bit test form: ((reg & mask_const) == 0) / != 0 (e.g. TBZ/TBNZ).
+    if lhs.kind == "binary" && attribute(lhs, "operator") == "&" && lhs.children.len() == 2 {
+        let (reg_tree, mask_tree) = if lhs.children[0].kind == "register" {
+            (&lhs.children[0], &lhs.children[1])
+        } else if lhs.children[1].kind == "register" {
+            (&lhs.children[1], &lhs.children[0])
+        } else {
+            return None;
+        };
+        if mask_tree.kind != "constant" { return None; }
+        let mask = number(mask_tree, "hex");
+        if mask == 0 { return None; }
+        let (register, _) = register(reg_tree).ok()?;
+        return Some(ZeroTest { register, zero_means_true, mask: Some(mask) });
+    }
+    None
 }
 
 struct LoopVariable {
@@ -1463,9 +1491,11 @@ fn natural_loop_backedge(
     let exit = tail + 1;
     if exit > trees.len() { return Ok(None); }
     // Require the backedge test to be a zero/nonzero test on a register.
-    let Some((test_register, continues_on_zero)) = zero_test(&tail_tree.children[0]) else {
+    let Some(test) = zero_test(&tail_tree.children[0]) else {
         return Ok(None);
     };
+    let test_register = test.register;
+    let continues_on_zero = test.zero_means_true;
     // Single-entry region: no other control transfer may target inside the loop
     // except the recognized backedge.
     for (index, tree) in trees.iter().enumerate() {
@@ -1511,9 +1541,15 @@ fn natural_loop_backedge(
     }
     // Bottom-tested: continue when condition holds at backedge.
     let test_value = variable_by_register[&test_register].0;
-    let condition_template = if continues_on_zero { "(($0) == UINT64_C(0))" } else { "(($0) != UINT64_C(0))" };
+    let condition_template = if let Some(mask) = test.mask {
+        if continues_on_zero { format!("((($0) & UINT64_C({mask:#x})) == UINT64_C(0))") } else { format!("((($0) & UINT64_C({mask:#x})) != UINT64_C(0))") }
+    } else if continues_on_zero {
+        "(($0) == UINT64_C(0))".to_string()
+    } else {
+        "(($0) != UINT64_C(0))".to_string()
+    };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template.into(), vec![test_value], start + tail as u64 * 4
+        "source-loop-condition", "condition", condition_template, vec![test_value], start + tail as u64 * 4
     )?;
     dag.type_node(condition, None);
 
@@ -1661,13 +1697,15 @@ fn natural_loop(
     } else {
         if tail <= header || tail + 1 != exit { return Ok(None); }
     }
-    let Some((test_register, exits_on_zero)) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
+    let Some(header_test) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
+    let test_register = header_test.register;
+    let exits_on_zero = header_test.zero_means_true;
     if unconditional_backedge {
         // Header-tested while loop: test conditionally exits, tail jumps back
         // unconditionally to the loop header/test. Continue when exit is false.
     } else {
-        let Some((tail_register, continues_on_zero)) = zero_test(&trees[tail].children[0]) else { return Ok(None) };
-        if test_register != tail_register || exits_on_zero == continues_on_zero {
+        let Some(tail_test) = zero_test(&trees[tail].children[0]) else { return Ok(None) };
+        if tail_test.register != test_register || tail_test.mask != header_test.mask || exits_on_zero == tail_test.zero_means_true {
             return Ok(None);
         }
     }
@@ -1717,9 +1755,16 @@ fn natural_loop(
         state.registers[register] = Symbol::Value(value, known);
     }
     let test_value = variable_by_register[&test_register].0;
-    let condition_template = if exits_on_zero { "(($0) != UINT64_C(0))" } else { "(($0) == UINT64_C(0))" };
+    let condition_template = if let Some(mask) = header_test.mask {
+        // Continue loop when header test does NOT take the exit.
+        if exits_on_zero { format!("((($0) & UINT64_C({mask:#x})) != UINT64_C(0))") } else { format!("((($0) & UINT64_C({mask:#x})) == UINT64_C(0))") }
+    } else if exits_on_zero {
+        "(($0) != UINT64_C(0))".to_string()
+    } else {
+        "(($0) == UINT64_C(0))".to_string()
+    };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template.into(), vec![test_value], start + header as u64 * 4
+        "source-loop-condition", "condition", condition_template, vec![test_value], start + header as u64 * 4
     )?;
     dag.type_node(condition, None);
 
