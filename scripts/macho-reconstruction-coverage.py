@@ -30,14 +30,14 @@ def inspect_batch(directory: pathlib.Path, source: pathlib.Path | None = None) -
             if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 1024 * 1024 * 1024:
                 raise ValueError("source is not a bounded regular file")
             hasher = hashlib.sha256()
-            magic = b""
+            header = b""
             remaining = before.st_size
             while remaining:
                 chunk = os.read(fd, min(1024 * 1024, remaining))
                 if not chunk:
                     raise ValueError("source ended during verification")
-                if not magic:
-                    magic = chunk[:4]
+                if len(header) < 8:
+                    header += chunk[:8 - len(header)]
                 hasher.update(chunk)
                 remaining -= len(chunk)
             after = os.fstat(fd)
@@ -49,12 +49,10 @@ def inspect_batch(directory: pathlib.Path, source: pathlib.Path | None = None) -
             os.close(fd)
         if hasher.hexdigest() != manifest["source_sha256"]:
             raise ValueError("source SHA-256 does not match the reconstruction batch")
-        if magic != bytes.fromhex("cffaedfe"):
+        if header[:4] != bytes.fromhex("cffaedfe"):
             raise ValueError("source is not a little-endian thin 64-bit Mach-O")
-        # cputype at offset 4: CPU_TYPE_ARM64=0x0100000c and
-        # CPU_TYPE_X86_64=0x01000007. Scope this milestone to Mach-O CPUs.
-        with source.open("rb") as stream:
-            header = stream.read(8)
+        # The header was captured from the same verified fd; do not reopen an
+        # attacker-replaceable path after identity verification.
         if len(header) != 8 or int.from_bytes(header[4:8], "little") not in (0x0100000c, 0x01000007):
             raise ValueError("Mach-O CPU type is outside this decompiler milestone")
     stats = {"recovered": 0, "review_only": 0, "failed": 0}
