@@ -1766,6 +1766,10 @@ fn natural_loop_backedge(
     let mut type_conflicts = BTreeSet::new();
     for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
         let pc = start + index as u64 * 4;
+        if tree.kind == "no-op" {
+            statement(tree, &mut state, dag, pc, call_prototypes)?;
+            continue;
+        }
         let register = if tree.kind == "assignment" {
             match register(&tree.children[0]) {
                 Ok((register, _)) => Some(register),
