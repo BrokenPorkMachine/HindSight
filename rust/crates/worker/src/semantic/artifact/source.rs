@@ -2836,12 +2836,20 @@ pub(super) fn recover_with_types(
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                     });
-                    let target_indices = targets.into_iter().filter_map(|target| {
-                        let delta = target.checked_sub(start)?;
-                        if delta % 4 != 0 { return None; }
+                    let mut target_indices = Vec::with_capacity(targets.len());
+                    for target in targets {
+                        let Some(delta) = target.checked_sub(start) else {
+                            return Err("resolved indirect dispatch target is outside the recovered function".into());
+                        };
+                        if delta % 4 != 0 {
+                            return Err("resolved indirect dispatch target is not instruction-aligned".into());
+                        }
                         let idx = (delta / 4) as usize;
-                        (idx < trees.len()).then_some((target, idx))
-                    }).collect::<Vec<_>>();
+                        if idx >= trees.len() {
+                            return Err("resolved indirect dispatch target is outside the recovered function".into());
+                        }
+                        target_indices.push((target, idx));
+                    }
                     if target_indices.is_empty() {
                         return Err("resolved indirect dispatch has no recoverable in-function continuation".into());
                     }
