@@ -65,7 +65,9 @@ struct VGBinaryWorkspace: View {
     @State private var showFunctions = true
     @State private var showRightPane = true
     @State private var followPC = true
-    @State private var centerMode: VGBinaryCenterMode = .split
+    // Keep disassembly readable by default. Side-by-side code/semantics is
+    // explicitly selectable when the investigation calls for comparison.
+    @State private var centerMode: VGBinaryCenterMode = .code
     @State private var semanticMode: VGBinarySemanticMode = .pseudocode
     @State private var rightMode: VGBinaryRightMode = .references
     @State private var showFunctionOverride = false

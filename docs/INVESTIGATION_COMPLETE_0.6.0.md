@@ -69,6 +69,11 @@ Gate: independently replayable observed traces and accurate capability notices.
 
 ### W4 — Investigation UX and accessibility (P0)
 
+The viewport, pane and multi-surface policy is defined in
+[UX Space Allocation 0.6.0](UX_SPACE_ALLOCATION_0.6.0.md). Multi-surface layouts
+must be justified by the task, with the main evidence canvas protected at
+compact sizes and global inspectors opt-in beside self-contained workspaces.
+
 - [ ] Test at 900×680, 1180×760, 1440×900 and full screen on an 8 GiB Mac.
 - [ ] Keep one investigation identity across all workspaces and the inspector.
 - [ ] Validate keyboard navigation, command palette, focus, VoiceOver labels,
