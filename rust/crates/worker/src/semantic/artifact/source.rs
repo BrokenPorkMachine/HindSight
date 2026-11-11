@@ -1790,10 +1790,16 @@ fn natural_loop_backedge(
     };
     let test_register = test.register;
     // Single-entry region: no other control transfer may target inside the loop
-    // except the recognized backedge.
+    // except the recognized backedge. Redundant fallthrough-equivalent gotos
+    // inside the body (targeting the immediately following instruction) are
+    // allowed.
     for (index, tree) in trees.iter().enumerate() {
         if !matches!(tree.kind, "goto" | "conditional-goto") || index == tail { continue; }
-        if target_index(number(tree, "target")).is_some_and(|target| (header..=tail).contains(&target)) {
+        let Some(target) = target_index(number(tree, "target")) else { continue; };
+        if tree.kind == "goto" && index >= header && index < tail && target == index + 1 {
+            continue;
+        }
+        if (header..=tail).contains(&target) {
             return Ok(None);
         }
     }
