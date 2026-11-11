@@ -57,6 +57,20 @@ class UXSpaceContract(unittest.TestCase):
             section = self.content[start:end]
             self.assertNotIn(".frame(minHeight: 650)", section, name)
 
+    def test_navigation_dock_can_collapse_without_losing_selection(self):
+        self.assertIn('@AppStorage("HindSight.navigationDockVisible")', self.content)
+        self.assertIn("navigationDockVisible.toggle()", self.content)
+        self.assertIn("if navigationDockIsVisible {", self.content)
+        self.assertIn("Button(action: toggleNavigationDock)", self.content)
+        self.assertIn('keyboardShortcut("\\\\", modifiers: .command)', self.content)
+        self.assertIn('"Show Navigation Dock"', self.content)
+        self.assertIn('"Hide Navigation Dock"', self.content)
+        # Focus Mode must temporarily hide the dock without overwriting preference.
+        self.assertIn("navigationDockVisible && !focusMode", self.content)
+        start = self.content.index("private func toggleFocusMode()")
+        end = self.content.index("private var hasNextPage:", start)
+        self.assertNotIn("navigationDockVisible =", self.content[start:end])
+
     def test_main_window_minimum_is_still_supported(self):
         self.assertIn(".frame(minWidth: 900, minHeight: 680)", self.content)
 
