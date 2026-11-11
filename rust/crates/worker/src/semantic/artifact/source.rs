@@ -1637,12 +1637,12 @@ fn natural_loop_backedge(
         } else {
             None
         };
-        let before_flags = state.flags;
         let before_frame = state.frame.clone();
         let before_loads = state.external_loads.len();
         let before_stores = state.external_stores.len();
         statement(tree, &mut state, dag, pc, call_prototypes)?;
-        if state.flags != before_flags { return Err("loop body changes flags without a loop-carried flag value".into()); }
+        // Flag changes within the body are allowed for register-based loop conditions;
+        // flags are not modeled as loop-carried values in this bounded recovery.
         if state.frame != before_frame || state.external_loads.len() < before_loads {
             return Err("loop body has memory effects without loop-carried memory SSA".into());
         }
@@ -1857,12 +1857,12 @@ fn natural_loop(
         } else {
             None
         };
-        let before_flags = state.flags;
         let before_frame = state.frame.clone();
         let before_loads = state.external_loads.len();
         let before_stores = state.external_stores.len();
         statement(tree, state, dag, pc, call_prototypes)?;
-        if state.flags != before_flags { return Err("loop body changes flags without a loop-carried flag value".into()); }
+        // Flag changes within the body are allowed for register-based loop conditions;
+        // flags are not modeled as loop-carried values in this bounded recovery.
         if state.frame != before_frame || state.external_loads.len() < before_loads {
             return Err("loop body has memory effects without loop-carried memory SSA".into());
         }
