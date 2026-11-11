@@ -64,6 +64,27 @@ builds never substitute for this gate.
 **Gate:** each inference has source instruction/evidence provenance, bounded failure
 behavior, corpus coverage, and an explicitly scoped validation result.
 
+### Mach-O semantic decompiler and reconstruction completion — P1 (next)
+
+This is the next primary engine-completion track following the bounded x86-64
+QEMU pilot. Prioritize ARM64/ARM64e Mach-O semantic fidelity, recovered
+variables/types, structured pseudocode, recompilable source and differential
+verification **before** widening general semantic decompilation to ELF/PE.
+See [Mach-O Decompiler Completion](MACHO_DECOMPILER_COMPLETION_0.6.0.md)
+for ordered M0–M8 and x86-64 Mach-O X0–X3 gates.
+
+- [ ] Establish measured per-function baseline over the existing decompilation
+  and source-reconstruction corpus; record incomplete/omitted functions.
+- [ ] Recover proven machine semantics, stack/memory SSA, types and ABI.
+- [ ] Render nested, evidence-linked source AST without invented effects.
+- [ ] Compile and independently differentially verify eligible reconstructed
+  functions, with source/architecture/optimization/host evidence attached.
+- [ ] Integrate source, CFG, disassembly and review into a focused, resizable UI.
+- [ ] Extend the same pipeline to x86-64 Mach-O; avoid a parallel text renderer.
+
+**Gate:** bounded, independently verified function/source reconstruction and
+explicit rejection reporting; attractive pseudocode is not sufficient.
+
 ### 2. ECU firmware analysis and bounded C167 execution — P1
 
 - [x] Import and structurally analyze ME7-class images; verify checksum descriptors,
