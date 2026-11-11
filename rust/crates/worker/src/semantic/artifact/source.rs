@@ -1747,6 +1747,14 @@ struct SourceLoop {
 fn is_noop_tree(tree: &Tree) -> bool {
     match tree.kind {
         "no-op" | "flags-compare" | "flags-arithmetic" => true,
+        "assignment" => {
+            // Bounded: assignment of a register to itself is a no-op.
+            tree.children.len() == 2
+                && tree.children[0].kind == "register"
+                && tree.children[1].kind == "register"
+                && register(&tree.children[0]).ok().map(|(r, _)| r)
+                    == register(&tree.children[1]).ok().map(|(r, _)| r)
+        }
         "sequence" => !tree.children.is_empty() && tree.children.iter().all(is_noop_tree),
         _ => false,
     }
