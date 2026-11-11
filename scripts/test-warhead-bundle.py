@@ -77,4 +77,9 @@ for source in javascript:
         target = (source.parent / specifier).resolve()
         assert target.is_file(), f"missing local import: {source.relative_to(bundle)} -> {specifier}"
 
+# The Community gate must be tested as part of every bundled-runtime refresh.
+# In particular this must fail if a private build overwrites the guarded registry.
+subprocess.run(["node", "--test", "scripts/test-warhead-community.mjs"],
+               check=True, cwd=root)
+
 print(f"Warhead bundle contract passed ({len(javascript)} JavaScript modules)")
