@@ -1,24 +1,75 @@
 import Foundation
 import CryptoKit
-/// Platform-specific indicators for workspaces.
+/// Source-backed artifact family. This classifies captured/header evidence;
+/// it is never a grant to execute tools or reinterpret an imported artifact.
 enum VGWorkspacePlatform: String, CaseIterable {
     case apple = "Machine Lab"
     case ecu = "Ecu Platform"
 }
 
 enum VGArtifactProfile: String, Codable, CaseIterable {
+    // Keep "apple" for launch-session compatibility with older Mach-O projects.
     case apple
     case ecu
+    case elf
+    case pe
+    case raw
     case generic
+
+    var title: String {
+        switch self {
+        case .apple: return "Mach-O"
+        case .ecu: return "ECU"
+        case .elf: return "ELF"
+        case .pe: return "PE/COFF"
+        case .raw: return "Raw"
+        case .generic: return "No artifact"
+        }
+    }
 
     static func derive(from record: ProjectRecord?) -> VGArtifactProfile {
         guard let record else { return .generic }
         let options = record.result.import_options
-        if options?.format == "ecu" || options?.architecture == "c167"
-            || record.result.architecture.localizedCaseInsensitiveContains("C167")
-            || record.result.file_kind.localizedCaseInsensitiveContains("ecu") { return .ecu }
-        if record.result.file_kind.localizedCaseInsensitiveContains("mach-o") { return .apple }
-        return .generic
+        let kind = record.result.file_kind.lowercased()
+        let format = options?.format.lowercased() ?? "auto"
+        let arch = record.result.architecture.lowercased()
+
+        // ECU explicitly selected by the validated import contract or identified
+        // through C167/ECU evidence; a filename or user-facing view toggle is
+        // never itself proof that the worker admitted an ECU image.
+        if format == "ecu" || options?.architecture == "c167"
+            || arch.contains("c167") || kind.contains("ecu") { return .ecu }
+
+        // Header-backed format evidence (or an explicit import interpretation)
+        // controls the default tool surface, not the file extension.
+        if kind.contains("mach-o") || format == "macho" { return .apple }
+        if kind.contains("elf") || format == "elf" { return .elf }
+        if kind.contains("pe") || kind.contains("coff") || format == "pe" { return .pe }
+        return .raw
+    }
+}
+
+/// Analyst-selected layout/tool *presentation*. It does not alter import options,
+/// change a captured binary's identity, or authorize runtime/ECU execution.
+enum VGArtifactViewMode: String, CaseIterable, Identifiable {
+    case automatic = "Auto"
+    case macho = "Mach-O"
+    case elf = "ELF"
+    case pe = "PE/COFF"
+    case ecu = "ECU"
+    case raw = "Raw"
+
+    var id: String { rawValue }
+
+    var profile: VGArtifactProfile? {
+        switch self {
+        case .automatic: return nil
+        case .macho: return .apple
+        case .elf: return .elf
+        case .pe: return .pe
+        case .ecu: return .ecu
+        case .raw: return .raw
+        }
     }
 }
 
