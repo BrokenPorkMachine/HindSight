@@ -980,7 +980,8 @@ fn address_setup_preserves_registers(code:&[u8],base:u64,start:usize,end:usize,r
   let word=le32(bytes);
   if word==0xd503_201f{continue}
   let destination=arm64_address_value(word,base+index as u64*4).map(|value|value.0)
-   .or_else(||arm64_add_immediate(word).map(|value|value.0));
+   .or_else(||arm64_add_immediate(word).map(|value|value.0))
+   .or_else(||arm64_sub_immediate(word).map(|value|value.0));
   let Some(destination)=destination else{return false};
   if registers.contains(&destination)||destination==31{return false}
  }
