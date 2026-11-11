@@ -1561,35 +1561,53 @@ fn zero_test(t: &Tree) -> Option<LoopTest> {
     None
 }
 
-/// Recognize a flag-condition branch produced by `CMP reg, #imm` immediately
-/// before `branch_index` as an equivalent register-vs-constant comparison.
-/// Supports eq/ne and signed/unsigned ordering predicates (bounded, conservative).
+/// Recognize a flag-condition branch produced by `CMP reg, #imm` or `TST reg, #imm`
+/// immediately before `branch_index` as an equivalent register-vs-constant comparison.
+/// CMP supports eq/ne and signed/unsigned ordering predicates; TST supports eq/ne
+/// as a masked zero test (bounded, conservative).
 fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize, trees: &[Tree]) -> Option<(LoopTest, usize)> {
     if condition.kind != "flag-condition" { return None; }
-    let cmp = match attribute(condition, "predicate") {
-        "eq" => LoopCmp::Eq,
-        "ne" => LoopCmp::Ne,
-        "lt" => LoopCmp::Slt,
-        "le" => LoopCmp::Sle,
-        "gt" => LoopCmp::Sgt,
-        "ge" => LoopCmp::Sge,
-        "lo" => LoopCmp::Ult, // unsigned <
-        "ls" => LoopCmp::Ule, // unsigned <=
-        "hi" => LoopCmp::Ugt, // unsigned >
-        "hs" => LoopCmp::Uge, // unsigned >=
-        _ => return None,
-    };
+    let predicate = attribute(condition, "predicate");
     if branch_index == 0 || branch_index <= header { return None; }
     let cmp_index = branch_index - 1;
     let cmp_tree = trees.get(cmp_index)?;
-    if cmp_tree.kind != "flags-compare" || attribute(cmp_tree, "operator") != "cmp" || cmp_tree.children.len() != 2 {
+    if cmp_tree.kind != "flags-compare" || cmp_tree.children.len() != 2 {
         return None;
     }
+    let op = attribute(cmp_tree, "operator");
     let rhs = &cmp_tree.children[1];
     if rhs.kind != "constant" { return None; }
-    let compare_value = number(rhs, "hex");
+    let imm = number(rhs, "hex");
     let (register, _) = register(&cmp_tree.children[0]).ok()?;
-    Some((LoopTest { register, cmp, compare_value, mask: None }, cmp_index))
+    match op {
+        "cmp" => {
+            let cmp = match predicate {
+                "eq" => LoopCmp::Eq,
+                "ne" => LoopCmp::Ne,
+                "lt" => LoopCmp::Slt,
+                "le" => LoopCmp::Sle,
+                "gt" => LoopCmp::Sgt,
+                "ge" => LoopCmp::Sge,
+                "lo" => LoopCmp::Ult, // unsigned <
+                "ls" => LoopCmp::Ule, // unsigned <=
+                "hi" => LoopCmp::Ugt, // unsigned >
+                "hs" => LoopCmp::Uge, // unsigned >=
+                _ => return None,
+            };
+            Some((LoopTest { register, cmp, compare_value: imm, mask: None }, cmp_index))
+        }
+        "tst" | "test" => {
+            // TST sets Z based on (left & right); eq => zero, ne => nonzero.
+            let cmp = match predicate {
+                "eq" => LoopCmp::Eq,
+                "ne" => LoopCmp::Ne,
+                _ => return None,
+            };
+            if imm == 0 { return None; }
+            Some((LoopTest { register, cmp, compare_value: 0, mask: Some(imm) }, cmp_index))
+        }
+        _ => None,
+    }
 }
 
 struct LoopVariable {
