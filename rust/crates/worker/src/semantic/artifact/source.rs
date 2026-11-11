@@ -2796,6 +2796,14 @@ pub(super) fn recover_with_types(
                         index = join_index;
                         continue;
                     }
+                    // Single proven in-function target: complete dispatch with no external
+                    // exits means all accounted cases reach this continuation.
+                    if target_indices.len() == 1 {
+                        let (_, single_index) = target_indices[0];
+                        let _ = read(&t.children[0], &mut state, &mut dag, pc)?;
+                        index = single_index;
+                        continue;
+                    }
                     if target_indices.len() > 16 {
                         return Err("resolved indirect dispatch has too many targets for bounded source recovery".into());
                     }
