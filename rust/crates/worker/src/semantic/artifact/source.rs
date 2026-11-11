@@ -3204,6 +3204,24 @@ pub(super) fn recover_with_types(
                     let delta = target - start;
                     let target_index = (delta / 4) as usize;
                     if t.kind == "goto" {
+                        // Bounded backedge loop: unconditional branch back to an
+                        // already visited preheader forms a cycle; try recovery
+                        // before following the goto.
+                        if target_index < index && seen.contains_key(&target_index) {
+                            let preheader_tree = trees.get(target_index);
+                            if preheader_tree.is_some_and(|t| t.kind == "conditional-goto") {
+                                let mut loop_state = seen[&target_index].clone();
+                                if let Some((source_loop, exit)) = natural_loop(
+                                    start, target_index, trees, &mut loop_state, &mut dag, call_prototypes
+                                )? {
+                                    for body_index in target_index + 1..exit { seen.insert(body_index, loop_state.clone()); }
+                                    source_loops.push(source_loop);
+                                    state = loop_state;
+                                    index = exit;
+                                    continue;
+                                }
+                            }
+                        }
                         index = target_index;
                         continue;
                     }
