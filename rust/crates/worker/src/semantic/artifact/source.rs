@@ -1982,18 +1982,32 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
                             } else {
                                 return Err("stack argument value not proven".into());
                             }
-                        } else if req_bytes == 4 && size == 8 && req_off == slot {
-                            let src = dag.value(value, 64, pc)?;
-                            let id = dag.add_role(
-                                "source-frame-reload",
-                                "slot",
-                                "((uint64_t)(uint32_t)((uint64_t)($0)))".to_owned(),
-                                vec![src],
-                                pc,
-                            )?;
-                            dag.nodes[id].origins.extend(origins);
-                            dag.type_node(id, Some(SourceType { spelling: "uint32_t".into(), bits: 32, signed: false, pointer: false }));
-                            Symbol::Value(id, 64)
+                        } else if matches!(req_bytes, 1 | 2 | 4) && matches!(size, 2 | 4 | 8) && req_bytes < size {
+                            let inner_offset = req_off - slot;
+                            if inner_offset >= 0
+                                && (inner_offset as u64 + req_bytes) <= size
+                                && (inner_offset % req_bytes as i64 == 0 || inner_offset == 0)
+                            {
+                                let src = dag.value(value, 64, pc)?;
+                                let shift = (inner_offset as u64) * 8;
+                                let shifted = if shift == 0 {
+                                    "((uint64_t)($0))".to_owned()
+                                } else {
+                                    format!("(((uint64_t)($0)) >> {shift})")
+                                };
+                                let (template, spelling) = match req_bytes {
+                                    1 => (format!("((uint64_t)(uint8_t){shifted})"), "uint8_t".to_owned()),
+                                    2 => (format!("((uint64_t)(uint16_t){shifted})"), "uint16_t".to_owned()),
+                                    4 => (format!("((uint64_t)(uint32_t){shifted})"), "uint32_t".to_owned()),
+                                    _ => return Err("stack argument value not proven".into()),
+                                };
+                                let id = dag.add_role("source-frame-reload", "slot", template, vec![src], pc)?;
+                                dag.nodes[id].origins.extend(origins);
+                                dag.type_node(id, Some(SourceType { spelling, bits: (req_bytes * 8) as u8, signed: false, pointer: false }));
+                                Symbol::Value(id, 64)
+                            } else {
+                                return Err("stack argument value not proven".into());
+                            }
                         } else {
                             return Err("stack argument value not proven".into());
                         }
