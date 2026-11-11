@@ -1703,6 +1703,14 @@ struct SourceLoop {
 }
 
 
+fn is_noop_tree(tree: &Tree) -> bool {
+    match tree.kind {
+        "no-op" => true,
+        "sequence" => !tree.children.is_empty() && tree.children.iter().all(is_noop_tree),
+        _ => false,
+    }
+}
+
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
         "no-op" | "flags-compare" | "flags-arithmetic" | "goto" => Ok(()),
@@ -1765,7 +1773,7 @@ fn natural_loop_backedge(
     // Tolerate bounded trailing no-ops between backedge and exit, but only
     // when no control transfer targets those no-ops (so skipping them is sound).
     let mut skipped = 0usize;
-    while exit < trees.len() && skipped < 4 && trees.get(exit).is_some_and(|t| t.kind == "no-op") {
+    while exit < trees.len() && skipped < 4 && trees.get(exit).is_some_and(is_noop_tree) {
         let noop_index = exit;
         let targeted = trees.iter().enumerate().any(|(i, tree)| {
             matches!(tree.kind, "goto" | "conditional-goto")
@@ -2030,7 +2038,7 @@ fn natural_loop(
         // are untargeted no-ops (unconditional backedge) or the gap is valid for a
         // conditional backedge fallthrough to exit.
         let trailing_untargeted_noop = |noop_index: usize| -> bool {
-            trees.get(noop_index).is_some_and(|t| t.kind == "no-op")
+            trees.get(noop_index).is_some_and(is_noop_tree)
                 && !trees.iter().enumerate().any(|(i, tree)| {
                     matches!(tree.kind, "goto" | "conditional-goto")
                         && target_index(number(tree, "target")) == Some(noop_index)
@@ -2088,7 +2096,7 @@ fn natural_loop(
         if tail + 1 == exit { return true; }
         if exit <= tail + 1 || exit > tail + 5 { return false; }
         for noop_index in (tail + 1)..exit {
-            if !trees.get(noop_index).is_some_and(|t| t.kind == "no-op") {
+            if !trees.get(noop_index).is_some_and(is_noop_tree) {
                 return false;
             }
             let targeted = trees.iter().enumerate().any(|(i, tree)| {
