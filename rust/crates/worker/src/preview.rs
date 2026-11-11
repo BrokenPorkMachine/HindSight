@@ -1105,7 +1105,7 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
  let index_provenance = if index_register != 31 {
   // Check nearby instructions for index register origin
   let mut origin = String::new();
-  for li in (load_index.saturating_sub(10)..load_index).rev() {
+  for li in (load_index.saturating_sub(12)..load_index).rev() {
     let w = le32(&code[li*4..li*4+4]);
     let rn = (w >> 5) & 31;
     // LDR (indexed/unsigned immediate) pattern: 0xF8xxxxxx with Rn in bits 20-16
