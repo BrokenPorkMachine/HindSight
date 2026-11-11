@@ -735,6 +735,20 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                     }
                 }
             }
+            // Bounded: extract low 4 bytes from an 8-byte scalar slot at the same offset.
+            if bytes == 4 && size == 8 && offset == slot {
+                let src = dag.value(value.clone(), 64, pc)?;
+                let id = dag.add_role(
+                    "source-frame-reload",
+                    "slot",
+                    "((uint64_t)(uint32_t)((uint64_t)($0)))".to_owned(),
+                    vec![src],
+                    pc,
+                )?;
+                dag.nodes[id].origins.extend(origins);
+                dag.type_node(id, Some(SourceType { spelling: "uint32_t".into(), bits: 32, signed: false, pointer: false }));
+                return Ok(Symbol::Value(id, 64));
+            }
             let _ = (origins,);
             return Err("external memory read width is unsupported".into());
         }
