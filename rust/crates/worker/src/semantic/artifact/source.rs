@@ -1955,6 +1955,18 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
                             } else {
                                 return Err("stack argument value not proven".into());
                             }
+                        } else if req_bytes == 4 && size == 8 && req_off == slot {
+                            let src = dag.value(value, 64, pc)?;
+                            let id = dag.add_role(
+                                "source-frame-reload",
+                                "slot",
+                                "((uint64_t)(uint32_t)((uint64_t)($0)))".to_owned(),
+                                vec![src],
+                                pc,
+                            )?;
+                            dag.nodes[id].origins.extend(origins);
+                            dag.type_node(id, Some(SourceType { spelling: "uint32_t".into(), bits: 32, signed: false, pointer: false }));
+                            Symbol::Value(id, 64)
                         } else {
                             return Err("stack argument value not proven".into());
                         }
