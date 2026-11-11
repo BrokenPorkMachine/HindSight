@@ -40,6 +40,30 @@ comparison, or live context improves the task.
   workflows when hosted inside a 680-point-height main window with headers,
   tab bar and status bar.
 
+## Navigation Dock (second 0.6.0 UX increment)
+
+- The global left sidebar is an **optional dock**, not required permanent chrome.
+- A leading toolbar button toggles it; `⌘\\` offers the same action.
+- When hidden, it is **removed from the top-level HSplitView** so the main
+  investigation canvas gains the full width rather than leaving a blank rail.
+- The existing workspace tabs, Workflows menu, and `⌘K` command palette remain
+  available without opening the dock.
+- The visibility choice persists across launches via `@AppStorage`.
+- Focus Mode temporarily suppresses the dock but does **not** overwrite the
+  user's chosen visibility setting.
+- A displayed dock retains its native resizable split control. Do not introduce
+  a second dock in dense workspaces that already provide internal navigation.
+
+### Navigation Dock acceptance (NOT YET QUALIFIED ON MAC)
+
+- [ ] Toggle at 900×680 and verify disassembly/graph visibly expands.
+- [ ] Toggle at 1180×760, 1440×900 and full screen; no clipping or blank rail.
+- [ ] Use `⌘\\`, toolbar control and VoiceOver; button correctly announces show/hide.
+- [ ] Hide dock, navigate among workspaces with tabs, Workflows and `⌘K`.
+- [ ] Enter/exit Focus Mode with dock shown, then with dock hidden; restore both.
+- [ ] Quit/relaunch, reopen investigation and verify saved dock preference.
+- [ ] While a job is running, toggle repeatedly; no loss of progress or selection.
+
 ## Layout principles
 
 1. **One authoritative selection.** Function, address, artifact and runtime

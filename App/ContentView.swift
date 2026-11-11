@@ -372,6 +372,14 @@ struct ContentView: View {
     @State private var projectTypeTargetFilter = ""
     @State private var commandPalettePresented = false
     @State private var sidebarQuery = ""
+    // A dock, not a permanent allocation: keep the user's choice across
+    // launches, while Focus Mode temporarily suppresses navigation chrome.
+    @AppStorage("HindSight.navigationDockVisible") private var navigationDockVisible = true
+    private var navigationDockIsVisible: Bool { navigationDockVisible && !focusMode }
+    private func toggleNavigationDock() {
+        guard !focusMode else { return }
+        navigationDockVisible.toggle()
+    }
     // Only expand a second inspector by default when the workspace needs it.
     // Overrides are scoped per workspace so a user can deliberately request
     // the global inspector without having to re-enable it on every visit.
@@ -3192,6 +3200,14 @@ struct ContentView: View {
     @ViewBuilder private func workspaceHeader(_ record: ProjectRecord?) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
+                Button(action: toggleNavigationDock) {
+                    Image(systemName: "sidebar.left")
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut("\\", modifiers: .command)
+                .disabled(focusMode)
+                .accessibilityLabel(navigationDockIsVisible ? "Hide Navigation Dock" : "Show Navigation Dock")
+                .help(focusMode ? "Exit Focus Mode to use the Navigation Dock" : (navigationDockIsVisible ? "Hide Navigation Dock (⌘\\)" : "Show Navigation Dock (⌘\\)"))
                 HStack(spacing: 4) {
                     Button(action: model.navigateBack) { Image(systemName: "chevron.left") }
                         .disabled(!model.canNavigateBack)
@@ -4053,7 +4069,7 @@ struct ContentView: View {
 
     var body: some View {
         HSplitView {
-            if !focusMode {
+            if navigationDockIsVisible {
                 workbenchSidebar()
                     .padding(.top, 30)
                     .frame(minWidth: 245, idealWidth: 285, maxWidth: 330)
