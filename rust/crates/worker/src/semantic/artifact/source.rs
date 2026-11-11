@@ -2162,6 +2162,15 @@ fn natural_loop(
         (conditional_backedges[0], false)
     } else if conditional_backedges.is_empty() && unconditional_backedges.len() == 1 {
         (unconditional_backedges[0], true)
+    } else if conditional_backedges.len() == 1 && unconditional_backedges.len() == 1 {
+        // Pattern A2: loop with two backedges (one conditional, one
+        // unconditional) targeting the same header. Use the later one as
+        // the tail. The body must still be straight-line (no internal
+        // control flow). This handles loops where an if-else has one
+        // branch that falls through to the backedge and one that jumps.
+        let t1 = conditional_backedges[0];
+        let t2 = unconditional_backedges[0];
+        if t1 > t2 { (t1, false) } else { (t2, true) }
     } else if conditional_backedges.is_empty() && unconditional_backedges.is_empty() && exit > preheader + 1 {
         if let Some(tail) = find_backedge_before_exit(exit, preheader, "goto") {
             // Pattern B: `preheader` is the loop header/test, unconditional backedge.
