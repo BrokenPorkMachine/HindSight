@@ -372,11 +372,22 @@ struct ContentView: View {
     @State private var projectTypeTargetFilter = ""
     @State private var commandPalettePresented = false
     @State private var sidebarQuery = ""
-    @State private var showInspector = true
+    // Only expand a second inspector by default when the workspace needs it.
+    // Overrides are scoped per workspace so a user can deliberately request
+    // the global inspector without having to re-enable it on every visit.
+    @State private var inspectorOverrides: [String: Bool] = [:]
+    private var hasIntegratedInspector: Bool {
+        ["CFG", "Binary Workspace", "Runtime Correlation", "Trace Explorer", "Evidence Graph", "Investigation Ledger"].contains(model.workspace)
+    }
+    private var inspectorIsVisible: Bool {
+        (inspectorOverrides[model.workspace] ?? !hasIntegratedInspector) && !focusMode
+    }
+    private func toggleWorkspaceInspector() {
+        inspectorOverrides[model.workspace] = !inspectorIsVisible
+    }
     @State private var inspectorMode: VGInspectorMode = .context
     @State private var workspaceTabs = ["Overview"]
     @State private var focusMode = false
-    @State private var inspectorBeforeFocus = true
     @State private var quickStartPresented = false
 
 
@@ -425,14 +436,9 @@ struct ContentView: View {
     }
 
     private func toggleFocusMode() {
-        if focusMode {
-            focusMode = false
-            showInspector = inspectorBeforeFocus
-        } else {
-            inspectorBeforeFocus = showInspector
-            focusMode = true
-            showInspector = false
-        }
+        // Focus mode suppresses chrome without overwriting the user's per-workspace
+        // decision to show the global inspector when they return to regular mode.
+        focusMode.toggle()
     }
 
     private var hasNextPage: Bool {
@@ -3270,9 +3276,9 @@ struct ContentView: View {
                     .toggleStyle(.button)
                     .help("Mentor mode")
 
-                Button { showInspector.toggle() } label: { Image(systemName: "sidebar.right") }
+                Button(action: toggleWorkspaceInspector) { Image(systemName: "sidebar.right") }
                     .buttonStyle(.borderless)
-                    .help(showInspector ? "Hide Inspector" : "Show Inspector")
+                    .help(inspectorIsVisible ? "Hide Inspector" : "Show Inspector")
 
                 Button(action: toggleFocusMode) {
                     Image(systemName: focusMode ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
@@ -3826,7 +3832,7 @@ struct ContentView: View {
 
     @ViewBuilder private func selectedWorkspaceAndInspector(_ record: ProjectRecord) -> some View {
         GeometryReader { proxy in
-            if showInspector && !focusMode {
+            if inspectorIsVisible {
                 if proxy.size.width >= 1040 {
                     HSplitView {
                         selectedWorkspaceContent(record)
