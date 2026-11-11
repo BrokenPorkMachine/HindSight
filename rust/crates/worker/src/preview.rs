@@ -974,6 +974,12 @@ fn address_setup_preserves(code:&[u8],base:u64,start:usize,end:usize,register:u3
  address_setup_preserves_registers(code,base,start,end,&[register])
 }
 
+fn arm64_mov_register(word:u32)->Option<u32>{
+ // MOV Xd, Xm => ORR Xd, XZR, Xm (shifted register, LSL #0)
+ // 64-bit: 0xAA0003E0 | (Rm<<16) | Rd ; 32-bit: 0x2A0003E0 | (Rm<<16) | Rd
+ if word&0x7FE0FFE0==0x2A0003E0 { Some(word&31) } else { None }
+}
+
 fn address_setup_preserves_registers(code:&[u8],base:u64,start:usize,end:usize,registers:&[u32])->bool{
  for index in start..end{
   let Some(bytes)=code.get(index*4..index*4+4)else{return false};
@@ -981,7 +987,8 @@ fn address_setup_preserves_registers(code:&[u8],base:u64,start:usize,end:usize,r
   if word==0xd503_201f{continue}
   let destination=arm64_address_value(word,base+index as u64*4).map(|value|value.0)
    .or_else(||arm64_add_immediate(word).map(|value|value.0))
-   .or_else(||arm64_sub_immediate(word).map(|value|value.0));
+   .or_else(||arm64_sub_immediate(word).map(|value|value.0))
+   .or_else(||arm64_mov_register(word));
   let Some(destination)=destination else{return false};
   if registers.contains(&destination)||destination==31{return false}
  }
@@ -1029,7 +1036,8 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
    if word==0xd503_201f{continue}
    let destination=arm64_address_value(word,base+i as u64*4).map(|v|v.0)
     .or_else(||arm64_add_immediate(word).map(|v|v.0))
-    .or_else(||arm64_sub_immediate(word).map(|v|v.0));
+    .or_else(||arm64_sub_immediate(word).map(|v|v.0))
+    .or_else(||arm64_mov_register(word));
    if destination!=Some(index_register){
     if destination.is_none(){address_only=false;break}
    }else{address_only=false;break}
