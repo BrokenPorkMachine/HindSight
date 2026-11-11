@@ -3403,7 +3403,7 @@ pub(super) fn recover_with_types(
                         index = single_index;
                         continue;
                     }
-                    if target_indices.len() > 16 {
+                    if target_indices.len() > 32 {
                         return Err("resolved indirect dispatch has too many targets for bounded source recovery".into());
                     }
                     let dispatch = read(&t.children[0], &mut state, &mut dag, pc)?;
