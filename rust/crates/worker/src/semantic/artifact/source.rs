@@ -1569,7 +1569,12 @@ fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize,
     if condition.kind != "flag-condition" { return None; }
     let predicate = attribute(condition, "predicate");
     if branch_index == 0 || branch_index <= header { return None; }
-    let cmp_index = branch_index - 1;
+    // Allow a single no-op between compare and branch (flags unaffected).
+    let mut cmp_index = branch_index - 1;
+    if trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") {
+        if cmp_index == 0 || cmp_index <= header { return None; }
+        cmp_index -= 1;
+    }
     let cmp_tree = trees.get(cmp_index)?;
     if cmp_tree.kind != "flags-compare" || cmp_tree.children.len() != 2 {
         return None;
