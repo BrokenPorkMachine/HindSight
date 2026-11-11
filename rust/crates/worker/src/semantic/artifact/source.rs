@@ -735,6 +735,48 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                     }
                 }
             }
+            // Bounded: extract 1/2/4 bytes from an 8-byte half of a 16-byte blob slot.
+            if matches!(bytes, 1 | 2 | 4) && size == 16 {
+                if let Symbol::Blob(blob_id) = value.clone() {
+                    let inner_offset = offset - slot;
+                    if inner_offset >= 0 && (inner_offset as u64 + bytes) <= 16 && (inner_offset % bytes as i64 == 0 || inner_offset == 0) {
+                        let (half_shift, sub_offset) = if inner_offset < 8 && (inner_offset as u64 + bytes) <= 8 {
+                            (0u64, inner_offset as u64)
+                        } else if inner_offset >= 8 && (inner_offset as u64 + bytes) <= 16 {
+                            (64u64, (inner_offset - 8) as u64)
+                        } else {
+                            (u64::MAX, 0)
+                        };
+                        if half_shift != u64::MAX {
+                            let signed = flag(t, "signed") != 0;
+                            let half = if half_shift == 0 {
+                                "((uint64_t)((unsigned __int128)($0)))".to_owned()
+                            } else {
+                                "((uint64_t)(((unsigned __int128)($0)) >> 64))".to_owned()
+                            };
+                            let bit_shift = sub_offset * 8;
+                            let shifted = if bit_shift == 0 {
+                                format!("({half})")
+                            } else {
+                                format!("(({half}) >> {bit_shift})")
+                            };
+                            let (template, spelling, ty_signed) = match (bytes, signed) {
+                                (1, false) => (format!("((uint64_t)(uint8_t){shifted})"), "uint8_t".to_owned(), false),
+                                (1, true) => (format!("((uint64_t)(int64_t)(int8_t){shifted})"), "int8_t".to_owned(), true),
+                                (2, false) => (format!("((uint64_t)(uint16_t){shifted})"), "uint16_t".to_owned(), false),
+                                (2, true) => (format!("((uint64_t)(int64_t)(int16_t){shifted})"), "int16_t".to_owned(), true),
+                                (4, false) => (format!("((uint64_t)(uint32_t){shifted})"), "uint32_t".to_owned(), false),
+                                (4, true) => (format!("((uint64_t)(int64_t)(int32_t){shifted})"), "int32_t".to_owned(), true),
+                                _ => return Err("external memory read width is unsupported".into()),
+                            };
+                            let id = dag.add_role("source-frame-reload", "slot", template, vec![blob_id], pc)?;
+                            dag.nodes[id].origins.extend(origins);
+                            dag.type_node(id, Some(SourceType { spelling, bits: (bytes * 8) as u8, signed: ty_signed, pointer: false }));
+                            return Ok(Symbol::Value(id, 64));
+                        }
+                    }
+                }
+            }
             // Bounded: extract N bytes from a larger scalar slot at a byte-aligned offset within it.
             if matches!(bytes, 1 | 2 | 4) && matches!(size, 2 | 4 | 8) && (bytes as u64) < size {
                 let inner_offset = offset - slot;
@@ -1976,6 +2018,51 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
                                     dag.nodes[id].origins.extend(origins);
                                     dag.type_node(id, Some(SourceType { spelling: "uint64_t".into(), bits: 64, signed: false, pointer: false }));
                                     Symbol::Value(id, 64)
+                                } else {
+                                    return Err("stack argument value not proven".into());
+                                }
+                            } else {
+                                return Err("stack argument value not proven".into());
+                            }
+                        } else if matches!(req_bytes, 1 | 2 | 4) && size == 16 {
+                            if let Symbol::Blob(blob_id) = value {
+                                let inner_offset = req_off - slot;
+                                if inner_offset >= 0
+                                    && (inner_offset as u64 + req_bytes) <= 16
+                                    && (inner_offset % req_bytes as i64 == 0 || inner_offset == 0)
+                                {
+                                    let (half_shift, sub_offset) = if inner_offset < 8 && (inner_offset as u64 + req_bytes) <= 8 {
+                                        (0u64, inner_offset as u64)
+                                    } else if inner_offset >= 8 && (inner_offset as u64 + req_bytes) <= 16 {
+                                        (64u64, (inner_offset - 8) as u64)
+                                    } else {
+                                        (u64::MAX, 0)
+                                    };
+                                    if half_shift != u64::MAX {
+                                        let half = if half_shift == 0 {
+                                            "((uint64_t)((unsigned __int128)($0)))".to_owned()
+                                        } else {
+                                            "((uint64_t)(((unsigned __int128)($0)) >> 64))".to_owned()
+                                        };
+                                        let bit_shift = sub_offset * 8;
+                                        let shifted = if bit_shift == 0 {
+                                            format!("({half})")
+                                        } else {
+                                            format!("(({half}) >> {bit_shift})")
+                                        };
+                                        let (template, spelling) = match req_bytes {
+                                            1 => (format!("((uint64_t)(uint8_t){shifted})"), "uint8_t".to_owned()),
+                                            2 => (format!("((uint64_t)(uint16_t){shifted})"), "uint16_t".to_owned()),
+                                            4 => (format!("((uint64_t)(uint32_t){shifted})"), "uint32_t".to_owned()),
+                                            _ => return Err("stack argument value not proven".into()),
+                                        };
+                                        let id = dag.add_role("source-frame-reload", "slot", template, vec![blob_id], pc)?;
+                                        dag.nodes[id].origins.extend(origins);
+                                        dag.type_node(id, Some(SourceType { spelling, bits: (req_bytes * 8) as u8, signed: false, pointer: false }));
+                                        Symbol::Value(id, 64)
+                                    } else {
+                                        return Err("stack argument value not proven".into());
+                                    }
                                 } else {
                                     return Err("stack argument value not proven".into());
                                 }
