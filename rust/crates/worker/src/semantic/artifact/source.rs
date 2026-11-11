@@ -1754,7 +1754,7 @@ fn is_noop_tree(tree: &Tree) -> bool {
 
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
-        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" => Ok(()),
+        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" | "call" => Ok(()),
         "memory-store" | "memory-store-pair" | "memory-load-pair" => {
             if tree.kind == "memory-store" && tree.children.len() != 2 { return Err(()); }
             if tree.kind.ends_with("-pair") && tree.children.len() < 2 { return Err(()); }
