@@ -102,7 +102,10 @@ fn catalog_pointer_type(spelling:&str, project_types:&[crate::reconstruction::Pr
 
 pub fn source_signature_with_project_types(name:&str,signature:&Signature,
     project_types:&[crate::reconstruction::ProjectTypeDependency])->Option<SourceSignature>{
-    if signature.declaration.contains("...")||signature.language=="C++ / Objective-C++"{return None}
+    // Bounded: accept C variadic declarations for fixed-parameter ABI/prototype only.
+    // Variadic arguments remain unresolved in call rendering/recovery and must not
+    // be treated as fully modeled.
+    if signature.language=="C++ / Objective-C++"{return None}
     let objc=signature.language=="Objective-C / Objective-C++";
     let name=if objc {format!("hs_recovered_imp_{}",name.bytes().map(|b|if b.is_ascii_alphanumeric(){b as char}else{'_'}).collect::<String>())}
         else{name.strip_prefix('_').unwrap_or(name).to_owned()};
