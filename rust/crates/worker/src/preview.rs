@@ -2063,6 +2063,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let scan_end_jt = map.address + code.len() as u64;
  for (index,chunk) in code.chunks_exact(4).enumerate() {
   let pc = map.address + index as u64 * 4;
+  if pc < start || pc >= end { continue; }
   let word=u32::from_le_bytes(chunk.try_into().unwrap());
   let Some(reg)=indirect_branch_reg(word) else { continue };
   let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { continue };
