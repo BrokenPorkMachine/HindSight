@@ -99,7 +99,7 @@ Before distributing 0.5.15, complete the official matrix on an Apple-Silicon Mac
 11. Run the topology-derived app/service type-check gates and verify `AnalysisNavigation.swift`, `AnalysisContinuity.swift`, and `HostPlatform.swift` are included in the generated target source sets; then complete clean Xcode Debug and Release builds.
 12. Open Function Neighborhoods on the firmware-scale stress artifact that previously caused a hang; confirm first paint remains responsive, evidence expands only in bounded batches, Code/CFG pivots work, and memory stays bounded enough for the 8 GiB baseline.
 13. On a disposable project copy, substitute symbolic links for `objects`, `staging`, and `analysis-cache`, plus a staged capture/cache file. Each case must fail closed without writing through the link or special file.
-14. Inspect `HindSight`, `CoordinatorService`, `reworker`, and `vg-emu-server` with `lipo -archs`; every distributed executable must contain both `arm64` and `x86_64`.
+14. Inspect `HindSight`, `CoordinatorService`, `reworker`, and `vg-emu-server` with `lipo -archs`; every officially distributed executable must contain `arm64`. Require `x86_64` only for separately produced experimental Intel/universal artifacts.
 15. If REA is enabled for the distribution, run a local provider qualification against an approved target and confirm `binary_session` availability, progress, cancellation, bounded response retention, structured Evidence identity, and `.vgcase` restore. The automated deterministic fixture runs during release preflight.
 
 ### Experimental Intel qualification (optional)
@@ -112,7 +112,7 @@ Before distributing 0.5.15, complete the official matrix on an Apple-Silicon Mac
 18. Exercise authorized native debugger attach/launch/step/breakpoint/memory/module/backtrace against a local ARM64 target.
 19. Exercise Hypervisor/SoC execution create/destroy, RAM access, vCPU registers/run exits, reset, trace, breakpoints, and firmware-load paths.
 
-Until that matrix is completed on both release hosts, treat the source archive as a release-candidate source package even though its internal channel is `stable`.
+Until the required Apple-Silicon release-host matrix is completed, treat the source archive as a release-candidate source package even though its internal channel is `stable`. Experimental Intel qualification is optional.
 
 ## 0.4.3 analysis-navigation qualification
 

@@ -1,4 +1,4 @@
-# Release Advisory: HindSight v0.5.13 Release Candidate
+# Release Advisory: HindSight v0.5.15 Release Candidate
 
 Official platform: macOS 14 or newer on Apple Silicon (`arm64`). Intel builds remain experimental and are not supplied as an official binary release.
 
