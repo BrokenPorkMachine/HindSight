@@ -1176,6 +1176,14 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         resolved_indirect_cases,
         resolved_indirect_index_info,
     } = input;
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("reconstruction lifting not yet implemented for architecture '{architecture}'"),
+        ));
+    }
     if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
