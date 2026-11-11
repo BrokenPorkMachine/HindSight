@@ -1068,10 +1068,10 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
   let mut found=None;for load in (index.saturating_sub(3)..index).rev(){if let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4])){if loaded==branch_reg&&width==8&&!signed&&address_setup_preserves_registers(code,base,load+1,index,&[branch_reg]){found=Some((load,table_reg,width,signed,index_is_32));break}}}let Some(found)=found else{return Ok(None)};found
  };
  let mut table_address=None;
- let search_start=load_index.saturating_sub(6);
+ let search_start=load_index.saturating_sub(8);
  for add_index in (search_start..load_index).rev(){
   let add_word=le32(&code[add_index*4..add_index*4+4]);let Some((rd,rn,immediate))=arm64_add_immediate(add_word)else{continue};if rd!=table_reg||!address_setup_preserves(code,base,add_index+1,load_index,table_reg){continue}
-  for address_index in (add_index.saturating_sub(5)..add_index).rev(){let address_word=le32(&code[address_index*4..address_index*4+4]);let Some((dest,value))=arm64_address_value(address_word,base+address_index as u64*4)else{continue};if dest==rn&&address_setup_preserves(code,base,address_index+1,add_index,rn){table_address=value.checked_add(immediate);break}}
+  for address_index in (add_index.saturating_sub(7)..add_index).rev(){let address_word=le32(&code[address_index*4..address_index*4+4]);let Some((dest,value))=arm64_address_value(address_word,base+address_index as u64*4)else{continue};if dest==rn&&address_setup_preserves(code,base,address_index+1,add_index,rn){table_address=value.checked_add(immediate);break}}
   if table_address.is_some(){break}
  }
  if table_address.is_none(){for address_index in (search_start..load_index).rev(){let word=le32(&code[address_index*4..address_index*4+4]);if let Some((dest,value))=arm64_address_value(word,base+address_index as u64*4){if dest==table_reg&&address_setup_preserves(code,base,address_index+1,load_index,table_reg){table_address=Some(value);break}}}}
