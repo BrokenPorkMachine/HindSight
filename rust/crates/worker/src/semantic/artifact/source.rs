@@ -3127,12 +3127,12 @@ pub(super) fn recover_with_types(
                 // when unhandled state components are identical and differing
                 // registers/frame values can be joined by evidence-backed phis.
                 let mut can_merge = true;
+                let mut any_diff = false;
                 if saved.external_loads != state.external_loads
                     || saved.external_stores != state.external_stores
                     || saved.external_access_pcs != state.external_access_pcs
                     || saved.fp_scalars != state.fp_scalars
                     || saved.q_blobs != state.q_blobs
-                    || saved.flags != state.flags
                     || saved.has_call != state.has_call
                     || saved.call_pcs != state.call_pcs
                     || saved.calls != state.calls
@@ -3142,10 +3142,27 @@ pub(super) fn recover_with_types(
                 {
                     can_merge = false;
                 }
+                // Flags may differ at joins; attempt phi merge when both sides are present.
+                let mut merged_flags = state.flags;
+                if can_merge {
+                    match (saved.flags, state.flags) {
+                        (None, None) => {}
+                        (Some(sf), Some(cf)) if sf == cf => {}
+                        (Some(sf), Some(cf)) => {
+                            if let Ok(phi_id) = dag.add("source-phi", "($0 ? $1 : $2)".to_string(),
+                                                          vec![saved.path, sf, cf], pc) {
+                                merged_flags = Some(phi_id);
+                                any_diff = true;
+                            } else {
+                                can_merge = false;
+                            }
+                        }
+                        _ => { can_merge = false; }
+                    }
+                }
                 if can_merge && saved.frame.keys().ne(state.frame.keys()) {
                     can_merge = false;
                 }
-                let mut any_diff = false;
                 let mut merged_regs = state.registers.clone();
                 if can_merge {
                     for reg in 0..state.registers.len() {
@@ -3200,6 +3217,7 @@ pub(super) fn recover_with_types(
                     let mut merged = state.clone();
                     merged.registers = merged_regs;
                     merged.frame = merged_frame;
+                    merged.flags = merged_flags;
                     merged.path = dag.add("source-path", "(($0) || ($1))".to_string(),
                                          vec![saved.path, state.path], pc)?;
                     seen.remove(&index);
