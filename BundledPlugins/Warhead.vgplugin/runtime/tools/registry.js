@@ -128,6 +128,10 @@ export class Registry {
     }
     async dispatch(name, args, ctx) {
         const tool = this.get(name);
+        // Public Community boundary before cache, config or execution.
+        const communityDenied = communityToolDenyReason(name, tool, args, ctx);
+        if (communityDenied)
+            return { name, ok: false, output: communityDenied, error: 'community policy denied' };
         if (!tool) {
             const known = this.names().join(', ');
             return {
