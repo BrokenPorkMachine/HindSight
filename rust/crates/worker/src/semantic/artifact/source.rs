@@ -2334,7 +2334,7 @@ pub(super) fn recover_with_types(
     while let Some((mut index, mut state, mut seen)) = pending.pop() {
         loop {
             visits += 1;
-            if visits > 4096 || pending.len() + returned.len() > 64 {
+            if visits > 8192 || pending.len() + returned.len() > 128 {
                 return Err("source path budget exhausted".into());
             }
             if seen.contains_key(&index) {
