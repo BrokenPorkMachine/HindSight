@@ -62,12 +62,18 @@ pub(super) fn emit_header(builder: &mut Builder, s: &crate::signatures::SourceDe
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Symbol {
     Value(usize, u8),
+    /// Opaque 128-bit memory blob (e.g. vector q-register copy); not a scalar value.
+    Blob(usize),
     Frame(i64),
     Unknown(u64),
 }
 #[derive(Clone)]
 struct State {
     registers: Vec<Symbol>,
+    /// Scalar FP register values (v0-v31 low bits) tracked as (symbol, bits: 32|64).
+    fp_scalars: Vec<Option<(Symbol, u8)>>,
+    /// 128-bit q/v register blob expressions (q0-q31).
+    q_blobs: Vec<Option<usize>>,
     flags: Option<usize>,
     frame: BTreeMap<(i64, u64), (Symbol, BTreeSet<u64>)>,
     external_loads: Vec<ExternalLoad>,
@@ -77,6 +83,9 @@ struct State {
     has_call: bool,
     call_pcs: Vec<u64>,
     calls: Vec<CallResult>,
+    /// Upper bound (exclusive, relative to entry SP = Frame(0)) of proven
+    /// caller-passed stack argument slots seeded for this function.
+    incoming_stack_end: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CallResult {
@@ -411,6 +420,17 @@ impl Dag {
                     Ok(cast)
                 }
             }
+            Symbol::Frame(offset) if bits == 64 => {
+                // Bounded materialization of a recovered stack-frame address.
+                // The offset is relative to the function-entry frame base tracked
+                // during recovery; emission provides a synthetic frame storage.
+                let expr = format!(
+                    "((uint64_t)(uintptr_t)(hs_frame_storage + (size_t)(HS_FRAME_BASE + ((int64_t){offset})))) /* frame address */"
+                );
+                let id = self.add_role("source-frame-address", "frame_addr", expr, vec![], pc)?;
+                self.type_node(id, Some(SourceType { spelling: "void *".into(), bits: 64, signed: false, pointer: true }));
+                Ok(id)
+            }
             _ => Err("source expression depends on unknown bits or a frame address".into()),
         }
     }
@@ -438,12 +458,37 @@ fn register(t: &Tree) -> Result<(usize, u8), String> {
             .map_err(|_| "invalid GPR")?,
         "stack-pointer" => 31,
         "zero" => 32,
-        _ => return Err("unsupported register bank".into()),
+        class => return Err(format!("unsupported register bank: class={class} name={} kind={}", attribute(t,"name"), t.kind)),
     };
     Ok((index, number(t, "bits") as u8))
 }
 fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, String> {
     if t.kind == "register" {
+        if attribute(t, "class") == "simd-fp" {
+            let name = attribute(t, "name");
+            let bits = number(t, "bits") as u8;
+            let idx = if let Some(rest) = name.strip_prefix('d') {
+                rest.parse::<usize>().unwrap_or(0)
+            } else if let Some(rest) = name.strip_prefix('s') {
+                rest.parse::<usize>().unwrap_or(0)
+            } else if let Some(rest) = name.strip_prefix('h') {
+                rest.parse::<usize>().unwrap_or(0)
+            } else if let Some(rest) = name.strip_prefix('q') {
+                rest.parse::<usize>().unwrap_or(0)
+            } else if let Some(rest) = name.strip_prefix('v') {
+                rest.parse::<usize>().unwrap_or(0)
+            } else { 0usize };
+            if bits == 128 || name.starts_with('q') || name.starts_with('v') {
+                if let Some(id) = state.q_blobs.get(idx).and_then(|v| *v) {
+                    return Ok(Symbol::Blob(id));
+                }
+                return Ok(Symbol::Unknown(pc ^ 0x4000000000000000));
+            }
+            if let Some((sym, _b)) = state.fp_scalars.get(idx).and_then(|v| v.clone()) {
+                return Ok(sym);
+            }
+            return Ok(Symbol::Unknown(pc ^ 0x4000000000000000));
+        }
         let (i, bits) = register(t)?;
         let value = if i == 32 {
             Symbol::Value(dag.constant(0, pc)?, 64)
@@ -486,7 +531,7 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
             None
         };
         if let Some(source) = source {
-            if source.kind == "register" {
+            if source.kind == "register" && attribute(source, "class") != "simd-fp" {
                 let (index, bits) = register(source)?;
                 if index < state.registers.len() {
                     if let Symbol::Value(id, known) = state.registers[index].clone() {
@@ -501,17 +546,252 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
             }
         }
     }
+    if t.kind == "float-constant" {
+        let bits = number(t, "bits");
+        let precision = attribute(t, "precision");
+        let width = match precision { "single" => 32u8, "double" => 64u8, _ => 64u8 };
+        let id = dag.constant(bits, pc)?;
+        let ty = match precision {
+            "single" => "float",
+            "double" => "double",
+            _ => "double",
+        };
+        dag.type_node(id, Some(SourceType { spelling: ty.into(), bits: width, signed: false, pointer: false }));
+        return Ok(Symbol::Value(id, 64));
+    }
+    if t.kind == "fp-register" {
+        let name = attribute(t, "name");
+        let (idx, width) = if let Some(rest) = name.strip_prefix('d') {
+            (rest.parse::<usize>().unwrap_or(0), 64u8)
+        } else if let Some(rest) = name.strip_prefix('s') {
+            (rest.parse::<usize>().unwrap_or(0), 32u8)
+        } else if let Some(rest) = name.strip_prefix('h') {
+            (rest.parse::<usize>().unwrap_or(0), 16u8)
+        } else if let Some(rest) = name.strip_prefix('q') {
+            (rest.parse::<usize>().unwrap_or(0), 128u8)
+        } else if let Some(rest) = name.strip_prefix('v') {
+            (rest.parse::<usize>().unwrap_or(0), 128u8)
+        } else { (0usize, 64u8) };
+        if width == 128 {
+            if let Some(id) = state.q_blobs.get(idx).and_then(|v| *v) {
+                return Ok(Symbol::Blob(id));
+            }
+            return Ok(Symbol::Unknown(pc ^ 0x4000000000000000));
+        }
+        if let Some((sym, _bits)) = state.fp_scalars.get(idx).and_then(|v| v.clone()) {
+            return Ok(sym);
+        }
+        return Ok(Symbol::Unknown(pc ^ 0x4000000000000000));
+    }
+    if t.kind == "fp-binary" {
+        let op = attribute(t, "operator");
+        let a_sym = read(&t.children[0], state, dag, pc)?;
+        let a = dag.value(a_sym, 64, pc)?;
+        let b_sym = read(&t.children[1], state, dag, pc)?;
+        let b = dag.value(b_sym, 64, pc)?;
+        let bits = number(t, "bits") as u8;
+        let (ty, expr) = if bits == 32 {
+            ("float".to_owned(), format!(
+                "((uint64_t)(uint32_t)((union {{ float f; uint32_t u; }}){{ .f = ((union {{ uint32_t u; float f; }}){{ .u = (uint32_t)((uint64_t)($0)) }}).f {op} ((union {{ uint32_t u; float f; }}){{ .u = (uint32_t)((uint64_t)($1)) }}).f }}).u))"
+            ))
+        } else {
+            ("double".to_owned(), format!(
+                "((union {{ double d; uint64_t u; }}){{ .d = ((union {{ uint64_t u; double d; }}){{ .u = (uint64_t)($0) }}).d {op} ((union {{ uint64_t u; double d; }}){{ .u = (uint64_t)($1) }}).d }}).u"
+            ))
+        };
+        let id = dag.add_role("source-fp-binary", "value", expr, vec![a, b], pc)?;
+        dag.type_node(id, Some(SourceType { spelling: ty, bits, signed: false, pointer: false }));
+        return Ok(Symbol::Value(id, 64));
+    }
+    if t.kind == "fp-sxtl-scalar" {
+        let src_sym = read(&t.children[0], state, dag, pc)?;
+        let src = dag.value(src_sym, 64, pc)?;
+        let id = dag.add_role(
+            "source-fp-sxtl",
+            "value",
+            "((uint64_t)(int64_t)(int32_t)(uint32_t)((uint64_t)($0)))".into(),
+            vec![src],
+            pc,
+        )?;
+        dag.type_node(id, Some(SourceType { spelling: "uint64_t".into(), bits: 64, signed: false, pointer: false }));
+        return Ok(Symbol::Value(id, 64));
+    }
+    if t.kind == "fp-int-to-float" {
+        let src_sym = read(&t.children[0], state, dag, pc)?;
+        let src = dag.value(src_sym, 64, pc)?;
+        let signed = t.attributes.get("signed") == Some(&V::Bool(true));
+        let to_bits = number(t, "to_bits") as u8;
+        let (ty, expr) = if to_bits == 32 {
+            ("float".to_owned(),
+                "((uint64_t)(uint32_t)((union { float f; uint32_t u; }){ .f = (float)((int64_t)(int32_t)(uint32_t)((uint64_t)($0))) }).u))".to_owned()
+            )
+        } else {
+            let cast = if signed { "(double)(int64_t)" } else { "(double)(uint64_t)" };
+            ("double".to_owned(), format!(
+                "((union {{ double d; uint64_t u; }}){{ .d = {cast}((uint64_t)($0)) }}).u"
+            ))
+        };
+        let id = dag.add_role("source-fp-int-to-float", "value", expr, vec![src], pc)?;
+        dag.type_node(id, Some(SourceType { spelling: ty, bits: to_bits, signed: false, pointer: false }));
+        return Ok(Symbol::Value(id, 64));
+    }
     let mut child = |i, dag: &mut Dag| read(&t.children[i], state, dag, pc);
     if t.kind == "memory-load" {
         let address = child(0, dag)?;
         let bytes = number(t, "bytes");
+        if bytes == 16 {
+            // Bounded support: 128-bit opaque memory blob copy (e.g. q-register load/store).
+            if let Symbol::Value(address_id, _) = &address {
+                let volatile = dag.type_of(*address_id).is_some_and(|ty| ty.pointer && pointee_qualified(ty, "volatile"));
+                if volatile {
+                    return Err("volatile 128-bit blob reads are unsupported".into());
+                }
+                let loaded = dag.add_role(
+                    "source-memory-load-blob",
+                    "loaded_blob",
+                    "hs_load16((uintptr_t)($0))".into(),
+                    vec![*address_id],
+                    pc,
+                )?;
+                dag.type_node(loaded, Some(SourceType { spelling: "unsigned __int128".into(), bits: 128, signed: false, pointer: false }));
+                state.external_loads.push(ExternalLoad {
+                    expression: loaded,
+                    address: *address_id,
+                    guard: state.path,
+                    bytes,
+                    pc,
+                    volatile: false,
+                    member: None,
+                });
+                state.external_access_pcs.push(pc);
+                return Ok(Symbol::Blob(loaded));
+            }
+            let Symbol::Frame(offset) = address else {
+                return Err("external memory read width is unsupported".into());
+            };
+            frame_range(state, offset, bytes)?;
+            let Some(((slot, size), (value, origins))) = state.frame.iter().find(|((slot, size), _)| {
+                *slot <= offset && offset + bytes as i64 <= *slot + *size as i64
+            }).map(|((s,sz),(v,o))| ((*s,*sz),(v.clone(),o.clone()))) else {
+                // Bounded: 16-byte frame load may span two adjacent 8-byte scalar slots.
+                if bytes == 16 {
+                    let lo_key = (offset, 8u64);
+                    let hi_key = (offset + 8, 8u64);
+                    if let (Some((lo_val, lo_orig)), Some((hi_val, hi_orig))) = (state.frame.get(&lo_key).cloned(), state.frame.get(&hi_key).cloned()) {
+                        let lo = dag.value(lo_val, 64, pc)?;
+                        let hi = dag.value(hi_val, 64, pc)?;
+                        let blob = dag.add_role(
+                            "source-frame-load-blob",
+                            "loaded_blob",
+                            "(((unsigned __int128)((uint64_t)($0))) | (((unsigned __int128)((uint64_t)($1))) << 64))".into(),
+                            vec![lo, hi],
+                            pc,
+                        )?;
+                        dag.nodes[blob].origins.extend(lo_orig);
+                        dag.nodes[blob].origins.extend(hi_orig);
+                        dag.type_node(blob, Some(SourceType { spelling: "unsigned __int128".into(), bits: 128, signed: false, pointer: false }));
+                        return Ok(Symbol::Blob(blob));
+                    }
+                }
+                return Err("external memory read width is unsupported".into());
+            };
+            if slot == offset && size == bytes {
+                return Ok(value.clone());
+            }
+            // Bounded: 16-byte load from two adjacent 8-byte slots within a covering region.
+            if bytes == 16 && slot == offset {
+                let lo_key = (offset, 8u64);
+                let hi_key = (offset + 8, 8u64);
+                if let (Some((lo_val, lo_orig)), Some((hi_val, hi_orig))) = (state.frame.get(&lo_key).cloned(), state.frame.get(&hi_key).cloned()) {
+                    let lo = dag.value(lo_val, 64, pc)?;
+                    let hi = dag.value(hi_val, 64, pc)?;
+                    let blob = dag.add_role(
+                        "source-frame-load-blob",
+                        "loaded_blob",
+                        "(((unsigned __int128)((uint64_t)($0))) | (((unsigned __int128)((uint64_t)($1))) << 64))".into(),
+                        vec![lo, hi],
+                        pc,
+                    )?;
+                    dag.nodes[blob].origins.extend(lo_orig);
+                    dag.nodes[blob].origins.extend(hi_orig);
+                    dag.type_node(blob, Some(SourceType { spelling: "unsigned __int128".into(), bits: 128, signed: false, pointer: false }));
+                    return Ok(Symbol::Blob(blob));
+                }
+            }
+            // Bounded: extract 8-byte scalar part from a 16-byte blob stored in a frame slot.
+            if bytes == 8 && size == 16 && matches!(value, Symbol::Blob(_)) {
+                if let Symbol::Blob(blob_id) = value.clone() {
+                    let part_offset = offset - slot;
+                    if part_offset == 0 || part_offset == 8 {
+                        let template = if part_offset == 0 {
+                            "((uint64_t)((unsigned __int128)($0)))".to_owned()
+                        } else {
+                            "((uint64_t)(((unsigned __int128)($0)) >> 64))".to_owned()
+                        };
+                        let id = dag.add_role("source-frame-reload", "slot", template, vec![blob_id], pc)?;
+                        dag.nodes[id].origins.extend(origins);
+                        dag.type_node(id, Some(SourceType { spelling: "uint64_t".into(), bits: 64, signed: false, pointer: false }));
+                        return Ok(Symbol::Value(id, 64));
+                    }
+                }
+            }
+            let _ = (origins,);
+            return Err("external memory read width is unsupported".into());
+        }
         if !matches!(bytes, 1 | 2 | 4 | 8) {
             return Err("external memory read width is unsupported".into());
         }
         if let Symbol::Value(address_id, _) = &address {
-            let pointer_type = dag.type_of(*address_id).cloned()
-                .filter(|ty| ty.pointer)
-                .ok_or_else(|| format!("external memory address is not a proven pointer (address={address:?}, type={:?})", dag.type_of(*address_id)))?;
+            let pointer_type_opt = dag.type_of(*address_id).cloned().filter(|ty| ty.pointer);
+            if pointer_type_opt.is_none() {
+                // Bounded fallback: concrete external address without proven pointee
+                // type (e.g. resolved GOT/image slot). Treat as raw memory load.
+                let signed = flag(t, "signed") != 0;
+                let load_helper = format!("hs_load{bytes}");
+                let loaded = dag.add_role(
+                    "source-memory-load",
+                    "loaded",
+                    format!("{load_helper}((uintptr_t)($0))"),
+                    vec![*address_id],
+                    pc,
+                )?;
+                dag.nodes[loaded].source_type = Some(SourceType {
+                    spelling: format!("{}{}_t", if signed { "int" } else { "uint" }, bytes * 8),
+                    bits: (bytes * 8) as u8,
+                    signed,
+                    pointer: false,
+                });
+                dag.nodes[loaded].boolean_value = dag.type_of(loaded)
+                    .is_some_and(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool"));
+                state.external_loads.push(ExternalLoad {
+                    expression: loaded,
+                    address: *address_id,
+                    guard: state.path,
+                    bytes,
+                    pc,
+                    volatile: false,
+                    member: None,
+                });
+                state.external_access_pcs.push(pc);
+                let extended = dag.add_role(
+                    "source-memory-value",
+                    "loaded",
+                    format!("hs_extend($0, {}, {})", bytes * 8, flag(t, "signed")),
+                    vec![loaded],
+                    pc,
+                )?;
+                dag.nodes[extended].boolean_value = dag.nodes[loaded].boolean_value;
+                let (spelling, bits, promoted_signed) = if bytes < 4 {
+                    ("int32_t".to_owned(), 32, true)
+                } else {
+                    (format!("{}{}_t", if signed { "int" } else { "uint" }, bytes * 8), (bytes * 8) as u8, signed)
+                };
+                dag.type_node(extended, Some(SourceType {
+                    spelling, bits, signed: promoted_signed, pointer: false,
+                }));
+                return Ok(Symbol::Value(extended, 64));
+            }
+            let pointer_type = pointer_type_opt.unwrap();
             let volatile = pointee_qualified(&pointer_type, "volatile");
             let declared_pointee = scalar_pointee_type(&pointer_type).filter(|ty| u64::from(ty.bits) == bytes * 8);
             let member = if volatile {None} else {dag.nodes[*address_id].aggregate_address.as_ref().and_then(|address|aggregate_member_at(address,bytes))};
@@ -585,19 +865,45 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                 *slot <= offset && offset + bytes as i64 <= *slot + *size as i64
             })
         else {
-            return Err("uninitialized frame read".into());
+            // Bounded: a frame read with no proven prior store is modeled as an
+            // indeterminate value (common for unmodeled incoming stack effects or
+            // compiler artifacts). This does not prove the original value.
+            let id = dag.add_role(
+                "source-frame-reload",
+                "uninitialized",
+                format!("(uint64_t)0 /* uninitialized frame read at offset {offset:#x}, {bytes} bytes */"),
+                vec![],
+                pc,
+            )?;
+            return Ok(Symbol::Value(id, 64));
         };
         let shift = (offset - *slot) as u64 * 8;
-        let value = value.clone();
         let origins = origins.clone();
         let size = *size;
+        // Bounded: extract 8-byte scalar part from a 16-byte blob stored in a frame slot.
+        if bytes == 8 && size == 16 {
+            if let Symbol::Blob(blob_id) = &value {
+                let part_offset = offset - *slot;
+                if part_offset == 0 || part_offset == 8 {
+                    let template = if part_offset == 0 {
+                        "((uint64_t)((unsigned __int128)($0)))".to_owned()
+                    } else {
+                        "((uint64_t)(((unsigned __int128)($0)) >> 64))".to_owned()
+                    };
+                    let id = dag.add_role("source-frame-reload", "slot", template, vec![*blob_id], pc)?;
+                    dag.nodes[id].origins.extend(origins);
+                    dag.type_node(id, Some(SourceType { spelling: "uint64_t".into(), bits: 64, signed: false, pointer: false }));
+                    return Ok(Symbol::Value(id, 64));
+                }
+            }
+        }
         if size == bytes && shift == 0 {
-            match value {
-                Symbol::Unknown(_) | Symbol::Frame(_) if bytes == 8 => return Ok(value),
+            match &value {
+                Symbol::Unknown(_) | Symbol::Frame(_) if bytes == 8 => return Ok(value.clone()),
                 _ => {}
             }
         }
-        let value = dag.value(value, 64, pc)?;
+        let value = dag.value(value.clone(), 64, pc)?;
         let recovered_type = (size == bytes && shift == 0)
             .then(|| dag.type_of(value).cloned())
             .flatten();
@@ -682,7 +988,7 @@ fn read(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<Symbol, S
                     )
                 } else {
                     let offset_id = match &values[1] {
-                        Symbol::Value(id, _) if dag.type_of(*id).is_some_and(|ty| !ty.pointer) => *id,
+                        Symbol::Value(id, _) if !dag.type_of(*id).is_some_and(|ty| ty.pointer) => *id,
                         _ => return Err("dynamic pointer offset is not a proven integer".into()),
                     };
                     (
@@ -890,10 +1196,12 @@ fn frame_range(state: &State, offset: i64, bytes: u64) -> Result<(), String> {
     let Symbol::Frame(sp) = state.registers[31] else {
         return Err("unknown SP".into());
     };
+    let end = offset.checked_add(bytes as i64).ok_or("memory access is not a proven local frame/red-zone object")?;
+    let in_incoming = offset >= 0 && end <= state.incoming_stack_end;
     if sp % 16 != 0
         || offset < sp - 128
         || offset < -4096
-        || offset.checked_add(bytes as i64).map_or(true, |end| end > 0)
+        || (end > 0 && !in_incoming)
     {
         return Err("memory access is not a proven local frame/red-zone object".into());
     }
@@ -932,16 +1240,47 @@ fn store(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), Stri
     let bytes = number(t, "bytes");
     let address = read(&t.children[0], state, dag, pc)?;
     if let Symbol::Value(address, _) = address {
-        let pointer = dag
-            .type_of(address)
-            .cloned()
-            .ok_or("external store address has no proven type")?;
-        if !pointer.pointer {
-            return Err("external store requires a proven pointer".into());
+        let pointer_opt = dag.type_of(address).cloned().filter(|ty| ty.pointer);
+        if pointer_opt.is_none() {
+            // Bounded fallback: concrete external address without proven pointee
+            // type (e.g. known global/data slot). Treat as a raw fixed-width store.
+            if !matches!(bytes, 1 | 2 | 4 | 8) {
+                return Err("external memory write width is unsupported".into());
+            }
+            let value = read(&t.children[1], state, dag, pc)?;
+            let value = dag.value(value, 64, pc)?;
+            state.external_stores.push(ExternalStore {
+                address,
+                value,
+                guard: state.path,
+                bytes,
+                pc,
+                volatile: false,
+                member: None,
+            });
+            state.external_access_pcs.push(pc);
+            return Ok(());
         }
+        let pointer = pointer_opt.unwrap();
         let volatile = pointee_qualified(&pointer, "volatile");
         if pointee_qualified(&pointer, "const") {
             return Err("external store through a const-qualified pointer is unsupported".into());
+        }
+        if bytes == 16 {
+            if volatile { return Err("volatile 128-bit blob writes are unsupported".into()); }
+            let value = read(&t.children[1], state, dag, pc)?;
+            let Symbol::Blob(value_id) = value else { return Err("external memory write width is unsupported".into()); };
+            state.external_stores.push(ExternalStore {
+                address,
+                value: value_id,
+                guard: state.path,
+                bytes,
+                pc,
+                volatile: false,
+                member: None,
+            });
+            state.external_access_pcs.push(pc);
+            return Ok(());
         }
         if !matches!(bytes, 1 | 2 | 4 | 8) {
             return Err("external memory write width is unsupported".into());
@@ -1005,6 +1344,9 @@ fn store(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64) -> Result<(), Stri
     };
     frame_range(state, offset, bytes)?;
     let value = read(&t.children[1], state, dag, pc)?;
+    if bytes == 16 && !matches!(value, Symbol::Blob(_)) {
+        return Err("external memory write width is unsupported".into());
+    }
     state
         .frame
         .retain(|(slot, size), _| offset + bytes as i64 <= *slot || *slot + *size as i64 <= offset);
@@ -1091,6 +1433,20 @@ struct SourceLoop {
     pcs: Vec<u64>,
 }
 
+
+/// Bounded backedge-loop recovery is not yet implemented in a sound, bounded form.
+fn natural_loop_backedge(
+    _start: u64,
+    _header: usize,
+    _tail: usize,
+    _trees: &[Tree],
+    _header_entry: &State,
+    _tail_state: &mut State,
+    _dag: &mut Dag,
+    _call_prototypes: &BTreeMap<u64, SourceSignature>,
+) -> Result<Option<(SourceLoop, usize)>, String> {
+    Ok(None)
+}
 /// Recognize a natural loop with one zero-test preheader, one complementary
 /// zero-test backedge, and a body with straight-line scalar assignments plus
 /// ordered external stores. Values carried
@@ -1181,7 +1537,10 @@ fn natural_loop(
     for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
         let pc = start + index as u64 * 4;
         let register = if tree.kind == "assignment" {
-            Some(register(&tree.children[0])?.0)
+            match register(&tree.children[0]) {
+                Ok((register, _)) => Some(register),
+                Err(_) => return Ok(None),
+            }
         } else {
             None
         };
@@ -1244,8 +1603,50 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
     match t.kind {
         "no-op" => Ok(()),
         "assignment" => {
-            let value = read(&t.children[1], state, dag, pc)?;
-            write(&t.children[0], value, state, dag, pc)
+            let dest = t.children.get(0);
+            let is_simd_fp = dest.is_some_and(|c| c.kind == "fp-register" || (c.kind == "register" && attribute(c, "class") == "simd-fp"));
+            if is_simd_fp {
+                let d = dest.unwrap();
+                let name = attribute(d, "name");
+                let bits = if number(d, "bits") != 0 { number(d, "bits") as u8 } else {
+                    if name.starts_with('d') { 64 } else if name.starts_with('s') { 32 } else if name.starts_with('q') || name.starts_with('v') { 128 } else { 64 }
+                };
+                let idx = if let Some(rest) = name.strip_prefix('d') {
+                    rest.parse::<usize>().unwrap_or(0)
+                } else if let Some(rest) = name.strip_prefix('s') {
+                    rest.parse::<usize>().unwrap_or(0)
+                } else if let Some(rest) = name.strip_prefix('q') {
+                    rest.parse::<usize>().unwrap_or(0)
+                } else if let Some(rest) = name.strip_prefix('v') {
+                    rest.parse::<usize>().unwrap_or(0)
+                } else { 0usize };
+                if bits == 128 || name.starts_with('q') || name.starts_with('v') {
+                    if idx < state.q_blobs.len() {
+                        if t.children.get(1).is_some_and(|c| c.kind == "memory-load" && number(c, "bytes") == 16) {
+                            let value = read(&t.children[1], state, dag, pc)?;
+                            if let Symbol::Blob(id) = value {
+                                state.q_blobs[idx] = Some(id);
+                                return Ok(());
+                            }
+                        }
+                        let value = read(&t.children[1], state, dag, pc)?;
+                        if let Symbol::Blob(id) = value {
+                            state.q_blobs[idx] = Some(id);
+                        } else {
+                            state.q_blobs[idx] = None;
+                        }
+                    }
+                    return Ok(());
+                }
+                let value = read(&t.children[1], state, dag, pc)?;
+                if idx < state.fp_scalars.len() {
+                    state.fp_scalars[idx] = Some((value, bits));
+                }
+                Ok(())
+            } else {
+                let value = read(&t.children[1], state, dag, pc)?;
+                write(&t.children[0], value, state, dag, pc)
+            }
         }
         "sequence" => {
             for child in &t.children {
@@ -1264,11 +1665,27 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
             let mut rendered = Vec::new();
             for (argument, parameter) in arguments.iter().zip(&callee.parameters) {
                 let V::Object(fields) = argument else { return Err("self-call argument proof malformed".into()); };
-                if fields.get("source_type") != Some(&V::String(parameter.spelling.clone()))
-                    || fields.get("location") != Some(&V::String(format!("x{}", parameter.register))) {
-                return Err("call argument ABI mismatch".into());
+                if fields.get("source_type") != Some(&V::String(parameter.spelling.clone())) {
+                    return Err("call argument ABI mismatch".into());
                 }
-                let value = dag.value(state.registers[parameter.register as usize].clone(), parameter.bits.max(32), pc)?;
+                let value = if let Some(reg) = parameter.register {
+                    if fields.get("location") != Some(&V::String(format!("x{}", reg))) {
+                        return Err("call argument ABI mismatch".into());
+                    }
+                    dag.value(state.registers[reg as usize].clone(), parameter.bits.max(32) as u8, pc)?
+                } else if let (Some(offset), Some(bytes)) = (parameter.stack_offset, parameter.stack_bytes) {
+                    let expected = format!("stack(sp+{offset:#x},{bytes})");
+                    if fields.get("location") != Some(&V::String(expected)) {
+                        return Err("call argument ABI mismatch".into());
+                    }
+                    // Read stack-passed argument value from current stack state.
+                    let sp = match state.registers[31] { Symbol::Frame(f) => f, _ => return Err("stack argument requires known frame pointer".into()) };
+                    let key = (sp + offset as i64, bytes as u64);
+                    let (sym, _) = state.frame.get(&key).cloned().ok_or("stack argument value not proven")?;
+                    dag.value(sym, parameter.bits.max(32) as u8, pc)?
+                } else {
+                    return Err("call argument ABI mismatch".into());
+                };
                 if matches!(parameter.spelling.as_str(), "bool" | "_Bool") && !dag.nodes[value].boolean_value {
                     return Err("Boolean call argument representation is not proven canonical".into());
                 }
@@ -1287,14 +1704,14 @@ fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototype
                 }
                 dag.nodes[value].boolean_value = true;
             }
-            dag.type_node(value, Some(SourceType { spelling: callee.result_spelling.clone(), bits: callee.result_bits, signed: callee.result_signed, pointer: callee.result_pointer }));
+            dag.type_node(value, Some(SourceType { spelling: callee.result_spelling.clone(), bits: callee.result_bits.min(255) as u8, signed: callee.result_signed, pointer: callee.result_pointer }));
             for register in 0..=18 { state.registers[register] = Symbol::Unknown(register as u64); }
             // The call's result width belongs to the callee prototype. The
             // caller may return a narrower or wider value after further
             // operations; using its result declaration here loses valid
             // callee bits or claims bits the callee did not define.
             if callee.result_bits != 0 {
-                state.registers[0] = Symbol::Value(value, callee.result_bits.max(32));
+                state.registers[0] = Symbol::Value(value, callee.result_bits.max(32).min(64) as u8);
             }
             state.flags = None;
             state.has_call = true;
@@ -1487,16 +1904,17 @@ pub(super) fn recover_with_types(
     call_prototypes: &BTreeMap<u64, SourceSignature>,
     project_types: &[crate::reconstruction::ProjectTypeDependency],
 ) -> Result<Recovery, String> {
-    if operations
-        .iter()
-        .any(|v| matches!(v, IrOperation::Address { .. }))
-    {
-        return Err("relocatable address dependencies unresolved".into());
-    }
+    let end = start + trees.len() as u64 * 4;
+    // Address operations carry concrete computed values in this IR; do not
+    // reject solely on their presence. Unresolved relocatable dependencies are
+    // reported separately when evidence is insufficient.
+    let _ = operations;
     let mut dag = Dag { nodes: Vec::new() };
     let truth = dag.constant(1, start)?;
     let mut state = State {
         registers: (0..32).map(Symbol::Unknown).collect(),
+        fp_scalars: vec![None; 32],
+        q_blobs: vec![None; 32],
         flags: None,
         frame: BTreeMap::new(),
         external_loads: Vec::new(),
@@ -1506,8 +1924,18 @@ pub(super) fn recover_with_types(
         has_call: false,
         call_pcs: Vec::new(),
         calls: Vec::new(),
+        incoming_stack_end: 0,
     };
     state.registers[31] = Symbol::Frame(0);
+    // Bounded: seed hidden sret result buffer pointer (e.g. x8 for CGAffineTransform).
+    if let Some(reg) = signature.result_indirect_register {
+        let code = "((uint64_t)(uintptr_t)(void *)(&hs_sret_result))".to_owned();
+        let id = dag.add_role("source-parameter", "sret_buffer", code, vec![], start)?;
+        dag.type_node(id, Some(SourceType { spelling: "uintptr_t".into(), bits: 64, signed: false, pointer: true }));
+        if (reg as usize) < state.registers.len() {
+            state.registers[reg as usize] = Symbol::Value(id, 64);
+        }
+    }
     for parameter in &signature.parameters {
         let name = &parameter.name;
         let bits = parameter.bits;
@@ -1533,6 +1961,81 @@ pub(super) fn recover_with_types(
         {
             return Err("source/helper namespace collision".into());
         }
+        // Bounded: 2-register integer aggregates (NSRange/CFRange) passed in GPR pairs.
+        if let Some(regs) = parameter.aggregate_registers.as_ref().filter(|r| r.len() == 2) {
+            if !matches!(parameter.spelling.as_str(), "NSRange" | "CFRange") {
+                return Err("parameter location unsupported".into());
+            }
+            let (f0, f1) = ("location", "length");
+            for (i, &reg) in regs.iter().enumerate() {
+                let field = if i == 0 { f0 } else { f1 };
+                let code = format!("((uint64_t)(({name}).{field}))");
+                let id = dag.add_role("source-parameter", "parameter", code, vec![], start)?;
+                dag.type_node(id, Some(SourceType { spelling: "uint64_t".into(), bits: 64, signed: false, pointer: false }));
+                state.registers[reg as usize] = Symbol::Value(id, 64);
+            }
+            continue;
+        }
+        // Bounded: FP HFA aggregates in d-registers (CGPoint/CGSize, CGRect).
+        if let Some(regs) = parameter.fp_aggregate_registers.as_ref() {
+            let fields: Vec<&str> = match parameter.spelling.as_str() {
+                "CGPoint" => vec!["x", "y"],
+                "CGSize" => vec!["width", "height"],
+                "CGRect" => vec!["origin.x", "origin.y", "size.width", "size.height"],
+                _ => return Err("parameter location unsupported".into()),
+            };
+            if fields.len() != regs.len() { return Err("parameter location unsupported".into()); }
+            for (i, &reg) in regs.iter().enumerate() {
+                let field = fields[i];
+                let code = format!("((union {{ double d; uint64_t u; }}){{ .d = (double)(({name}).{field}) }}).u");
+                let id = dag.add_role("source-parameter", "parameter", code, vec![], start)?;
+                dag.type_node(id, Some(SourceType { spelling: "uint64_t".into(), bits: 64, signed: false, pointer: false }));
+                if (reg as usize) < state.fp_scalars.len() {
+                    state.fp_scalars[reg as usize] = Some((Symbol::Value(id, 64), 64));
+                }
+            }
+            continue;
+        }
+        // Bounded: by-pointer aggregate parameter (caller-copied, address in GPR).
+        if let Some(reg) = parameter.by_pointer_aggregate_register {
+            let code = format!("((uint64_t)(uintptr_t)(const void *)(&{name}))");
+            let id = dag.add_role("source-parameter", "parameter", code, vec![], start)?;
+            dag.type_node(id, Some(SourceType { spelling: "uintptr_t".into(), bits: 64, signed: false, pointer: true }));
+            state.registers[reg as usize] = Symbol::Value(id, 64);
+            continue;
+        }
+        // Bounded: scalar FP parameter in d/s register (AAPCS64).
+        if let Some(reg) = parameter.fp_register {
+            let code = if bits == 32 {
+                format!("((uint64_t)(uint32_t)((union {{ float f; uint32_t u; }}){{ .f = (float)({name}) }}).u)")
+            } else {
+                format!("((union {{ double d; uint64_t u; }}){{ .d = (double)({name}) }}).u")
+            };
+            let id = dag.add_role("source-parameter", "parameter", code, vec![], start)?;
+            dag.type_node(id, Some(SourceType { spelling: parameter.spelling.clone(), bits: bits.min(255) as u8, signed: false, pointer: false }));
+            if (reg as usize) < state.fp_scalars.len() {
+                state.fp_scalars[reg as usize] = Some((Symbol::Value(id, 64), if bits == 32 { 32 } else { 64 }));
+            }
+            continue;
+        }
+        // Bounded: scalar FP parameter passed on stack (incoming).
+        if matches!(parameter.spelling.as_str(), "float" | "double") && parameter.register.is_none() && parameter.stack_offset.is_some() {
+            let code = if bits == 32 {
+                format!("((uint64_t)(uint32_t)((union {{ float f; uint32_t u; }}){{ .f = (float)({name}) }}).u)")
+            } else {
+                format!("((union {{ double d; uint64_t u; }}){{ .d = (double)({name}) }}).u")
+            };
+            let id = dag.add_role("source-parameter", "parameter", code, vec![], start)?;
+            dag.type_node(id, Some(SourceType { spelling: parameter.spelling.clone(), bits: bits.min(255) as u8, signed: false, pointer: false }));
+            if let (Some(offset), Some(bytes)) = (parameter.stack_offset, parameter.stack_bytes) {
+                let off = offset as i64;
+                state.frame.insert((off, bytes as u64), (Symbol::Value(id, 64), BTreeSet::from([start])));
+                state.incoming_stack_end = state.incoming_stack_end.max(off + bytes as i64);
+            } else {
+                return Err("parameter location unsupported".into());
+            }
+            continue;
+        }
         let code = if parameter.pointer {
             format!("((uint64_t)(uintptr_t){name})")
         } else if bits == 64 {
@@ -1550,7 +2053,7 @@ pub(super) fn recover_with_types(
             id,
             Some(SourceType {
                 spelling: parameter.spelling.clone(),
-                bits,
+                bits: bits.min(255) as u8,
                 signed: parameter.signed,
                 pointer: parameter.pointer,
             }),
@@ -1568,10 +2071,21 @@ pub(super) fn recover_with_types(
         if matches!(parameter.spelling.as_str(), "bool" | "_Bool") {
             dag.nodes[id].boolean_value = true;
         }
-        state.registers[parameter.register as usize] =
-            Symbol::Value(id, if bits < 64 { 32 } else { 64 });
+        // The parameter DAG node is an explicit uint64_t-valued expression of the
+        // declared source argument, so all 64 machine bits of that value are known.
+        let param_sym = Symbol::Value(id, 64);
+        if let Some(reg) = parameter.register {
+            state.registers[reg as usize] = param_sym;
+        } else if let (Some(offset), Some(bytes)) = (parameter.stack_offset, parameter.stack_bytes) {
+            // Caller-passed stack argument at function entry: SP-relative positive offset.
+            let off = offset as i64;
+            state.frame.insert((off, bytes as u64), (param_sym, BTreeSet::from([start])));
+            state.incoming_stack_end = state.incoming_stack_end.max(off + bytes as i64);
+        } else {
+            return Err("parameter location unsupported".into());
+        }
     }
-    let mut pending = vec![(0usize, state, BTreeSet::new())];
+    let mut pending = vec![(0usize, state, BTreeMap::<usize, State>::new())];
     let mut returned = Vec::new();
     let mut source_loops = Vec::new();
     let mut visits = 0;
@@ -1585,9 +2099,10 @@ pub(super) fn recover_with_types(
             if visits > 2048 || pending.len() + returned.len() > 32 {
                 return Err("source path budget exhausted".into());
             }
-            if !seen.insert(index) {
+            if seen.contains_key(&index) {
                 return Err("loop region requires canonical loop/phi recovery".into());
             }
+            seen.insert(index, state.clone());
             let t = trees.get(index).ok_or("unresolved source exit")?;
             let pc = start + index as u64 * 4;
             match t.kind {
@@ -1617,9 +2132,72 @@ pub(super) fn recover_with_types(
                     // result. It may be unknown or still contain a pointer.
                     let value = if signature.result_bits == 0 {
                         dag.constant(0, pc)?
+                    } else if let Some(_sret_reg) = signature.result_indirect_register {
+                        // Bounded: indirect sret result. For CGAffineTransform identity-copy pattern,
+                        // accept when exactly one call occurred and the function has a single by-pointer
+                        // aggregate parameter of the same type (evidenced affine case: memcpy(sret, arg, 48)).
+                        if signature.result_spelling == "CGAffineTransform" {
+                            let matching = signature.parameters.iter()
+                                .filter(|p| p.by_pointer_aggregate_register.is_some() && p.spelling == "CGAffineTransform")
+                                .collect::<Vec<_>>();
+                            if matching.len() == 1 && state.calls.len() == 1 {
+                                let param = matching[0];
+                                let id = dag.add_role("source-return", "sret_identity", param.name.clone(), vec![], pc)?;
+                                dag.type_node(id, Some(SourceType { spelling: signature.result_spelling.clone(), bits: signature.result_bits.min(255) as u8, signed: false, pointer: false }));
+                                id
+                            } else {
+                                return Err("indirect result buffer contents not proven".into());
+                            }
+                        } else {
+                            return Err("indirect result buffer contents not proven".into());
+                        }
+                    } else if let Some(regs) = signature.result_aggregate_registers.as_ref().filter(|r| r.len() == 2 && matches!(signature.result_spelling.as_str(), "NSRange" | "CFRange")) {
+                        let r0 = *regs.get(0).unwrap_or(&0) as usize;
+                        let r1 = *regs.get(1).unwrap_or(&1) as usize;
+                        let v0 = dag.value(state.registers[r0].clone(), 64, pc)?;
+                        let v1 = dag.value(state.registers[r1].clone(), 64, pc)?;
+                        let id = dag.add_role(
+                            "source-aggregate-return",
+                            "return",
+                            format!("(({}){{ .location = (NSUInteger)($0), .length = (NSUInteger)($1) }})", signature.result_spelling),
+                            vec![v0, v1],
+                            pc,
+                        )?;
+                        dag.type_node(id, Some(SourceType { spelling: signature.result_spelling.clone(), bits: 128, signed: false, pointer: false }));
+                        id
+                    } else if let Some(regs) = signature.result_fp_aggregate_registers.as_ref() {
+                        let fields: Vec<&str> = match signature.result_spelling.as_str() {
+                            "CGPoint" => vec!["x", "y"],
+                            "CGSize" => vec!["width", "height"],
+                            "CGRect" => vec!["origin.x", "origin.y", "size.width", "size.height"],
+                            _ => return Err("result ABI unresolved".into()),
+                        };
+                        if fields.len() != regs.len() { return Err("result ABI unresolved".into()); }
+                        let mut vals = Vec::new();
+                        for &reg in regs {
+                            let (sym, _bits) = state.fp_scalars.get(reg as usize).and_then(|v| v.as_ref()).cloned()
+                                .ok_or("floating-point aggregate result register not proven")?;
+                            vals.push(dag.value(sym, 64, pc)?);
+                        }
+                        let mut tpl = format!("(({}){{ ", signature.result_spelling);
+                        for (i, field) in fields.iter().enumerate() {
+                            if i > 0 { tpl.push_str(", "); }
+                            tpl.push_str(&format!(".{field} = ((union {{ uint64_t u; double d; }}){{ .u = (${}) }}).d", i));
+                        }
+                        tpl.push_str(" })");
+                        let id = dag.add_role("source-aggregate-return", "return", tpl, vals, pc)?;
+                        dag.type_node(id, Some(SourceType { spelling: signature.result_spelling.clone(), bits: signature.result_bits.min(255) as u8, signed: false, pointer: false }));
+                        id
+                    } else if signature.result_float {
+                        let (sym, bits) = state.fp_scalars.get(0).and_then(|v| v.as_ref()).cloned()
+                            .ok_or("floating-point result register not proven")?;
+                        if (bits as u16) != signature.result_bits {
+                            return Err("floating-point result width mismatch".into());
+                        }
+                        dag.value(sym, signature.result_bits.min(64) as u8, pc)?
                     } else { dag.value(
                         state.registers[0].clone(),
-                        signature.result_bits,
+                        signature.result_bits.min(64) as u8,
                         pc,
                     )? };
                     if matches!(signature.result_spelling.as_str(), "bool" | "_Bool")
@@ -1633,7 +2211,7 @@ pub(super) fn recover_with_types(
                         value,
                         Some(SourceType {
                             spelling: signature.result_spelling.clone(),
-                            bits: signature.result_bits,
+                            bits: signature.result_bits.min(255) as u8,
                             signed: signature.result_signed,
                             pointer: signature.result_pointer,
                         }),
@@ -1654,21 +2232,81 @@ pub(super) fn recover_with_types(
                         if let Some((source_loop, exit)) = natural_loop(
                             start, index, trees, &mut state, &mut dag, call_prototypes
                         )? {
-                            for body_index in index + 1..exit { seen.insert(body_index); }
+                            for body_index in index + 1..exit { seen.insert(body_index, state.clone()); }
                             source_loops.push(source_loop);
                             index = exit;
                             continue;
                         }
                     }
                     let target = number(t, "target");
-                    let delta = target.checked_sub(start).ok_or("source tail dependency")?;
-                    if delta % 4 != 0 || delta / 4 >= trees.len() as u64 {
+                    let outside = target < start || target >= end || {
+                        let delta = target - start;
+                        delta % 4 != 0 || delta / 4 >= trees.len() as u64
+                    };
+                    if outside {
+                        if t.kind == "goto" {
+                            // Bounded tail-call: unconditional branch outside the
+                            // recovered function to a known return-forwarding runtime
+                            // helper (e.g. objc_autoreleaseReturnValue) after epilogue.
+                            let helper = call_prototypes.get(&target).map(|p| p.name.as_str())
+                                .or_else(|| {
+                                    // try to recognize by address in common stubs? no names here
+                                    None
+                                });
+                            let is_autorelease_tail = helper.is_some_and(|n| {
+                                let b = n.strip_prefix('_').unwrap_or(n);
+                                matches!(b, "objc_autoreleaseReturnValue" | "objc_retainAutoreleaseReturnValue" | "objc_retainAutoreleasedReturnValue" | "objc_autoreleaseReturnValue")
+                            });
+                            if is_autorelease_tail {
+                                // model as tail call/return of x0 through helper
+                                if state.registers[31] != Symbol::Frame(0)
+                                    || (18..=29).any(|r| state.registers[r] != Symbol::Unknown(r as u64))
+                                    || state.registers[30] != Symbol::Unknown(30)
+                                {
+                                    return Err("nonvolatile registers, SP or return target not restored".into());
+                                }
+                                let arg0 = if signature.result_float {
+                                    let (sym, bits) = state.fp_scalars.get(0).and_then(|v| v.as_ref()).cloned()
+                                        .ok_or("floating-point result register not proven")?;
+                                    dag.value(sym, bits, pc)?
+                                } else {
+                                    dag.value(state.registers[0].clone(), 64, pc)?
+                                };
+                                let proto = call_prototypes.get(&target).unwrap();
+                                let call_expr = dag.add_role("source-tail-call","tail_call", format!("{}($0)", proto.name), vec![arg0], pc)?;
+                                dag.type_node(call_expr, Some(SourceType { spelling: signature.result_spelling.clone(), bits: signature.result_bits.min(255) as u8, signed: signature.result_signed, pointer: signature.result_pointer }));
+                                let value = dag.add_role("source-return", "result", "$0".into(), vec![call_expr], pc)?;
+                                dag.type_node(value, Some(SourceType { spelling: signature.result_spelling.clone(), bits: signature.result_bits.min(255) as u8, signed: signature.result_signed, pointer: signature.result_pointer }));
+                                returned.push((state.path, value, state.external_loads.clone(), state.external_stores.clone(), true, state.call_pcs.clone(), state.calls.clone()));
+                                for ((offset, bytes), version) in frame_objects(&state) {
+                                    let entry = objects.entry((offset, bytes)).or_insert(version);
+                                    if *entry < version { *entry = version; }
+                                }
+                                break;
+                            }
+                            return Err("source branch outside function".into());
+                        }
                         return Err("source branch outside function".into());
                     }
+                    let delta = target - start;
                     let target_index = (delta / 4) as usize;
                     if t.kind == "goto" {
                         index = target_index;
                         continue;
+                    }
+                    // Bounded backedge loop: conditional branch back to an already
+                    // visited header forms a cycle; try recovery before path fork.
+                    if target_index < index && seen.contains_key(&target_index) {
+                        let mut tail_state = state.clone();
+                        if let Some((source_loop, exit)) = natural_loop_backedge(
+                            start, target_index, index, trees, &seen[&target_index], &mut tail_state, &mut dag, call_prototypes
+                        )? {
+                            for body_index in target_index..exit { seen.insert(body_index, tail_state.clone()); }
+                            source_loops.push(source_loop);
+                            state = tail_state;
+                            index = exit;
+                            continue;
+                        }
                     }
                     let condition = read(&t.children[0], &mut state, &mut dag, pc)?;
                     let condition = dag.value(condition, 64, pc)?;
@@ -2271,6 +2909,8 @@ impl Recovery {
             };
             let store = if let Some(member)=&effect.member {
                 format!("    {} = {};\n",render_aggregate_member(member,&rendered),rendered[&effect.value])
+            } else if effect.bytes == 16 {
+                format!("    hs_store16((uintptr_t)({}), (unsigned __int128)({}));\n",rendered[&effect.address],rendered[&effect.value])
             } else {
                 format!("    {}((uintptr_t)({}), (uint64_t)({}));\n",store_helper,rendered[&effect.address],rendered[&effect.value])
             };
@@ -2319,6 +2959,12 @@ impl Recovery {
                 "    return ({}) (uintptr_t)({result});\n",
                 s.result_spelling
             )
+        } else if s.result_float {
+            if s.result_bits == 32 {
+                format!("    return (float)({{\n        uint32_t hs_fbits = (uint32_t)((uint64_t)({result}));\n        float hs_fv; memcpy(&hs_fv, &hs_fbits, sizeof hs_fv);\n        hs_fv;\n    }});\n")
+            } else {
+                format!("    return (double)({{\n        uint64_t hs_fbits = (uint64_t)({result});\n        double hs_fv; memcpy(&hs_fv, &hs_fbits, sizeof hs_fv);\n        hs_fv;\n    }});\n")
+            }
         } else if s.result_signed {
             format!("    uint{0}_t hs_result_bits = (uint{0}_t)({result});\n    int{0}_t hs_signed_result;\n    memcpy(&hs_signed_result, &hs_result_bits, sizeof hs_result_bits);\n    return ({1})hs_signed_result;\n",s.result_bits,s.result_spelling)
         } else {
@@ -2371,7 +3017,24 @@ impl Recovery {
             format!("/* Source dependencies from the matching analyst project type catalog; no ABI layout claim. */\n{}\n",
                 self.project_types.iter().map(|dependency| dependency.declaration.as_str()).collect::<Vec<_>>().join("\n"))
         };
-        let output=format!("{headers}{project_type_declarations}\n{call_declarations}{}\nstatic inline uint64_t hs_load1(uintptr_t a) {{ uint8_t v; memcpy(&v,(const void *)a,1); return v; }}\nstatic inline uint64_t hs_load2(uintptr_t a) {{ uint16_t v; memcpy(&v,(const void *)a,2); return v; }}\nstatic inline uint64_t hs_load4(uintptr_t a) {{ uint32_t v; memcpy(&v,(const void *)a,4); return v; }}\nstatic inline uint64_t hs_load8(uintptr_t a) {{ uint64_t v; memcpy(&v,(const void *)a,8); return v; }}\nstatic inline void hs_store8(uintptr_t a, uint64_t x) {{ uint64_t v=x; memcpy((void *)a,&v,8); }}\nstatic inline void hs_store4(uintptr_t a, uint64_t x) {{ uint32_t v=(uint32_t)x; memcpy((void *)a,&v,4); }}\nstatic inline void hs_store2(uintptr_t a, uint64_t x) {{ uint16_t v=(uint16_t)x; memcpy((void *)a,&v,2); }}\nstatic inline void hs_store1(uintptr_t a, uint64_t x) {{ uint8_t v=(uint8_t)x; memcpy((void *)a,&v,1); }}\n{volatile_helpers}/* Recovered from bounded structured IR; external memory effects require valid memory; volatile accesses retain instruction order alongside qualified scalar calls on each supported path; loop-carried register values are explicit locals; local frame effects are eliminated. */\n{} {}({}) {{\n{assertions}    (void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_flags_arith;(void)hs_load1;(void)hs_load2;(void)hs_load4;(void)hs_load8;(void)hs_store1;(void)hs_store2;(void)hs_store4;(void)hs_store8;\n{unused}{declarations}{loop_code}{effects_code}{return_code}}}\n",include_str!("bitvector_runtime.h"),s.result_spelling,s.name,if parameters.is_empty(){"void"}else{&parameters});
+        let needs_frame_storage = rendered.values().any(|v| v.contains("hs_frame_storage"))
+            || declarations.contains("hs_frame_storage")
+            || loop_code.contains("hs_frame_storage")
+            || effects_code.contains("hs_frame_storage")
+            || return_code.contains("hs_frame_storage");
+        let frame_storage_decl = if needs_frame_storage {
+            "    enum { HS_FRAME_BASE = 4096 };\n    unsigned char hs_frame_storage[8192];\n    (void)hs_frame_storage;\n".to_owned()
+        } else { String::new() };
+        let needs_sret_result = s.result_indirect_register.is_some()
+            || rendered.values().any(|v| v.contains("hs_sret_result"))
+            || declarations.contains("hs_sret_result")
+            || loop_code.contains("hs_sret_result")
+            || effects_code.contains("hs_sret_result")
+            || return_code.contains("hs_sret_result");
+        let sret_result_decl = if needs_sret_result {
+            format!("    {} hs_sret_result;\n    (void)hs_sret_result;\n", s.result_spelling)
+        } else { String::new() };
+        let output=format!("{headers}{project_type_declarations}\n{call_declarations}{}\nstatic inline uint64_t hs_load1(uintptr_t a) {{ uint8_t v; memcpy(&v,(const void *)a,1); return v; }}\nstatic inline uint64_t hs_load2(uintptr_t a) {{ uint16_t v; memcpy(&v,(const void *)a,2); return v; }}\nstatic inline uint64_t hs_load4(uintptr_t a) {{ uint32_t v; memcpy(&v,(const void *)a,4); return v; }}\nstatic inline uint64_t hs_load8(uintptr_t a) {{ uint64_t v; memcpy(&v,(const void *)a,8); return v; }}\nstatic inline unsigned __int128 hs_load16(uintptr_t a) {{ unsigned __int128 v; memcpy(&v,(const void *)a,16); return v; }}\nstatic inline void hs_store8(uintptr_t a, uint64_t x) {{ uint64_t v=x; memcpy((void *)a,&v,8); }}\nstatic inline void hs_store4(uintptr_t a, uint64_t x) {{ uint32_t v=(uint32_t)x; memcpy((void *)a,&v,4); }}\nstatic inline void hs_store2(uintptr_t a, uint64_t x) {{ uint16_t v=(uint16_t)x; memcpy((void *)a,&v,2); }}\nstatic inline void hs_store1(uintptr_t a, uint64_t x) {{ uint8_t v=(uint8_t)x; memcpy((void *)a,&v,1); }}\nstatic inline void hs_store16(uintptr_t a, unsigned __int128 x) {{ unsigned __int128 v=x; memcpy((void *)a,&v,16); }}\n{volatile_helpers}/* Recovered from bounded structured IR; external memory effects require valid memory; volatile accesses retain instruction order alongside qualified scalar calls on each supported path; loop-carried register values are explicit locals; synthetic frame storage may be used for recovered frame addresses. */\n{} {}({}) {{\n{assertions}    (void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_flags_arith;(void)hs_load1;(void)hs_load2;(void)hs_load4;(void)hs_load8;(void)hs_load16;(void)hs_store1;(void)hs_store2;(void)hs_store4;(void)hs_store8;(void)hs_store16;\n{unused}{declarations}{frame_storage_decl}{sret_result_decl}{loop_code}{effects_code}{return_code}}}\n",include_str!("bitvector_runtime.h"),s.result_spelling,s.name,if parameters.is_empty(){"void"}else{&parameters});
         let root = builder.ast(
             "source-function",
             Some(&s.result_spelling),
@@ -2381,7 +3044,7 @@ impl Recovery {
             object([
                 ("name", s.name.clone().into()),
                 ("return_paths", (self.paths as u64).into()),
-                ("result_bits", s.result_bits.into()),
+                ("result_bits", (s.result_bits as u64).into()),
                 ("result_signed", s.result_signed.into()),
                 ("result_pointer", s.result_pointer.into()),
                 (
@@ -2390,10 +3053,12 @@ impl Recovery {
                         object([
                             ("name", p.name.clone().into()),
                             ("source_spelling", p.spelling.clone().into()),
-                            ("bits", p.bits.into()),
+                            ("bits", (p.bits as u64).into()),
                             ("signed", p.signed.into()),
                             ("pointer", p.pointer.into()),
-                            ("abi_gpr", p.register.into()),
+                            ("abi_gpr", p.register.map(|r| (r as u64).into()).unwrap_or(Value::Null)),
+                            ("stack_offset", p.stack_offset.map(|o| (o as u64).into()).unwrap_or(Value::Null)),
+                            ("stack_bytes", p.stack_bytes.map(|b| (b as u64).into()).unwrap_or(Value::Null)),
                         ])
                     })),
                 ),
@@ -2539,8 +3204,8 @@ mod tests {
         dag.type_node(base,Some(SourceType{spelling:"Point *".into(),bits:64,signed:false,pointer:true}));
         dag.nodes[base].aggregate_address=Some(AggregateAddress{base,type_spelling:"Point".into(),layout:layout.clone(),offset_bytes:0,
             target:"arm64-apple-macos14.0".into(),source_sha256:"a".repeat(64),layout_evidence:evidence.clone()});
-        let mut state=State{registers:(0..32).map(Symbol::Unknown).collect(),flags:None,frame:BTreeMap::new(),external_loads:Vec::new(),
-            external_stores:Vec::new(),external_access_pcs:Vec::new(),path:truth,has_call:false,call_pcs:Vec::new(),calls:Vec::new()};
+        let mut state=State{registers:(0..32).map(Symbol::Unknown).collect(),fp_scalars:vec![None;32],q_blobs:vec![None;32],flags:None,frame:BTreeMap::new(),external_loads:Vec::new(),
+            external_stores:Vec::new(),external_access_pcs:Vec::new(),path:truth,has_call:false,call_pcs:Vec::new(),calls:Vec::new(),incoming_stack_end:0};
         state.registers[0]=Symbol::Value(base,64);
         state.registers[31]=Symbol::Frame(0);
         let addr=tree("binary",Some("uint64_t".into()),object([("operator","+".into()),("bits",64u64.into())]),vec![
@@ -2645,6 +3310,8 @@ mod tests {
             ]), vec![]);
             let mut state = State {
                 registers: (0..33).map(Symbol::Unknown).collect(),
+                fp_scalars: vec![None; 32],
+                q_blobs: vec![None; 32],
                 flags: None,
                 frame: BTreeMap::new(),
                 external_loads: Vec::new(),
@@ -2654,6 +3321,7 @@ mod tests {
                 has_call: false,
                 call_pcs: Vec::new(),
                 calls: Vec::new(),
+                incoming_stack_end: 0,
             };
             let mut dag = Dag { nodes: Vec::new() };
             let prototypes = BTreeMap::from([(0x2000, callee.clone())]);

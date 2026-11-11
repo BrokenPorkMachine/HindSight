@@ -421,6 +421,26 @@ fn proven_objc_dispatch_slot(address:u64,indirect_facts:&[(String,String,u64)],b
  let names=indirect_facts.iter().filter(|(_,kind,slot)|*slot==address&&matches!(kind.as_str(),"lazy-pointer"|"nonlazy-pointer")).map(|(name,_,_)|name.as_str()).chain(binds.iter().map(|fact|fact.symbol.as_str())).collect::<std::collections::BTreeSet<_>>();
  names.len()==1&&names.iter().next().is_some_and(|name|ordinary_objc_dispatch(name))
 }
+
+fn objc_msgsend_stub_selector(file:&mut File,window:&[u8],size:u64,target:u64,indirect_facts:&[(String,String,u64)])->io::Result<Option<String>>{
+ let section_list=sections(window);
+ let Some(stub_section)=section_for_va(&section_list,target).filter(|section|section.sect=="__objc_stubs") else { return Ok(None); };
+ let relative=target-stub_section.addr;
+ if relative.checked_add(20).is_none() || relative+20>stub_section.size { return Ok(None); }
+ let Some(bytes)=read_va(file,&section_list,size,target,20)? else { return Ok(None); };
+ let first=le32(&bytes[0..4]);let second=le32(&bytes[4..8]);let third=le32(&bytes[8..12]);let fourth=le32(&bytes[12..16]);let fifth=le32(&bytes[16..20]);
+ let load_fields=|word:u32|->Option<(u32,u32,u64)>{if word&0x3b00_0000!=0x3900_0000||(word>>22)&3!=1||word>>30!=3{return None}Some((word&31,(word>>5)&31,(((word>>10)&0xfff)as u64)*8))};
+ let Some((base_register,page))=arm64_address_value(first,target) else { return Ok(None); };
+ let Some((loaded,load_base,offset))=load_fields(second) else { return Ok(None); };
+ let Some((dispatch_register,_dispatch_page))=arm64_address_value(third,target+8) else { return Ok(None); };
+ let Some((dispatch_loaded,dispatch_base,_dispatch_offset))=load_fields(fourth) else { return Ok(None); };
+ let is_dispatch=fifth&0xffff_fc1f==0xd61f_0000&&(fifth>>5)&31==dispatch_register;
+ if !(base_register==1&&first>>31!=0&&loaded==1&&load_base==1&&dispatch_register==16&&third>>31!=0&&dispatch_loaded==16&&dispatch_base==16&&is_dispatch){ return Ok(None); }
+ let _ = indirect_facts;
+ let Some(reference)=page.checked_add(offset) else { return Ok(None); };
+ objc_selector_name(file,&section_list,size,reference,macho_image_base(window))
+}
+
 fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],base:u64,calls:&[(u64,u64,u64)],symbols:&[(u64,String)],indirect_facts:&[(String,String,u64)])->io::Result<std::collections::BTreeMap<u64,String>>{
  let mut result=std::collections::BTreeMap::new();
  let section_list=sections(window);
@@ -438,7 +458,7 @@ fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],b
       arm64_address_value(first,target),load_fields(second),arm64_address_value(third,target+8),load_fields(fourth)){
       let is_dispatch=fifth&0xffff_fc1f==0xd61f_0000&&(fifth>>5)&31==dispatch_register;
       if base_register==1&&first>>31!=0&&loaded==1&&load_base==1&&dispatch_register==16&&third>>31!=0&&dispatch_loaded==16&&dispatch_base==16&&is_dispatch&&dispatch_page.checked_add(dispatch_offset).is_some_and(|slot|proven_objc_dispatch_slot(slot,indirect_facts,&bind_facts)){
-       if let Some(reference)=page.checked_add(offset){selector=objc_selector_name(file,&section_list,size,reference)?;}
+       if let Some(reference)=page.checked_add(offset){selector=objc_selector_name(file,&section_list,size,reference,macho_image_base(window))?;}
       }
      }
     }
@@ -456,7 +476,7 @@ fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],b
        if address_index+2==load_index{let add_word=le32(&code[(address_index+1)*4..(address_index+2)*4]);if let Some((destination,source,immediate))=arm64_add_immediate(add_word){if destination==base_register&&source==base_register{address=address.and_then(|value|value.checked_add(immediate));reference=address;}}}
       }}
      }
-     if let Some(address)=reference{selector=objc_selector_name(file,&section_list,size,address)?;}
+     if let Some(address)=reference{selector=objc_selector_name(file,&section_list,size,address,macho_image_base(window))?;}
     }
    }
   }
@@ -482,16 +502,36 @@ fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
 
 fn read_va(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,len:usize)->io::Result<Option<Vec<u8>>>{
  let Some(sec)=section_for_va(secs,va) else{return Ok(None)};
- let Some(len)=u64::try_from(len).ok() else{return Ok(None)};
+ let Some(len_u)=u64::try_from(len).ok() else{return Ok(None)};
  let rel=va-sec.addr;
- let Some(rel_end)=rel.checked_add(len) else{return Ok(None)};
+ let Some(rel_end)=rel.checked_add(len_u) else{return Ok(None)};
  let Some(file_offset)=sec.offset.checked_add(rel) else{return Ok(None)};
- let Some(file_end)=file_offset.checked_add(len) else{return Ok(None)};
+ let Some(file_end)=file_offset.checked_add(len_u) else{return Ok(None)};
  if rel_end>sec.size||file_end>size{return Ok(None)}
- let Ok(len)=usize::try_from(len) else{return Ok(None)};
  Ok(Some(read_exact_range(file,file_offset,len)?))
 }
-fn objc_metadata_string(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,max:usize)->io::Result<Option<String>>{
+fn macho_image_base(window:&[u8])->u64{
+ dyld_segments(window).into_iter().find(|segment|segment.name=="__TEXT").map(|segment|segment.vmaddr).unwrap_or(0)
+}
+fn objc_ptr_candidates(raw:u64,base:u64)->[u64;4]{
+ let masked=if base!=0 { base.saturating_add(raw & 0xffff_ffff) } else { 0 };
+ let masked43=if base!=0 { base.saturating_add(raw & 0x0000_07ff_ffff_ffff) } else { 0 };
+ let offset=if base!=0 { base.saturating_add(raw) } else { 0 };
+ [raw, masked, masked43, offset]
+}
+fn read_objc_va(file:&mut File,secs:&[SectionInfo],size:u64,raw:u64,base:u64,len:usize)->io::Result<Option<(u64,Vec<u8>)>>{
+ for va in objc_ptr_candidates(raw,base){ if va==0 {continue}
+  if let Some(bytes)=read_va(file,secs,size,va,len)? { return Ok(Some((va,bytes))); }
+ }
+ Ok(None)
+}
+fn resolve_objc_ptr(raw:u64,base:u64,secs:&[SectionInfo])->u64{
+ if raw==0 { return 0; }
+ for va in objc_ptr_candidates(raw,base){ if va!=0 && section_for_va(secs,va).is_some() { return va; } }
+ raw
+}
+fn objc_metadata_string(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64,max:usize)->io::Result<Option<String>>{
+ let va=resolve_objc_ptr(va,base,secs);
  let Some(section)=section_for_va(secs,va)else{return Ok(None)};
  if matches!(section.flags&255,1|0xc|0x12){return Ok(None)}
  let length=(section.size-(va-section.addr)).min(max as u64+1) as usize;
@@ -501,17 +541,18 @@ fn objc_metadata_string(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,max:u
  if text.chars().any(char::is_control){return Ok(None)}
  Ok(Some(text.to_owned()))
 }
-fn objc_selector_name(file:&mut File,secs:&[SectionInfo],size:u64,va:u64)->io::Result<Option<String>>{
+fn objc_selector_name(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64)->io::Result<Option<String>>{
  let Some(section)=section_for_va(secs,va)else{return Ok(None)};
  if ["__objc_methname","__cstring"].contains(&section.sect.as_str()){return read_cstr_at(file,section,va,512)}
  if section.sect!="__objc_selrefs"{return Ok(None)}
- let Some(bytes)=read_va(file,secs,size,va,8)?else{return Ok(None)};let target=le64(&bytes);
+ let Some(bytes)=read_va(file,secs,size,va,8)?else{return Ok(None)};let target=resolve_objc_ptr(le64(&bytes),base,secs);
  let Some(name_section)=section_for_va(secs,target)else{return Ok(None)};
  if !["__objc_methname","__cstring"].contains(&name_section.sect.as_str()){return Ok(None)}
  read_cstr_at(file,name_section,target,512)
 }
-fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,kind:&str,owner:Option<&str>,extended:&[Option<String>],out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::MethodLayout>> {
+fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64,kind:&str,owner:Option<&str>,extended:&[Option<String>],out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::MethodLayout>> {
  let mut records=Vec::new();
+ let va=resolve_objc_ptr(va,base,secs);
  if va==0||section_for_va(secs,va).is_none(){return Ok(records)}
  let Some(h)=read_va(file,secs,size,va,8)? else{return Ok(records)};
  let flags=le32(&h[..4]);let count=le32(&h[4..8]).min(4096) as usize;let relative=flags&0x8000_0000!=0;
@@ -522,10 +563,13 @@ fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,kind:&str
   let (sel,ty,imp)=if relative{
    let selector_word=le32(&m[0..4]);let selector_direct=selector_word&1!=0;
    let selector_relative=if selector_direct{selector_word&!1}else{selector_word};
-   (resolve_rel(0,selector_relative).map(|address|(address,selector_direct)),resolve_rel(4,le32(&m[4..8])),resolve_rel(8,le32(&m[8..12])).map(|address|(address,false)))
-  }else{(Some((le64(&m[0..8]),false)),Some(le64(&m[8..16])),Some((le64(&m[16..24]),false)))};
-  let selector=if let Some((address,_direct))=sel{objc_selector_name(file,secs,size,address)?.unwrap_or_else(||"<selector unresolved>".into())}else{"<selector unresolved>".into()};
-  let types=extended.get(i).and_then(Clone::clone).or(ty.and_then(|v|section_for_va(secs,v)).map(|s|read_cstr_at(file,s,ty.unwrap(),512)).transpose()?.flatten()).unwrap_or_else(||"<types unresolved>".into());
+   let sel_va=resolve_rel(0,selector_relative);
+   // direct selectors are inline relative string pointers in some formats; indirect go via selrefs
+   let sel_resolved=sel_va.map(|address| if selector_direct || section_for_va(secs,address).is_some_and(|s|s.sect=="__objc_selrefs"||s.sect=="__objc_methname"||s.sect=="__cstring") { (address,selector_direct) } else { (resolve_objc_ptr(address,base,secs),selector_direct) });
+   (sel_resolved,resolve_rel(4,le32(&m[4..8])).map(|a|resolve_objc_ptr(a,base,secs)),resolve_rel(8,le32(&m[8..12])).map(|a|(resolve_objc_ptr(a,base,secs),false)))
+  }else{(Some((resolve_objc_ptr(le64(&m[0..8]),base,secs),false)),Some(resolve_objc_ptr(le64(&m[8..16]),base,secs)),Some((resolve_objc_ptr(le64(&m[16..24]),base,secs),false)))};
+  let selector=if let Some((address,_direct))=sel{objc_selector_name(file,secs,size,address,base)?.unwrap_or_else(||"<selector unresolved>".into())}else{"<selector unresolved>".into()};
+  let types=extended.get(i).and_then(Clone::clone).or(ty.and_then(|v|section_for_va(secs,v).map(|s|(s,v))).map(|(s,v)|read_cstr_at(file,s,v,512)).transpose()?.flatten()).unwrap_or_else(||"<types unresolved>".into());
   let confidence=if selector.starts_with('<'){"candidate"}else{"validated"};
   if confidence=="validated"&&!types.starts_with('<')&&types.is_ascii(){
    if let Some((implementation,_))=imp.filter(|(address,_)|address%4==0&&section_for_va(secs,*address).is_some_and(|section|section.flags&0x8000_0400!=0)){
@@ -538,8 +582,9 @@ fn objc_method_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,kind:&str
  }
  Ok(records)
 }
-fn objc_ivar_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::IvarLayout>> {
+fn objc_ivar_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64,out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::IvarLayout>> {
  let mut records=Vec::new();
+ let va=resolve_objc_ptr(va,base,secs);
  if va==0{return Ok(records)}
  let Some(header)=read_va(file,secs,size,va,8)?else{return Ok(records)};
  let stride=le32(&header[..4]) as usize;let count=le32(&header[4..8]) as usize;
@@ -547,9 +592,9 @@ fn objc_ivar_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut St
  for index in 0..count {
   let Some(entry)=va.checked_add(8).and_then(|value|value.checked_add(index as u64*stride as u64))else{break};
   let Some(bytes)=read_va(file,secs,size,entry,32)?else{break};
-  let offset_pointer=le64(&bytes[..8]);let name_pointer=le64(&bytes[8..16]);let type_pointer=le64(&bytes[16..24]);
-  let Some(name)=objc_metadata_string(file,secs,size,name_pointer,512)?else{continue};
-  let Some(encoding)=objc_metadata_string(file,secs,size,type_pointer,512)?else{continue};
+  let offset_pointer=resolve_objc_ptr(le64(&bytes[..8]),base,secs);let name_pointer=resolve_objc_ptr(le64(&bytes[8..16]),base,secs);let type_pointer=resolve_objc_ptr(le64(&bytes[16..24]),base,secs);
+  let Some(name)=objc_metadata_string(file,secs,size,name_pointer,base,512)?else{continue};
+  let Some(encoding)=objc_metadata_string(file,secs,size,type_pointer,base,512)?else{continue};
   if !super::objc::identifier(&name)||encoding.is_empty()||!encoding.is_ascii()||encoding.bytes().any(|byte|byte.is_ascii_control()){continue}
   // objc4 ivar_t.offset points to an int32_t, even in LP64 images.
   let Some(section)=section_for_va(secs,offset_pointer).filter(|section|section.sect=="__objc_ivar"&&section.flags&255==0)else{continue};
@@ -565,30 +610,34 @@ fn objc_ivar_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut St
  }
  Ok(records)
 }
-fn objc_protocol_names(file:&mut File,secs:&[SectionInfo],size:u64,va:u64)->io::Result<Vec<String>> {
- let mut names=Vec::new();if va==0||section_for_va(secs,va).is_none(){return Ok(names)}let Some(h)=read_va(file,secs,size,va,8)?else{return Ok(names)};let count=le64(&h[..8]).min(128) as usize;
- for i in 0..count {let Some(slot)=va.checked_add(8).and_then(|value|value.checked_add((i*8) as u64))else{break};let Some(pointer)=read_va(file,secs,size,slot,8)?else{break};let target=le64(&pointer);let Some(protocol)=read_va(file,secs,size,target,16)?else{continue};let name_va=le64(&protocol[8..16]);let Some(section)=section_for_va(secs,name_va)else{continue};let Some(name)=read_cstr_at(file,section,name_va,512)?else{continue};if !name.is_empty()&&name.len()<=256&&name.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'))&&!names.contains(&name){names.push(name)} }
+fn objc_protocol_names(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64)->io::Result<Vec<String>> {
+ let mut names=Vec::new();let va=resolve_objc_ptr(va,base,secs);if va==0||section_for_va(secs,va).is_none(){return Ok(names)}let Some(h)=read_va(file,secs,size,va,8)?else{return Ok(names)};let count=le64(&h[..8]).min(128) as usize;
+ for i in 0..count {let Some(slot)=va.checked_add(8).and_then(|value|value.checked_add((i*8) as u64))else{break};let Some(pointer)=read_va(file,secs,size,slot,8)?else{break};let target=resolve_objc_ptr(le64(&pointer),base,secs);let Some((_,protocol))=read_objc_va(file,secs,size,target,base,16)?else{continue};let name_va=resolve_objc_ptr(le64(&protocol[8..16]),base,secs);let Some(section)=section_for_va(secs,name_va)else{continue};let Some(name)=read_cstr_at(file,section,name_va,512)?else{continue};if !name.is_empty()&&name.len()<=256&&name.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'))&&!names.contains(&name){names.push(name)} }
  Ok(names)
 }
-fn objc_class_name(file:&mut File,secs:&[SectionInfo],size:u64,class_va:u64)->io::Result<Option<String>> {
+fn objc_class_name(file:&mut File,secs:&[SectionInfo],size:u64,class_va:u64,base:u64)->io::Result<Option<String>> {
+ let class_va=resolve_objc_ptr(class_va,base,secs);
  let Some(class)=read_va(file,secs,size,class_va,40)?else{return Ok(None)};
- let Some((_,ro))=objc_ro_record(file,secs,size,le64(&class[32..40]))?else{return Ok(None)};
- objc_metadata_string(file,secs,size,le64(&ro[24..32]),512)
+ let Some((_,ro))=objc_ro_record(file,secs,size,le64(&class[32..40]),base)?else{return Ok(None)};
+ objc_metadata_string(file,secs,size,le64(&ro[24..32]),base,512)
 }
-fn objc_protocol_object(file:&mut File,secs:&[SectionInfo],size:u64,pva:u64,out:&mut String,limit:&mut usize)->io::Result<()> {
- if pva==0||section_for_va(secs,pva).is_none(){return Ok(())}let Some(ph)=read_va(file,secs,size,pva,72)? else{return Ok(())};let declared_size=le32(&ph[64..68]) as usize;if !(72..=4096).contains(&declared_size)||read_va(file,secs,size,pva,declared_size)?.is_none(){return Ok(())}let name_va=le64(&ph[8..16]);let name=if name_va!=0{if let Some(s)=section_for_va(secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<protocol name unresolved>".into())}else{"<protocol name unresolved>".into()}}else{"<protocol name unresolved>".into()};let confidence=if name.starts_with('<'){"candidate"}else{"validated"};let adopted=objc_protocol_names(file,secs,size,le64(&ph[16..24]))?;let adoption=if adopted.is_empty(){String::new()}else{format!(" adopts={}",adopted.join(","))};out.push_str(&format!("  protocol {pva:#018x} name={name}{adoption} confidence={confidence}\n"));*limit+=1;if out.len()>60_000{return Ok(())}
+fn objc_protocol_object(file:&mut File,secs:&[SectionInfo],size:u64,pva:u64,base:u64,out:&mut String,limit:&mut usize)->io::Result<()> {
+ let pva=resolve_objc_ptr(pva,base,secs);
+ if pva==0||section_for_va(secs,pva).is_none(){return Ok(())}let Some(ph)=read_va(file,secs,size,pva,72)? else{return Ok(())};let declared_size=le32(&ph[64..68]) as usize;if !(72..=4096).contains(&declared_size)||read_va(file,secs,size,pva,declared_size)?.is_none(){return Ok(())}let name_va=resolve_objc_ptr(le64(&ph[8..16]),base,secs);let name=if name_va!=0{if let Some(s)=section_for_va(secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<protocol name unresolved>".into())}else{"<protocol name unresolved>".into()}}else{"<protocol name unresolved>".into()};let confidence=if name.starts_with('<'){"candidate"}else{"validated"};let adopted=objc_protocol_names(file,secs,size,le64(&ph[16..24]),base)?;let adoption=if adopted.is_empty(){String::new()}else{format!(" adopts={}",adopted.join(","))};out.push_str(&format!("  protocol {pva:#018x} name={name}{adoption} confidence={confidence}\n"));*limit+=1;if out.len()>60_000{return Ok(())}
  // protocol_t method-list fields follow the isa/name/protocol-list pair on 64-bit Mach-O.
- let lists=[("required-instance",24usize),("required-class",32),("optional-instance",40),("optional-class",48)].map(|(label,off)|(label,le64(&ph[off..off+8])));let counts=lists.map(|(_,list)|read_va(file,secs,size,list,8).ok().flatten().map(|header|le32(&header[4..8]).min(4096) as usize).unwrap_or(0));let total=counts.iter().sum::<usize>().min(16_384);let mut extended=Vec::new();if declared_size>=80 {if let Some(full)=read_va(file,secs,size,pva,80)?{let table=le64(&full[72..80]);for index in 0..total {let value=read_va(file,secs,size,table.saturating_add(index as u64*8),8)?.and_then(|slot|{let address=le64(&slot);section_for_va(secs,address).map(|section|(section,address))}).map(|(section,address)|read_cstr_at(file,section,address,1024)).transpose()?.flatten();extended.push(value);}}}
- let mut cursor=0usize;for (index,(label,list)) in lists.into_iter().enumerate(){let end=cursor.saturating_add(counts[index]).min(extended.len());let overrides=if cursor<end{&extended[cursor..end]}else{&[]};objc_method_list(file,secs,size,list,label,None,overrides,out,limit)?;cursor=cursor.saturating_add(counts[index]);}
+ let lists=[("required-instance",24usize),("required-class",32),("optional-instance",40),("optional-class",48)].map(|(label,off)|(label,resolve_objc_ptr(le64(&ph[off..off+8]),base,secs)));let counts=lists.map(|(_,list)|read_va(file,secs,size,list,8).ok().flatten().map(|header|le32(&header[4..8]).min(4096) as usize).unwrap_or(0));let total=counts.iter().sum::<usize>().min(16_384);let mut extended=Vec::new();if declared_size>=80 {if let Some(full)=read_va(file,secs,size,pva,80)?{let table=resolve_objc_ptr(le64(&full[72..80]),base,secs);for index in 0..total {let value=read_va(file,secs,size,table.saturating_add(index as u64*8),8)?.and_then(|slot|{let address=resolve_objc_ptr(le64(&slot),base,secs);section_for_va(secs,address).map(|section|(section,address))}).map(|(section,address)|read_cstr_at(file,section,address,1024)).transpose()?.flatten();extended.push(value);}}}
+ let mut cursor=0usize;for (index,(label,list)) in lists.into_iter().enumerate(){let end=cursor.saturating_add(counts[index]).min(extended.len());let overrides=if cursor<end{&extended[cursor..end]}else{&[]};objc_method_list(file,secs,size,list,base,label,None,overrides,out,limit)?;cursor=cursor.saturating_add(counts[index]);}
  Ok(())
 }
-fn objc_protocol_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut String,limit:&mut usize)->io::Result<()> {
+fn objc_protocol_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64,out:&mut String,limit:&mut usize)->io::Result<()> {
+ let va=resolve_objc_ptr(va,base,secs);
  if va==0||section_for_va(secs,va).is_none(){return Ok(())}let Some(h)=read_va(file,secs,size,va,8)? else{return Ok(())};let count=le64(&h[..8]).min(4096) as usize;
- for i in 0..count {let Some(slot)=va.checked_add(8).and_then(|value|value.checked_add((i*8) as u64))else{break};let Some(p)=read_va(file,secs,size,slot,8)? else{break};objc_protocol_object(file,secs,size,le64(&p),out,limit)?;if out.len()>60_000{return Ok(())}}
+ for i in 0..count {let Some(slot)=va.checked_add(8).and_then(|value|value.checked_add((i*8) as u64))else{break};let Some(p)=read_va(file,secs,size,slot,8)? else{break};objc_protocol_object(file,secs,size,le64(&p),base,out,limit)?;if out.len()>60_000{return Ok(())}}
  Ok(())
 }
-fn objc_property_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::PropertyLayout>> {
+fn objc_property_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,base:u64,out:&mut String,limit:&mut usize)->io::Result<Vec<super::objc::PropertyLayout>> {
  let mut records=Vec::new();
+ let va=resolve_objc_ptr(va,base,secs);
  if va==0{return Ok(records)}
  let Some(header)=read_va(file,secs,size,va,8)?else{return Ok(records)};
  let stride=le32(&header[..4]) as usize;let count=le32(&header[4..8]) as usize;
@@ -596,8 +645,8 @@ fn objc_property_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mu
  for index in 0..count {
   let Some(entry)=va.checked_add(8).and_then(|value|value.checked_add(index as u64*stride as u64))else{break};
   let Some(bytes)=read_va(file,secs,size,entry,16)?else{break};
-  let Some(name)=objc_metadata_string(file,secs,size,le64(&bytes[..8]),512)?else{continue};
-  let Some(attributes)=objc_metadata_string(file,secs,size,le64(&bytes[8..16]),2048)?else{continue};
+  let Some(name)=objc_metadata_string(file,secs,size,le64(&bytes[..8]),base,512)?else{continue};
+  let Some(attributes)=objc_metadata_string(file,secs,size,le64(&bytes[8..16]),base,2048)?else{continue};
   let Some(property)=super::objc::PropertyLayout::parse(entry,name,attributes)else{continue};
   out.push_str(&format!("  property {entry:#018x} name={} attributes={} getter={} setter={} backing_ivar={} confidence=validated\n",
    property.name,property.attributes,property.getter,property.setter.as_deref().unwrap_or("<readonly>"),property.ivar.as_deref().unwrap_or("<unresolved>")));
@@ -608,38 +657,38 @@ fn objc_property_list(file:&mut File,secs:&[SectionInfo],size:u64,va:u64,out:&mu
 // The supported on-disk LP64 class_ro_t has a 16-byte scalar header, then
 // ivarLayout/name/methods/protocols/ivars/weakIvarLayout/properties pointers.
 // Only a positively marked class_rw_t is followed through its RO pointer.
-fn objc_ro_record(file:&mut File,secs:&[SectionInfo],size:u64,bits:u64)->io::Result<Option<(u64,Vec<u8>)>> {
- let mut address=bits&!7u64;
- if let Some(prefix)=read_va(file,secs,size,address,16)?{
-  if le32(&prefix[..4])&0x8000_0000!=0{address=le64(&prefix[8..16])&!7u64;}
- }
+fn objc_ro_record(file:&mut File,secs:&[SectionInfo],size:u64,bits:u64,base:u64)->io::Result<Option<(u64,Vec<u8>)>> {
+ let mut address=resolve_objc_ptr(bits&!7u64,base,secs);
+ let Some(prefix)=read_va(file,secs,size,address,16)?else{return Ok(None)};
+ if le32(&prefix[..4])&0x8000_0000!=0{address=resolve_objc_ptr(le64(&prefix[8..16])&!7u64,base,secs);}
  let Some(bytes)=read_va(file,secs,size,address,72)?else{return Ok(None)};
  let start=le32(&bytes[4..8]);let extent=le32(&bytes[8..12]);
  if start>extent||extent>16*1024*1024{return Ok(None)}
  let name_address=le64(&bytes[24..32]);
- let Some(name)=objc_metadata_string(file,secs,size,name_address,512)?else{return Ok(None)};
+ let Some(name)=objc_metadata_string(file,secs,size,name_address,base,512)?else{return Ok(None)};
  if name.is_empty()||name.len()>256||!name.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.')){return Ok(None)}
  Ok(Some((address,bytes)))
 }
 fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<(String,Vec<super::objc::ClassLayout>)>{
- let secs=sections(window);let mut out=String::new();let mut layouts=Vec::new();
+ let secs=sections(window);let base=macho_image_base(window);let mut out=String::new();let mut layouts=Vec::new();
  let external_classes=objc_external_class_binds(file,window,size)?;
  let mut classes=0usize;let mut methods=0usize;let mut ivars=0usize;let mut protocols=0usize;let mut properties=0usize;
  for list in secs.iter().filter(|section|section.sect=="__objc_classlist"){
   if list.offset>size||list.size>size-list.offset||list.size>2*1024*1024{continue}
   let data=read_exact_range(file,list.offset,list.size as usize)?;
   for (index,pointer) in data.chunks_exact(8).enumerate().take(20_000){
-   let class_address=le64(pointer);let Some(class)=read_va(file,&secs,size,class_address,40)?else{continue};
-   let super_address=le64(&class[8..16]);
-   let Some((ro_address,ro))=objc_ro_record(file,&secs,size,le64(&class[32..40]))?else{
+   let class_address=resolve_objc_ptr(le64(pointer),base,&secs);
+   let Some(class)=read_va(file,&secs,size,class_address,40)?else{continue};
+   let super_address=resolve_objc_ptr(le64(&class[8..16]),base,&secs);
+   let Some((ro_address,ro))=objc_ro_record(file,&secs,size,le64(&class[32..40]),base)?else{
     out.push_str(&format!("candidate class[{index}] {class_address:#018x} super={super_address:#018x} (RO record unresolved)\n"));continue
    };
-   let Some(name)=objc_metadata_string(file,&secs,size,le64(&ro[24..32]),512)?else{continue};
+   let Some(name)=objc_metadata_string(file,&secs,size,le64(&ro[24..32]),base,512)?else{continue};
    let methods_address=le64(&ro[32..40]);let protocols_address=le64(&ro[40..48]);let ivars_address=le64(&ro[48..56]);let properties_address=le64(&ro[64..72]);
    let instance_start=le32(&ro[4..8]);let instance_size=le32(&ro[8..12]);
-   let conformances=objc_protocol_names(file,&secs,size,protocols_address)?;
+   let conformances=objc_protocol_names(file,&secs,size,protocols_address,base)?;
    let conforms=if conformances.is_empty(){String::new()}else{format!("  conforms={}",conformances.join(","))};
-   let local_superclass=objc_class_name(file,&secs,size,super_address)?;
+   let local_superclass=objc_class_name(file,&secs,size,super_address,base)?;
    let imported_superclass=class_address.checked_add(8).and_then(|slot|external_classes.get(&slot));
    let superclass=match (local_superclass,imported_superclass){
     (Some(local),Some((imported,_))) if local!=*imported=>String::new(),
@@ -648,21 +697,21 @@ fn objc_class_graph(file:&mut File,window:&[u8],size:u64)->io::Result<(String,Ve
     _=>String::new()
    };
    out.push_str(&format!("reconstructed class {class_address:#018x}  name={name}  super={super_address:#018x}{superclass}  ro={ro_address:#018x}{conforms} instance_start={instance_start} instance_size={instance_size}\n"));classes+=1;
-   let mut declared_methods=objc_method_list(file,&secs,size,methods_address,"instance",Some(&name),&[],&mut out,&mut methods)?;
+   let mut declared_methods=objc_method_list(file,&secs,size,methods_address,base,"instance",Some(&name),&[],&mut out,&mut methods)?;
    // The metaclass uses the same RO layout: methods are at byte 32.
-   let isa=le64(&class[..8]);
+   let isa=resolve_objc_ptr(le64(&class[..8]),base,&secs);
    if let Some(meta)=read_va(file,&secs,size,isa,40)?{
-    if let Some((_,meta_ro))=objc_ro_record(file,&secs,size,le64(&meta[32..40]))?{
-     declared_methods.extend(objc_method_list(file,&secs,size,le64(&meta_ro[32..40]),"class",Some(&name),&[],&mut out,&mut methods)?);
+    if let Some((_,meta_ro))=objc_ro_record(file,&secs,size,le64(&meta[32..40]),base)?{
+     declared_methods.extend(objc_method_list(file,&secs,size,le64(&meta_ro[32..40]),base,"class",Some(&name),&[],&mut out,&mut methods)?);
     }
    }
-   let expected_members=if ivars_address==0{Some(0)}else{read_va(file,&secs,size,ivars_address,8)?.map(|header|le32(&header[4..8]) as usize)};
-   let members:Vec<_>=objc_ivar_list(file,&secs,size,ivars_address,&mut out,&mut ivars)?.into_iter().filter(|ivar|{
+   let expected_members=if resolve_objc_ptr(ivars_address,base,&secs)==0{Some(0)}else{read_va(file,&secs,size,resolve_objc_ptr(ivars_address,base,&secs),8)?.map(|header|le32(&header[4..8]) as usize)};
+   let members:Vec<_>=objc_ivar_list(file,&secs,size,ivars_address,base,&mut out,&mut ivars)?.into_iter().filter(|ivar|{
     ivar.offset>=instance_start&&ivar.offset.checked_add(ivar.size).is_some_and(|end|end<=instance_size)
    }).collect();
-   objc_protocol_list(file,&secs,size,protocols_address,&mut out,&mut protocols)?;
-   let declared_properties=objc_property_list(file,&secs,size,properties_address,&mut out,&mut properties)?;
-   let expected_properties=if properties_address==0{Some(0)}else{read_va(file,&secs,size,properties_address,8)?.map(|header|le32(&header[4..8]) as usize)};
+   objc_protocol_list(file,&secs,size,protocols_address,base,&mut out,&mut protocols)?;
+   let declared_properties=objc_property_list(file,&secs,size,properties_address,base,&mut out,&mut properties)?;
+   let expected_properties=if resolve_objc_ptr(properties_address,base,&secs)==0{Some(0)}else{read_va(file,&secs,size,resolve_objc_ptr(properties_address,base,&secs),8)?.map(|header|le32(&header[4..8]) as usize)};
    let ivars_complete=expected_members==Some(members.len());let properties_complete=expected_properties==Some(declared_properties.len());
    if !ivars_complete||!properties_complete{out.push_str("  member coverage incomplete; affected source member/type reconstruction withheld\n")}
    layouts.push(super::objc::ClassLayout{address:class_address,name,instance_start,instance_size,ivars:members,properties:declared_properties,methods:declared_methods,ivars_complete,properties_complete,runtime:false});
@@ -1064,11 +1113,11 @@ fn chained_fixups_summary(file:&mut File,window:&[u8],size:u64)->io::Result<Stri
  Ok(format!("LC_DYLD_CHAINED_FIXUPS\n  file={off:#x} size={len:#x}\n  fixups_version={version}\n  starts_offset={starts_off:#x}\n  imports_offset={imports_off:#x} count={imports_count} format={imports_format}\n  symbols_offset={symbols_off:#x} format={symbols_format}\n  payload_offsets_valid={}\n\nContainer/header validation is complete; pointer-chain walking remains evidence-gated until per-segment starts/page records validate.\n",valid))
 }
 fn objc_protocol_property_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
- let secs=sections(window);let mut out=String::new();let mut count=0usize;let mut methods=0usize;let mut properties=0usize;
- for sec in secs.iter().filter(|s|s.sect=="__objc_protolist") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for p in bytes.chunks_exact(8).take(20_000){let target=le64(p);if target==0{continue}objc_protocol_object(file,&secs,size,target,&mut out,&mut count)?;}}
+ let secs=sections(window);let base=macho_image_base(window);let mut out=String::new();let mut count=0usize;let mut methods=0usize;let mut properties=0usize;
+ for sec in secs.iter().filter(|s|s.sect=="__objc_protolist") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for p in bytes.chunks_exact(8).take(20_000){let target=le64(p);if target==0{continue}objc_protocol_object(file,&secs,size,target,base,&mut out,&mut count)?;}}
  // Protocol references are useful even when the referenced protocol object is in a dylib.
- for sec in secs.iter().filter(|s|s.sect=="__objc_protorefs") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let target=le64(p);if target==0{continue}let Some(offset)=(i as u64).checked_mul(8)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};if let Some(ts)=section_for_va(&secs,target){out.push_str(&format!("reference {},{} {site:#018x} -> {target:#018x} {},{} confidence=validated\n",sec.seg,sec.sect,ts.seg,ts.sect));count+=1;if out.len()>60_000{return Ok(out)}}}}
- for sec in secs.iter().filter(|s|s.sect=="__objc_catlist") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let cat=le64(p);let Some(c)=read_va(file,&secs,size,cat,48)? else{continue};let name_va=le64(&c[..8]);let cls=le64(&c[8..16]);let name=if name_va!=0{if let Some(s)=section_for_va(&secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<category name unresolved>".into())}else{"<category name unresolved>".into()}}else{"<category name unresolved>".into()};let class_name=objc_class_name(file,&secs,size,cls)?;let protocols_va=le64(&c[32..40]);let conformances=objc_protocol_names(file,&secs,size,protocols_va)?;let resolved_class=class_name.map(|value|format!(" class_name={value}")).unwrap_or_default();let conforms=if conformances.is_empty(){String::new()}else{format!(" conforms={}",conformances.join(","))};out.push_str(&format!("category {cat:#018x} name={name} class={cls:#018x}{resolved_class}{conforms} confidence=validated\n"));count+=1;objc_method_list(file,&secs,size,le64(&c[16..24]),"category-instance",None,&[],&mut out,&mut methods)?;objc_method_list(file,&secs,size,le64(&c[24..32]),"category-class",None,&[],&mut out,&mut methods)?;objc_protocol_list(file,&secs,size,protocols_va,&mut out,&mut count)?;objc_property_list(file,&secs,size,le64(&c[40..48]),&mut out,&mut properties)?;if out.len()>60_000{return Ok(out)}let _=i;}}
+ for sec in secs.iter().filter(|s|s.sect=="__objc_protorefs") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let target=resolve_objc_ptr(le64(p),base,&secs);if target==0{continue}let Some(offset)=(i as u64).checked_mul(8)else{continue};let Some(site)=section_va_at(sec,offset)else{continue};if let Some(ts)=section_for_va(&secs,target){out.push_str(&format!("reference {},{} {site:#018x} -> {target:#018x} {},{} confidence=validated\n",sec.seg,sec.sect,ts.seg,ts.sect));count+=1;if out.len()>60_000{return Ok(out)}}}}
+ for sec in secs.iter().filter(|s|s.sect=="__objc_catlist") {if sec.offset>size||sec.size>size-sec.offset||sec.size>2*1024*1024{continue}let bytes=read_exact_range(file,sec.offset,sec.size as usize)?;for (i,p) in bytes.chunks_exact(8).enumerate().take(20_000){let cat=resolve_objc_ptr(le64(p),base,&secs);let Some(c)=read_va(file,&secs,size,cat,48)? else{continue};let name_va=resolve_objc_ptr(le64(&c[..8]),base,&secs);let cls=resolve_objc_ptr(le64(&c[8..16]),base,&secs);let name=if name_va!=0{if let Some(s)=section_for_va(&secs,name_va){read_cstr_at(file,s,name_va,512)?.unwrap_or_else(||"<category name unresolved>".into())}else{"<category name unresolved>".into()}}else{"<category name unresolved>".into()};let class_name=objc_class_name(file,&secs,size,cls,base)?;let protocols_va=le64(&c[32..40]);let conformances=objc_protocol_names(file,&secs,size,protocols_va,base)?;let resolved_class=class_name.map(|value|format!(" class_name={value}")).unwrap_or_default();let conforms=if conformances.is_empty(){String::new()}else{format!(" conforms={}",conformances.join(","))};out.push_str(&format!("category {cat:#018x} name={name} class={cls:#018x}{resolved_class}{conforms} confidence=validated\n"));count+=1;objc_method_list(file,&secs,size,le64(&c[16..24]),base,"category-instance",None,&[],&mut out,&mut methods)?;objc_method_list(file,&secs,size,le64(&c[24..32]),base,"category-class",None,&[],&mut out,&mut methods)?;objc_protocol_list(file,&secs,size,protocols_va,base,&mut out,&mut count)?;objc_property_list(file,&secs,size,le64(&c[40..48]),base,&mut out,&mut properties)?;if out.len()>60_000{return Ok(out)}let _=i;}}
  if count==0{out.push_str("No validated Objective-C protocol/category pointer edges were recovered in the bounded pass.\n");}else{out.push_str(&format!("\nValidated Objective-C protocol/category objects: {count}; category methods: {methods}; properties: {properties}.\n"));}Ok(out)
 }
 fn swift_field_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>{
@@ -1826,6 +1875,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  // symbols alone do not identify the address of an imported call target.
  let (_,_,indirect_facts)=indirect_symbol_data(&mut file,&window,size)?;
  let signature_symbols=reconstruction_symbols(&facts.symbols,&export_names,&indirect_facts);
+ let stub_names=indirect_facts.iter().filter(|(_,kind,_)|kind=="stub").map(|(name,_,address)|(*address,name.clone())).collect::<std::collections::BTreeMap<_,_>>();
  // ObjC IMP names participate in signature/prototype recovery but are not
  // reported as nlist symbols: their provenance is the ObjC records above.
  let mut recovery_symbols=signature_symbols.clone();
@@ -1833,7 +1883,9 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
   if !recovery_symbols.iter().any(|(candidate,_)|candidate==address) { recovery_symbols.push((*address,name.clone())); }
  }
  recovery_symbols.sort();recovery_symbols.dedup();
- let native=super::reconstruction::NativeEvidence{symbols:signature_symbols.clone(),objc_layouts:facts.objc_layouts.clone(),objc_records:facts.objc_classes.clone(),objc_function_names:facts.objc_function_names.clone(),export_names,export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone()};
+ let mut got_symbols=std::collections::BTreeMap::<u64,String>::new();
+ for (name,kind,va) in &indirect_facts { if matches!(kind.as_str(),"nonlazy-pointer"|"lazy-pointer"|"got") { got_symbols.entry(*va).or_insert_with(|| name.clone()); } }
+ let mut native=super::reconstruction::NativeEvidence{symbols:signature_symbols.clone(),objc_layouts:facts.objc_layouts.clone(),objc_records:facts.objc_classes.clone(),objc_function_names:facts.objc_function_names.clone(),export_names,export_starts:facts.export_starts.clone(),lc_function_starts:facts.lc_function_starts.clone(),unwind_starts:facts.unwind_starts.clone(),got_symbols,stub_symbols:stub_names.clone()};
  let index=facts.starts.binary_search(&start).map_err(|_|invalid("Start is not an admitted function boundary"))?;
  if index+1==facts.starts.len()&&(code.len() as u64)<map.bytes{return Err(invalid("Final function bound is outside the code scan budget"));}
  let canonical_end=facts.starts.get(index+1).copied().unwrap_or(map.address+map.bytes);
@@ -1865,6 +1917,117 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  }
  call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
  call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
+ // Add evidence-backed prototypes for direct calls to objc_msgSend$selector stubs.
+ // The selector is recovered from the stub's validated selref load; the ABI
+ // argument/result locations come from the unique validated method encoding for
+ // that selector in this image's Objective-C metadata. Runtime side effects of
+ // message dispatch remain unproven.
+ let objc_selector_encodings = {
+  let mut map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+  for line in facts.objc_classes.lines().chain( /* protocols may also be relevant but records already separate */ "".lines()) {}
+  // parse from objc_classes/records: facts.objc_classes contains class records; protocols in separate? we need full records
+  // easier: use objc_signature_candidates? but we want by selector
+  map
+ };
+ // Build selector->unique encoding map from validated method records in class and protocol metadata.
+ let mut selector_encoding_map: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+ for records in [&facts.objc_classes] { // objc_classes text includes validated method lines
+  for line in records.lines().filter(|line| line.contains(" method ") && line.contains("confidence=validated")) {
+   let Some(sel)=line.split(" name=").nth(1).and_then(|tail|tail.split("  types=").next()) else { continue };
+   let Some(enc)=line.split("  types=").nth(1).and_then(|tail|tail.split("  imp=").next()) else { continue };
+   selector_encoding_map.entry(sel.trim().to_owned()).or_default().insert(enc.trim().to_owned());
+  }
+ }
+ // also include protocol records if available via objc_protocols? not in facts; best effort from classes
+ let known_runtime_proto = |name: &str| -> Option<super::signatures::Signature> {
+  let decl = match name {
+   "_objc_setProperty_nonatomic_copy" | "objc_setProperty_nonatomic_copy" => "void objc_setProperty_nonatomic_copy(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+   "_objc_setProperty_atomic_copy" | "objc_setProperty_atomic_copy" => "void objc_setProperty_atomic_copy(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+   "_objc_setProperty_nonatomic" | "objc_setProperty_nonatomic" => "void objc_setProperty_nonatomic(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+   "_objc_setProperty_atomic" | "objc_setProperty_atomic" => "void objc_setProperty_atomic(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+   "_objc_storeStrong" | "objc_storeStrong" => "void objc_storeStrong(id *object, id value);",
+   "_objc_storeWeak" | "objc_storeWeak" => "id objc_storeWeak(id *object, id value);",
+   "_objc_loadWeakRetained" | "objc_loadWeakRetained" => "id objc_loadWeakRetained(id *object);",
+   "_objc_destroyWeak" | "objc_destroyWeak" => "void objc_destroyWeak(id *object);",
+   "_objc_copyWeak" | "objc_copyWeak" => "void objc_copyWeak(id *dest, id *src);",
+   "_objc_initWeak" | "objc_initWeak" => "id objc_initWeak(id *object, id value);",
+   "_objc_moveWeak" | "objc_moveWeak" => "void objc_moveWeak(id *dest, id *src);",
+   "_objc_retain" | "objc_retain" => "id objc_retain(id value);",
+   "_objc_release" | "objc_release" => "void objc_release(id value);",
+   "_objc_autorelease" | "objc_autorelease" => "id objc_autorelease(id value);",
+   "_objc_retainAutorelease" | "objc_retainAutorelease" => "id objc_retainAutorelease(id value);",
+   "_objc_autoreleaseReturnValue" | "objc_autoreleaseReturnValue" => "id objc_autoreleaseReturnValue(id value);",
+   "_objc_retainAutoreleasedReturnValue" | "objc_retainAutoreleasedReturnValue" => "id objc_retainAutoreleasedReturnValue(id value);",
+   "_objc_retainAutoreleaseReturnValue" | "objc_retainAutoreleaseReturnValue" => "id objc_retainAutoreleaseReturnValue(id value);",
+   "_objc_unsafeClaimAutoreleasedReturnValue" | "objc_unsafeClaimAutoreleasedReturnValue" => "id objc_unsafeClaimAutoreleasedReturnValue(id value);",
+   "_objc_opt_new" | "objc_opt_new" => "id objc_opt_new(id cls);",
+   "_objc_opt_class" | "objc_opt_class" => "id objc_opt_class(id obj);",
+   "_objc_opt_self" | "objc_opt_self" => "id objc_opt_self(id obj);",
+   "_objc_opt_isKindOfClass" | "objc_opt_isKindOfClass" => "bool objc_opt_isKindOfClass(id obj, Class cls);",
+   "_objc_opt_respondsToSelector" | "objc_opt_respondsToSelector" => "bool objc_opt_respondsToSelector(id obj, SEL sel);",
+   "_objc_alloc" | "objc_alloc" => "id objc_alloc(Class cls);",
+   "_objc_alloc_init" | "objc_alloc_init" => "id objc_alloc_init(Class cls);",
+   "_objc_autoreleasePoolPush" | "objc_autoreleasePoolPush" => "void *objc_autoreleasePoolPush(void);",
+   "_objc_autoreleasePoolPop" | "objc_autoreleasePoolPop" => "void objc_autoreleasePoolPop(void *pool);",
+
+   "_objc_msgSendSuper2" | "objc_msgSendSuper2" => "id objc_msgSendSuper2(void *super, SEL op);",
+   "_objc_msgSendSuper" | "objc_msgSendSuper" => "id objc_msgSendSuper(void *super, SEL op);",
+   "_objc_msgSendSuper2_stret" | "objc_msgSendSuper2_stret" => "void objc_msgSendSuper2_stret(void *ret, void *super, SEL op);",
+   "_objc_msgSendSuper_stret" | "objc_msgSendSuper_stret" => "void objc_msgSendSuper_stret(void *ret, void *super, SEL op);",
+   "_memcpy" | "memcpy" => "void *memcpy(void *restrict dst, const void *restrict src, size_t n);",
+   "_memmove" | "memmove" => "void *memmove(void *dst, const void *src, size_t n);",
+   "_memset" | "memset" => "void *memset(void *dst, int c, size_t n);",
+   "_memcmp" | "memcmp" => "int memcmp(const void *s1, const void *s2, size_t n);",
+   "_fwrite" | "fwrite" => "size_t fwrite(const void *ptr, size_t size, size_t nmemb, void *stream);",
+   "_fread" | "fread" => "size_t fread(void *ptr, size_t size, size_t nmemb, void *stream);",
+   "_strlen" | "strlen" => "size_t strlen(const char *s);",
+   "_strcmp" | "strcmp" => "int strcmp(const char *s1, const char *s2);",
+   "_strncmp" | "strncmp" => "int strncmp(const char *s1, const char *s2, size_t n);",
+   "_strcpy" | "strcpy" => "char *strcpy(char *dst, const char *src);",
+   "_strncpy" | "strncpy" => "char *strncpy(char *dst, const char *src, size_t n);",
+   "_printf" | "printf" => "int printf(const char *format, ...);",
+   "_puts" | "puts" => "int puts(const char *s);",
+   _ => return None,
+  };
+  Some(super::signatures::Signature { language: "C", declaration: decl.to_owned(), source: "known Objective-C runtime ABI contract" })
+ };
+ let fn_code=code.get(start.saturating_sub(map.address) as usize .. end.saturating_sub(map.address).min(code.len() as u64) as usize).unwrap_or(&[]);
+ for (index,chunk) in fn_code.chunks_exact(4).enumerate() {
+  let _pc=start + index as u64*4;
+  let word=u32::from_le_bytes(chunk.try_into().unwrap());
+  let Some((target,"call",_))=branch_target(word,_pc) else { continue };
+  let mut stub_symbol: Option<String> = None;
+  if let Ok(Some(selector))=objc_msgsend_stub_selector(&mut file,&window,size,target,&indirect_facts) {
+   stub_symbol = Some(format!("_objc_msgSend${selector}"));
+   if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
+    if let Some(encodings)=selector_encoding_map.get(&selector) {
+     if encodings.len()==1 {
+      let encoding=encodings.iter().next().unwrap();
+      let synthetic=format!("-[__hs_objc_msgsend__ {selector}]");
+      if let Some(signature)=super::signatures::objc_method(&synthetic,encoding) {
+       call_prototypes.push((target, stub_symbol.clone().unwrap(), signature));
+      }
+     }
+    }
+   }
+  }
+  if let Some(name)=stub_symbol.clone() {
+   if !native.symbols.iter().any(|(a,_)|*a==target) { native.symbols.push((target,name)); }
+  }
+  if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
+   let resolved_name = stub_symbol.or_else(|| recovery_symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.clone()))
+    .or_else(|| native.symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.clone()))
+    .or_else(|| indirect_facts.iter().find(|(_,_,a)|*a==target).map(|(n,_,_)|n.clone()));
+   if let Some(name)=resolved_name {
+    if let Some(signature)=known_runtime_proto(&name) {
+     call_prototypes.push((target,name,signature));
+    }
+   }
+  }
+ }
+ call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
+ call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
+
  let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}

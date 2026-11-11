@@ -23,6 +23,10 @@ pub struct NativeEvidence {
     pub lc_function_starts: Vec<u64>,
     /// Unwind info function starts.
     pub unwind_starts: Vec<u64>,
+    /// Resolved GOT/non-lazy/lazy pointer slot symbol names.
+    pub got_symbols: std::collections::BTreeMap<u64, String>,
+    /// Import/stub symbol names resolved from indirect-symbol evidence (e.g. dyld stubs).
+    pub stub_symbols: std::collections::BTreeMap<u64, String>,
 }
 
 pub struct Input<'a> {

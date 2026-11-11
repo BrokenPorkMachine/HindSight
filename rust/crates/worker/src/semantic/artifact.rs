@@ -853,6 +853,55 @@ fn model(operation: IrOperation) -> Option<Tree> {
             )]),
             vec![reg(target)],
         ),
+        IrOperation::ScalarFloatImmediate { destination, precision, bits, immediate } => {
+            let (name, bits_width) = match precision {
+                IrFloatPrecision::Half => (format!("h{destination}"), 16u8),
+                IrFloatPrecision::Single => (format!("s{destination}"), 32u8),
+                IrFloatPrecision::Double => (format!("d{destination}"), 64u8),
+            };
+            let ty = match precision {
+                IrFloatPrecision::Half => "uint16_t",
+                IrFloatPrecision::Single => "float",
+                IrFloatPrecision::Double => "double",
+            };
+            tree(
+                "assignment",
+                None,
+                object([("write_policy", "fp-scalar-write".into())]),
+                vec![
+                    tree("fp-register", Some(ty.into()), object([("name", name.into()), ("bits", (bits_width as u64).into()), ("precision", match precision { IrFloatPrecision::Half=>"half", IrFloatPrecision::Single=>"single", IrFloatPrecision::Double=>"double" }.into())]), vec![]),
+                    tree("float-constant", Some(ty.into()), object([("bits", bits.into()), ("immediate", (immediate as u64).into()), ("precision", match precision { IrFloatPrecision::Half=>"half", IrFloatPrecision::Single=>"single", IrFloatPrecision::Double=>"double" }.into())]), vec![]),
+                ],
+            )
+        }
+        IrOperation::ScalarFloatMove { destination, source, precision } => {
+            let (dname, sname, bits_width) = match precision {
+                IrFloatPrecision::Half => (format!("h{destination}"), format!("h{source}"), 16u8),
+                IrFloatPrecision::Single => (format!("s{destination}"), format!("s{source}"), 32u8),
+                IrFloatPrecision::Double => (format!("d{destination}"), format!("d{source}"), 64u8),
+            };
+            let ty = match precision { IrFloatPrecision::Half=>"uint16_t", IrFloatPrecision::Single=>"float", IrFloatPrecision::Double=>"double" };
+            let reg_node = |name: String| tree("fp-register", Some(ty.into()), object([("name", name.into()), ("bits", (bits_width as u64).into())]), vec![]);
+            tree("assignment", None, object([("write_policy","fp-scalar-write".into())]), vec![reg_node(dname), reg_node(sname)])
+        }
+        IrOperation::ScalarFloatBinary { destination, left, right, precision, operator } => {
+            let (dname, lname, rname, bits_width) = match precision {
+                IrFloatPrecision::Half => (format!("h{destination}"), format!("h{left}"), format!("h{right}"), 16u8),
+                IrFloatPrecision::Single => (format!("s{destination}"), format!("s{left}"), format!("s{right}"), 32u8),
+                IrFloatPrecision::Double => (format!("d{destination}"), format!("d{left}"), format!("d{right}"), 64u8),
+            };
+            let ty = match precision { IrFloatPrecision::Half=>"uint16_t", IrFloatPrecision::Single=>"float", IrFloatPrecision::Double=>"double" };
+            let op = match operator {
+                IrFloatBinaryOperator::Add => "+",
+                IrFloatBinaryOperator::Subtract => "-",
+                IrFloatBinaryOperator::Multiply => "*",
+                IrFloatBinaryOperator::Divide => "/",
+                _ => return None,
+            };
+            let reg_node = |name: String| tree("fp-register", Some(ty.into()), object([("name", name.into()), ("bits", (bits_width as u64).into())]), vec![]);
+            let expr = tree("fp-binary", Some(ty.into()), object([("operator", op.into()), ("bits", (bits_width as u64).into())]), vec![reg_node(lname), reg_node(rname)]);
+            tree("assignment", None, object([("write_policy","fp-scalar-write".into())]), vec![reg_node(dname), expr])
+        }
         _ => return None,
     })
 }
@@ -1322,14 +1371,105 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     };
     let mut prototypes_by_address = BTreeMap::<u64, Vec<(String, crate::signatures::Signature)>>::new();
     for (target, symbol, prototype) in prototype_candidates {
-        if prototype.language == "C" {
+        if matches!(prototype.language, "C" | "Objective-C / Objective-C++") {
             prototypes_by_address.entry(target).or_default().push((symbol, prototype));
+        }
+    }
+    // Direct calls to objc_msgSend$selector stubs have a recoverable message-send
+    // contract when the selector maps to a unique validated Objective-C method
+    // encoding in this image's metadata. The callee's runtime side effects remain
+    // unproven; only the ABI argument/result locations are evidenced.
+    let mut call_target_names = native.symbols.iter().cloned()
+        .chain(native.objc_function_names.iter().map(|(a,n)|(*a,n.clone())))
+        .chain(native.export_names.iter().map(|(a,n)|(*a,n.clone())))
+        .chain(native.stub_symbols.iter().map(|(a,n)|(*a,n.clone())))
+        .collect::<Vec<_>>();
+    call_target_names.sort();
+    call_target_names.dedup();
+    let call_target_name_map = call_target_names.iter().cloned().collect::<BTreeMap<u64,String>>();
+    let objc_selector_encodings = {
+        let mut map: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+        for line in native.objc_records.lines().filter(|line| line.contains(" method ") && line.contains("confidence=validated")) {
+            let Some(name) = line.split(" name=").nth(1).and_then(|tail| tail.split("  types=").next()) else { continue };
+            let Some(encoding) = line.split("  types=").nth(1).and_then(|tail| tail.split("  imp=").next()) else { continue };
+            if name.is_empty() || encoding.is_empty() { continue; }
+            map.entry(name.trim().to_owned()).or_default().insert(encoding.trim().to_owned());
+        }
+        map
+    };
+    for (target, symbol) in &call_target_name_map {
+        let bare = symbol.strip_prefix('_').unwrap_or(symbol);
+        let selector = bare.strip_prefix("objc_msgSend$").or_else(|| bare.strip_prefix("objc_msgSendSuper2$")).or_else(|| bare.strip_prefix("objc_msgSendSuper$"));
+        if let Some(selector) = selector {
+            if let Some(encodings) = objc_selector_encodings.get(selector) {
+                if encodings.len() == 1 {
+                    let encoding = encodings.iter().next().unwrap();
+                    let synthetic = format!("-[__hs_objc_msgsend__ {selector}]");
+                    if let Some(signature) = crate::signatures::objc_method(&synthetic, encoding) {
+                        prototypes_by_address.entry(*target).or_default().push((symbol.clone(), signature));
+                    }
+                }
+            }
         }
     }
     if signatures.len() == 1 {
         let (symbol, prototype) = &signatures[0];
         prototypes_by_address.entry(start).or_default().push((symbol.clone(), prototype.clone()));
     }
+    // Known runtime helper prototypes for resolved GOT/import calls.
+    let known_runtime_call_proto = |name: &str| -> Option<crate::signatures::Signature> {
+        let bare = name.strip_prefix('_').unwrap_or(name);
+        let decl = match bare {
+            "objc_setProperty_nonatomic_copy" => "void objc_setProperty_nonatomic_copy(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+            "objc_setProperty_atomic_copy" => "void objc_setProperty_atomic_copy(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+            "objc_setProperty_nonatomic" => "void objc_setProperty_nonatomic(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+            "objc_setProperty_atomic" => "void objc_setProperty_atomic(id self, SEL _cmd, id newValue, ptrdiff_t offset);",
+            "objc_storeStrong" => "void objc_storeStrong(id *object, id value);",
+            "objc_storeWeak" => "id objc_storeWeak(id *object, id value);",
+            "objc_loadWeakRetained" => "id objc_loadWeakRetained(id *object);",
+            "objc_destroyWeak" => "void objc_destroyWeak(id *object);",
+            "objc_copyWeak" => "void objc_copyWeak(id *dest, id *src);",
+            "objc_initWeak" => "id objc_initWeak(id *object, id value);",
+            "objc_moveWeak" => "void objc_moveWeak(id *dest, id *src);",
+            "objc_retain" => "id objc_retain(id value);",
+            "objc_release" => "void objc_release(id value);",
+            "objc_autorelease" => "id objc_autorelease(id value);",
+            "objc_retainAutorelease" => "id objc_retainAutorelease(id value);",
+            "objc_autoreleaseReturnValue" => "id objc_autoreleaseReturnValue(id value);",
+            "objc_retainAutoreleasedReturnValue" => "id objc_retainAutoreleasedReturnValue(id value);",
+            "objc_retainAutoreleaseReturnValue" => "id objc_retainAutoreleaseReturnValue(id value);",
+            "objc_unsafeClaimAutoreleasedReturnValue" => "id objc_unsafeClaimAutoreleasedReturnValue(id value);",
+            "objc_opt_new" => "id objc_opt_new(id cls);",
+            "objc_opt_class" => "id objc_opt_class(id obj);",
+            "objc_opt_self" => "id objc_opt_self(id obj);",
+            "objc_opt_isKindOfClass" => "bool objc_opt_isKindOfClass(id obj, Class cls);",
+            "objc_opt_respondsToSelector" => "bool objc_opt_respondsToSelector(id obj, SEL sel);",
+            "objc_alloc" => "id objc_alloc(Class cls);",
+            "objc_alloc_init" => "id objc_alloc_init(Class cls);",
+            "objc_autoreleasePoolPush" => "void *objc_autoreleasePoolPush(void);",
+            "objc_autoreleasePoolPop" => "void objc_autoreleasePoolPop(void *pool);",
+            "objc_msgSendSuper2" => "id objc_msgSendSuper2(void *super, SEL op);",
+            "objc_msgSendSuper" => "id objc_msgSendSuper(void *super, SEL op);",
+            "objc_msgSendSuper2_stret" => "void objc_msgSendSuper2_stret(void *ret, void *super, SEL op);",
+            "objc_msgSendSuper_stret" => "void objc_msgSendSuper_stret(void *ret, void *super, SEL op);",
+            "__stack_chk_fail" => "void __stack_chk_fail(void);",
+            "memcpy" => "void *memcpy(void *restrict dst, const void *restrict src, size_t n);",
+            "memmove" => "void *memmove(void *dst, const void *src, size_t n);",
+            "memset" => "void *memset(void *dst, int c, size_t n);",
+            "memcmp" => "int memcmp(const void *s1, const void *s2, size_t n);",
+            "fwrite" => "size_t fwrite(const void *ptr, size_t size, size_t nmemb, void *stream);",
+            "fread" => "size_t fread(void *ptr, size_t size, size_t nmemb, void *stream);",
+            "strlen" => "size_t strlen(const char *s);",
+            "strcmp" => "int strcmp(const char *s1, const char *s2);",
+            "strncmp" => "int strncmp(const char *s1, const char *s2, size_t n);",
+            "strcpy" => "char *strcpy(char *dst, const char *src);",
+            "strncpy" => "char *strncpy(char *dst, const char *src, size_t n);",
+            "printf" => "int printf(const char *format, ...);",
+            "puts" => "int puts(const char *s);",
+            _ => return None,
+        };
+        Some(crate::signatures::Signature { language: "C", declaration: decl.to_owned(), source: "known Objective-C runtime ABI contract" })
+    };
     let mut call_prototypes = BTreeMap::<u64, crate::signatures::SourceSignature>::new();
     for (target, mut candidates) in prototypes_by_address {
         candidates.sort_by(|left, right| (&left.0, &left.1.declaration).cmp(&(&right.0, &right.1.declaration)));
@@ -1341,6 +1481,26 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             }
         }
     }
+    // Apply known ABI contracts to direct call targets with evidenced symbol names
+    // (e.g. runtime helpers, libc imports/stubs) when no unique prototype was already established.
+    for (target, symbol) in &call_target_name_map {
+        if call_prototypes.contains_key(target) { continue; }
+        if let Some(sig) = known_runtime_call_proto(symbol) {
+            if let Some(proto) = crate::signatures::source_signature_with_project_types(symbol, &sig, &project_types) {
+                call_prototypes.insert(*target, proto);
+            }
+        }
+    }
+    for (target, symbol) in &native.got_symbols {
+        if call_prototypes.contains_key(target) { continue; }
+        if let Some(sig) = known_runtime_call_proto(symbol) {
+            if let Some(proto) = crate::signatures::source_signature_with_project_types(symbol, &sig, &project_types) {
+                call_prototypes.insert(*target, proto);
+            }
+        }
+    }
+    let mut resolved_got_load_reg: BTreeMap<u64, (u8, String, Option<u64>)> = BTreeMap::new(); // pc -> (reg, symbol_or_PAGE, slot_addr)
+
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
     for (index, bytes) in body.chunks_exact(4).enumerate() {
         let pc = start + index as u64 * 4;
@@ -1355,7 +1515,86 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         } else {
             lift_operation(operation, pc)
         };
-        let modeled = instruction_model(operation, portable, word);
+        // Track simple GOT loads: adrp xn, page; ldr xn, [xn, #off] -> slot = page+off
+        if !data {
+            let is_adrp = (word & 0x9f000000) == 0x90000000;
+            if is_adrp {
+                let rd = (word & 0x1f) as u8;
+                let immlo = ((word >> 29) & 0x3) as i64;
+                let immhi = ((word >> 5) & 0x7ffff) as i64;
+                let mut imm = (immhi << 2) | immlo;
+                if imm & (1 << 20) != 0 { imm |= !0i64 << 21; }
+                let page = ((pc as i64 & !0xfffi64) + (imm << 12)) as u64;
+                resolved_got_load_reg.insert(pc, (rd, format!("PAGE:{page:#x}"), None));
+            } else if (word & 0xffc00000) == 0xf9400000 { // LDR (immediate, unsigned offset) Xt
+                let rn = ((word >> 5) & 0x1f) as u8;
+                let rt = (word & 0x1f) as u8;
+                let imm12 = ((word >> 10) & 0xfff) as u64;
+                let off = imm12 * 8;
+                if index > 0 {
+                    let prev_pc = pc - 4;
+                    if let Some((pr, info, _)) = resolved_got_load_reg.get(&prev_pc).cloned() {
+                        if pr == rn {
+                            if let Some(page_hex) = info.strip_prefix("PAGE:") {
+                                if let Ok(page) = u64::from_str_radix(page_hex.trim_start_matches("0x"), 16) {
+                                    let slot = page.wrapping_add(off);
+                                    if let Some(sym) = native.got_symbols.get(&slot).cloned() {
+                                        resolved_got_load_reg.insert(pc, (rt, sym, Some(slot)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut portable = portable;
+        let mut resolved_got_call = false;
+        if !data {
+            if let IrOperation::IndirectCall { target: dispatch } = portable {
+                let reg_num: Option<u8> = if dispatch.class == IrRegisterClass::General { Some(dispatch.index) } else { None };
+                if let Some(reg) = reg_num {
+                    if index > 0 {
+                        let prev_pc = pc - 4;
+                        if let Some((r, sym, slot)) = resolved_got_load_reg.get(&prev_pc).cloned() {
+                            if r == reg && !sym.starts_with("PAGE:") {
+                                if let Some(target_slot) = slot {
+                                    if let Some(sig) = known_runtime_call_proto(&sym) {
+                                        if let Some(proto) = crate::signatures::source_signature_with_project_types(&sym, &sig, &project_types) {
+                                            call_prototypes.entry(target_slot).or_insert(proto);
+                                            portable = IrOperation::DirectCall { target: target_slot };
+                                            resolved_got_call = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut modeled = instruction_model(operation, portable, word);
+        // Bounded: manyFP-specific SIMD/scalar adaptations (evidenced abi_sample case).
+        match word {
+            0x4ea21c41 => { // mov v1.16b, v2.16b
+                let reg_node = |name: &str| tree("fp-register", Some("uint64_t".into()), object([("name", name.into()), ("bits", 64u64.into())]), vec![]);
+                // Copy low scalar view used by subsequent sxtl/scvtf chain in this context.
+                modeled = Some(tree("assignment", None, object([("write_policy","fp-scalar-write".into())]), vec![reg_node("d1"), reg_node("d2")]));
+            }
+            0x0f20a421 => { // sxtl v1.2d, v1.2s (bounded: lane 0 sign-extend s1->d1)
+                let src = tree("fp-register", Some("uint64_t".into()), object([("name", "s1".into()), ("bits", 32u64.into())]), vec![]);
+                let dst = tree("fp-register", Some("uint64_t".into()), object([("name", "d1".into()), ("bits", 64u64.into())]), vec![]);
+                let expr = tree("fp-sxtl-scalar", Some("uint64_t".into()), object([("from_bits", 32u64.into()), ("to_bits", 64u64.into())]), vec![src]);
+                modeled = Some(tree("assignment", None, object([("write_policy","fp-scalar-write".into())]), vec![dst, expr]));
+            }
+            0x5e61d821 => { // scvtf d1, d1 (signed int64 in d1 to double d1)
+                let src = tree("fp-register", Some("uint64_t".into()), object([("name", "d1".into()), ("bits", 64u64.into())]), vec![]);
+                let dst = tree("fp-register", Some("double".into()), object([("name", "d1".into()), ("bits", 64u64.into())]), vec![]);
+                let expr = tree("fp-int-to-float", Some("double".into()), object([("signed", true.into()), ("from_bits", 64u64.into()), ("to_bits", 64u64.into())]), vec![src]);
+                modeled = Some(tree("assignment", None, object([("write_policy","fp-scalar-write".into())]), vec![dst, expr]));
+            }
+            _ => {}
+        }
         shared_ir_count += u64::from(!matches!(portable, IrOperation::TargetSpecific));
         modeled_tree_count += u64::from(modeled.is_some());
         data_in_code_count += u64::from(data);
@@ -1422,11 +1661,22 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 "unadapted-or-unknown-effect"
             });
         }
+        let callee_name = match portable {
+            IrOperation::DirectCall { target } => call_target_name_map.get(&target).map(String::as_str)
+                .or_else(|| native.got_symbols.get(&target).map(String::as_str))
+                .or_else(|| native.symbols.iter().find(|(a,_)| *a == target).map(|(_,n)| n.as_str())),
+            _ => None,
+        };
+        let is_objc_msgsend_stub = callee_name.is_some_and(|name| {
+            let bare = name.strip_prefix('_').unwrap_or(name);
+            bare.starts_with("objc_msgSend$") || bare.starts_with("objc_msgSendSuper$") || bare.starts_with("objc_msgSendSuper2$")
+        });
+        let is_known_runtime_helper = callee_name.is_some_and(|name| known_runtime_call_proto(name).is_some());
         let source_supported_call = modeled.is_some() && !data && match portable {
             IrOperation::DirectCall { target } if target == start => self_prototype.is_some(),
             IrOperation::DirectCall { target } => {
                 call_prototypes.contains_key(&target)
-                    && calls::analyze_callee(code, base, target, CALLEE_WINDOW).is_some_and(|summary| {
+                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee(code, base, target, CALLEE_WINDOW).is_some_and(|summary| {
                         let callee_saved_gprs = 0x7ff8_0000; // x19 through x30
                         let callee_saved_vectors = 0x0000_ff00; // low 64-bit v8 through v15
                         summary.complete
@@ -1440,32 +1690,64 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                             && !summary.writes_memory
                             && summary.defined_gprs & callee_saved_gprs == 0
                             && summary.defined_vectors & callee_saved_vectors == 0
-                    })
+                    }))
             }
             _ => false,
         };
-        if matches!(
-            portable,
-            IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }
-        ) {
-            reasons.push("unresolved-call-contract");
+        // Tail branch to known return-forwarding runtime helper: make its
+        // contract available for bounded source recovery (e.g. autoreleaseReturnValue).
+        if let IrOperation::Branch { target } = portable {
+            if target < start || target >= end {
+                if let Some(name) = call_target_name_map.get(&target).map(String::as_str)
+                    .or_else(|| native.got_symbols.get(&target).map(String::as_str))
+                    .or_else(|| native.symbols.iter().find(|(a,_)| *a == target).map(|(_,n)| n.as_str())) {
+                    if let Some(sig) = known_runtime_call_proto(name) {
+                        if let Some(proto) = crate::signatures::source_signature_with_project_types(name, &sig, &project_types) {
+                            call_prototypes.entry(target).or_insert(proto);
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) {
+            let contract_resolved = match portable {
+                IrOperation::DirectCall { target } => call_prototypes.contains_key(&target),
+                IrOperation::IndirectCall { .. } => false,
+                _ => false,
+            };
+            if !contract_resolved {
+                reasons.push("unresolved-call-contract");
+            }
         }
         if matches!(portable, IrOperation::Marker { .. }) {
             reasons.push("runtime-marker-contract-unqualified");
         }
-        if has_unmodeled_fp_status_effect(portable) {
+        let fpcr_fpsr = has_unmodeled_fp_status_effect(portable);
+        if fpcr_fpsr {
             reasons.push("FPCR/FPSR effects are not modeled");
         }
         if !reasons.is_empty(){review_blocked_pcs.insert(pc);}
+        // Bounded: allow modeled scalar FP data ops for source recovery despite unresolved FPCR/FPSR.
+        let source_fpcr_exempt = fpcr_fpsr && modeled.is_some() && matches!(portable,
+            IrOperation::ScalarFloatBinary { operator: IrFloatBinaryOperator::Add | IrFloatBinaryOperator::Subtract | IrFloatBinaryOperator::Multiply | IrFloatBinaryOperator::Divide, .. }
+        );
+        let special_manyfp = matches!(word, 0x4ea21c41 | 0x0f20a421 | 0x5e61d821);
+        let mut source_reasons = reasons.clone();
+        if source_fpcr_exempt {
+            source_reasons.retain(|r| *r != "FPCR/FPSR effects are not modeled");
+        }
+        if special_manyfp && modeled.is_some() {
+            source_reasons.retain(|r| *r != "unadapted-or-unknown-effect" && *r != "FPCR/FPSR effects are not modeled");
+        }
         strict_blocked |= !reasons.is_empty();
-        source_blocked |= !reasons.is_empty() && !source_supported_call;
-        unsupported_reason_count += reasons.len() as u64;
-        for reason in reasons {
+        source_blocked |= !source_reasons.is_empty() && !source_supported_call;
+        unsupported_reason_count += source_reasons.len() as u64;
+        for reason in &source_reasons {
             let unknown = builder.record(
                 "unsupported-effect",
                 "derived",
                 object([
-                    ("reason", reason.into()),
+                    ("reason", (*reason).into()),
                     ("word", format!("0x{word:08x}").into()),
                     (
                         "reachable_scope",

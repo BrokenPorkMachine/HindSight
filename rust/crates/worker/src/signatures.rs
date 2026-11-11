@@ -13,11 +13,21 @@ pub struct Signature {
 /// Structured declaration/ABI input for source recovery. Machine analyses do
 /// not parse a rendered signature report to discover names or locations.
 #[derive(Clone, Debug)]
-pub struct SourceParameter { pub name:String, pub spelling:String, pub bits:u8, pub signed:bool, pub pointer:bool, pub register:u8 }
+pub struct SourceParameter { pub name:String, pub spelling:String, pub bits:u16, pub signed:bool, pub pointer:bool, pub register:Option<u8>, pub stack_offset:Option<usize>, pub stack_bytes:Option<u8>, pub aggregate_registers:Option<Vec<u8>>, pub fp_aggregate_registers:Option<Vec<u8>>, /// Bounded: GPR holding address of caller-copied by-pointer aggregate argument.
+    pub by_pointer_aggregate_register:Option<u8>, /// Bounded: FP scalar register number (d/s register, AAPCS64 float arg/result).
+    pub fp_register:Option<u8> }
 #[derive(Clone, Debug)]
 pub struct SourceSignature {
     pub signature:Signature, pub name:String, pub parameters:Vec<SourceParameter>,
-    pub result_spelling:String, pub result_bits:u8, pub result_signed:bool, pub result_pointer:bool,
+    pub result_spelling:String, pub result_bits:u16, pub result_signed:bool, pub result_pointer:bool,
+    /// True when the scalar result is returned in s0/d0 (AArch64 AAPCS64 float/double).
+    pub result_float: bool,
+    /// 2-register integer aggregate result (e.g. NSRange/CFRange in x0,x1).
+    pub result_aggregate_registers: Option<Vec<u8>>,
+    /// HFA FP-aggregate result registers (e.g. CGRect in d0-d3).
+    pub result_fp_aggregate_registers: Option<Vec<u8>>,
+    /// Hidden indirect result buffer register (e.g. x8 for sret). Bounded.
+    pub result_indirect_register: Option<u8>,
 }
 
 /// Declaration evidence has no register-location or implementation claim.
@@ -97,31 +107,159 @@ pub fn source_signature_with_project_types(name:&str,signature:&Signature,
     let name=if objc {format!("hs_recovered_imp_{}",name.bytes().map(|b|if b.is_ascii_alphanumeric(){b as char}else{'_'}).collect::<String>())}
         else{name.strip_prefix('_').unwrap_or(name).to_owned()};
     if !c_identifier(&name){return None}
-    let scalar=|spelling:&str|{
-        let spelling=uncomment_type(spelling)?;
-        // These are declarations, not arbitrary C expressions. Complex
-        // declarators, block pointers and unvalidated typedefs stay unresolved.
+    let scalar=|spelling_in:&str|{
+        let spelling=uncomment_type(spelling_in)?;
         if !spelling.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b' '|b'*')){return None}
         let bare=spelling.split(|c:char|c.is_whitespace()||c=='*').filter(|s|!s.is_empty()&&!matches!(*s,"const"|"volatile"|"restrict"|"__restrict"|"__restrict__"|"_Nonnull"|"_Nullable"|"__kindof")).collect::<Vec<_>>().join(" ");
         let native=["void","char","signed char","unsigned char","short","short int","signed short","unsigned short","unsigned short int","int","signed","signed int","unsigned","unsigned int","long","long int","unsigned long","unsigned long int","long long","long long int","unsigned long long","unsigned long long int","int8_t","uint8_t","int16_t","uint16_t","int32_t","uint32_t","int64_t","uint64_t","intptr_t","uintptr_t","size_t","ssize_t","ptrdiff_t","id","Class","SEL","NSInteger","NSUInteger","CFIndex","CFTypeID","CFOptionFlags","CFStringEncoding","CFNumberType","CFURLPathStyle","CFPropertyListFormat","dispatch_once_t","CFTypeRef","CFAllocatorRef","CFStringRef","CFArrayRef","CFDictionaryRef","CFBooleanRef","CFNumberRef","CFDataRef","CFBundleRef","CFURLRef","CFPropertyListRef","CFErrorRef","CFRunLoopRef"];
         let catalog_pointer=catalog_pointer_type(&spelling,project_types);
-        if !native.contains(&bare.as_str()) && !catalog_pointer && !matches!(bare.as_str(),"bool"|"_Bool"|"signed int"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
-        let AbiType::Integer(bytes)=abi_type(&spelling)? else{return None};
-        let kind=abi_integer_kind(&spelling)?;
-        if kind==AbiIntegerKind::Boolean && !matches!(bare.as_str(),"bool"|"_Bool"){return None}
-        Some((spelling.trim().to_owned(),bytes*8,kind==AbiIntegerKind::Signed,kind==AbiIntegerKind::Pointer))
+        match abi_type(&spelling)? {
+            AbiType::Float(bytes) => {
+                // Bounded: scalar float/double only (AAPCS64). long double excluded.
+                if !matches!(bare.as_str(), "float" | "double") { return None }
+                Some((spelling.trim().to_owned(), (bytes as u16)*8, false, false))
+            }
+            AbiType::Integer(bytes) => {
+                let kind=abi_integer_kind(&spelling)?;
+                if kind==AbiIntegerKind::Pointer {
+                    let star_count = spelling.matches('*').count();
+                    let known_pointer_name = matches!(bare.as_str(), "id"|"Class"|"SEL"|"instancetype"|"dispatch_queue_t"|"dispatch_block_t"|
+                        "CFTypeRef"|"CFAllocatorRef"|"CFStringRef"|"CFArrayRef"|"CFDictionaryRef"|"CFBooleanRef"|"CFNumberRef"|"CFDataRef"|
+                        "CFBundleRef"|"CFURLRef"|"CFPropertyListRef"|"CFErrorRef"|"CFRunLoopRef");
+                    if spelling.contains("(^") || spelling.contains('[') || spelling.contains('{') { return None }
+                    if star_count == 0 {
+                        if !(known_pointer_name || catalog_pointer) { return None }
+                    } else if star_count == 1 {
+                        let known_pointee = native.contains(&bare.as_str()) || catalog_pointer
+                            || matches!(bare.as_str(), "bool"|"_Bool"|"float"|"double"|"long double"
+                                |"signed int"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int");
+                        if !known_pointee { return None }
+                    } else {
+                        return None
+                    }
+                } else if !native.contains(&bare.as_str()) && !catalog_pointer && !matches!(bare.as_str(),"bool"|"_Bool"|"signed int"|"signed short int"|"signed long"|"signed long int"|"signed long long"|"signed long long int"){return None}
+                if kind==AbiIntegerKind::Boolean && !matches!(bare.as_str(),"bool"|"_Bool"){return None}
+                Some((spelling.trim().to_owned(),(bytes as u16)*8,kind==AbiIntegerKind::Signed,kind==AbiIntegerKind::Pointer))
+            }
+            _ => None,
+        }
     };
     let result_type=signature_return_type(signature)?;
-    let (result_spelling,result_bits,result_signed,result_pointer)=if result_type.trim()=="void" {
-        ("void".to_owned(),0,false,false)
-    }else{scalar(&result_type)?};
+    let mut result_aggregate_registers: Option<Vec<u8>> = None;
+    let mut result_fp_aggregate_registers: Option<Vec<u8>> = None;
+    let mut result_indirect_register: Option<u8> = None;
+    let (result_spelling,result_bits,result_signed,result_pointer,result_float)=if result_type.trim()=="void" {
+        ("void".to_owned(),0,false,false,false)
+    }else if let Some(v)=scalar(&result_type){
+        let is_float = matches!(v.0.as_str(), "float" | "double");
+        (v.0,v.1,v.2,v.3,is_float)
+    }else{
+        let spelling=uncomment_type(&result_type).unwrap_or_default().trim().to_owned();
+        match spelling.as_str(){
+            "float"=>("float".to_owned(),32,false,false,true),
+            "double"=>("double".to_owned(),64,false,false,true),
+            "NSRange"|"CFRange" if matches!(abi_result_type(&spelling), Some(AbiType::IntegerAggregate(2))) => {
+                result_aggregate_registers = Some(vec![0,1]);
+                (spelling,128,false,false,false)
+            }
+            "CGPoint"|"CGSize" if matches!(abi_result_type(&spelling), Some(AbiType::FloatAggregate(2))) => {
+                result_fp_aggregate_registers = Some(vec![0,1]);
+                (spelling,128,false,false,false)
+            }
+            "CGRect" if matches!(abi_result_type(&spelling), Some(AbiType::FloatAggregate(4))) => {
+                result_fp_aggregate_registers = Some(vec![0,1,2,3]);
+                (spelling,256u16,false,false,false)
+            }
+            // Bounded: CGAffineTransform returned indirectly via hidden x8 (AAPCS64 sret).
+            "CGAffineTransform" if matches!(abi_result_type(&spelling), Some(AbiType::HiddenResultPointer(6))) => {
+                result_indirect_register = Some(8);
+                (spelling,384,false,false,false)
+            }
+            _=>return None,
+        }
+    };
     let mut parameters=Vec::new();let mut names=std::collections::BTreeSet::new();
     for parameter in abi_parameters(Some(signature)){
-        let (spelling,bits,signed,pointer)=scalar(parameter.source_type.as_deref()?)?;
+        let src_ty = parameter.source_type.as_deref()?;
         if !c_identifier(&parameter.name)||!names.insert(parameter.name.clone()){return None}
-        parameters.push(SourceParameter{name:parameter.name,spelling,bits,signed,pointer,register:parameter.general_register?});
+        // Bounded: 2-register integer aggregates (NSRange/CFRange) in GPR pairs.
+        if matches!(abi_type(src_ty), Some(AbiType::IntegerAggregate(2))) {
+            if matches!(src_ty, "NSRange" | "CFRange") && parameter.general_register.is_none() && parameter.stack_scalar.is_none() {
+                let regs: Vec<u8> = parameter.register.split(|c: char| !c.is_ascii_digit())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<u8>().ok())
+                    .filter(|r| parameter.register.contains(&format!("x{r}")))
+                    .collect();
+                if regs.len() == 2 {
+                    parameters.push(SourceParameter{
+                        name:parameter.name, spelling:src_ty.to_owned(), bits:128, signed:false, pointer:false,
+                        register:None, stack_offset:None, stack_bytes:None, aggregate_registers:Some(regs), fp_aggregate_registers:None, by_pointer_aggregate_register:None, fp_register:None
+                    });
+                    continue;
+                }
+            }
+            return None;
+        }
+        // Bounded: FP HFA aggregates in d-registers (CGPoint/CGSize:2, CGRect:4).
+        if matches!(abi_type(src_ty), Some(AbiType::FloatAggregate(n)) if n == 2 || n == 4) {
+            if matches!(src_ty, "CGPoint" | "CGSize" | "CGRect") && parameter.general_register.is_none() && parameter.stack_scalar.is_none() {
+                let expected = if src_ty == "CGRect" { 4 } else { 2 };
+                let regs: Vec<u8> = parameter.register.split(|c: char| !c.is_ascii_digit())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<u8>().ok())
+                    .filter(|r| parameter.register.contains(&format!("d{r}")))
+                    .collect();
+                if regs.len() == expected {
+                    let bits = (expected as u16) * 64;
+                    parameters.push(SourceParameter{
+                        name:parameter.name, spelling:src_ty.to_owned(), bits, signed:false, pointer:false,
+                        register:None, stack_offset:None, stack_bytes:None, aggregate_registers:None, fp_aggregate_registers:Some(regs), by_pointer_aggregate_register:None, fp_register:None
+                    });
+                    continue;
+                }
+            }
+            return None;
+        }
+        // Bounded: by-pointer aggregate parameter (caller-copied, address in GPR), e.g. CGAffineTransform.
+        if parameter.register.contains("by-pointer aggregate<") {
+            if let Some(gp) = parameter.general_register {
+                if src_ty == "CGAffineTransform" && matches!(abi_type(src_ty), Some(AbiType::FloatAggregate(6))) {
+                    parameters.push(SourceParameter{
+                        name:parameter.name, spelling:src_ty.to_owned(), bits:384, signed:false, pointer:false,
+                        register:None, stack_offset:None, stack_bytes:None, aggregate_registers:None, fp_aggregate_registers:None, by_pointer_aggregate_register:Some(gp), fp_register:None
+                    });
+                    continue;
+                }
+            }
+            return None;
+        }
+        let Some((spelling,bits,signed,pointer))=scalar(src_ty) else {
+            if name.contains("manyFP") || src_ty.contains("double") { /* debug */ }
+            return None;
+        };
+        // Bounded: FP scalar in d/s register (AAPCS64).
+        if matches!(abi_type(src_ty), Some(AbiType::Float(_))) && parameter.general_register.is_none() {
+            if parameter.register.starts_with('d') || parameter.register.starts_with('s') {
+                if let Some(reg) = parameter.register.trim_start_matches(|c:char| c=='d'||c=='s').parse::<u8>().ok() {
+                    parameters.push(SourceParameter{name:parameter.name,spelling,bits,signed,pointer,register:None,stack_offset:None,stack_bytes:None,aggregate_registers:None,fp_aggregate_registers:None,by_pointer_aggregate_register:None,fp_register:Some(reg)});
+                    continue;
+                }
+                // Fall through: register string like "stack argument..." starts with 's' but is not an FP reg.
+            }
+            if let Some((offset,bytes))=parameter.stack_scalar {
+                parameters.push(SourceParameter{name:parameter.name,spelling,bits,signed,pointer,register:None,stack_offset:Some(offset),stack_bytes:Some(bytes),aggregate_registers:None,fp_aggregate_registers:None,by_pointer_aggregate_register:None,fp_register:None});
+                continue;
+            }
+            return None;
+        }
+        let (register,stack_offset,stack_bytes)=if let Some(reg)=parameter.general_register {
+            (Some(reg),None,None)
+        } else if let Some((offset,bytes))=parameter.stack_scalar.filter(|_| matches!(abi_type(&spelling), Some(AbiType::Integer(_)))) {
+            (None,Some(offset),Some(bytes))
+        } else { return None };
+        parameters.push(SourceParameter{name:parameter.name,spelling,bits,signed,pointer,register,stack_offset,stack_bytes,aggregate_registers:None,fp_aggregate_registers:None,by_pointer_aggregate_register:None,fp_register:None});
     }
-    Some(SourceSignature{signature:signature.clone(),name,parameters,result_spelling,result_bits,result_signed,result_pointer})
+    Some(SourceSignature{signature:signature.clone(),name,parameters,result_spelling,result_bits,result_signed,result_pointer,result_float,result_aggregate_registers,result_fp_aggregate_registers,result_indirect_register})
 }
 
 /// All exact declaration candidates for one admitted target start. Conflicts
@@ -131,6 +269,16 @@ pub fn source_candidates(start:u64,names:&[&str],objc_records:&str,external:&BTr
     for &name in names {
         if let Some(signature)=external.get(name).or_else(||external.get(name.strip_prefix('_').unwrap_or(name))){candidates.push((name.to_owned(),signature.clone()));}
         if let Some(signature)=symbol(name){candidates.push((name.to_owned(),signature));}
+        // Evidence-bounded: exported/entry-point main with no other declaration.
+        // Standard C permits int main(void) and forms with parameters; the
+        // implementation body is recovered separately and must remain consistent.
+        if matches!(name, "main" | "_main") {
+            candidates.push((name.to_owned(), Signature {
+                language: "C",
+                declaration: "int main(void);".into(),
+                source: "standard C entry-point declaration (evidence-bounded)",
+            }));
+        }
     }
     // This is the existing bounded metadata parser, not pseudocode parsing.
     for (address,(name,signature)) in objc_signature_candidates(objc_records){
@@ -544,6 +692,8 @@ fn foundation_method(name: &str) -> Option<&'static str> {
 
 fn objc_selector_syntax(selector: &str) -> bool {
     if selector.is_empty() { return false; }
+    // ARC/compiler-generated special selectors.
+    if matches!(selector, ".cxx_destruct" | ".cxx_construct") { return true; }
     let count = selector.bytes().filter(|b| *b == b':').count();
     if count > 32 || (count > 0 && !selector.ends_with(':')) { return false; }
     selector.split(':').all(|part| part.is_empty() ||
@@ -633,6 +783,82 @@ fn object_declarations(layouts: &[super::objc::ClassLayout]) -> String {
     output
 }
 
+
+fn objc_protocol_definitions(records:&str, wanted:&std::collections::BTreeSet<String>)->String{
+    let mut current:Option<(String,Vec<String>)>=None;
+    let mut methods:std::collections::BTreeMap<String,Vec<(bool,bool,String)>>=std::collections::BTreeMap::new();
+    let mut parents:std::collections::BTreeMap<String,Vec<String>>=std::collections::BTreeMap::new();
+    let flush=|name:&String,adopted:&Vec<String>,items:&Vec<(bool,bool,String)>|->Option<String>{
+        if !wanted.contains(name){return None}
+        let inheritance=if adopted.is_empty(){String::new()}else{format!(" <{}>",adopted.join(", "))};
+        let mut out=format!("@protocol {name}{inheritance}\n");
+        let mut req_i=false;let mut req_c=false;let mut opt_i=false;let mut opt_c=false;
+        for (class_method,optional,decl) in items{
+            if *optional{
+                if !*class_method && !opt_i{out.push_str("@optional\n");opt_i=true;}
+                if *class_method && !opt_c{out.push_str("@optional\n");opt_c=true;}
+            }else{
+                if !*class_method && !req_i{out.push_str("@required\n");req_i=true;}
+                if *class_method && !req_c{out.push_str("@required\n");req_c=true;}
+            }
+            out.push_str(decl);out.push('\n');
+            if out.len()>20_000{return Some(out)}
+        }
+        out.push_str("@end\n");
+        Some(out)
+    };
+    let mut out=String::new();
+    for line in records.lines().take(8192){
+        let line=line.trim();
+        if line.len()>4096 { continue; }
+        if line.starts_with("  protocol ") || line.starts_with("protocol ") {
+            // flush previous if we collected one (though we collect per name via maps)
+        }
+        if let Some(tail)=line.strip_prefix("protocol ").or_else(||line.strip_prefix("  protocol ")){
+            // parse header
+            if let Some((fields,_confidence))=tail.rsplit_once(" confidence="){
+                let mut tokens=fields.split_whitespace();
+                if let Some(name)=tokens.nth(1){ // first token after address is name=... in "0x.. name=HSProto ..." format
+                    if let Some(name)=name.strip_prefix("name="){
+                        let valid=|value:&str|!value.is_empty()&&value.len()<=256&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'_'|b'$'|b'.'));
+                        if valid(name){
+                            let adopted=tokens.clone().find_map(|field|field.strip_prefix("adopts=")).map(|values|values.split(',').filter(|v|valid(v)&&*v!=name).take(32).map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();
+                            parents.entry(name.to_owned()).or_insert(adopted);
+                            methods.entry(name.to_owned()).or_default();
+                            current=Some((name.to_owned(),Vec::new()));
+                            continue;
+                        }
+                    }
+                }
+            }
+            current=None; continue;
+        }
+        if line.starts_with("reconstructed class ")||line.starts_with("category ")||line.starts_with("reference "){ current=None; continue; }
+        let Some((owner,_))=current.as_ref() else { continue; };
+        if !wanted.contains(owner){ continue; }
+        let Some((kind,_))=line.split_once(" method ") else { continue; };
+        if !matches!(kind,"required-instance"|"required-class"|"optional-instance"|"optional-class")||!line.ends_with("confidence=validated"){continue}
+        let Some((selector,tail))=line.split(" name=").nth(1).and_then(|t|t.split_once("  types=")) else {continue};
+        if selector.is_empty()||selector.len()>512||!selector.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'_'|b':')){continue}
+        let Some((encoding,_))=tail.split_once("  imp=") else {continue};
+        let class_method=kind.ends_with("-class");
+        let optional=kind.starts_with("optional-");
+        let synthetic=format!("{}[__protocol__{owner} {selector}]", if class_method {'+'} else {'-'});
+        let Some(signature)=objc_method(&synthetic,encoding) else {continue};
+        let decl=signature.declaration;
+        if let Some(items)=methods.get_mut(owner){
+            if !items.iter().any(|(_,_,d)|d==&decl){ items.push((class_method,optional,decl)); }
+        }
+    }
+    for (name,items) in &methods{
+        if let Some(def)=flush(name, parents.get(name).unwrap_or(&Vec::new()), items){
+            if out.len()+def.len()>30_000{ break; }
+            out.push_str(&def); out.push('\n');
+        }
+    }
+    out
+}
+
 /// A target-local class review header, never an assertion of complete layout
 /// or implementation. Only one unambiguous IMP owner may supply its members.
 pub fn objc_header_for_imp(address:u64, records:&str, layouts:&[super::objc::ClassLayout])->Option<String>{
@@ -652,12 +878,18 @@ pub fn objc_header_for_imp(address:u64, records:&str, layouts:&[super::objc::Cla
             .map(|values|values.split(',').filter(|value|super::objc::identifier(value)).take(32).map(str::to_owned).collect::<std::collections::BTreeSet<_>>()).unwrap_or_default();
         relationships.insert((parent,protocols));
     }
+    let mut adopted_protocols=std::collections::BTreeSet::new();
     if relationships.len()==1{
         let (parent,protocols)=relationships.iter().next()?;
+        adopted_protocols=protocols.clone();
         let inheritance=parent.as_ref().map(|name|format!(" : {name}")).unwrap_or_default();
         let adoption=if protocols.is_empty(){String::new()}else{format!(" <{}>",protocols.iter().cloned().collect::<Vec<_>>().join(", "))};
         declaration=declaration.replacen(&format!("@interface {} {{",owner.name),&format!("@interface {}{inheritance}{adoption} {{",owner.name),1);
-        if !protocols.is_empty(){declaration=format!("@protocol {};\n{declaration}",protocols.iter().cloned().collect::<Vec<_>>().join(", "));}
+        if !protocols.is_empty(){
+            let defs=objc_protocol_definitions(records,&adopted_protocols);
+            declaration=if defs.is_empty(){format!("@protocol {};\n{declaration}",protocols.iter().cloned().collect::<Vec<_>>().join(", "))}
+                else{format!("{defs}{declaration}")};
+        }
     }else if relationships.len()>1{declaration.insert_str(0,"/* Conflicting superclass/conformance records: relationships withheld. */\n");}
     let mut methods=BTreeMap::<String,std::collections::BTreeSet<String>>::new();
     for (imp,(name,signature)) in objc_signature_candidates(records){
@@ -2335,7 +2567,7 @@ fn recover_internal(
         let recovered = source_signature("_hs_test", &signed).expect("signed int is a supported scalar spelling");
         assert_eq!(recovered.result_bits, 32);
         assert!(recovered.result_signed && recovered.parameters[0].signed);
-        assert_eq!(recovered.parameters[0].register, 0);
+        assert_eq!(recovered.parameters[0].register, Some(0));
         for (spelling, bits) in [("signed char", 8), ("signed short", 16), ("signed short int", 16),
             ("signed", 32), ("signed int", 32), ("signed long", 64), ("signed long int", 64),
             ("signed long long", 64), ("signed long long int", 64)] {
@@ -2344,19 +2576,61 @@ fn recover_internal(
             assert_eq!((recovered.result_bits, recovered.parameters[0].bits), (bits, bits), "{spelling}");
             assert!(recovered.result_signed && recovered.parameters[0].signed, "{spelling}");
         }
-        for declaration in ["double hs_test(double first, float second);",
-            "long double hs_test(long double value);",
-            "__int128 hs_test(unsigned __int128 value);",
-            "NSRange hs_test(NSRange value);", "CFRange hs_test(CFRange value);",
-            "CGPoint hs_test(CGPoint value);", "CGSize hs_test(CGSize value);",
-            "CGRect hs_test(CGRect value);", "CGAffineTransform hs_test(CGAffineTransform value);",
-            "uint64_t hs_test(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h, uint64_t i);"] {
+        for declaration in ["long double hs_test(long double value);",
+            "__int128 hs_test(unsigned __int128 value);"] {
             let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
             let recovered = source_declaration("_hs_test", &signature).expect("safe scalar header");
             assert_eq!(recovered.name, "hs_test");
             assert!(!recovered.parameters.is_empty());
             assert!(source_signature("_hs_test", &signature).is_none(), "body ABI remains unsupported");
         }
+        // Bounded: scalar float/double parameters and results in FP registers/stack (AAPCS64).
+        {
+            let signature = Signature { language: "C", declaration: "double hs_test(double first, float second);".into(), source: "analyst" };
+            let recovered = source_declaration("_hs_test", &signature).expect("safe scalar header");
+            assert_eq!(recovered.name, "hs_test");
+            assert!(!recovered.parameters.is_empty());
+            let body = source_signature("_hs_test", &signature).expect("float/double scalar FP ABI supported for bounded recovery");
+            assert!(body.result_float, "expected float/double scalar result in FP register");
+            assert!(body.parameters.iter().any(|p| p.fp_register.is_some()), "expected FP scalar parameter register");
+        }
+        // Bounded: indirect sret aggregate (CGAffineTransform, x8) with by-pointer aggregate parameter.
+        {
+            let signature = Signature { language: "C", declaration: "CGAffineTransform hs_test(CGAffineTransform value);".into(), source: "analyst" };
+            let recovered = source_declaration("_hs_test", &signature).expect("safe scalar header");
+            assert_eq!(recovered.name, "hs_test");
+            assert!(!recovered.parameters.is_empty());
+            let body = source_signature("_hs_test", &signature).expect("CGAffineTransform sret/by-pointer ABI supported for bounded recovery");
+            assert_eq!(body.result_indirect_register, Some(8), "expected indirect sret result in x8");
+            assert!(body.parameters.iter().any(|p| p.by_pointer_aggregate_register.is_some() && p.spelling == "CGAffineTransform"), "expected by-pointer aggregate parameter");
+        }
+        // Bounded: FP HFA aggregates (CGPoint/CGSize/CGRect) are supported for body recovery.
+        for declaration in ["CGPoint hs_test(CGPoint value);", "CGSize hs_test(CGSize value);", "CGRect hs_test(CGRect value);"] {
+            let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
+            let recovered = source_declaration("_hs_test", &signature).expect("safe scalar header");
+            assert_eq!(recovered.name, "hs_test");
+            assert!(!recovered.parameters.is_empty());
+            let body = source_signature("_hs_test", &signature).expect("CGPoint/CGSize/CGRect HFA ABI supported for bounded recovery");
+            assert!(body.parameters.iter().any(|p| p.fp_aggregate_registers.as_ref().is_some_and(|r| !r.is_empty())), "expected FP aggregate parameter registers");
+            assert!(body.result_fp_aggregate_registers.as_ref().is_some_and(|r| !r.is_empty()), "expected FP aggregate result registers");
+        }
+        // Bounded: 2-register integer aggregates (NSRange/CFRange) are supported for body recovery.
+        for declaration in ["NSRange hs_test(NSRange value);", "CFRange hs_test(CFRange value);"] {
+            let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };
+            let recovered = source_declaration("_hs_test", &signature).expect("safe scalar header");
+            assert_eq!(recovered.name, "hs_test");
+            assert!(!recovered.parameters.is_empty());
+            let body = source_signature("_hs_test", &signature).expect("NSRange/CFRange 2-reg aggregate ABI supported for bounded recovery");
+            assert!(body.parameters.iter().any(|p| p.aggregate_registers.as_ref().is_some_and(|r| r.len() == 2)), "expected aggregate parameter registers");
+            assert!(body.result_aggregate_registers.as_ref().is_some_and(|r| r.len() == 2), "expected aggregate result registers");
+        }
+        // Stack-passed scalar arguments are now modeled for bounded body recovery.
+        let stack_sig = Signature { language: "C", declaration: "uint64_t hs_test(uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, uint64_t f, uint64_t g, uint64_t h, uint64_t i);".into(), source: "analyst" };
+        let recovered = source_declaration("_hs_test", &stack_sig).expect("safe scalar header");
+        assert_eq!(recovered.name, "hs_test");
+        assert!(!recovered.parameters.is_empty());
+        let body = source_signature("_hs_test", &stack_sig).expect("stack-passed scalar ABI now supported for bounded recovery");
+        assert!(body.parameters.iter().any(|p| p.stack_offset.is_some()), "expected a stack-passed parameter");
         for declaration in ["Mystery hs_test(Mystery value);", "double hs_test(double switch);",
             "double hs_test(double value, double value);", "double hs_test(double value, ...);"] {
             let signature = Signature { language: "C", declaration: declaration.into(), source: "analyst" };

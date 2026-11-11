@@ -221,7 +221,7 @@ pub(super) fn locations_from_prototype(
         arguments.push(ArgumentLocation {
             name: Some(parameter.name.clone()),
             source_type: Some(parameter.spelling.clone()),
-            location: format!("x{}", parameter.register),
+            location: if let Some(reg) = parameter.register { format!("x{}", reg) } else if let (Some(offset), Some(bytes)) = (parameter.stack_offset, parameter.stack_bytes) { format!("stack(sp+{offset:#x},{bytes})") } else { "unresolved".into() },
         });
     }
     let result = if prototype.result_spelling == "void" {
