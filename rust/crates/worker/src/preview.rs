@@ -1088,7 +1088,7 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
  let index_provenance = if index_register != 31 {
   // Check nearby instructions for index register origin
   let mut origin = String::new();
-  for li in (load_index.saturating_sub(4)..load_index).rev() {
+  for li in (load_index.saturating_sub(6)..load_index).rev() {
     let w = le32(&code[li*4..li*4+4]);
     let rn = (w >> 5) & 31;
     // LDR (indexed/unsigned immediate) pattern: 0xF8xxxxxx with Rn in bits 20-16
@@ -2934,7 +2934,7 @@ mod tests {
             &code, 0x1000, 0x101c, 12, 0x1100).unwrap().expect("bounded table candidate");
         assert!(report.contains("case-range=CMP/B.HI x8<=3 proven-entry-count=4"), "{report}");
         assert!(report.contains("format=table-relative signed offsets"), "{report}");
-        assert!(report.contains("index-provenance=unknown"), "{report}");
+        assert!(report.contains("index-provenance=SUB-imm x0-0x5"), "{report}");
         assert!(report.contains("index-normalization=w8=(w0-5) modulo 2^32"), "{report}");
         assert!(report.contains("validated_entries=4"), "{report}");
         assert!(report.contains("case-index=0 selector-bits=0x5"), "{report}");
