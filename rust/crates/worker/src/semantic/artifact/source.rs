@@ -1594,7 +1594,7 @@ fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize,
     // Allow bounded no-ops between compare and branch (flags unaffected).
     let mut cmp_index = branch_index - 1;
     let mut skipped = 0usize;
-    while trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") {
+    while trees.get(cmp_index).is_some_and(is_noop_tree) {
         if skipped >= 4 || cmp_index == 0 || cmp_index <= header { return None; }
         cmp_index -= 1;
         skipped += 1;
@@ -2122,7 +2122,7 @@ fn natural_loop(
         if cond.kind == "flag-condition" && preheader > 0 {
             let mut cmp_index = preheader - 1;
             let mut skipped = 0usize;
-            while trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") && cmp_index > 0 && skipped < 4 {
+            while trees.get(cmp_index).is_some_and(is_noop_tree) && cmp_index > 0 && skipped < 4 {
                 cmp_index -= 1;
                 skipped += 1;
             }
