@@ -956,7 +956,8 @@ fn arm64_indexed_jump_load(word:u32)->Option<(u32,u32,u32,bool,bool)>{
  // (3,1): LDR 64-bit unsigned (absolute pointer tables)
  // (2,2): LDRSW 32-bit sign-extended (table-relative signed offsets)
  // (1,3): LDRSH 64-bit sign-extended (table-relative signed 16-bit offsets)
- let (width,signed)=match(size,opc){(3,1)=>(8,false),(2,2)=>(4,true),(1,3)=>(2,true),_=>return None};
+ // (0,3): LDRSB 64-bit sign-extended (table-relative signed 8-bit offsets)
+ let (width,signed)=match(size,opc){(3,1)=>(8,false),(2,2)=>(4,true),(1,3)=>(2,true),(0,3)=>(1,true),_=>return None};
  Some((word&31,(word>>5)&31,width,signed,option==2))
 }
 
@@ -1054,7 +1055,7 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
  for candidate in (index.saturating_sub(4)..index).rev(){
   let word=le32(&code[candidate*4..candidate*4+4]);let Some((rd,rn,rm,wide))=shifted_add_register(word)else{continue};
   if rd==branch_reg&&rn!=31&&rm!=31&&wide&&address_setup_preserves_registers(code,base,candidate+1,index,&[branch_reg]){
-   for load in (candidate.saturating_sub(3)..candidate).rev(){let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&matches!(width,2|4)&&signed&&address_setup_preserves_registers(code,base,load+1,candidate,&[rm,rn]){load_index=Some(load);relative_base=Some(table_reg);relative_index_is_32=Some(index_is_32);break}}
+   for load in (candidate.saturating_sub(3)..candidate).rev(){let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&matches!(width,1|2|4)&&signed&&address_setup_preserves_registers(code,base,load+1,candidate,&[rm,rn]){load_index=Some(load);relative_base=Some(table_reg);relative_index_is_32=Some(index_is_32);break}}
    if load_index.is_some(){break}
   }
  }
@@ -1115,7 +1116,7 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
   format!(" case-range={} x{index_register}{}{} proven-entry-count={}{}",bound.guard,bound.operator,bound.maximum,bound.entries,normalization)
  }).unwrap_or_default();
  let mut out=format!("table={table_address:#018x} format={} entry_width={width} table_index=x{index_register} index-provenance={} scan_limit=32 confidence=candidate{bound_note}\n",if signed{"table-relative signed offsets"}else{"absolute pointers"},index_provenance);let mut valid=0usize;let mut stopped=None;
- for case in 0..count{let Some(offset)=table_offset.checked_add(case as u64*width as u64)else{stopped=Some((case,"file offset overflow"));break};if offset>size||width as u64>size-offset{stopped=Some((case,"entry exceeds file"));break}let entry=read_exact_range(file,offset,width as usize)?;let raw=match width{8=>le64(&entry),4=>u64::from(le32(&entry)),2=>u64::from(u16::from_le_bytes([entry[0],entry[1]])),_=>{stopped=Some((case,"unsupported entry width"));break}};let target=if signed{let sval:i64=match width{2=>(raw as u16 as i16 as i64),4=>(raw as u32 as i32 as i64),8=>(raw as i64),_=>break};table_address.checked_add_signed(sval)}else{Some(raw)};
+ for case in 0..count{let Some(offset)=table_offset.checked_add(case as u64*width as u64)else{stopped=Some((case,"file offset overflow"));break};if offset>size||width as u64>size-offset{stopped=Some((case,"entry exceeds file"));break}let entry=read_exact_range(file,offset,width as usize)?;let raw=match width{8=>le64(&entry),4=>u64::from(le32(&entry)),2=>u64::from(u16::from_le_bytes([entry[0],entry[1]])),1=>u64::from(entry[0]),_=>{stopped=Some((case,"unsupported entry width"));break}};let target=if signed{let sval:i64=match width{1=>(raw as u8 as i8 as i64),2=>(raw as u16 as i16 as i64),4=>(raw as u32 as i32 as i64),8=>(raw as i64),_=>break};table_address.checked_add_signed(sval)}else{Some(raw)};
   let Some(target)=target.filter(|target|*target>=base&&*target<scan_end&&(*target-base)%4==0)else{stopped=Some((case,"entry target is outside admitted executable bytes or is unaligned"));break};valid+=1;let selector_case=proven_bound.and_then(|bound|bound.normalization).and_then(|(_,bias,is_32)|bias.checked_add(case as u64).map(|value|if is_32{value&u64::from(u32::MAX)}else{value}));let selector_note=selector_case.map(|value|format!(" selector-bits={value:#x}")).unwrap_or_default();out.push_str(&format!("  case-index={case}{selector_note} entry={offset:#x} target={target:#018x} validation=executable-aligned\n"));
  }
  if valid==0{return Ok(None)}
