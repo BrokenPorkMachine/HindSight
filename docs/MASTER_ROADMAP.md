@@ -119,6 +119,33 @@ admission, and a reproducible trace/snapshot boundary.
 **Gate:** operators can identify an exact build/input/policy state, reproduce a
 failure without target-data exfiltration, and recover safely.
 
+## Product-completion milestone: 0.6.0 — Investigation Complete (P0)
+
+The existing research tracks above remain authoritative. Their release-critical
+subset is organized into an end-to-end completion sequence in
+[Investigation Complete 0.6.0](INVESTIGATION_COMPLETE_0.6.0.md).
+
+- [ ] **C0:** Reconcile release/version/schema identity, run the portable and
+  macOS gates, and publish a known-good baseline with open failures.
+- [ ] **C1:** Complete project → import → analyze → evidence pivot → hypothesis
+  → save/reopen → verifiable export with the bundled synthetic ARM64 fixture.
+- [ ] **C2:** Qualify responsive UX, accessibility, recovery and case-integrity
+  behavior on the supported 8 GiB Apple-Silicon host.
+- [ ] **C3:** Qualify bounded real-world reconstruction and provenance against
+  an independent corpus rather than interpreting attractive pseudocode as proof.
+- [ ] **C4:** Qualify explicitly scoped runtime/debug/emulation paths; keep
+  unsupported hardware profiles experimental.
+- [ ] **C5:** Produce and review clean candidate artifacts with host evidence.
+  Signed/notarized distribution remains separately gated.
+- [ ] **C6 (optional):** Qualify Warhead Community as a separately audited
+  addition; the full HindSight non-agent investigation workflow must never
+  depend on the agent.
+
+**Release gate:** do not mark 0.6.0 complete on the basis of documentation,
+static fixtures alone, or a model's claims. Each relevant workflow must have
+a tested, recorded, independently reproducible PASS result. Failed/unavailable
+features remain explicit rather than silently disappearing from navigation.
+
 ## Supporting references
 
 | Area | Reference |
