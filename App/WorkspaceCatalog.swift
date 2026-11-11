@@ -218,7 +218,7 @@ enum VGWorkspaceCatalog {
         case .apple: return descriptor.platforms.contains(.apple)
         // Preserve the pre-profile workspace set for raw/unknown artifacts while
         // keeping ECU-only evidence surfaces scoped to positively identified ECUs.
-        case .generic: return descriptor.platforms.contains(.apple)
+        case .elf, .pe, .raw, .generic: return descriptor.platforms.contains(.apple)
         }
     }
 
