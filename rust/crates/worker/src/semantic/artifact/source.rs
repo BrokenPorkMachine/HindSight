@@ -1654,6 +1654,30 @@ struct SourceLoop {
 }
 
 
+fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
+    match tree.kind {
+        "no-op" | "flags-compare" => Ok(()),
+        "memory-store" => {
+            if tree.children.len() != 2 { return Err(()); }
+            Ok(())
+        }
+        "assignment" => {
+            if tree.children.len() != 2 { return Err(()); }
+            let (register, _) = register(&tree.children[0]).map_err(|_| ())?;
+            if register == 29 || register == 30 || register >= 31 { return Err(()); }
+            written.insert(register);
+            Ok(())
+        }
+        "sequence" => {
+            for child in &tree.children {
+                collect_loop_written(child, written)?;
+            }
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
 /// Bounded bottom-tested/backedge loop recovery: a conditional backedge at
 /// `tail` jumps to `header` (already visited on this path), with fallthrough to
 /// `tail + 1` as the single exit. This covers simple do-while/counting forms
@@ -1709,21 +1733,11 @@ fn natural_loop_backedge(
     }
     let mut written = BTreeSet::new();
     for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
-        if tree.kind == "no-op" { continue; }
         if loop_cmp_index == Some(index) {
             // Bounded loop-test compare (flags-compare CMP reg,#imm) is allowed.
             continue;
         }
-        if tree.kind == "flags-compare" {
-            // Bounded: flag-setting compare in body (flags not loop-carried).
-            continue;
-        }
-        if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
-        if tree.kind == "memory-store" { continue; }
-        let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
-        // Allow general-purpose loop-carried registers (excluding FP/LR/SP).
-        if register == 29 || register == 30 || register >= 31 { return Ok(None); }
-        written.insert(register);
+        if collect_loop_written(tree, &mut written).is_err() { return Ok(None); }
     }
     // For flag-cmp-based tests, the compared register must be a loop-carried value
     // (written in body) so the condition can vary.
@@ -2014,22 +2028,10 @@ fn natural_loop(
     let mut written = BTreeSet::new();
     let body_start = if test_at_header { header + 1 } else { header };
     for (index, tree) in trees.iter().enumerate().take(tail).skip(body_start) {
-        if tree.kind == "no-op" { continue; }
         if loop_cmp_index == Some(index) {
             continue;
         }
-        if tree.kind == "flags-compare" {
-            // Bounded: flag-setting compare in body (flags not loop-carried).
-            continue;
-        }
-        if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
-        if tree.kind == "memory-store" { continue; }
-        let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
-        // Allow general-purpose loop-carried registers; exclude FP/LR/SP (29-31).
-        // x18-x28 may be callee-saved or platform-specific but can be modeled as
-        // loop-carried values when their updates are fully recovered in this loop.
-        if register == 29 || register == 30 || register >= 31 { return Ok(None); }
-        written.insert(register);
+        if collect_loop_written(tree, &mut written).is_err() { return Ok(None); }
     }
     if !written.contains(&test_register) { return Ok(None); }
 
