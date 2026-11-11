@@ -50,7 +50,7 @@ def check(root: pathlib.Path) -> list[str]:
         schema = schema_match.group(1)
         require(f"version != {schema} || metadataVersion != {schema}" in store,
                 "ProjectStore does not recognize Resources/schema.sql current schema")
-        require(f"Project SQLite schema {schema}" in status,
+        require(re.search(rf"project SQLite schema {schema}\\b", status, re.IGNORECASE) is not None,
                 "STATUS.md current project SQLite schema is stale")
         require(f"Project schema remains version {schema}" in status,
                 "STATUS.md stable-source project schema is stale")
