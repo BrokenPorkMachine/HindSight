@@ -40,7 +40,8 @@ async function main() {
     const errors = [];
     try {
         const result = await runTurn({ model: request.model, registry, config: cfg,
-            ctx: { cwd: 'HindSight Studio snapshot', config: () => cfg, signal: abort.signal, todos: createTodoStore() },
+            ctx: { cwd: 'HindSight Studio snapshot', communitySnapshot: true,
+                config: () => cfg, signal: abort.signal, todos: createTodoStore() },
             history: [], userText: request.prompt + '\nProvide reviewable code or findings. This invocation cannot read arbitrary files, apply patches, or run commands.',
             signal: abort.signal, onToolStart: async (call) => registry.get(call.name)?.mutates === false,
             onEvent: event => {

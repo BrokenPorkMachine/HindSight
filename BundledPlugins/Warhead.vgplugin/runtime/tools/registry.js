@@ -22,6 +22,7 @@ import { hindsightContext } from './hindsight.js';
 import { webSearch } from './web_search.js';
 import { fetchWebPage } from './web_fetch.js';
 import { toolCache } from './cache.js';
+import { communityToolDenyReason, communityToolUnavailable } from '../community/guardrails.js';
 /** Every tool the agent knows about. Availability is NOT decided here — the
  *  permission gate authorizes each call. This list is the capability surface;
  *  the gate is the policy surface, and keeping them separate means adding a tool
@@ -115,18 +116,22 @@ export class Registry {
         this.tools.push(tool);
     }
     names() {
-        return this.tools.map(t => t.def.name);
+        return this.tools.filter(t => !communityToolUnavailable(t.def.name)).map(t => t.def.name);
     }
     /** Flat tool definitions. The client wraps these into the {type:'function'}
      *  envelope that /api/chat expects, so the wire shape lives in one place. */
     definitions() {
-        return this.tools.map(t => t.def);
+        return this.tools.filter(t => !communityToolUnavailable(t.def.name)).map(t => t.def);
     }
     get(name) {
         return this.tools.find(t => t.def.name === name);
     }
     async dispatch(name, args, ctx) {
         const tool = this.get(name);
+        // Public Community boundary before cache, config or execution.
+        const communityDenied = communityToolDenyReason(name, tool, args, ctx);
+        if (communityDenied)
+            return { name, ok: false, output: communityDenied, error: 'community policy denied' };
         if (!tool) {
             const known = this.names().join(', ');
             return {

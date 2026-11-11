@@ -39,6 +39,11 @@ import { ReaMcpClient } from '../rea/mcp-client.js';
 import { HindsightMcpClient } from '../rea/hindsight-mcp-client.js';
 import { RemoteMcpHost } from '../mcp/remote.js';
 import { closeNativeRuntime } from '../model/native-runtime.js';
+// The broad private Warhead CLI is NOT part of the Community preview.
+// Its non-tool command paths require an independent security audit and OS sandbox.
+// HindSight invokes the bounded cli/extension.js entrypoint instead.
+throw new Error('Warhead Community CLI is disabled until independent entrypoint and OS sandbox qualification. Use the HindSight Studio extension.');
+
 function actionableError(message) {
     const lower = message.toLowerCase();
     if (lower.includes('und_err_headers_timeout') || lower.includes('und_err_body_timeout')) {
