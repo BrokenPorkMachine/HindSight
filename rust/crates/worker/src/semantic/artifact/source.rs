@@ -3196,7 +3196,10 @@ pub(super) fn recover_with_types(
                                     if let Ok(phi_id) = dag.add("source-phi", "($0 ? $1 : $2)".to_string(),
                                                   vec![saved.path, *sid, *cid], pc) {
                                         if let Some(entry) = merged_frame.get_mut(&key) {
+                                            let mut provenance = saved.frame[&key].1.clone();
+                                            provenance.extend(state.frame[&key].1.iter().copied());
                                             entry.0 = Symbol::Value(phi_id, *sbits);
+                                            entry.1 = provenance;
                                         } else {
                                             can_merge = false; break;
                                         }
