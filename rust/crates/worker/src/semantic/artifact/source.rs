@@ -3097,7 +3097,7 @@ pub(super) fn recover_with_types(
                     let follow_goto_chain = |mut idx: usize| -> Option<usize> {
                         let mut steps = 0usize;
                         loop {
-                            if steps > 12 { return None; }
+                            if steps > 24 { return None; }
                             let tgt_tree = trees.get(idx)?;
                             if tgt_tree.kind == "no-op" {
                                 idx = idx.checked_add(1)?;
