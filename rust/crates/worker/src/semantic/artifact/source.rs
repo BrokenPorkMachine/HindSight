@@ -1656,7 +1656,7 @@ struct SourceLoop {
 
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
-        "no-op" | "flags-compare" => Ok(()),
+        "no-op" | "flags-compare" | "flags-arithmetic" => Ok(()),
         "memory-store" => {
             if tree.children.len() != 2 { return Err(()); }
             Ok(())
@@ -1669,8 +1669,15 @@ fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<()
             Ok(())
         }
         "sequence" => {
+            // Bounded: accept sequences only when they contain flag/no-op effects
+            // without assignments or memory stores, so loop-carried updates and
+            // memory effects remain explicitly tracked by top-level body items.
             for child in &tree.children {
-                collect_loop_written(child, written)?;
+                match child.kind {
+                    "no-op" | "flags-compare" | "flags-arithmetic" => {}
+                    "sequence" => collect_loop_written(child, written)?,
+                    _ => return Err(()),
+                }
             }
             Ok(())
         }
@@ -1842,11 +1849,16 @@ fn natural_loop_backedge(
                 state.registers[register] = Symbol::Value(destination, known);
             }
             None => {
-                if tree.kind == "flags-compare" {
-                    // Bounded: compare/flag-setting instruction with no GPR write and no
+                if matches!(tree.kind, "flags-compare" | "flags-arithmetic") {
+                    // Bounded: flag-setting instruction with no GPR write and no
                     // memory store (flags not loop-carried in this recovery).
                     if state.external_stores.len() != before_stores {
-                        return Err("loop flags-compare unexpectedly produced a memory store".into());
+                        return Err("loop flag-setting instruction unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "sequence" {
+                    // Bounded: accepted sequences contain only flag/no-op effects.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop sequence unexpectedly produced a memory store".into());
                     }
                 } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
                     stores.push(state.external_stores.pop().expect("store count checked"));
@@ -2130,9 +2142,13 @@ fn natural_loop(
                 state.registers[register] = Symbol::Value(destination, known);
             }
             None => {
-                if tree.kind == "flags-compare" {
+                if matches!(tree.kind, "flags-compare" | "flags-arithmetic") {
                     if state.external_stores.len() != before_stores {
-                        return Err("loop flags-compare unexpectedly produced a memory store".into());
+                        return Err("loop flag-setting instruction unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "sequence" {
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop sequence unexpectedly produced a memory store".into());
                     }
                 } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
                     stores.push(state.external_stores.pop().expect("store count checked"));
