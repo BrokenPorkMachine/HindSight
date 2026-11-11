@@ -1000,7 +1000,7 @@ struct UnsignedSwitchBound{
 /// Bound a jump-table scan only for the common adjacent unsigned CMP/B.cond
 /// guard, with an unchanged index and a default edge outside the dispatch.
 fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_register:u32,index_is_32:bool,branch_pc:u64)->Option<UnsignedSwitchBound>{
- let first=load_index.saturating_sub(8);
+ let first=load_index.saturating_sub(12);
  for branch_index in (first..load_index).rev(){
   let branch=le32(code.get(branch_index*4..branch_index*4+4)?);
   if branch&0xff00_0010!=0x5400_0000{continue}
