@@ -1408,7 +1408,7 @@ struct ContentView: View {
                         model.selectEvidence("binary diff address=\(value)")
                     }
                 )
-                .frame(minHeight: 650)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             case "Binary Workspace":
                 if let analysis = model.currentAnalysis {
                     VGBinaryWorkspace(
@@ -1491,7 +1491,7 @@ struct ContentView: View {
                         onExportPDF: model.exportInvestigationPDF,
                         onExportJSON: model.exportInvestigationJSON
                     )
-                    .frame(minHeight: 650)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView(
                         "Ledger unavailable",
@@ -1558,7 +1558,7 @@ struct ContentView: View {
                         },
                         onOpenWorkspace: { model.workspace = $0 }
                     )
-                    .frame(minHeight: 650)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView(
                         "Analyze the binary first",
@@ -1588,7 +1588,7 @@ struct ContentView: View {
                         onInterrupt: model.debugInterrupt,
                         onOpenCorrelation: { model.workspace = "Runtime Correlation" }
                     )
-                    .frame(minHeight: 650)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView(
                         "Analyze the binary first",
@@ -1624,7 +1624,7 @@ struct ContentView: View {
                         },
                         onRefreshModules: model.debugRefreshModules
                     )
-                    .frame(minHeight: 650)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .onAppear {
                         if model.debugAttached && model.debugModules.isEmpty { model.debugRefreshModules() }
                     }
