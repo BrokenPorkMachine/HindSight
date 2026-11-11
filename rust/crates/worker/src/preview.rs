@@ -967,6 +967,18 @@ fn arm64_sub_immediate(word:u32)->Option<(u32,u32,u64,bool)>{
  Some((word&31,(word>>5)&31,immediate,word>>31==0))
 }
 
+fn arm64_and_immediate(word:u32)->Option<u32>{
+ // AND Xd, Xn, #imm (64-bit, N=1): 0x92000000 | ... ; 32-bit: 0x12000000 | ...
+ if word&0x7f000000!=0x12000000{return None}
+ Some(word&31)
+}
+
+fn arm64_orr_immediate(word:u32)->Option<u32>{
+ // ORR Xd, Xn, #imm (64-bit, N=1): 0xb2000000 | ... ; 32-bit: 0x32000000 | ...
+ if word&0x7f000000!=0x32000000{return None}
+ Some(word&31)
+}
+
 /// Admit only recognized address construction to preserve a candidate base
 /// register across a short backward slice. Unknown instructions may redefine
 /// the base, so they stop table promotion rather than being guessed through.
@@ -988,7 +1000,9 @@ fn address_setup_preserves_registers(code:&[u8],base:u64,start:usize,end:usize,r
   let destination=arm64_address_value(word,base+index as u64*4).map(|value|value.0)
    .or_else(||arm64_add_immediate(word).map(|value|value.0))
    .or_else(||arm64_sub_immediate(word).map(|value|value.0))
-   .or_else(||arm64_mov_register(word));
+   .or_else(||arm64_mov_register(word))
+   .or_else(||arm64_and_immediate(word))
+   .or_else(||arm64_orr_immediate(word));
   let Some(destination)=destination else{return false};
   if registers.contains(&destination)||destination==31{return false}
  }
@@ -1037,7 +1051,9 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
    let destination=arm64_address_value(word,base+i as u64*4).map(|v|v.0)
     .or_else(||arm64_add_immediate(word).map(|v|v.0))
     .or_else(||arm64_sub_immediate(word).map(|v|v.0))
-    .or_else(||arm64_mov_register(word));
+    .or_else(||arm64_mov_register(word))
+    .or_else(||arm64_and_immediate(word))
+    .or_else(||arm64_orr_immediate(word));
    if destination!=Some(index_register){
     if destination.is_none(){address_only=false;break}
    }else{address_only=false;break}
