@@ -3461,7 +3461,18 @@ pub(super) fn recover_with_types(
                                 steps += 1;
                                 continue;
                             }
-                            if tgt_tree.kind != "goto" { return Some(idx); }
+                            if tgt_tree.kind != "goto" && tgt_tree.kind != "conditional-goto" { return Some(idx); }
+                            if tgt_tree.kind == "conditional-goto" {
+                                // Only follow if it targets the next sequential instruction.
+                                let tgt = number(tgt_tree, "target");
+                                let delta = tgt.checked_sub(start)?;
+                                if delta % 4 != 0 { return Some(idx); }
+                                let tgt_idx = (delta / 4) as usize;
+                                if tgt_idx != idx + 1 { return Some(idx); }
+                                idx = idx.checked_add(1)?;
+                                steps += 1;
+                                continue;
+                            }
                             let tgt = number(tgt_tree, "target");
                             let delta = tgt.checked_sub(start)?;
                             if delta % 4 != 0 { return None; }
