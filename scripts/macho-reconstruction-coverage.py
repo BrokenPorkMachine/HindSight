@@ -82,6 +82,7 @@ def inspect_batch(directory: pathlib.Path, source: pathlib.Path | None = None) -
         "claim": "validated reconstruction artifact coverage, NOT original source recovery or behavioral equivalence",
         "source_sha256": manifest["source_sha256"],
         "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "macho_format": "verified thin 64-bit" if source is not None else "UNVERIFIED (source not supplied)",
         "attempted": attempted,
         "discovered_in_scope": manifest.get("discovered_in_scope"),
         "omitted_by_limit": manifest.get("omitted_by_limit"),
