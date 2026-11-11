@@ -1919,7 +1919,58 @@ fn natural_loop(
     } else {
         if tail <= header || tail + 1 != exit { return Ok(None); }
     }
-    let Some(header_test) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
+    let header_test = if let Some(test) = zero_test(&preheader_tree.children[0]) {
+        test
+    } else if !test_at_header {
+        // Pattern A only: preheader is an entry guard evaluated once (not the
+        // loop header re-evaluated each iteration), so a flag-condition from a
+        // compare immediately before preheader is sound for the entry test.
+        let cond = &preheader_tree.children[0];
+        if cond.kind == "flag-condition" && preheader > 0 {
+            let mut cmp_index = preheader - 1;
+            if trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") && cmp_index > 0 {
+                cmp_index -= 1;
+            }
+            let cmp_tree = trees.get(cmp_index);
+            let parsed = cmp_tree.and_then(|ct| {
+                if ct.kind != "flags-compare" || ct.children.len() != 2 { return None; }
+                let op = attribute(ct, "operator");
+                let rhs = ct.children.get(1)?;
+                if rhs.kind != "constant" { return None; }
+                let imm = number(rhs, "hex");
+                let (register, _) = register(&ct.children[0]).ok()?;
+                let predicate = attribute(cond, "predicate");
+                match op {
+                    "cmp" => {
+                        let cmp = match predicate {
+                            "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne,
+                            "lt" => LoopCmp::Slt, "le" => LoopCmp::Sle,
+                            "gt" => LoopCmp::Sgt, "ge" => LoopCmp::Sge,
+                            "lo" => LoopCmp::Ult, "ls" => LoopCmp::Ule,
+                            "hi" => LoopCmp::Ugt, "hs" => LoopCmp::Uge,
+                            _ => return None,
+                        };
+                        Some(LoopTest { register, cmp, compare_value: imm, mask: None })
+                    }
+                    "cmn" => {
+                        let cmp = match predicate { "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne, _ => return None };
+                        Some(LoopTest { register, cmp, compare_value: imm.wrapping_neg(), mask: None })
+                    }
+                    "tst" | "test" => {
+                        let cmp = match predicate { "eq" => LoopCmp::Eq, "ne" => LoopCmp::Ne, _ => return None };
+                        if imm == 0 { return None; }
+                        Some(LoopTest { register, cmp, compare_value: 0, mask: Some(imm) })
+                    }
+                    _ => None,
+                }
+            });
+            match parsed { Some(t) => t, None => return Ok(None) }
+        } else {
+            return Ok(None);
+        }
+    } else {
+        return Ok(None);
+    };
     let test_register = header_test.register;
     let mut loop_cmp_index: Option<usize> = None;
     if unconditional_backedge {
