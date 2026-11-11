@@ -1055,10 +1055,10 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
 fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],base:u64,pc:u64,branch_reg:u32,scan_end:u64)->io::Result<Option<String>>{
  let index=pc.saturating_sub(base)as usize/4;if index>=code.len()/4{return Ok(None)}
  let mut load_index=None;let mut relative_base=None;let mut relative_index_is_32=None;
- for candidate in (index.saturating_sub(4)..index).rev(){
+ for candidate in (index.saturating_sub(5)..index).rev(){
   let word=le32(&code[candidate*4..candidate*4+4]);let Some((rd,rn,rm,wide))=shifted_add_register(word)else{continue};
   if rd==branch_reg&&rn!=31&&rm!=31&&wide&&address_setup_preserves_registers(code,base,candidate+1,index,&[branch_reg]){
-   for load in (candidate.saturating_sub(3)..candidate).rev(){let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&matches!(width,1|2|4)&&signed&&address_setup_preserves_registers(code,base,load+1,candidate,&[rm,rn]){load_index=Some(load);relative_base=Some(table_reg);relative_index_is_32=Some(index_is_32);break}}
+   for load in (candidate.saturating_sub(4)..candidate).rev(){let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4]))else{continue};if loaded==rm&&table_reg==rn&&matches!(width,1|2|4)&&signed&&address_setup_preserves_registers(code,base,load+1,candidate,&[rm,rn]){load_index=Some(load);relative_base=Some(table_reg);relative_index_is_32=Some(index_is_32);break}}
    if load_index.is_some(){break}
   }
  }
@@ -1068,7 +1068,7 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
   let (_,_,w,s,idx32)=arm64_indexed_jump_load(load_word).unwrap();
   (load_index,relative_base.unwrap(),w,s,idx32)
  }else{
-  let mut found=None;for load in (index.saturating_sub(3)..index).rev(){if let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4])){if loaded==branch_reg&&width==8&&!signed&&address_setup_preserves_registers(code,base,load+1,index,&[branch_reg]){found=Some((load,table_reg,width,signed,index_is_32));break}}}let Some(found)=found else{return Ok(None)};found
+  let mut found=None;for load in (index.saturating_sub(4)..index).rev(){if let Some((loaded,table_reg,width,signed,index_is_32))=arm64_indexed_jump_load(le32(&code[load*4..load*4+4])){if loaded==branch_reg&&width==8&&!signed&&address_setup_preserves_registers(code,base,load+1,index,&[branch_reg]){found=Some((load,table_reg,width,signed,index_is_32));break}}}let Some(found)=found else{return Ok(None)};found
  };
  let mut table_address=None;
  let search_start=load_index.saturating_sub(8);
