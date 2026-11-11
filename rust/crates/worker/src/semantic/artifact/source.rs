@@ -2744,27 +2744,47 @@ pub(super) fn recover_with_types(
                     if target_indices.is_empty() {
                         return Err("resolved indirect dispatch has no recoverable in-function continuation".into());
                     }
-                    // Bounded join: if every in-function dispatch target is an immediate
-                    // unconditional goto to the same continuation, the dispatch can be
-                    // treated as a single in-function continuation without forking paths.
+                    // Bounded join: if every in-function dispatch target reaches the same
+                    // continuation through a chain of unconditional gotos, treat as a single
+                    // continuation without forking. Chains are followed only while targets
+                    // remain unconditional gotos within the function and no cycle/ambiguity
+                    // is introduced.
+                    let follow_goto_chain = |mut idx: usize| -> Option<usize> {
+                        let mut steps = 0usize;
+                        loop {
+                            if steps > 8 { return None; }
+                            let tgt_tree = trees.get(idx)?;
+                            if tgt_tree.kind != "goto" { return Some(idx); }
+                            let tgt = number(tgt_tree, "target");
+                            let delta = tgt.checked_sub(start)?;
+                            if delta % 4 != 0 { return None; }
+                            let tgt_idx = (delta / 4) as usize;
+                            if tgt_idx >= trees.len() { return None; }
+                            idx = tgt_idx;
+                            steps += 1;
+                        }
+                    };
                     let common_goto = if target_indices.len() >= 2 {
                         let mut common: Option<usize> = None;
                         let mut all_same = true;
                         for (_, idx) in &target_indices {
-                            let Some(tgt_tree) = trees.get(*idx) else { all_same = false; break; };
-                            if tgt_tree.kind != "goto" { all_same = false; break; }
-                            let tgt = number(tgt_tree, "target");
-                            let Some(delta) = tgt.checked_sub(start) else { all_same = false; break; };
-                            if delta % 4 != 0 { all_same = false; break; }
-                            let tgt_idx = (delta / 4) as usize;
-                            if tgt_idx >= trees.len() { all_same = false; break; }
+                            let Some(join_idx) = follow_goto_chain(*idx) else { all_same = false; break; };
+                            // Only join if we actually reached a common non-trivial continuation
+                            // (or a goto-chain-resolved point) consistently.
                             match common {
-                                None => common = Some(tgt_idx),
-                                Some(prev) if prev == tgt_idx => {}
+                                None => common = Some(join_idx),
+                                Some(prev) if prev == join_idx => {}
                                 _ => { all_same = false; break; }
                             }
                         }
-                        if all_same { common } else { None }
+                        // Require that at least one target involved a goto/trampoline form;
+                        // otherwise this is not a dispatch-join case we need to special-case.
+                        if all_same {
+                            let all_direct_same = target_indices.iter().all(|(_, idx)| Some(*idx) == common);
+                            if all_direct_same { None } else { common }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
