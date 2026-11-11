@@ -1757,7 +1757,21 @@ fn natural_loop_backedge(
         return Ok(None);
     }
     if tail < header { return Ok(None); }
-    let exit = tail + 1;
+    let mut exit = tail + 1;
+    if exit > trees.len() { return Ok(None); }
+    // Tolerate a single trailing no-op between backedge and exit, but only
+    // when no control transfer targets that no-op (so skipping it is sound).
+    if exit < trees.len() && trees.get(exit).is_some_and(|t| t.kind == "no-op") {
+        let noop_index = exit;
+        let targeted = trees.iter().enumerate().any(|(i, tree)| {
+            matches!(tree.kind, "goto" | "conditional-goto")
+                && target_index(number(tree, "target")) == Some(noop_index)
+                && i != tail
+        });
+        if !targeted {
+            exit += 1;
+        }
+    }
     if exit > trees.len() { return Ok(None); }
     // Require the backedge test to be a zero/nonzero test on a register,
     // or an equivalent flag-condition from CMP reg,#0 immediately before tail.
@@ -1980,38 +1994,58 @@ fn natural_loop(
         trees[index].kind == "goto"
             && target_index(number(&trees[index], "target")) == Some(header)
     }).collect::<Vec<_>>();
+    let find_backedge_before_exit = |exit: usize, target_header: usize, want_kind: &str| -> Option<usize> {
+        if exit == 0 { return None; }
+        let mut idx = exit - 1;
+        if trees.get(idx).is_some_and(|t| t.kind == "no-op") {
+            if idx == 0 { return None; }
+            idx = idx.saturating_sub(1);
+        }
+        if idx >= exit { return None; }
+        trees.get(idx).filter(|tree| tree.kind == want_kind && target_index(number(tree, "target")) == Some(target_header)).map(|_| idx)
+    };
     let (tail, unconditional_backedge) = if conditional_backedges.len() == 1 && unconditional_backedges.is_empty() {
         (conditional_backedges[0], false)
     } else if conditional_backedges.is_empty() && unconditional_backedges.len() == 1 {
         (unconditional_backedges[0], true)
-    } else if conditional_backedges.is_empty() && unconditional_backedges.is_empty()
-        && exit > preheader + 1
-        && trees.get(exit - 1).is_some_and(|tree| {
-            tree.kind == "goto" && target_index(number(tree, "target")) == Some(preheader)
-        })
-    {
-        // Pattern B: `preheader` is the loop header/test, unconditional backedge.
-        header = preheader;
-        test_at_header = true;
-        (exit - 1, true)
-    } else if conditional_backedges.is_empty() && unconditional_backedges.is_empty()
-        && exit > preheader + 1
-        && trees.get(exit - 1).is_some_and(|tree| {
-            tree.kind == "conditional-goto" && target_index(number(tree, "target")) == Some(preheader)
-        })
-    {
-        // Pattern B: `preheader` is the loop header/test, conditional backedge
-        // (complementary to the header exit test) with fallthrough to exit.
-        header = preheader;
-        test_at_header = true;
-        (exit - 1, false)
+    } else if conditional_backedges.is_empty() && unconditional_backedges.is_empty() && exit > preheader + 1 {
+        if let Some(tail) = find_backedge_before_exit(exit, preheader, "goto") {
+            // Pattern B: `preheader` is the loop header/test, unconditional backedge.
+            // Allow a single trailing no-op before exit after the backedge.
+            header = preheader;
+            test_at_header = true;
+            (tail, true)
+        } else if let Some(tail) = find_backedge_before_exit(exit, preheader, "conditional-goto") {
+            // Pattern B: `preheader` is the loop header/test, conditional backedge
+            // (complementary to the header exit test) with fallthrough to exit.
+            // Allow a single trailing no-op before exit after the backedge.
+            header = preheader;
+            test_at_header = true;
+            (tail, false)
+        } else {
+            return Ok(None);
+        }
     } else {
         return Ok(None);
     };
+    let trailing_noop_safe = |noop_index: usize, tail: usize| -> bool {
+        trees.get(noop_index).is_some_and(|t| t.kind == "no-op")
+            && !trees.iter().enumerate().any(|(i, tree)| {
+                matches!(tree.kind, "goto" | "conditional-goto")
+                    && target_index(number(tree, "target")) == Some(noop_index)
+                    && i != tail
+            })
+    };
     if !test_at_header {
-        if tail <= header || tail + 1 != exit { return Ok(None); }
+        // Pattern A: tolerate a single trailing no-op between tail and exit.
+        if tail <= header || !(tail + 1 == exit || (tail + 2 == exit && trailing_noop_safe(tail + 1, tail))) {
+            return Ok(None);
+        }
     } else {
-        if tail <= header || tail + 1 != exit { return Ok(None); }
+        // Pattern B: tolerate a single trailing no-op between tail and exit.
+        if tail <= header || !(tail + 1 == exit || (tail + 2 == exit && trailing_noop_safe(tail + 1, tail))) {
+            return Ok(None);
+        }
     }
     let header_test = if let Some(test) = zero_test(&preheader_tree.children[0]) {
         test
