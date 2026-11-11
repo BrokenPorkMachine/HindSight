@@ -1818,11 +1818,21 @@ fn natural_loop(
     let Some(header_test) = zero_test(&preheader_tree.children[0]) else { return Ok(None) };
     let test_register = header_test.register;
     let exits_on_zero = header_test.zero_means_true;
+    let mut loop_cmp_index: Option<usize> = None;
     if unconditional_backedge {
         // Header-tested while loop: test conditionally exits, tail jumps back
         // unconditionally to the loop header/test. Continue when exit is false.
     } else {
-        let Some(tail_test) = zero_test(&trees[tail].children[0]) else { return Ok(None) };
+        let tail_cond = &trees[tail].children[0];
+        let tail_test = if let Some(test) = zero_test(tail_cond) {
+            test
+        } else if let Some((test, cmp_index)) = zero_test_from_flag_cmp(tail_cond, tail, if test_at_header { header } else { header.saturating_sub(0) }, trees) {
+            // Flag-cmp compare at tail-1 is in the loop body.
+            loop_cmp_index = Some(cmp_index);
+            test
+        } else {
+            return Ok(None);
+        };
         if tail_test.register != test_register || tail_test.mask != header_test.mask || exits_on_zero == tail_test.zero_means_true {
             return Ok(None);
         }
@@ -1841,8 +1851,11 @@ fn natural_loop(
     }
     let mut written = BTreeSet::new();
     let body_start = if test_at_header { header + 1 } else { header };
-    for tree in &trees[body_start..tail] {
+    for (index, tree) in trees.iter().enumerate().take(tail).skip(body_start) {
         if tree.kind == "no-op" { continue; }
+        if loop_cmp_index == Some(index) {
+            continue;
+        }
         if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
         if tree.kind == "memory-store" { continue; }
         let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
@@ -1919,6 +1932,12 @@ fn natural_loop(
             return Err("loop instruction has an unsupported number of memory reads".into());
         }
         loads.extend(body_loads);
+        if loop_cmp_index == Some(index) {
+            if state.external_stores.len() != before_stores {
+                return Err("loop test compare unexpectedly produced a memory store".into());
+            }
+            continue;
+        }
         match register {
             Some(register) => {
                 if state.external_stores.len() != before_stores {
