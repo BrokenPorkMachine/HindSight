@@ -1705,7 +1705,7 @@ struct SourceLoop {
 
 fn is_noop_tree(tree: &Tree) -> bool {
     match tree.kind {
-        "no-op" => true,
+        "no-op" | "flags-compare" | "flags-arithmetic" => true,
         "sequence" => !tree.children.is_empty() && tree.children.iter().all(is_noop_tree),
         _ => false,
     }
