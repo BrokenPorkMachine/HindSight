@@ -1754,7 +1754,7 @@ fn is_noop_tree(tree: &Tree) -> bool {
 
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
-        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" | "conditional-goto" | "call" => Ok(()),
+        "no-op" | "flags-compare" | "flags-arithmetic" | "goto" | "conditional-goto" | "call" | "memory-load" => Ok(()),
         "memory-store" | "memory-store-pair" | "memory-load-pair" => {
             if tree.kind == "memory-store" && tree.children.len() != 2 { return Err(()); }
             if tree.kind.ends_with("-pair") && tree.children.len() < 2 { return Err(()); }
@@ -2044,6 +2044,12 @@ fn natural_loop_backedge(
                     // be unchanged.
                     if state.external_stores.len() != before_stores {
                         return Err("loop call unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "memory-load" {
+                    // Bounded: standalone memory load (no GPR write at top level).
+                    // No external store is produced.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop memory-load unexpectedly produced a memory store".into());
                     }
                 } else if matches!(tree.kind, "memory-store-pair" | "memory-load-pair") {
                     // Bounded: frame (stack) pair operations; no external memory
@@ -2451,6 +2457,12 @@ fn natural_loop(
                     // be unchanged.
                     if state.external_stores.len() != before_stores {
                         return Err("loop call unexpectedly produced a memory store".into());
+                    }
+                } else if tree.kind == "memory-load" {
+                    // Bounded: standalone memory load (no GPR write at top level).
+                    // No external store is produced.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop memory-load unexpectedly produced a memory store".into());
                     }
                 } else if matches!(tree.kind, "memory-store-pair" | "memory-load-pair") {
                     // Bounded: frame (stack) pair operations; no external memory
