@@ -482,7 +482,7 @@ pub(crate) fn prove_non_returning_with_resolved_indirects(
         let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
         let flow = match portable {
             super::super::IrOperation::Branch { target } => Flow::Direct(target),
-            super::super::IrOperation::ConditionalBranch { .. } => Flow::Conditional,
+            super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
             super::super::IrOperation::IndirectBranch { .. } => {
                 if let Some(targets) = resolved_indirect_targets.get(&pc) {
                     Flow::ResolvedIndirect(targets.clone())
@@ -517,7 +517,16 @@ pub(crate) fn prove_non_returning_with_resolved_indirects(
             return false;
         };
         match flow {
-            Flow::Returns | Flow::Conditional | Flow::Unknown => return false,
+            Flow::Returns | Flow::Unknown => return false,
+            Flow::Conditional(target) => {
+                // Both arms are reachable; every path must be non-returning.
+                if target <= pc {
+                    // Backward taken edge is a loop on that path.
+                } else {
+                    pending.push(target);
+                }
+                pending.push(pc + 4);
+            }
             Flow::ResolvedIndirect(targets) => {
                 // Proven complete indirect dispatch: follow all in-function
                 // targets. An empty set means no in-function continuation, but
@@ -579,7 +588,7 @@ enum Flow {
     /// An unconditional branch to a resolved address.
     Direct(u64),
     /// A conditional branch; either arm may be taken.
-    Conditional,
+    Conditional(u64),
     /// A branch or call whose target is not resolved.
     Unknown,
     /// A proven complete indirect branch to zero or more in-function targets.
