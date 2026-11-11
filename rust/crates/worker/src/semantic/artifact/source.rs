@@ -1591,11 +1591,13 @@ fn zero_test_from_flag_cmp(condition: &Tree, branch_index: usize, header: usize,
     if condition.kind != "flag-condition" { return None; }
     let predicate = attribute(condition, "predicate");
     if branch_index == 0 || branch_index <= header { return None; }
-    // Allow a single no-op between compare and branch (flags unaffected).
+    // Allow bounded no-ops between compare and branch (flags unaffected).
     let mut cmp_index = branch_index - 1;
-    if trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") {
-        if cmp_index == 0 || cmp_index < header { return None; }
+    let mut skipped = 0usize;
+    while trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") {
+        if skipped >= 4 || cmp_index == 0 || cmp_index <= header { return None; }
         cmp_index -= 1;
+        skipped += 1;
     }
     if cmp_index < header { return None; }
     let cmp_tree = trees.get(cmp_index)?;
@@ -2069,8 +2071,10 @@ fn natural_loop(
         let cond = &preheader_tree.children[0];
         if cond.kind == "flag-condition" && preheader > 0 {
             let mut cmp_index = preheader - 1;
-            if trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") && cmp_index > 0 {
+            let mut skipped = 0usize;
+            while trees.get(cmp_index).is_some_and(|t| t.kind == "no-op") && cmp_index > 0 && skipped < 4 {
                 cmp_index -= 1;
+                skipped += 1;
             }
             let cmp_tree = trees.get(cmp_index);
             let parsed = cmp_tree.and_then(|ct| {
