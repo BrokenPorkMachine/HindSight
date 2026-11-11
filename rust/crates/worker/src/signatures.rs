@@ -951,9 +951,9 @@ fn refine_property_signatures(signatures:&mut BTreeMap<u64,(String,Signature)>, 
     }
 }
 
-fn object_member_statements(code:&[u8],base:u64,start:u64,end:u64,file_offset:u64,data_ranges:&[(u64,u64,u16)],layout:&super::objc::ClassLayout) -> BTreeMap<u64,String> {
+fn object_member_statements(code:&[u8],base:u64,start:u64,end:u64,file_offset:u64,data_ranges:&[(u64,u64,u16)],layout:&super::objc::ClassLayout,resolved_indirect_targets:&std::collections::BTreeMap<u64,Vec<u64>>) -> BTreeMap<u64,String> {
     let slots=layout.ivars.iter().map(|ivar|ivar.offset_pointer).collect();
-    super::semantic::object_member_accesses(code,base,start,end,file_offset,data_ranges,&slots).into_iter().filter_map(|(site,access)|{
+    super::semantic::object_member_accesses_with_resolved_indirects(code,base,start,end,file_offset,data_ranges,&slots,resolved_indirect_targets).into_iter().filter_map(|(site,access)|{
         let offset=if let Some(slot)=access.offset_pointer {
             let mut candidates=layout.ivars.iter().filter(|ivar|ivar.offset_pointer==slot);
             let field=candidates.next()?;if candidates.next().is_some(){return None}u64::from(field.offset)
@@ -1307,11 +1307,16 @@ struct SwitchEvidence {
     range: Option<String>,
     normalization: Option<String>,
     cases: Vec<(u64,Option<u64>,u64)>,
+    /// True only when the jump-table report proves all cases in the bounded
+    /// range were enumerated (no unresolved entries, not capped).
+    complete: bool,
 }
 
 fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
     let mut result=BTreeMap::new();
     let mut current=None;
+    let mut has_unresolved=false;
+    let mut stopped_at_proven_bound=false;
     for line in report.lines() {
         if line.contains(" BR x") && line.contains("bounded indexed-table evidence") {
             let mut fields=line.split_whitespace();
@@ -1322,6 +1327,8 @@ fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
             current=address.zip(register).map(|(address,register)|{
                 result.insert(address,SwitchEvidence{branch_register:register,..SwitchEvidence::default()});address
             });
+            has_unresolved=false;
+            stopped_at_proven_bound=false;
             continue;
         }
         let Some(address)=current else{continue};
@@ -1331,8 +1338,8 @@ fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
                 if let Some(range)=line.split("case-range=").nth(1).and_then(|s|s.split(" proven-entry-count=").next()) {
                     evidence.range=Some(range.to_owned());
                 }
-                if let Some(normalization)=line.split("index-normalization=").nth(1).and_then(|s|s.split(" modulo ").next()) {
-                    evidence.normalization=Some(normalization.to_owned());
+                if let Some(normalization)=line.split("index-normalization=").nth(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                    evidence.normalization=Some(normalization);
                 }
             }
         }
@@ -1342,7 +1349,19 @@ fn parse_switch_evidence(report: &str) -> BTreeMap<u64,SwitchEvidence> {
             let selector=line.split("selector-bits=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
             if let (Some(case),Some(target))=(case,target){if let Some(evidence)=result.get_mut(&address){evidence.cases.push((case,selector,target));}}
         }
-        if line.starts_with("validated_entries=") { current=None; }
+        if line.trim_start().starts_with("unresolved-entry") {
+            has_unresolved=true;
+        }
+        if line.trim_start().starts_with("enumeration stopped at proven unsigned index bound") {
+            stopped_at_proven_bound=true;
+        }
+        if line.starts_with("validated_entries=") {
+            if let Some(evidence)=result.get_mut(&address){
+                let validated=line.split("validated_entries=").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);
+                evidence.complete=!has_unresolved && stopped_at_proven_bound && validated==evidence.cases.len();
+            }
+            current=None;
+        }
     }
     result.retain(|_,evidence|evidence.index_register.is_some()&&!evidence.cases.is_empty());
     result
@@ -2147,7 +2166,37 @@ fn render_arm64_body(
     if lo >= hi || hi > code.len() { return None; }
     let body_code = &code[lo..hi];
     let stable_stack=super::semantic::stack_pointer_is_stable(code,base,start,end);
-    let machine = super::semantic::render(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges);
+    let switch_evidence=parse_switch_evidence(jump_tables);
+    let name_seeds = parameter_name_seeds(signature, parameter_evidence, start);
+    let mut resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+    for (&pc, evidence) in &switch_evidence {
+        if pc < start || pc >= end { continue; }
+        // Only use targets when enumeration is explicitly complete for the
+        // proven range/bounds; partial evidence must not hide possible
+        // in-function re-entry successors.
+        if !evidence.complete { continue; }
+        let mut in_function_targets = Vec::new();
+        let mut in_function_case_count = 0usize;
+        let mut external_cases = 0usize;
+        for &(_, _, target) in &evidence.cases {
+            if target >= start && target < end && (target - start) % 4 == 0 {
+                in_function_targets.push(target);
+                in_function_case_count += 1;
+            } else {
+                external_cases += 1;
+            }
+        }
+        in_function_targets.sort_unstable();
+        in_function_targets.dedup();
+        // All parsed cases must be accounted for as in-function successors or
+        // external exits; external targets cannot re-enter the function.
+        // An empty in-function set with all cases external means the indirect
+        // branch exits the function with no possible re-entry.
+        if in_function_case_count + external_cases >= evidence.cases.len() {
+            resolved_indirect_targets.insert(pc, in_function_targets);
+        }
+    }
+    let machine = super::semantic::render_with_resolved_indirects(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges, &resolved_indirect_targets);
     let mut instructions = Vec::<(u64,String)>::new();
     for line in machine.lines() {
         let Some(line) = line.trim_start().strip_prefix("0x") else { continue };
@@ -2157,9 +2206,8 @@ fn render_arm64_body(
         if !statement.is_empty() { instructions.push((address, statement.into())); }
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
-    let name_seeds = parameter_name_seeds(signature, parameter_evidence, start);
-    let parameter_names: super::semantic::ParameterNameAnalysis = super::semantic::parameter_value_names(code, base, start, end, file_offset, data_ranges, &name_seeds);
-    let object_statements=object_layout.map(|layout|object_member_statements(code,base,start,end,file_offset,data_ranges,layout)).unwrap_or_default();
+    let parameter_names: super::semantic::ParameterNameAnalysis = super::semantic::parameter_value_names_with_resolved_indirects(code, base, start, end, file_offset, data_ranges, &name_seeds, &resolved_indirect_targets);
+    let object_statements=object_layout.map(|layout|object_member_statements(code,base,start,end,file_offset,data_ranges,layout,&resolved_indirect_targets)).unwrap_or_default();
     let no_aliases = BTreeMap::new();
     // Structured regions render their statements through
     // `render_linear_statement`, which keeps the raw registers; apply the same
@@ -2171,7 +2219,6 @@ fn render_arm64_body(
             Some(parameter_names.outputs.get(&address).unwrap_or(&no_aliases)));
         if stable_stack { localize_stack_slot_accesses(&substituted) } else { substituted }
     };
-    let switch_evidence=parse_switch_evidence(jump_tables);
     let mut labels = instructions.iter().filter_map(|(_,statement)| {
         let target = statement.strip_prefix("goto 0x")
             .or_else(|| statement.strip_prefix("if (").and_then(|rest| rest.split_once(") goto 0x").map(|(_,target)|target)))?;
@@ -2219,17 +2266,62 @@ fn render_arm64_body(
     let mut instruction_index = 0usize;
     while instruction_index < instructions.len() {
         let (address, statement) = &instructions[instruction_index];
-        if let Some(evidence)=switch_evidence.get(address).filter(|evidence|statement.starts_with("goto x")&&!evidence.cases.is_empty()){
-            let index_register=evidence.index_register?;
+        if let Some(evidence)=switch_evidence.get(address).filter(|evidence|statement.starts_with("goto x")&&!evidence.cases.is_empty() && evidence.complete){
+            let index_register=evidence.index_register.unwrap_or(evidence.branch_register);
             let bound=evidence.range.as_ref().map(|range|format!(" proven unsigned range: {range};")).unwrap_or_else(||" index range unresolved;".into());
             let normalization=evidence.normalization.as_ref().map(|value|format!(" normalized index: {value};")).unwrap_or_default();
-            out.push_str(&format!("    {address:#018x}: switch (x{index_register}) {{ /* bounded jump-table candidate;{bound}{normalization} case labels are table indices, source switch remains unproven */\n"));
+            let has_external = evidence.cases.iter().any(|&(_,_,target)| !instruction_addresses.contains(&target));
+            let external_note = if has_external { " some cases exit this recovered function;" } else { "" };
+            out.push_str(&format!("    {address:#018x}: switch (x{index_register}) {{ /* proven complete bounded jump table;{bound}{normalization}{external_note} case labels are table indices, source switch remains unproven */\n"));
+            let mut grouped: std::collections::BTreeMap<u64, Vec<(u64, Option<u64>)>> = std::collections::BTreeMap::new();
             for &(case,selector_bits,target) in &evidence.cases {
-                let destination=if instruction_addresses.contains(&target){format!("goto loc_{target:x};")}else{format!("goto {target:#x}; /* target outside this recovered function */")};
-                let selector=selector_bits.map(|bits|format!("; normalized selector bits {bits:#x}")).unwrap_or_default();
-                out.push_str(&format!("        case {case}: {destination} /* table target {target:#x}{selector} */\n"));
+                grouped.entry(target).or_default().push((case,selector_bits));
             }
-            out.push_str(&format!("        default: /* unresolved indirect target in x{}; no edge inferred */\n    }}\n",evidence.branch_register));
+            for (target, cases) in &grouped {
+                let destination=if instruction_addresses.contains(target){format!("goto loc_{target:x};")}else{format!("goto {target:#x}; /* target outside this recovered function */")};
+                for &(case, _) in cases {
+                    out.push_str(&format!("        case {case}:\n"));
+                }
+                let selector_info = if cases.iter().all(|(_, bits)| bits.is_none()) {
+                    String::new()
+                } else if cases.len() == 1 {
+                    cases[0].1.map(|bits| format!("; normalized selector bits {bits:#x}")).unwrap_or_default()
+                } else {
+                    let parts = cases.iter().map(|(case,bits)| match bits { Some(bits)=>format!("case {case}:{bits:#x}"), None=>format!("case {case}:?") }).collect::<Vec<_>>().join(", ");
+                    format!("; normalized selector bits [{parts}]")
+                };
+                out.push_str(&format!("            {destination} /* table target {target:#x}{selector_info} */\n"));
+            }
+            out.push_str(&format!("        default: /* proven complete enumeration; no additional in-range case */\n    }}\n"));
+            instruction_index+=1;
+            continue;
+        } else if let Some(evidence)=switch_evidence.get(address).filter(|evidence|statement.starts_with("goto x")&&!evidence.cases.is_empty()){
+            let index_register=evidence.index_register.unwrap_or(evidence.branch_register);
+            let bound=evidence.range.as_ref().map(|range|format!(" proven unsigned range: {range};")).unwrap_or_else(||" index range unresolved;".into());
+            let normalization=evidence.normalization.as_ref().map(|value|format!(" normalized index: {value};")).unwrap_or_default();
+            let has_external = evidence.cases.iter().any(|&(_,_,target)| !instruction_addresses.contains(&target));
+            let external_note = if has_external { " some cases exit this recovered function;" } else { "" };
+            out.push_str(&format!("    {address:#018x}: switch (x{index_register}) {{ /* bounded jump-table candidate, incomplete/uncapped;{bound}{normalization}{external_note} case labels are table indices, source switch remains unproven */\n"));
+            let mut grouped: std::collections::BTreeMap<u64, Vec<(u64, Option<u64>)>> = std::collections::BTreeMap::new();
+            for &(case,selector_bits,target) in &evidence.cases {
+                grouped.entry(target).or_default().push((case,selector_bits));
+            }
+            for (target, cases) in &grouped {
+                let destination=if instruction_addresses.contains(target){format!("goto loc_{target:x};")}else{format!("goto {target:#x}; /* target outside this recovered function */")};
+                for &(case, _) in cases {
+                    out.push_str(&format!("        case {case}:\n"));
+                }
+                let selector_info = if cases.iter().all(|(_, bits)| bits.is_none()) {
+                    String::new()
+                } else if cases.len() == 1 {
+                    cases[0].1.map(|bits| format!("; normalized selector bits {bits:#x}")).unwrap_or_default()
+                } else {
+                    let parts = cases.iter().map(|(case,bits)| match bits { Some(bits)=>format!("case {case}:{bits:#x}"), None=>format!("case {case}:?") }).collect::<Vec<_>>().join(", ");
+                    format!("; normalized selector bits [{parts}]")
+                };
+                out.push_str(&format!("            {destination} /* table target {target:#x}{selector_info} */\n"));
+            }
+            out.push_str(&format!("        default: /* unresolved/incomplete indirect target in x{}; no complete edge set inferred */\n    }}\n", evidence.branch_register));
             instruction_index+=1;
             continue;
         }
@@ -2514,7 +2606,7 @@ fn recover_internal(
         let evidence = parsed.get(&0x1000).expect("validated table candidate");
         assert_eq!(evidence.index_register, Some(8));
         assert_eq!(evidence.range.as_deref(), Some("CMP/B.HI x8<=3"));
-        assert_eq!(evidence.normalization.as_deref(), Some("w8=(w0-5)"));
+        assert_eq!(evidence.normalization.as_deref(), Some("w8=(w0-5) modulo 2^32"));
         assert_eq!(evidence.cases, vec![(0, Some(5), 0x1100)]);
 
         let branch = 0xd61f_01c0u32.to_le_bytes(); // br x14
@@ -2522,11 +2614,13 @@ fn recover_internal(
             &std::collections::BTreeMap::new(), &branch, 0x1000, 0, &[], "", &[], report,
             &std::collections::BTreeMap::new(), None).expect("rendered candidate switch");
         assert!(body.contains("proven unsigned range: CMP/B.HI x8<=3"), "{body}");
-        assert!(body.contains("normalized index: w8=(w0-5)"), "{body}");
+        assert!(body.contains("normalized index: w8=(w0-5) modulo 2^32"), "{body}");
         assert!(body.contains("normalized selector bits 0x5"), "{body}");
+        assert!(body.contains("bounded jump-table candidate, incomplete/uncapped"), "{body}");
         assert!(body.contains("source switch remains unproven"), "{body}");
-        assert!(body.contains("default: /* unresolved indirect target in x14; no edge inferred */"), "{body}");
-        assert!(!body.contains("default: goto x14"), "{body}");
+        assert!(body.contains("target outside this recovered function"), "{body}");
+        assert!(body.contains("no complete edge set inferred"), "{body}");
+        assert!(!body.contains("proven complete bounded jump table"), "{body}");
     }
 
     #[test]

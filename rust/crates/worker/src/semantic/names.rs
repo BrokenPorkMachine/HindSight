@@ -275,10 +275,11 @@ impl NameState {
         if let Some(value) =
             value.filter(|&value| seeds[value as usize].bits <= bytes.saturating_mul(8))
         {
-            if self.saved.len() < 64 {
+            if self.saved.len() < 64 || self.saved.contains_key(&(offset, bytes)) {
                 self.saved.insert((offset, bytes), value);
             } else {
-                self.saved.clear();
+                // Bounded: stop tracking additional frame identities rather than
+                // discarding existing proven parameter spills.
                 self.exhausted = true;
             }
         }
@@ -496,6 +497,30 @@ impl NameState {
                         self.read(source_index, source.bits.min(destination.bits), seeds);
                 }
             }
+            IrOperation::Extend {
+                destination,
+                source,
+                from,
+                ..
+            } => {
+                if let (Some(destination_index), Some(source_index)) = (gp(destination), gp(source)) {
+                    result.registers[destination_index] =
+                        self.read(source_index, from.min(source.bits).min(destination.bits), seeds);
+                }
+            }
+            IrOperation::Extract {
+                destination,
+                source,
+                lsb: 0,
+                width,
+                signed: false,
+                ..
+            } => {
+                if let (Some(destination_index), Some(source_index)) = (gp(destination), gp(source)) {
+                    result.registers[destination_index] =
+                        self.read(source_index, width.min(source.bits).min(destination.bits), seeds);
+                }
+            }
             IrOperation::ScalarFloatMove {
                 destination,
                 source,
@@ -709,6 +734,10 @@ impl NameState {
 
 /// Complete bounded function analysis. Unknown effects kill state; unresolved
 /// indirect successors and budget exhaustion withhold the whole substitution.
+/// `resolved_indirect_targets` maps indirect-branch instruction PCs to proven
+/// in-function successor PCs (e.g. bounded jump-table cases); when provided for
+/// an indirect branch, its known targets are used instead of bailing the whole
+/// analysis.
 #[allow(clippy::too_many_arguments)]
 pub fn parameter_value_names(
     code: &[u8],
@@ -719,6 +748,22 @@ pub fn parameter_value_names(
     data_ranges: &[(u64, u64, u16)],
     seeds: &[ParameterNameSeed],
 ) -> ParameterNameAnalysis {
+    parameter_value_names_with_resolved_indirects(code, base, start, end, file_offset, data_ranges, seeds, &BTreeMap::new())
+}
+
+/// Like [`parameter_value_names`] but with proven indirect-branch targets.
+#[allow(clippy::too_many_arguments)]
+pub fn parameter_value_names_with_resolved_indirects(
+    code: &[u8],
+    base: u64,
+    start: u64,
+    end: u64,
+    file_offset: u64,
+    data_ranges: &[(u64, u64, u16)],
+    seeds: &[ParameterNameSeed],
+    resolved_indirect_targets: &BTreeMap<u64, Vec<u64>>,
+) -> ParameterNameAnalysis {
+    const MAX_NAME_ANALYSIS_WORDS: u64 = 512;
     let fail = |reason| ParameterNameAnalysis {
         blocker: Some(reason),
         ..Default::default()
@@ -727,7 +772,7 @@ pub fn parameter_value_names(
         || end <= start
         || (start - base) % 4 != 0
         || (end - start) % 4 != 0
-        || (end - start) / 4 > MAX_WORDS_PER_FUNCTION as u64
+        || (end - start) / 4 > MAX_NAME_ANALYSIS_WORDS
     {
         return fail("function bounds or instruction budget");
     }
@@ -787,10 +832,13 @@ pub fn parameter_value_names(
         })
         .collect::<Vec<_>>();
     // Unknown successors may re-enter at any instruction with different state.
-    if operations
-        .iter()
-        .any(|operation| matches!(operation, IrOperation::IndirectBranch { .. }))
-    {
+    // A present entry means targets are proven complete (possibly all external
+    // exits, i.e. no in-function successors).
+    if operations.iter().enumerate().any(|(index, operation)| {
+        let pc = start + index as u64 * 4;
+        matches!(operation, IrOperation::IndirectBranch { .. })
+            && !resolved_indirect_targets.contains_key(&pc)
+    }) {
         return fail("unresolved indirect successors");
     }
     let mut successors = vec![Vec::new(); operations.len()];
@@ -808,6 +856,16 @@ pub fn parameter_value_names(
                 }
             }
             IrOperation::Return { .. } => {}
+            IrOperation::IndirectBranch { .. } => {
+                let pc = start + index as u64 * 4;
+                if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                    for &target in targets {
+                        if target >= start && target < end && (target - start) % 4 == 0 {
+                            successors[index].push(((target - start) / 4) as usize);
+                        }
+                    }
+                }
+            }
             _ if index + 1 < operations.len() => successors[index].push(index + 1),
             _ => {}
         }
@@ -822,19 +880,17 @@ pub fn parameter_value_names(
     let mut incoming = vec![None::<NameState>; operations.len()];
     incoming[0] = Some(NameState::entry(seeds));
     let mut queue = VecDeque::from([0usize]);
-    let mut steps = 0;
+    let mut steps = 0usize;
+    let step_budget = (operations.len() * 256).clamp(32768, 131072);
     while let Some(index) = queue.pop_front() {
         steps += 1;
-        if steps > 32768 {
+        if steps > step_budget {
             return fail("parameter identity fixed-point budget");
         }
         let outgoing = incoming[index]
             .as_ref()
             .unwrap()
             .transfer(operations[index], seeds);
-        if outgoing.exhausted {
-            return fail("frame identity slot budget");
-        }
         for &successor in &successors[index] {
             let next = incoming[successor]
                 .as_ref()
@@ -850,6 +906,14 @@ pub fn parameter_value_names(
     }
     let mut result = ParameterNameAnalysis::default();
     let mut note_bytes = 0usize;
+    if incoming.iter().flatten().any(|state| state.exhausted) {
+        result.notes.insert(
+            start,
+            "frame identity slot budget reached; additional spills may be untracked"
+                .into(),
+        );
+        note_bytes = result.notes[&start].len();
+    }
     for (index, state) in incoming.iter().enumerate() {
         let Some(state) = state else { continue };
         let pc = start + index as u64 * 4;
@@ -1035,6 +1099,17 @@ mod tests {
         let copied = state.transfer(copy(2, 1, 64), &seeds);
         assert_eq!(copied.display(&seeds)["w2"], "value1_copy_x2");
         assert!(!copied.display(&seeds).contains_key("x2"));
+        // Zero-extension of a 32-bit parameter identity preserves it.
+        let extended = state.transfer(
+            IrOperation::Extend {
+                destination: reg(2, 64),
+                source: reg(1, 32),
+                signed: false,
+                from: 32,
+            },
+            &seeds,
+        );
+        assert_eq!(extended.display(&seeds)["w2"], "value1_copy_x2");
         let narrow = state.transfer(
             IrOperation::ScalarFloatMove {
                 destination: 2,
@@ -1235,8 +1310,11 @@ mod tests {
             analyze(&[0xd61f0200], &seeds).blocker,
             Some("unresolved indirect successors")
         );
+        // 129 instructions is within the parameter-name analysis budget (512),
+        // so a simple NOP+... sequence is analyzable rather than blocked.
+        assert!(analyze(&vec![0xd503201f; 129], &seeds).blocker.is_none());
         assert_eq!(
-            analyze(&vec![0xd503201f; 129], &seeds).blocker,
+            analyze(&vec![0xd503201f; 513], &seeds).blocker,
             Some("function bounds or instruction budget")
         );
         let code = [0xd503201fu32, 0xd65f03c0]
@@ -1265,10 +1343,51 @@ mod tests {
             .map(|index| 0xf90003e0 | (index << 10))
             .chain([0xd65f03c0])
             .collect::<Vec<_>>();
-        assert_eq!(
-            analyze(&stores, &seeds).blocker,
-            Some("frame identity slot budget")
+        // Bounded: exceeding frame identity slots no longer discards existing
+        // proven parameter spills; analysis remains available.
+        assert!(analyze(&stores, &seeds).blocker.is_none());
+    }
+
+    #[test]
+    fn resolved_indirect_branch_targets_remove_successor_blocker() {
+        let seeds = [seed(0, 64, false)];
+        // mov x2, x0; br x1; ret
+        let words = [0xaa0003e2u32, 0xd61f0020, 0xd65f03c0];
+        let unresolved = analyze(&words, &seeds);
+        assert_eq!(unresolved.blocker, Some("unresolved indirect successors"));
+        let code = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let mut resolved = BTreeMap::new();
+        resolved.insert(0x1004u64, vec![0x1008u64]);
+        let analysis = parameter_value_names_with_resolved_indirects(
+            &code,
+            0x1000,
+            0x1000,
+            0x1000 + code.len() as u64,
+            0,
+            &[],
+            &seeds,
+            &resolved,
         );
+        assert!(analysis.blocker.is_none(), "{:?}", analysis.blocker);
+        assert_eq!(analysis.outputs[&0x1000]["x2"], "value0_copy_x2");
+        assert_eq!(analysis.inputs[&0x1008]["x2"], "value0_copy_x2");
+
+        // Proven complete indirect branch with no in-function successors (all
+        // external exits) does not block analysis and adds no re-entry edges.
+        let mut exit_resolved = BTreeMap::new();
+        exit_resolved.insert(0x1004u64, Vec::new());
+        let exit_analysis = parameter_value_names_with_resolved_indirects(
+            &code,
+            0x1000,
+            0x1000,
+            0x1000 + code.len() as u64,
+            0,
+            &[],
+            &seeds,
+            &exit_resolved,
+        );
+        assert!(exit_analysis.blocker.is_none(), "{:?}", exit_analysis.blocker);
+        assert_eq!(exit_analysis.outputs[&0x1000]["x2"], "value0_copy_x2");
     }
 
     #[test]

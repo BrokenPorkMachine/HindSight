@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 
 mod names;
-pub use names::{parameter_value_names, ParameterNameSeed, ParameterNameAnalysis};
+pub use names::{parameter_value_names, parameter_value_names_with_resolved_indirects, ParameterNameSeed, ParameterNameAnalysis};
 mod files;
 mod file_ssa;
 #[cfg(test)]
@@ -18,7 +18,7 @@ pub(crate) use artifact::{
 };
 
 const MAX_FUNCTIONS: usize = 8;
-const MAX_WORDS_PER_FUNCTION: usize = 128;
+const MAX_WORDS_PER_FUNCTION: usize = 256;
 const MAX_OUTPUT: usize = 48_000;
 
 #[derive(Clone, Debug)]
@@ -8475,6 +8475,14 @@ pub struct ObjectMemberAccess {
 /// them. Offset-slot identity is preserved instead of folding a runtime-slid
 /// ivar offset to its on-disk numeric value.
 pub fn object_member_accesses(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
+    object_member_accesses_with_resolved_indirects(code, base, start, end, file_offset, data_ranges, slots, &std::collections::BTreeMap::new())
+}
+
+/// Like [`object_member_accesses`] but with proven indirect-branch targets.
+/// `resolved_indirect_targets` maps indirect-branch PCs to proven in-function
+/// successor PCs (e.g. complete bounded jump-table cases). Unresolved indirect
+/// branches still withhold results to avoid unsound re-entry assumptions.
+pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
     use std::collections::{BTreeMap, VecDeque};
     let mut result = BTreeMap::new();
     if start<base || end<=start || (start-base)%4!=0 || (end-start)%4!=0 || (end-start)/4>MAX_WORDS_PER_FUNCTION as u64 { return result; }
@@ -8484,7 +8492,12 @@ pub fn object_member_accesses(code:&[u8], base:u64, start:u64, end:u64, file_off
         if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){IrOperation::TargetSpecific}
         else{lift_operation(decode(u32::from_le_bytes(word.try_into().unwrap()),pc),pc)}
     }).collect::<Vec<_>>();
-    if operations.iter().any(|operation|matches!(operation,IrOperation::IndirectBranch{..})){return result}
+    // A present entry means targets are proven complete (possibly all
+    // external exits, i.e. no in-function successors).
+    if operations.iter().enumerate().any(|(index,operation)|{
+        let pc=start+index as u64*4;
+        matches!(operation,IrOperation::IndirectBranch{..}) && !resolved_indirect_targets.contains_key(&pc)
+    }){return result}
     let mut states=vec![None::<ObjectState>;operations.len()];states[0]=Some(ObjectState::entry());
     let mut work=VecDeque::from([0usize]);let mut iterations=0;
     while let Some(index)=work.pop_front(){
@@ -8496,7 +8509,15 @@ pub fn object_member_accesses(code:&[u8], base:u64, start:u64, end:u64, file_off
                 if target>=start&&target<end&&(target-start)%4==0{successors.push(((target-start)/4) as usize)}
                 if matches!(operations[index],IrOperation::ConditionalBranch{..})&&index+1<operations.len(){successors.push(index+1)}
             }
-            IrOperation::Return{..}|IrOperation::IndirectBranch{..}=>{}
+            IrOperation::Return{..}=>{}
+            IrOperation::IndirectBranch{..}=>{
+                let pc=start+index as u64*4;
+                if let Some(targets)=resolved_indirect_targets.get(&pc){
+                    for &target in targets{
+                        if target>=start&&target<end&&(target-start)%4==0{successors.push(((target-start)/4) as usize)}
+                    }
+                }
+            }
             _ if index+1<operations.len()=>successors.push(index+1),
             _=>{}
         }
@@ -8574,7 +8595,30 @@ mod object_member_tests {
         let code=[0xf9400400u32,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         assert!(object_member_accesses(&code,0x1000,0x1000,0x1008,0,&[(0,4,1)],&std::collections::BTreeSet::new()).is_empty());
         assert!(accesses(&[0xf9400401,0xd61f0200,0xd65f03c0]).is_empty());
-        assert!(accesses(&vec![0xf9400401;129]).is_empty());
+        // 129 instructions is within the raised function budget (256).
+        assert!(!accesses(&vec![0xf9400401;129]).is_empty());
+        assert!(accesses(&vec![0xf9400401;257]).is_empty());
+    }
+
+    #[test]
+    fn resolved_indirect_branch_targets_allow_member_access_proofs() {
+        // mov x8,x0; br x9; ldr x1,[x8,#8]; ret
+        let words=[0xaa0003e8u32,0xd61f0120,0xf9400501,0xd65f03c0];
+        assert!(accesses(&words).is_empty(), "unresolved indirect branch must withhold proofs");
+        let code=words.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+        let resolved=std::collections::BTreeMap::from([(0x1004u64, vec![0x1008u64])]);
+        let proven=object_member_accesses_with_resolved_indirects(&code,0x1000,0x1000,0x1010,0,&[],&std::collections::BTreeSet::new(),&resolved);
+        assert_eq!(proven[&0x1008].offset,Some(8));
+        assert_eq!(proven[&0x1008].register,"x1");
+
+        // Proven complete indirect branch with all external exits: no in-function
+        // re-entry, so earlier accesses remain provable.
+        // ldr x1,[x0,#8]; br x9
+        let exit_words=[0xf9400401u32,0xd61f0120];
+        let exit_code=exit_words.iter().flat_map(|word|word.to_le_bytes()).collect::<Vec<_>>();
+        let exit_resolved=std::collections::BTreeMap::from([(0x1004u64, Vec::<u64>::new())]);
+        let exit_proven=object_member_accesses_with_resolved_indirects(&exit_code,0x1000,0x1000,0x1008,0,&[],&std::collections::BTreeSet::new(),&exit_resolved);
+        assert_eq!(exit_proven[&0x1000].offset,Some(8));
     }
 
     #[test]
@@ -8621,6 +8665,17 @@ pub fn render(
     file_offset: u64,
     starts: &[u64],
     data_ranges: &[(u64, u64, u16)],
+) -> String {
+    render_with_resolved_indirects(code, base, file_offset, starts, data_ranges, &std::collections::BTreeMap::new())
+}
+
+pub fn render_with_resolved_indirects(
+    code: &[u8],
+    base: u64,
+    file_offset: u64,
+    starts: &[u64],
+    data_ranges: &[(u64, u64, u16)],
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> String {
     if code.is_empty() || starts.is_empty() {
         return String::new();
@@ -8774,7 +8829,15 @@ pub fn render(
                         if let Some(fallthrough) = block_of(nt) { successors.push(fallthrough); }
                     }
                 }
-                IrOperation::IndirectBranch { .. } => {}
+                IrOperation::IndirectBranch { .. } => {
+                    if let Some(targets) = resolved_indirect_targets.get(&last_pc) {
+                        for &target in targets {
+                            if let Some(target) = block_of(target) {
+                                successors.push(target);
+                            }
+                        }
+                    }
+                }
                 IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. } => {
                     let nt = last_pc + 4;
                     if let Some(fallthrough) = block_of(nt) {

@@ -49,6 +49,17 @@ pub struct Input<'a> {
     /// establish ABI layout or instruction semantics by themselves.
     pub project_types: Vec<ProjectTypeDependency>,
     pub native: NativeEvidence,
+    /// Proven complete indirect-branch targets keyed by instruction PC.
+    /// Present entries mean enumeration is complete (possibly empty = all
+    /// external exits, no in-function successors).
+    pub resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>>,
+    /// Proven complete in-function case mappings for resolved indirect branches,
+    /// keyed by instruction PC: `(case_index, target)` in enumeration order.
+    /// Only populated for in-function targets of complete jump tables.
+    pub resolved_indirect_cases: std::collections::BTreeMap<u64, Vec<(u64, u64)>>,
+    /// Proven jump-table index/bound hints for resolved indirect branches,
+    /// keyed by instruction PC (e.g. index register, case-range, normalization).
+    pub resolved_indirect_index_info: std::collections::BTreeMap<u64, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

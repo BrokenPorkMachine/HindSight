@@ -2028,7 +2028,79 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
  call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
 
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native};
+ let parsed_sections = sections(&window);
+ let mut resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+ let mut resolved_indirect_cases: std::collections::BTreeMap<u64, Vec<(u64, u64)>> = std::collections::BTreeMap::new();
+ let mut resolved_indirect_index_info: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
+ let scan_end_jt = map.address + code.len() as u64;
+ for (index,chunk) in code.chunks_exact(4).enumerate() {
+  let pc = map.address + index as u64 * 4;
+  let word=u32::from_le_bytes(chunk.try_into().unwrap());
+  let Some(reg)=indirect_branch_reg(word) else { continue };
+  let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { continue };
+  // Parse completeness and targets from the jump-table report.
+  let mut has_unresolved=false;
+  let mut stopped_at_proven_bound=false;
+  let mut validated=0usize;
+  let mut case_targets: Vec<(u64,u64)> = Vec::new();
+  let mut index_register: Option<u8> = None;
+  let mut case_range: Option<String> = None;
+  let mut normalization: Option<String> = None;
+  for line in entries.lines() {
+   if let Some(reg)=line.split("table_index=x").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<u8>().ok()) {
+    index_register=Some(reg);
+    if let Some(range)=line.split("case-range=").nth(1).and_then(|s|s.split(" proven-entry-count=").next()) {
+     case_range=Some(range.to_owned());
+    }
+    if let Some(norm)=line.split("index-normalization=").nth(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+     normalization=Some(norm);
+    }
+   }
+   if line.trim_start().starts_with("case-index=") {
+    let trimmed = line.trim_start();
+    let case_index = trimmed.strip_prefix("case-index=").and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<u64>().ok());
+    let target = trimmed.split("target=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
+    if let (Some(case_index), Some(target)) = (case_index, target) {
+     case_targets.push((case_index, target));
+    }
+   }
+   if line.trim_start().starts_with("unresolved-entry") { has_unresolved=true; }
+   if line.trim_start().starts_with("enumeration stopped at proven unsigned index bound") { stopped_at_proven_bound=true; }
+   if line.starts_with("validated_entries=") {
+    validated=line.split("validated_entries=").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);
+   }
+  }
+  let complete=!has_unresolved && stopped_at_proven_bound && validated==case_targets.len() && !case_targets.is_empty();
+  if !complete { continue; }
+  let fn_start = function_for(&facts.starts, pc);
+  let fn_end = facts.starts.iter().copied().find(|&s| s > fn_start).unwrap_or(scan_end_jt);
+  let mut in_function_targets=Vec::new();
+  let mut in_function_cases=Vec::new();
+  let mut external_cases=0usize;
+  for (case_index,target) in case_targets.iter().copied() {
+   if target>=fn_start && target<fn_end && (target-fn_start)%4==0 {
+    in_function_targets.push(target);
+    in_function_cases.push((case_index,target));
+   } else { external_cases+=1; }
+  }
+  in_function_targets.sort_unstable(); in_function_targets.dedup();
+  in_function_cases.sort_unstable_by_key(|(case,target)|(*target,*case));
+  in_function_cases.dedup();
+  if in_function_cases.len()+external_cases>=case_targets.len() {
+   resolved_indirect_targets.insert(pc,in_function_targets);
+   if !in_function_cases.is_empty() {
+    resolved_indirect_cases.insert(pc,in_function_cases);
+   }
+   let mut parts = Vec::new();
+   if let Some(reg)=index_register { parts.push(format!("table_index=x{reg}")); }
+   if let Some(range)=case_range { parts.push(format!("case-range={range}")); }
+   if let Some(norm)=normalization { parts.push(format!("index-normalization={norm}")); }
+   if external_cases > 0 { parts.push(format!("external-cases={external_cases}")); }
+   if !parts.is_empty() { resolved_indirect_index_info.insert(pc, parts.join(" ")); }
+  }
+ }
+ // Rewind? not necessary; further reads use absolute offsets
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native,resolved_indirect_targets,resolved_indirect_cases,resolved_indirect_index_info};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)
@@ -2088,9 +2160,32 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  boundary_sources.retain(|address,_|starts.binary_search(address).is_ok());
  if boundary_sources.get(&map.address).map_or(true,std::collections::BTreeSet::is_empty){boundary_sources.entry(map.address).or_default().insert("section-start fallback");}
  let mut functions=String::new();
- let mut leaders=starts.clone();let mut edges:Vec<(u64,u64,&str)>=Vec::new();let mut calls:Vec<(u64,u64,u64)>=Vec::new();let mut ir=String::new();let mut dataflow=String::new();let mut ssa=String::new();let mut jump_tables=String::new();let mut decoded=0usize;let mut data_words=0usize;let mut versions=[0u32;32];let mut data_index=0usize;
+ let mut leaders=starts.clone();let mut edges:Vec<(u64,u64,&str)>=Vec::new();let mut calls:Vec<(u64,u64,u64)>=Vec::new();let mut ir=String::new();let mut dataflow=String::new();let mut ssa=String::new();let mut jump_tables=String::new();let mut semantic_resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();let mut decoded=0usize;let mut data_words=0usize;let mut versions=[0u32;32];let mut data_index=0usize;
  for (i,ch) in code.chunks_exact(4).enumerate(){let pc=map.address+(i as u64)*4;let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));}
-  if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if jump_tables.len()<60_000{if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end)?{jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  bounded indexed-table evidence\n{entries}\n"));}else{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}}
+  if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end)?{
+    // Collect proven complete in-function targets for semantic CFG/rendering.
+    let mut has_unresolved=false; let mut stopped_at_proven_bound=false; let mut validated=0usize; let mut cases:Vec<u64>=Vec::new();
+    for line in entries.lines() {
+      if line.trim_start().starts_with("case-index=") {
+        if let Some(target)=line.split("target=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok()) { cases.push(target); }
+      }
+      if line.trim_start().starts_with("unresolved-entry") { has_unresolved=true; }
+      if line.trim_start().starts_with("enumeration stopped at proven unsigned index bound") { stopped_at_proven_bound=true; }
+      if line.starts_with("validated_entries=") { validated=line.split("validated_entries=").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0); }
+    }
+    if !has_unresolved && stopped_at_proven_bound && validated==cases.len() && !cases.is_empty() {
+      let fn_start=function_for(&starts,pc);
+      let fn_end=starts.iter().copied().find(|&s| s>fn_start).unwrap_or(scan_end);
+      let mut in_function_targets=Vec::new(); let mut external_cases=0usize;
+      for target in cases.iter().copied() {
+        if target>=fn_start && target<fn_end && (target-fn_start)%4==0 { in_function_targets.push(target); } else { external_cases+=1; }
+      }
+      let in_function_case_count = cases.len().saturating_sub(external_cases);
+      in_function_targets.sort_unstable(); in_function_targets.dedup();
+      if in_function_case_count+external_cases>=cases.len() { semantic_resolved_indirect_targets.insert(pc,in_function_targets); }
+    }
+    if jump_tables.len()<60_000{jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  bounded indexed-table evidence\n{entries}\n"));}}
+   else{if jump_tables.len()<60_000{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}}
   if let Some((target,k,split))=branch_target(w,pc){if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&pc+4<scan_end{leaders.push(pc+4);edges.push((pc,pc+4,"fallthrough"));}}
   else if is_terminal(w)&&pc+4<scan_end{leaders.push(pc+4);}
  }
@@ -2168,7 +2263,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
  for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
- let semantic_preview=compose_semantic_preview(&super::semantic::render(&code,map.address,map.offset,&starts,&data_ranges),&reconstructed_pseudocode);
+ let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets),&reconstructed_pseudocode);
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;
  for (source,workspace,kind,text,priority) in [

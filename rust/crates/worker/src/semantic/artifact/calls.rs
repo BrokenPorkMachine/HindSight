@@ -443,13 +443,24 @@ impl CalleeSummary {
 /// * a trap — an undefined instruction or a system call that never returns.
 ///
 /// Anything else leaves the question unresolved: a reachable return, a
-/// conditional branch, an indirect branch, or an undecodable word all make
-/// the proof fail rather than guess.
+/// conditional branch, an unresolved indirect branch, or an undecodable word
+/// all make the proof fail rather than guess. Proven complete indirect-branch
+/// targets are followed when provided.
 pub(crate) fn prove_non_returning(
     code: &[u8],
     base: u64,
     target: u64,
     budget: usize,
+) -> bool {
+    prove_non_returning_with_resolved_indirects(code, base, target, budget, &std::collections::BTreeMap::new())
+}
+
+pub(crate) fn prove_non_returning_with_resolved_indirects(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> bool {
     let Some(offset) = target.checked_sub(base).map(|value| value as usize) else {
         return false;
@@ -472,7 +483,13 @@ pub(crate) fn prove_non_returning(
         let flow = match portable {
             super::super::IrOperation::Branch { target } => Flow::Direct(target),
             super::super::IrOperation::ConditionalBranch { .. } => Flow::Conditional,
-            super::super::IrOperation::IndirectBranch { .. } => Flow::Unknown,
+            super::super::IrOperation::IndirectBranch { .. } => {
+                if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                    Flow::ResolvedIndirect(targets.clone())
+                } else {
+                    Flow::Unknown
+                }
+            }
             super::super::IrOperation::Return { .. } => Flow::Returns,
             super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
             super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
@@ -486,35 +503,57 @@ pub(crate) fn prove_non_returning(
         return false;
     }
     // Walk the reachable instructions. Reaching a return, a conditional
-    // branch, or an indirect transfer means the callee may come back, so the
-    // proof fails.
+    // branch, or an unresolved indirect transfer means the callee may come
+    // back, so the proof fails.
     let mut visited: BTreeSet<u64> = BTreeSet::new();
     let mut pending: Vec<u64> = vec![window[0].0];
     while let Some(pc) = pending.pop() {
         if !visited.insert(pc) {
             continue;
         }
-        let Some((_, flow)) = window.iter().find(|(address, _)| *address == pc) else {
+        let Some((_, flow)) = window.iter().find(|(address, _)| *address == pc).cloned() else {
             // A branch outside the decoded window leaves the callee's fate
             // unknown.
             return false;
         };
         match flow {
             Flow::Returns | Flow::Conditional | Flow::Unknown => return false,
+            Flow::ResolvedIndirect(targets) => {
+                // Proven complete indirect dispatch: follow all in-function
+                // targets. An empty set means no in-function continuation, but
+                // control may exit to unanalyzed code, so non-returning is not
+                // provable from this window alone.
+                if targets.is_empty() {
+                    return false;
+                }
+                for target in targets {
+                    if target <= pc {
+                        // Treat a backward resolved target as a loop edge.
+                        // Conservatively require that all other paths also prove
+                        // non-returning; continue exploring this path's loop is
+                        // insufficient alone, so mark as non-returning only if
+                        // the whole reachable graph has no return path. Following
+                        // a backward edge is equivalent to reaching a visited/loop
+                        // state in this proof; do not enqueue it as progress.
+                        continue;
+                    }
+                    pending.push(target);
+                }
+            }
             Flow::Calls(target) => {
                 // The callee calls onward. It still returns to this frame
                 // unless that callee never returns.
-                if !prove_non_returning(code, base, *target, budget.min(64)) {
+                if !prove_non_returning_with_resolved_indirects(code, base, target, budget.min(64), resolved_indirect_targets) {
                     return false;
                 }
             }
             Flow::Direct(target) => {
                 // A backward branch is an infinite loop: control never
                 // reaches a return from that point.
-                if *target <= pc {
-                    return true;
+                if target <= pc {
+                    continue;
                 }
-                pending.push(*target);
+                pending.push(target);
             }
             Flow::FallsThrough => {
                 let next = pc + 4;
@@ -525,11 +564,15 @@ pub(crate) fn prove_non_returning(
             }
         }
     }
-    false
+    // Every reachable path in the decoded window either loops, reaches a
+    // proven non-returning call, or exits the analyzed region without a
+    // return. Exiting the window is unresolved, but exits were rejected above;
+    // an exhausted worklist with no return/unknown means no returning path.
+    true
 }
 
 /// The control-flow shape of one decoded callee instruction.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Flow {
     /// The instruction continues at the next address.
     FallsThrough,
@@ -539,6 +582,8 @@ enum Flow {
     Conditional,
     /// A branch or call whose target is not resolved.
     Unknown,
+    /// A proven complete indirect branch to zero or more in-function targets.
+    ResolvedIndirect(Vec<u64>),
     /// The callee returns to its caller.
     Returns,
     /// A call to a resolved callee.
@@ -586,6 +631,16 @@ pub(super) fn analyze_callee(
     base: u64,
     target: u64,
     budget: usize,
+) -> Option<CalleeSummary> {
+    analyze_callee_with_resolved_indirects(code, base, target, budget, &std::collections::BTreeMap::new())
+}
+
+pub(super) fn analyze_callee_with_resolved_indirects(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> Option<CalleeSummary> {
     let offset = target.checked_sub(base)? as usize;
     if offset % 4 != 0 {
@@ -682,7 +737,23 @@ pub(super) fn analyze_callee(
                 pending.push(pc + 4);
             }
             super::super::IrOperation::IndirectBranch { .. } => {
-                summary.opaque = true;
+                if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                    if targets.is_empty() {
+                        // Proven complete dispatch with no in-function
+                        // continuation: control leaves this analyzed window.
+                        summary.escaped = true;
+                    } else {
+                        for &target in targets {
+                            if target <= pc {
+                                summary.loops = true;
+                            } else {
+                                pending.push(target);
+                            }
+                        }
+                    }
+                } else {
+                    summary.opaque = true;
+                }
             }
             super::super::IrOperation::TargetSpecific => {
                 summary.opaque = true;

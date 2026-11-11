@@ -53,6 +53,38 @@ mod fp_status_tests {
         let discarded = model(lift_operation(decode(0x9e18_ec3f, 0x1000), 0x1000)).unwrap();
         assert_eq!(discarded.render(), "discard(fcvtzs(s1, fractional_bits=5)); /* FP status effects unresolved */");
     }
+
+    #[test]
+    fn resolved_indirect_goto_renders_targets_and_case_map() {
+        let dispatch = tree(
+            "register",
+            Some("uint64_t".into()),
+            object([("name", "x9".into()), ("bits", 64u64.into()), ("class", "general".into())]),
+            vec![],
+        );
+        let node = tree(
+            "indirect-goto",
+            None,
+            object([
+                ("dispatch", "x9".into()),
+                ("resolved_targets_complete", true.into()),
+                ("targets", array([address(0x1004), address(0x1008)])),
+                ("case_map", array([
+                    object([("case", 0u64.into()), ("target", address(0x1004))]),
+                    object([("case", 2u64.into()), ("target", address(0x1008))]),
+                ])),
+                ("index_info", "table_index=x8 case-range=CMP/B.HS x8<4".into()),
+            ]),
+            vec![dispatch],
+        );
+        let rendered = node.render();
+        assert!(rendered.contains("indirect_goto(x9"), "{rendered}");
+        assert!(rendered.contains("targets=[0x1004, 0x1008]") || rendered.contains("targets=[0x0000000000001004, 0x0000000000001008]"), "{rendered}");
+        assert!(rendered.contains("0x0->0x1004") || rendered.contains("0x0->0x0000000000001004"), "{rendered}");
+        assert!(rendered.contains("0x2->0x1008") || rendered.contains("0x2->0x0000000000001008"), "{rendered}");
+        assert!(rendered.contains("table_index=x8"), "{rendered}");
+        assert!(rendered.contains("resolved complete"), "{rendered}");
+    }
 }
 
 pub(crate) use constraints::{Constraint, ConstraintKind, Solution as ConstraintSolution};
@@ -1033,6 +1065,37 @@ impl Tree {
                 child(0),
                 text_attribute(self, "target").trim_start_matches("0x")
             ),
+            "indirect-goto" => {
+                let dispatch = child(0);
+                let targets = match self.attributes.get("targets") {
+                    Some(V::Array(items)) => items.iter().filter_map(|item| match item {
+                        V::String(v) => Some(v.clone()),
+                        V::Int(v) => Some(format!("{v:#x}")),
+                        _ => None,
+                    }).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let cases = match self.attributes.get("case_map") {
+                    Some(V::Array(items)) => items.iter().filter_map(|item| {
+                        let V::Object(fields) = item else { return None };
+                        let case = match fields.get("case") { Some(V::Int(v)) => Some(format!("{v:#x}")), Some(V::String(v)) => Some(v.clone()), _ => None }?;
+                        let target = match fields.get("target") { Some(V::String(v)) => Some(v.clone()), Some(V::Int(v)) => Some(format!("{v:#x}")), _ => None }?;
+                        Some(format!("{case}->{target}"))
+                    }).collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                let info = match self.attributes.get("index_info") {
+                    Some(V::String(v)) if !v.is_empty() => format!(" {v};"),
+                    _ => String::new(),
+                };
+                if targets.is_empty() {
+                    format!("indirect_goto({dispatch}); /* resolved complete, no in-function targets{info} */")
+                } else if cases.is_empty() {
+                    format!("indirect_goto({dispatch}, targets=[{}]); /* resolved complete{info} */", targets.join(", "))
+                } else {
+                    format!("indirect_goto({dispatch}, targets=[{}], cases=[{}]); /* resolved complete{info} */", targets.join(", "), cases.join(", "))
+                }
+            }
             "machine-return" => format!(
                 "return_to({}); /* source result ABI unresolved */",
                 child(0)
@@ -1109,6 +1172,9 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         call_prototypes: prototype_candidates,
         project_types,
         native,
+        resolved_indirect_targets,
+        resolved_indirect_cases,
+        resolved_indirect_index_info,
     } = input;
     if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
         return Err(io::Error::new(
@@ -1595,6 +1661,89 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             }
             _ => {}
         }
+        // A complete, proven jump-table resolves an indirect branch's in-function
+        // successors (or proves no in-function re-entry). Model it explicitly so
+        // the artifact does not report the dispatch as an unadapted effect.
+        // Single-target complete dispatch is equivalent to a direct goto for
+        // recovery purposes; multi-way and exit-only dispatch remain explicitly
+        // structured as indirect-goto and are source-gated separately.
+        if modeled.is_none() {
+            if let IrOperation::IndirectBranch { target } = portable {
+                if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                    if targets.len() == 1 {
+                        let case_map = resolved_indirect_cases.get(&pc).map(|cases| {
+                            array(cases.iter().filter(|(_, t)| targets.contains(t)).map(|(case_index, target_addr)| {
+                                object([
+                                    ("case", (*case_index).into()),
+                                    ("target", address(*target_addr)),
+                                ])
+                            }))
+                        });
+                        let mut attrs = object([
+                            ("target", address(targets[0])),
+                            ("dispatch", target.target().name().into()),
+                            ("resolved_indirect_single_target", true.into()),
+                        ]);
+                        if let V::Object(ref mut fields) = attrs {
+                            if let Some(case_map) = case_map {
+                                fields.insert("case_map".into(), case_map);
+                            }
+                            if let Some(info) = resolved_indirect_index_info.get(&pc) {
+                                fields.insert("index_info".into(), info.clone().into());
+                                if let Some(external) = info
+                                    .split_whitespace()
+                                    .find_map(|token| token.strip_prefix("external-cases="))
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    fields.insert("external_exit_cases".into(), external.into());
+                                }
+                            }
+                        }
+                        modeled = Some(tree(
+                            "goto",
+                            None,
+                            attrs,
+                            vec![reg(target)],
+                        ));
+                    } else {
+                        let case_map = resolved_indirect_cases.get(&pc).map(|cases| {
+                            array(cases.iter().filter(|(_, t)| targets.contains(t)).map(|(case_index, target_addr)| {
+                                object([
+                                    ("case", (*case_index).into()),
+                                    ("target", address(*target_addr)),
+                                ])
+                            }))
+                        });
+                        let mut attrs = object([
+                            ("dispatch", target.target().name().into()),
+                            ("resolved_targets_complete", true.into()),
+                            ("targets", array(targets.iter().map(|target| address(*target)))),
+                        ]);
+                        if let V::Object(ref mut fields) = attrs {
+                            if let Some(case_map) = case_map {
+                                fields.insert("case_map".into(), case_map);
+                            }
+                            if let Some(info) = resolved_indirect_index_info.get(&pc) {
+                                fields.insert("index_info".into(), info.clone().into());
+                                if let Some(external) = info
+                                    .split_whitespace()
+                                    .find_map(|token| token.strip_prefix("external-cases="))
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    fields.insert("external_exit_cases".into(), external.into());
+                                }
+                            }
+                        }
+                        modeled = Some(tree(
+                            "indirect-goto",
+                            None,
+                            attrs,
+                            vec![reg(target)],
+                        ));
+                    }
+                }
+            }
+        }
         shared_ir_count += u64::from(!matches!(portable, IrOperation::TargetSpecific));
         modeled_tree_count += u64::from(modeled.is_some());
         data_in_code_count += u64::from(data);
@@ -1654,6 +1803,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         )?;
         builder.edge(&decoded, &ir, "lifts-to")?;
         let mut reasons = Vec::new();
+        let resolved_indirect_branch_needs_source_structure = match portable {
+            IrOperation::IndirectBranch { .. } => resolved_indirect_targets
+                .get(&pc)
+                .is_some_and(|targets| targets.is_empty()),
+            _ => false,
+        };
         if modeled.is_none() {
             reasons.push(if data {
                 "data-in-code"
@@ -1676,7 +1831,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             IrOperation::DirectCall { target } if target == start => self_prototype.is_some(),
             IrOperation::DirectCall { target } => {
                 call_prototypes.contains_key(&target)
-                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee(code, base, target, CALLEE_WINDOW).is_some_and(|summary| {
+                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee_with_resolved_indirects(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets).is_some_and(|summary| {
                         let callee_saved_gprs = 0x7ff8_0000; // x19 through x30
                         let callee_saved_vectors = 0x0000_ff00; // low 64-bit v8 through v15
                         summary.complete
@@ -1739,6 +1894,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         if special_manyfp && modeled.is_some() {
             source_reasons.retain(|r| *r != "unadapted-or-unknown-effect" && *r != "FPCR/FPSR effects are not modeled");
         }
+        if resolved_indirect_branch_needs_source_structure {
+            // The dispatch successors are proven for CFG/effect purposes, but the
+            // recovered source form for multi-way or exit-only indirect control
+            // flow is not yet structured.
+            source_reasons.push("resolved-indirect-dispatch-not-yet-recovered-as-source");
+        }
         strict_blocked |= !reasons.is_empty();
         source_blocked |= !source_reasons.is_empty() && !source_supported_call;
         unsupported_reason_count += source_reasons.len() as u64;
@@ -1783,7 +1944,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         // of what the callee does. The observation is capped and explicitly
         // scoped; it never replaces the caller-visible ABI contract.
         let tree = match portable {
-            IrOperation::DirectCall { target } => match calls::analyze_callee(code, base, target, CALLEE_WINDOW) {
+            IrOperation::DirectCall { target } => match calls::analyze_callee_with_resolved_indirects(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets) {
                 Some(summary) => {
                     let mut tree = tree;
                     tree.attributes = calls::with_callee_payload(tree.attributes, &summary);
@@ -1801,7 +1962,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 let mut tree = tree;
                 tree.attributes = calls::with_non_returning_payload(
                     tree.attributes,
-                    calls::prove_non_returning(code, base, target, CALLEE_WINDOW),
+                    calls::prove_non_returning_with_resolved_indirects(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets),
                 );
                 tree
             }
@@ -1888,7 +2049,16 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         successors.push(index + 1);
                     }
                 }
-                IrOperation::Return { .. } | IrOperation::IndirectBranch { .. } => {}
+                IrOperation::Return { .. } => {}
+                IrOperation::IndirectBranch { .. } => {
+                    if let Some(targets) = resolved_indirect_targets.get(&instruction.address) {
+                        for &target in targets {
+                            if target >= start && target < high && (target - start) % 4 == 0 {
+                                successors.push(((target - start) / 4) as usize);
+                            }
+                        }
+                    }
+                }
                 _ if index + 1 < lifted.len() => successors.push(index + 1),
                 _ => {}
             }
@@ -1931,11 +2101,11 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("known_edges_reachable", block.reachable.into()),
                 (
                     "unknown_successors",
-                    matches!(
-                        models[index],
-                        IrOperation::IndirectBranch { .. } | IrOperation::TargetSpecific
-                    )
-                    .into(),
+                    V::Bool(
+                        (matches!(models[index], IrOperation::IndirectBranch { .. })
+                            && !resolved_indirect_targets.contains_key(&function.cfg.blocks[index].start))
+                            || matches!(models[index], IrOperation::TargetSpecific),
+                    ),
                 ),
                 (
                     "dominators",
