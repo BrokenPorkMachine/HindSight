@@ -1755,8 +1755,9 @@ fn is_noop_tree(tree: &Tree) -> bool {
 fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<(), ()> {
     match tree.kind {
         "no-op" | "flags-compare" | "flags-arithmetic" | "goto" => Ok(()),
-        "memory-store" => {
-            if tree.children.len() != 2 { return Err(()); }
+        "memory-store" | "memory-store-pair" | "memory-load-pair" => {
+            if tree.kind == "memory-store" && tree.children.len() != 2 { return Err(()); }
+            if tree.kind.ends_with("-pair") && tree.children.len() < 2 { return Err(()); }
             Ok(())
         }
         "assignment" => {
@@ -2015,6 +2016,12 @@ fn natural_loop_backedge(
                     // targeting the next sequential instruction in this loop body).
                     if state.external_stores.len() != before_stores {
                         return Err("loop goto unexpectedly produced a memory store".into());
+                    }
+                } else if matches!(tree.kind, "memory-store-pair" | "memory-load-pair") {
+                    // Bounded: frame (stack) pair operations; no external memory
+                    // effect is produced, so external store count must be unchanged.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop pair operation unexpectedly produced a memory store".into());
                     }
                 } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
                     stores.push(state.external_stores.pop().expect("store count checked"));
@@ -2408,6 +2415,12 @@ fn natural_loop(
                     // targeting the next sequential instruction in this loop body).
                     if state.external_stores.len() != before_stores {
                         return Err("loop goto unexpectedly produced a memory store".into());
+                    }
+                } else if matches!(tree.kind, "memory-store-pair" | "memory-load-pair") {
+                    // Bounded: frame (stack) pair operations; no external memory
+                    // effect is produced, so external store count must be unchanged.
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop pair operation unexpectedly produced a memory store".into());
                     }
                 } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
                     stores.push(state.external_stores.pop().expect("store count checked"));
