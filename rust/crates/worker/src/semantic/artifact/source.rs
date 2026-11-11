@@ -2660,6 +2660,38 @@ pub(super) fn recover_with_types(
                     if target_indices.is_empty() {
                         return Err("resolved indirect dispatch has no recoverable in-function continuation".into());
                     }
+                    // Bounded join: if every in-function dispatch target is an immediate
+                    // unconditional goto to the same continuation, the dispatch can be
+                    // treated as a single in-function continuation without forking paths.
+                    let common_goto = if target_indices.len() >= 2 {
+                        let mut common: Option<usize> = None;
+                        let mut all_same = true;
+                        for (_, idx) in &target_indices {
+                            let Some(tgt_tree) = trees.get(*idx) else { all_same = false; break; };
+                            if tgt_tree.kind != "goto" { all_same = false; break; }
+                            let tgt = number(tgt_tree, "target");
+                            let Some(delta) = tgt.checked_sub(start) else { all_same = false; break; };
+                            if delta % 4 != 0 { all_same = false; break; }
+                            let tgt_idx = (delta / 4) as usize;
+                            if tgt_idx >= trees.len() { all_same = false; break; }
+                            match common {
+                                None => common = Some(tgt_idx),
+                                Some(prev) if prev == tgt_idx => {}
+                                _ => { all_same = false; break; }
+                            }
+                        }
+                        if all_same { common } else { None }
+                    } else {
+                        None
+                    };
+                    if let Some(join_index) = common_goto {
+                        // Sound: complete dispatch with all in-function cases routed to
+                        // the same continuation; case selection does not affect which
+                        // in-function block is reached.
+                        let _ = read(&t.children[0], &mut state, &mut dag, pc)?;
+                        index = join_index;
+                        continue;
+                    }
                     if target_indices.len() > 16 {
                         return Err("resolved indirect dispatch has too many targets for bounded source recovery".into());
                     }
