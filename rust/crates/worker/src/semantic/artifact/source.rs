@@ -1768,12 +1768,20 @@ fn collect_loop_written(tree: &Tree, written: &mut BTreeSet<usize>) -> Result<()
             Ok(())
         }
         "sequence" => {
-            // Bounded: accept sequences only when they contain flag/no-op effects
-            // without assignments or memory stores, so loop-carried updates and
-            // memory effects remain explicitly tracked by top-level body items.
+            // Bounded: accept sequences containing flag/no-op effects and
+            // assignments. Assignments inside sequences are treated as
+            // loop-carried updates (same as top-level assignments). Memory
+            // stores are still rejected to keep external effects tracked by
+            // top-level body items.
             for child in &tree.children {
                 match child.kind {
                     "no-op" | "flags-compare" | "flags-arithmetic" => {}
+                    "assignment" => {
+                        if child.children.len() != 2 { return Err(()); }
+                        let (register, _) = register(&child.children[0]).map_err(|_| ())?;
+                        if register == 29 || register == 30 || register >= 31 { return Err(()); }
+                        written.insert(register);
+                    }
                     "sequence" => collect_loop_written(child, written)?,
                     _ => return Err(()),
                 }
