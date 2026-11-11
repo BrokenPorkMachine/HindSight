@@ -2933,8 +2933,10 @@ pub(super) fn recover_with_types(
                             }
                         };
                         // Expected proven forms include e.g. "CMP/B.HI x8<=3" and "CMP/B.HS x8<4".
-                        // Extract a conservative upper-bound condition on the index expression only
-                        // when the register/comparison token parses unambiguously.
+                        // Extract conservative bound conditions on the index expression only when
+                        // register/comparison tokens parse unambiguously. Combine multiple bounds
+                        // (e.g. lower and upper) if present.
+                        let mut conds = Vec::<String>::new();
                         for token in range.split_whitespace() {
                             if let Some(rest) = token.strip_prefix('x').or_else(|| token.strip_prefix('w')) {
                                 let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -2942,16 +2944,30 @@ pub(super) fn recover_with_types(
                                 let tail = &rest[digits..];
                                 if let Some(bound) = tail.strip_prefix("<=") {
                                     if let Some(value) = parse_bound_value(bound) {
-                                        return Some(format!("(($1) <= UINT64_C({value}))"));
+                                        conds.push(format!("(($1) <= UINT64_C({value}))"));
+                                    }
+                                } else if let Some(bound) = tail.strip_prefix(">=") {
+                                    if let Some(value) = parse_bound_value(bound) {
+                                        conds.push(format!("(($1) >= UINT64_C({value}))"));
                                     }
                                 } else if let Some(bound) = tail.strip_prefix('<') {
                                     if let Some(value) = parse_bound_value(bound) {
-                                        return Some(format!("(($1) < UINT64_C({value}))"));
+                                        conds.push(format!("(($1) < UINT64_C({value}))"));
+                                    }
+                                } else if let Some(bound) = tail.strip_prefix('>') {
+                                    if let Some(value) = parse_bound_value(bound) {
+                                        conds.push(format!("(($1) > UINT64_C({value}))"));
                                     }
                                 }
                             }
                         }
-                        None
+                        conds.sort();
+                        conds.dedup();
+                        match conds.len() {
+                            0 => None,
+                            1 => conds.pop(),
+                            _ => Some(format!("({})", conds.join(" && "))),
+                        }
                     };
                     let guard_for = |target: u64,
                                      case_labels: &std::collections::BTreeMap<u64, Vec<u64>>,
