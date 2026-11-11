@@ -1681,6 +1681,10 @@ fn natural_loop_backedge(
             // Bounded loop-test compare (flags-compare CMP reg,#imm) is allowed.
             continue;
         }
+        if tree.kind == "flags-compare" {
+            // Bounded: flag-setting compare in body (flags not loop-carried).
+            continue;
+        }
         if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
         if tree.kind == "memory-store" { continue; }
         let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
@@ -1787,10 +1791,17 @@ fn natural_loop_backedge(
                 state.registers[register] = Symbol::Value(destination, known);
             }
             None => {
-                if state.external_stores.len() != before_stores + 1 {
-                    return Err("loop memory store is not a single external write".into());
+                if tree.kind == "flags-compare" {
+                    // Bounded: compare/flag-setting instruction with no GPR write and no
+                    // memory store (flags not loop-carried in this recovery).
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop flags-compare unexpectedly produced a memory store".into());
+                    }
+                } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
+                    stores.push(state.external_stores.pop().expect("store count checked"));
+                } else {
+                    return Err("loop body contains unsupported non-assignment instruction".into());
                 }
-                stores.push(state.external_stores.pop().expect("store count checked"));
             }
         }
     }
@@ -1919,6 +1930,10 @@ fn natural_loop(
         if loop_cmp_index == Some(index) {
             continue;
         }
+        if tree.kind == "flags-compare" {
+            // Bounded: flag-setting compare in body (flags not loop-carried).
+            continue;
+        }
         if !matches!(tree.kind, "assignment" | "memory-store") || tree.children.len() != 2 { return Ok(None); }
         if tree.kind == "memory-store" { continue; }
         let (register, _) = match register(&tree.children[0]) { Ok(value) => value, Err(_) => return Ok(None) };
@@ -2025,10 +2040,15 @@ fn natural_loop(
                 state.registers[register] = Symbol::Value(destination, known);
             }
             None => {
-                if state.external_stores.len() != before_stores + 1 {
-                    return Err("loop memory store is not a single external write".into());
+                if tree.kind == "flags-compare" {
+                    if state.external_stores.len() != before_stores {
+                        return Err("loop flags-compare unexpectedly produced a memory store".into());
+                    }
+                } else if state.external_stores.len() == before_stores + 1 && tree.kind == "memory-store" {
+                    stores.push(state.external_stores.pop().expect("store count checked"));
+                } else {
+                    return Err("loop body contains unsupported non-assignment instruction".into());
                 }
-                stores.push(state.external_stores.pop().expect("store count checked"));
             }
         }
     }
