@@ -1898,7 +1898,12 @@ fn natural_loop_backedge(
         let before_frame = state.frame.clone();
         let before_loads = state.external_loads.len();
         let before_stores = state.external_stores.len();
-        statement(tree, &mut state, dag, pc, call_prototypes)?;
+        if tree.kind == "goto" {
+            // Bounded: redundant fallthrough-equivalent goto (validated as targeting
+            // the next sequential instruction in this loop body). No state effects.
+        } else {
+            statement(tree, &mut state, dag, pc, call_prototypes)?;
+        }
         // Flag changes within the body are allowed for register-based loop conditions;
         // flags are not modeled as loop-carried values in this bounded recovery.
         if state.frame != before_frame || state.external_loads.len() < before_loads {
@@ -2291,7 +2296,12 @@ fn natural_loop(
         let before_frame = state.frame.clone();
         let before_loads = state.external_loads.len();
         let before_stores = state.external_stores.len();
-        statement(tree, state, dag, pc, call_prototypes)?;
+        if tree.kind == "goto" {
+            // Bounded: redundant fallthrough-equivalent goto (validated as targeting
+            // the next sequential instruction in this loop body). No state effects.
+        } else {
+            statement(tree, state, dag, pc, call_prototypes)?;
+        }
         // Flag changes within the body are allowed for register-based loop conditions;
         // flags are not modeled as loop-carried values in this bounded recovery.
         if state.frame != before_frame || state.external_loads.len() < before_loads {
