@@ -1864,6 +1864,17 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 }
             }
         }
+        // Direct calls to known runtime helpers/stubs: make exact prototype
+        // contracts available for bounded source recovery when proven by name.
+        if let IrOperation::DirectCall { target } = portable {
+            if let Some(name) = callee_name {
+                if let Some(sig) = known_runtime_call_proto(name) {
+                    if let Some(proto) = crate::signatures::source_signature_with_project_types(name, &sig, &project_types) {
+                        call_prototypes.entry(target).or_insert(proto);
+                    }
+                }
+            }
+        }
         if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) {
             let contract_resolved = match portable {
                 IrOperation::DirectCall { target } => call_prototypes.contains_key(&target),
