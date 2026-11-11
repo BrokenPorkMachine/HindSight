@@ -1071,15 +1071,27 @@ fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],bas
  let count=section_entries.min(32).min(proven_bound.map_or(usize::MAX,|bound|bound.entries));
  if count==0{return Ok(None)}
  let index_provenance = if index_register != 31 {
-  // Check nearby loads for index register origin
+  // Check nearby instructions for index register origin
   let mut origin = String::new();
   for li in (load_index.saturating_sub(4)..load_index).rev() {
     let w = le32(&code[li*4..li*4+4]);
     let rn = (w >> 5) & 31;
-    // LDR (indexed) pattern: 0xF8xxxxxx with Rn in bits 20-16
+    // LDR (indexed/unsigned immediate) pattern: 0xF8xxxxxx with Rn in bits 20-16
     if (w & 0xfc00_0000) == 0xf800_0000 {
       let imm = ((w & 0x03ff_0000) >> 10) as i64;
       if rn == index_register { origin = format!("LDRw-indexed@{imm:#x}"); break; }
+    }
+    if let Some((rd, src, imm)) = arm64_add_immediate(w) {
+      if rd == index_register {
+        origin = format!("ADD-imm x{src}+{imm:#x}");
+        break;
+      }
+    }
+    if let Some((rd, src, imm, _is_32)) = arm64_sub_immediate(w) {
+      if rd == index_register {
+        origin = format!("SUB-imm x{src}-{imm:#x}");
+        break;
+      }
     }
   }
   if origin.is_empty() { "unknown".into() } else { origin }
