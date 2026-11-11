@@ -379,6 +379,7 @@ struct VGAdaptiveThreePane<Leading: View, Center: View, Trailing: View>: View {
     let trailing: Trailing
 
     @State private var selectedAuxiliary: VGAdaptivePane = .navigator
+    @State private var compactDockPresented = false
 
     init(
         leadingTitle: String = "Navigator",
@@ -467,11 +468,26 @@ struct VGAdaptiveThreePane<Leading: View, Center: View, Trailing: View>: View {
         if availableAuxiliaryPanes.isEmpty {
             center
         } else {
-            VSplitView {
+            // At the supported 900×680 window minimum, stacking the navigator
+            // under the canvas made dense workspaces effectively unusable.
+            // Keep the full canvas, while retaining one-click access to both
+            // auxiliary panes. This is intentionally NOT a persistent split.
+            ZStack(alignment: .topTrailing) {
                 center
-                    .frame(minHeight: 320)
-                auxiliaryDock
-                    .frame(minHeight: 190, idealHeight: 260, maxHeight: 390)
+                Button {
+                    compactDockPresented.toggle()
+                } label: {
+                    Label("Panels", systemImage: "sidebar.right")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel("Open \\(leadingTitle) and \\(trailingTitle) panels")
+                .help("Open auxiliary panels without reducing the main canvas")
+                .padding(10)
+                .popover(isPresented: $compactDockPresented, arrowEdge: .top) {
+                    auxiliaryDock
+                        .frame(width: 340, height: 380)
+                }
             }
         }
     }
