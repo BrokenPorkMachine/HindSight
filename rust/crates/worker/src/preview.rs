@@ -1001,7 +1001,11 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
   let branch=le32(code.get(branch_index*4..branch_index*4+4)?);
   if branch&0xff00_0010!=0x5400_0000{continue}
   let (kind,operator,extra)=match branch&15{8=> ("CMP/B.HI","<=",1u64),2=>("CMP/B.HS","<",0),_=>continue};
-  let Some(cmp_index)=branch_index.checked_sub(1)else{continue};
+  // Allow a single NOP between CMP and conditional branch.
+  let mut cmp_index = branch_index.checked_sub(1)?;
+  if le32(code.get(cmp_index*4..cmp_index*4+4)?) == 0xd503_201f {
+   cmp_index = cmp_index.checked_sub(1)?;
+  }
   let cmp=le32(code.get(cmp_index*4..cmp_index*4+4)?);
   if cmp&0x7f00_001f!=0x7100_001f || ((cmp>>5)&31)!=index_register || (cmp>>31==0)!=index_is_32 {continue}
   let imm=u64::from((cmp>>10)&0xfff) << (if cmp&(1<<22)!=0{12}else{0});
@@ -1023,8 +1027,12 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
   if !address_only{continue}
   let count=imm.checked_add(extra)?;
   if count==0 {continue}
-  let normalization=cmp_index.checked_sub(1).and_then(|sub_index|{
-   let sub=le32(code.get(sub_index*4..sub_index*4+4)?);
+  let normalization=cmp_index.checked_sub(1).and_then(|mut sub_index|{
+   let mut sub=le32(code.get(sub_index*4..sub_index*4+4)?);
+   if sub==0xd503_201f {
+    sub_index=sub_index.checked_sub(1)?;
+    sub=le32(code.get(sub_index*4..sub_index*4+4)?);
+   }
    let (destination,source,bias,is_32)=arm64_sub_immediate(sub)?;
    (destination==index_register&&source!=31&&destination!=31&&is_32==index_is_32)
     .then_some((source,bias,is_32))
