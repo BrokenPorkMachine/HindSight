@@ -4,6 +4,8 @@ import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 from openstep import load_project
 R=pathlib.Path(__file__).resolve().parents[1]
+# Current version/schema/platform docs must agree with actual release sources.
+subprocess.run([sys.executable, str(R / 'scripts/check-product-consistency.py')], check=True)
 def source_files(pattern):
     for root, dirs, files in os.walk(R):
         dirs[:] = [name for name in dirs if name not in {'.git', 'build', 'iphemeral-latest'}]
