@@ -3559,9 +3559,6 @@ pub(super) fn recover_with_types(
                                 .and_then(|s| s.parse::<usize>().ok())
                         }))
                         .unwrap_or(0);
-                    if external_exit_cases > 0 {
-                        return Err("resolved indirect dispatch has proven external exits; continuation not recoverable as in-function source".into());
-                    }
                     let table_index = index_info.and_then(|info| {
                         info.split_whitespace()
                             .find_map(|token| token.strip_prefix("table_index="))
@@ -3595,6 +3592,9 @@ pub(super) fn recover_with_types(
                     }
                     if target_indices.is_empty() {
                         return Err("resolved indirect dispatch has no recoverable in-function continuation".into());
+                    }
+                    if external_exit_cases > 0 {
+                        return Err("resolved indirect dispatch has proven external exits; continuation not recoverable as in-function source".into());
                     }
                     // Bounded join: if every in-function dispatch target reaches the same
                     // continuation through a chain of unconditional gotos (skipping no-ops),
