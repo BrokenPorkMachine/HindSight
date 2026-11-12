@@ -8721,6 +8721,19 @@ pub fn render_with_resolved_indirects(
     data_ranges: &[(u64, u64, u16)],
     resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> String {
+    render_with_resolved_indirects_and_pcs(code, base, file_offset, starts, data_ranges, resolved_indirect_targets, &[], &[])
+}
+
+pub fn render_with_resolved_indirects_and_pcs(
+    code: &[u8],
+    base: u64,
+    file_offset: u64,
+    starts: &[u64],
+    data_ranges: &[(u64, u64, u16)],
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    _insn_pcs: &[u64],
+    _insn_sizes: &[u32],
+) -> String {
     if code.is_empty() || starts.is_empty() {
         return String::new();
     }
