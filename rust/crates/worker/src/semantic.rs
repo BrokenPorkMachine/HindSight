@@ -8742,7 +8742,8 @@ pub fn render_with_resolved_indirects_and_pcs(
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
-        if start < base || start >= function_end || (start - base) % 4 != 0 {
+        let fixed_width_4 = _insn_pcs.is_empty() || starts.len() != 1;
+        if start < base || start >= function_end || (fixed_width_4 && (start - base) % 4 != 0) {
             continue;
         }
         out.push_str(&format!(
@@ -8752,13 +8753,30 @@ pub fn render_with_resolved_indirects_and_pcs(
         let high =
             ((function_end - base) as usize).min(low.saturating_add(MAX_WORDS_PER_FUNCTION * 4));
 
-        // Collect instruction PCs in range.
-        let mut pcs: Vec<u64> = Vec::new();
-        let mut i = 0usize;
-        while low + (i + 1) * 4 <= high {
-            pcs.push(start + (i as u64) * 4);
-            i += 1;
-        }
+        // Collect instruction PCs in range. Prefer provided PC/size maps for single-function rendering.
+        let (pcs, insn_size_map): (Vec<u64>, std::collections::BTreeMap<u64, u32>) = if !fixed_width_4 {
+            let mut map = std::collections::BTreeMap::new();
+            let mut list = Vec::new();
+            for (i, &pc) in _insn_pcs.iter().enumerate() {
+                if pc < start || pc >= function_end || list.len() >= MAX_WORDS_PER_FUNCTION { continue; }
+                let sz = *_insn_sizes.get(i).unwrap_or(&4);
+                list.push(pc);
+                map.insert(pc, sz);
+            }
+            if list.is_empty() {
+                let mut pcs_v: Vec<u64> = Vec::new();
+                let mut j = 0usize;
+                while low + (j + 1) * 4 <= high { pcs_v.push(start + (j as u64) * 4); j += 1; }
+                (pcs_v, std::collections::BTreeMap::new())
+            } else {
+                (list, map)
+            }
+        } else {
+            let mut pcs_v: Vec<u64> = Vec::new();
+            let mut j = 0usize;
+            while low + (j + 1) * 4 <= high { pcs_v.push(start + (j as u64) * 4); j += 1; }
+            (pcs_v, std::collections::BTreeMap::new())
+        };
         if pcs.is_empty() {
             out.push_str("}\n");
             if out.len() >= MAX_OUTPUT {
@@ -8767,16 +8785,22 @@ pub fn render_with_resolved_indirects_and_pcs(
             continue;
         }
 
+        let size_of = |pc: u64| -> u32 { insn_size_map.get(&pc).copied().unwrap_or(4) };
         let word_at = |pc: u64| -> u32 {
             let off = (pc - base) as usize;
-            // ARM64 fixed-width decode path; variable-length streams need size-aware decode.
+            // ARM64 fixed-width decode path for 4-byte instructions; other sizes not yet decoded.
+            if off + 4 > code.len() { return 0; }
             u32::from_le_bytes(code[off..off + 4].try_into().unwrap())
         };
         let span_end = |pc: u64| -> u64 {
             if let Some(i) = pcs.iter().position(|&p| p == pc) {
-                pcs.get(i + 1).copied().unwrap_or(pc + 4)
+                if insn_size_map.contains_key(&pc) {
+                    pc.saturating_add(size_of(pc) as u64)
+                } else {
+                    pcs.get(i + 1).copied().unwrap_or(pc.saturating_add(size_of(pc) as u64))
+                }
             } else {
-                pc + 4
+                pc.saturating_add(size_of(pc) as u64)
             }
         };
         let is_data = |pc: u64| -> bool {
@@ -8790,13 +8814,25 @@ pub fn render_with_resolved_indirects_and_pcs(
         // CFG analysis and value propagation consume this representation rather
         // than decoding or parsing rendered assembly text again.
         let lifted_instructions: Vec<LiftedInstruction> = pcs.iter().map(|&pc| {
-            let operation = decode(word_at(pc), pc);
-            LiftedInstruction {
-                address: pc,
-                word: word_at(pc),
-                portable: lift_operation(operation, pc),
-                operation,
-                data: is_data(pc),
+            let sz = size_of(pc);
+            let data = is_data(pc);
+            if sz == 4 {
+                let operation = decode(word_at(pc), pc);
+                LiftedInstruction {
+                    address: pc,
+                    word: word_at(pc),
+                    portable: lift_operation(operation, pc),
+                    operation,
+                    data,
+                }
+            } else {
+                LiftedInstruction {
+                    address: pc,
+                    word: 0,
+                    portable: IrOperation::TargetSpecific,
+                    operation: Operation::Opaque,
+                    data,
+                }
             }
         }).collect();
 
