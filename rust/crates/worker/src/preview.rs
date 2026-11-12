@@ -929,31 +929,33 @@ fn caller_callee_constraints(
 /// width the definition proves, not a source type: a caller observes the
 /// machine representation, the callee side states the declared type, and the
 /// constraint solver keeps the two as separate claims.
-/// ARM64-specific 4-byte instruction scan; non-ARM64 returns no observations conservatively.
+/// ARM64-specific instruction scan; non-ARM64 returns no observations conservatively.
 fn observed_argument_widths(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,architecture:&str)->std::collections::BTreeMap<u64,std::collections::BTreeMap<u8,u8>>{
  let mut out=std::collections::BTreeMap::new();
  if !super::semantic::is_arm64_arch(architecture) { return out; }
+ let insn=super::semantic::ARM64_INSN_BYTES as usize;
+ let insn_u64=super::semantic::ARM64_INSN_BYTES;
  for &(_,site,_) in calls.iter().take(2000){
   let lo=site.saturating_sub(base) as usize;
   let function_start=starts.iter().copied().rfind(|start|*start<=site).unwrap_or(base);
-  let start=lo.saturating_sub(16*4).max(function_start.saturating_sub(base) as usize);
+  let start=lo.saturating_sub(16*insn).max(function_start.saturating_sub(base) as usize);
   let mut defs:[Option<u64>;8]=[None;8];
   if lo<=code.len(){
    let scan_hi=lo.min(code.len());
    let mut si=0usize;
-   while start+si+4<=scan_hi{
-    let w=le32(&code[start+si..start+si+4]);
-    if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];si+=4;continue}
+   while start+si+insn<=scan_hi{
+    let w=le32(&code[start+si..start+si+insn]);
+    if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];si+=insn;continue}
     if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some(base+start as u64+si as u64);}}
-    si+=4;
+    si+=insn;
    }
   }
   let mut observed=std::collections::BTreeMap::new();
   for register in 0..8u8{
    if let Some(pc)=defs[register as usize]{
     let offset=pc.saturating_sub(base) as usize;
-    if offset+4<=code.len(){
-     let width=definition_value_width(le32(&code[offset..offset+4]));
+    if offset+insn<=code.len(){
+     let width=definition_value_width(le32(&code[offset..offset+insn]));
      observed.insert(register,width);
     }
    }
