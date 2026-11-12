@@ -733,57 +733,85 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch(
     resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
     architecture: &str,
 ) -> Option<CalleeSummary> {
+    analyze_callee_with_resolved_indirects_and_arch_and_pcs(code, base, target, budget, resolved_indirect_targets, architecture, &[], &[])
+}
+
+/// Architecture- and PC/size-map-aware callee summary.
+/// When instruction PCs/sizes are provided they drive fallthrough/next-PC computation; decode/lift
+/// remains ARM64 4-byte only (non-ARM64 or non-4-byte instructions bail conservatively).
+pub(super) fn analyze_callee_with_resolved_indirects_and_arch_and_pcs(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    architecture: &str,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+) -> Option<CalleeSummary> {
     let arch = architecture.to_ascii_lowercase();
     let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
     if !is_arm64 {
         // x86_64 and other architectures: variable-length decode/flow/SSA-effect analysis not yet implemented.
         return None;
     }
-    let offset = target.checked_sub(base)? as usize;
-    if offset % 4 != 0 {
-        return None;
+    let pc_info: Option<std::collections::BTreeMap<u64, (usize, u32)>> = if !insn_pcs.is_empty() {
+        let mut map = std::collections::BTreeMap::new();
+        for (i, &pc) in insn_pcs.iter().enumerate() {
+            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(i).unwrap_or(&4) } else { 4 };
+            map.insert(pc, (i, sz));
+        }
+        Some(map)
+    } else { None };
+    let next_pc_of = |pc: u64| -> Option<u64> {
+        if let Some(ref map) = pc_info {
+            if let Some(&(i, sz)) = map.get(&pc) {
+                if insn_pcs.get(i + 1).copied().is_some() { return insn_pcs.get(i + 1).copied(); }
+                return Some(pc.saturating_add(sz as u64));
+            }
+            None
+        } else {
+            Some(pc + 4)
+        }
+    };
+    // A target outside the decodable region has no window at all.
+    if let Some(ref map) = pc_info {
+        if !map.contains_key(&target) { return None; }
+    } else {
+        let offset = target.checked_sub(base)? as usize;
+        if offset % 4 != 0 { return None; }
+        code.get(offset..offset + 4)?;
     }
-    // A target outside the captured image has no window at all, so there is
-    // nothing to observe.
-    code.get(offset..offset + 4)?;
     let mut summary = CalleeSummary::default();
     let mut visited: BTreeSet<u64> = BTreeSet::new();
-    let mut pending: Vec<u64> = vec![base + offset as u64];
+    let mut pending: Vec<u64> = vec![target];
     while let Some(pc) = pending.pop() {
         if summary.instructions >= budget {
-            // Reachable work remains, so the observation is capped rather
-            // than complete.
             summary.truncated = true;
             break;
         }
         if !visited.insert(pc) {
-            // An instruction already walked needs no second visit. Reaching a
-            // join from a second predecessor is not a loop; only a backward
-            // edge is, and the branch arms below record it.
             continue;
         }
-        let Some(word) = read_word(code, base, pc) else {
-            // Control left the decodable region of the captured image, so the
-            // callee's behaviour past this point is unknown.
-            summary.escaped = true;
+        let sz = if let Some(ref map) = pc_info {
+            match map.get(&pc) { Some(&(_, sz)) => sz, None => { summary.escaped = true; continue; } }
+        } else { 4 };
+        if sz != 4 {
+            summary.opaque = true;
             continue;
-        };
+        }
+        let Some(off) = pc.checked_sub(base).and_then(|v| usize::try_from(v).ok()) else { summary.escaped = true; continue; };
+        let Some(bytes) = code.get(off..off + 4) else { summary.escaped = true; continue; };
+        let word = u32::from_le_bytes(bytes.try_into().ok()?);
         let operation = super::super::decode(word, pc);
         let portable = super::super::lift_operation(operation, pc);
-        // The flag and vector files are not part of the shared GPR effects, so
-        // they are recovered from the same per-instruction evidence the SSA
-        // preview publishes rather than re-derived from rendered text.
         let lifted = super::super::LiftedInstruction { address: pc, word, operation, portable, data: false };
         let flag_effects = super::super::files::instruction_flag_effects(&lifted);
         let vector_effects = super::super::files::instruction_vector_effects(&lifted);
         summary.instructions += 1;
-        if flag_effects.defines != 0 {
-            summary.defines_flags = true;
-        }
+        if flag_effects.defines != 0 { summary.defines_flags = true; }
         for range in &vector_effects.writes {
-            if range.register < 32 {
-                summary.defined_vectors |= 1u32 << range.register;
-            }
+            if range.register < 32 { summary.defined_vectors |= 1u32 << range.register; }
         }
         let effects = portable.gpr_effects();
         summary.defined_gprs |= effects.definitions;
@@ -792,75 +820,44 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch(
             | super::super::IrOperation::LoadPair { .. }
             | super::super::IrOperation::SimdLoad { .. }
             | super::super::IrOperation::SimdPairLoad { .. }
-            | super::super::IrOperation::AtomicLoad { .. } => {
-                summary.reads_memory = true;
-            }
+            | super::super::IrOperation::AtomicLoad { .. } => { summary.reads_memory = true; }
             super::super::IrOperation::Store { .. }
             | super::super::IrOperation::StorePair { .. }
             | super::super::IrOperation::SimdStore { .. }
             | super::super::IrOperation::SimdPairStore { .. }
-            | super::super::IrOperation::AtomicStore { .. } => {
-                summary.writes_memory = true;
-            }
-            super::super::IrOperation::Return { .. } => {
-                // A return ends the frame. A tail transfer leaves it for
-                // another function; either way control does not fall through.
-                summary.returns = true;
-            }
+            | super::super::IrOperation::AtomicStore { .. } => { summary.writes_memory = true; }
+            super::super::IrOperation::Return { .. } => { summary.returns = true; }
             super::super::IrOperation::DirectCall { .. }
             | super::super::IrOperation::IndirectCall { .. } => {
-                // A call is not an unmodeled instruction: it has a known
-                // caller-visible contract even when its target is unknown.
                 summary.calls = true;
-                pending.push(pc + 4);
+                if let Some(next) = next_pc_of(pc) { pending.push(next); } else { summary.escaped = true; }
             }
             super::super::IrOperation::Branch { target } => {
-                if target <= pc {
-                    // A backward branch is an infinite loop: control never
-                    // reaches a return from this path.
-                    summary.loops = true;
-                } else {
-                    pending.push(target);
-                }
+                if target <= pc { summary.loops = true; } else { pending.push(target); }
             }
             super::super::IrOperation::ConditionalBranch { target, .. } => {
-                // Both arms are reachable, so both are walked. A backward
-                // target is the loop edge; the fallthrough is the exit.
-                if target <= pc {
-                    summary.loops = true;
-                } else {
-                    pending.push(target);
-                }
-                pending.push(pc + 4);
+                if target <= pc { summary.loops = true; } else { pending.push(target); }
+                if let Some(next) = next_pc_of(pc) { pending.push(next); } else { summary.escaped = true; }
             }
             super::super::IrOperation::IndirectBranch { .. } => {
                 if let Some(targets) = resolved_indirect_targets.get(&pc) {
                     if targets.is_empty() {
-                        // Proven complete dispatch with no in-function
-                        // continuation: control leaves this analyzed window.
                         summary.escaped = true;
                     } else {
                         for &target in targets {
-                            if target <= pc {
-                                summary.loops = true;
-                            } else {
-                                pending.push(target);
-                            }
+                            if target <= pc { summary.loops = true; } else { pending.push(target); }
                         }
                     }
                 } else {
                     summary.opaque = true;
                 }
             }
-            super::super::IrOperation::TargetSpecific => {
-                summary.opaque = true;
+            super::super::IrOperation::TargetSpecific => { summary.opaque = true; }
+            _ => {
+                if let Some(next) = next_pc_of(pc) { pending.push(next); } else { summary.escaped = true; }
             }
-            _ => pending.push(pc + 4),
         }
     }
-    // The walk is complete exactly when nothing was left unobserved: the
-    // budget held, control stayed in the decodable region, and every
-    // instruction decoded to a modeled operation.
     summary.complete = !summary.truncated && !summary.escaped && !summary.opaque;
     Some(summary)
 }
