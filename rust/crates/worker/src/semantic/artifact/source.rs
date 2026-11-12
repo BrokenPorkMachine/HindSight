@@ -4097,16 +4097,16 @@ fn semit_span_end(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, tre
     if let Some(i) = index_of_pc(pc, insn_pcs, start, trees_len) {
         if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
         if insn_pcs.is_empty() { return start + (i as u64 + 1) * 4; }
-        return insn_pcs.get(i + 1).copied().unwrap_or(pc + 4);
+        return insn_pcs.get(i + 1).copied().unwrap_or_else(|| pc.saturating_add(4));
     }
     if !insn_pcs.is_empty() {
         // Variable-length stream: try to resolve size/index for pc even if index_of_pc used different count semantics.
         if let Ok(i) = insn_pcs.binary_search(&pc) {
             if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
-            return insn_pcs.get(i + 1).copied().unwrap_or(pc + 4);
+            return insn_pcs.get(i + 1).copied().unwrap_or_else(|| pc.saturating_add(4));
         }
     }
-    pc + 4
+    pc.saturating_add(4)
 }
 
 impl Recovery {

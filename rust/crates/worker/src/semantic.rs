@@ -8830,8 +8830,11 @@ pub fn render_with_resolved_indirects_and_pcs(
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
-        let fixed_width_4 = _insn_pcs.is_empty() || starts.len() != 1;
-        if start < base || start >= function_end || (fixed_width_4 && (start - base) % 4 != 0) {
+        if start < base || start >= function_end {
+            continue;
+        }
+        let use_pc_map = !_insn_pcs.is_empty();
+        if !use_pc_map && (start - base) % 4 != 0 {
             continue;
         }
         out.push_str(&format!(
@@ -8841,21 +8844,26 @@ pub fn render_with_resolved_indirects_and_pcs(
         let high =
             ((function_end - base) as usize).min(low.saturating_add(MAX_WORDS_PER_FUNCTION * 4));
 
-        // Collect instruction PCs in range. Prefer provided PC/size maps for single-function rendering.
-        let (pcs, insn_size_map): (Vec<u64>, std::collections::BTreeMap<u64, u32>) = if !fixed_width_4 {
+        // Collect instruction PCs in range. Prefer provided PC/size maps when available.
+        let (pcs, insn_size_map): (Vec<u64>, std::collections::BTreeMap<u64, u32>) = if use_pc_map {
             let mut map = std::collections::BTreeMap::new();
             let mut list = Vec::new();
             for (i, &pc) in _insn_pcs.iter().enumerate() {
                 if pc < start || pc >= function_end || list.len() >= MAX_WORDS_PER_FUNCTION { continue; }
-                let sz = *_insn_sizes.get(i).unwrap_or(&4);
+                let sz = if _insn_sizes.len() == _insn_pcs.len() { *_insn_sizes.get(i).unwrap_or(&4) } else { 4 };
                 list.push(pc);
                 map.insert(pc, sz);
             }
             if list.is_empty() {
-                let mut pcs_v: Vec<u64> = Vec::new();
-                let mut j = 0usize;
-                while low + (j + 1) * 4 <= high { pcs_v.push(start + (j as u64) * 4); j += 1; }
-                (pcs_v, std::collections::BTreeMap::new())
+                // Fallback: ARM64 fixed-width synthesis when provided map has no entries in range.
+                if (start - base) % 4 != 0 {
+                    (Vec::new(), std::collections::BTreeMap::new())
+                } else {
+                    let mut pcs_v: Vec<u64> = Vec::new();
+                    let mut j = 0usize;
+                    while low + (j + 1) * 4 <= high { pcs_v.push(start + (j as u64) * 4); j += 1; }
+                    (pcs_v, std::collections::BTreeMap::new())
+                }
             } else {
                 (list, map)
             }
