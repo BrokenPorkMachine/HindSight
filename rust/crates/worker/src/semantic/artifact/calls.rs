@@ -462,6 +462,26 @@ pub(crate) fn prove_non_returning_with_resolved_indirects(
     budget: usize,
     resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> bool {
+    prove_non_returning_with_resolved_indirects_and_arch(code, base, target, budget, resolved_indirect_targets, "arm64")
+}
+
+/// Architecture-aware non-return proof. Currently only ARM64 fixed-width 4-byte decode is supported;
+/// other architectures bail conservatively (no unsound claim).
+pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    architecture: &str,
+) -> bool {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 {
+        // x86_64 and other architectures: variable-length decode/flow analysis not yet implemented.
+        // Bail conservatively - no unsound non-returning claim.
+        return false;
+    }
     let Some(offset) = target.checked_sub(base).map(|value| value as usize) else {
         return false;
     };
@@ -552,7 +572,7 @@ pub(crate) fn prove_non_returning_with_resolved_indirects(
             Flow::Calls(target) => {
                 // The callee calls onward. It still returns to this frame
                 // unless that callee never returns.
-                if !prove_non_returning_with_resolved_indirects(code, base, target, budget.min(64), resolved_indirect_targets) {
+                if !prove_non_returning_with_resolved_indirects_and_arch(code, base, target, budget.min(64), resolved_indirect_targets, "arm64") {
                     return false;
                 }
             }
@@ -651,6 +671,25 @@ pub(super) fn analyze_callee_with_resolved_indirects(
     budget: usize,
     resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> Option<CalleeSummary> {
+    analyze_callee_with_resolved_indirects_and_arch(code, base, target, budget, resolved_indirect_targets, "arm64")
+}
+
+/// Architecture-aware callee summary. Currently only ARM64 fixed-width 4-byte decode is supported;
+/// other architectures return `None` conservatively (no unsound observation).
+pub(super) fn analyze_callee_with_resolved_indirects_and_arch(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    architecture: &str,
+) -> Option<CalleeSummary> {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 {
+        // x86_64 and other architectures: variable-length decode/flow/SSA-effect analysis not yet implemented.
+        return None;
+    }
     let offset = target.checked_sub(base)? as usize;
     if offset % 4 != 0 {
         return None;
