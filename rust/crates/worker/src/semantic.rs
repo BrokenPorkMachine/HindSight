@@ -8229,12 +8229,6 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
 
 pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(usize, u8, u64, String)> {
     let Some(pcs) = call_scan_window_pcs(base, function_start, callsite, insn_pcs) else { return Vec::new(); };
-    if insn_pcs.is_empty() {
-        // preserve existing fixed-width bounds behavior
-        if (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return Vec::new(); }
-        let Some(call_index) = usize::try_from(callsite - base).ok().map(|offset| offset / 4) else { return Vec::new() };
-        if call_index.saturating_mul(4) > code.len() { return Vec::new(); }
-    }
     let mut flow = Flow::new();
     let mut stack_aliases = std::collections::BTreeMap::<u8, Vec<u64>>::new();
     let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
