@@ -2166,9 +2166,9 @@ fn render_arm64_body(
     let hi = usize::try_from(end.min(base.saturating_add(code.len() as u64)) - base).ok()?;
     if lo >= hi || hi > code.len() { return None; }
     let body_code = &code[lo..hi];
-    let stable_stack=super::semantic::stack_pointer_is_stable(code,base,start,end);
     let insn_pcs: Vec<u64> = (0..(body_code.len() / 4)).map(|i| start + i as u64 * 4).collect();
     let insn_sizes: Vec<u32> = vec![4; insn_pcs.len()];
+    let stable_stack=super::semantic::stack_pointer_is_stable_with_pcs(code,base,start,end,&insn_pcs,&insn_sizes);
     let pc_set: std::collections::BTreeSet<u64> = insn_pcs.iter().copied().collect();
     let switch_evidence=parse_switch_evidence(jump_tables);
     let name_seeds = parameter_name_seeds(signature, parameter_evidence, start);

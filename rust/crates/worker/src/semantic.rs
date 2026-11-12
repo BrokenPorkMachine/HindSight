@@ -8678,16 +8678,43 @@ mod object_member_tests {
 /// recovered function is understood well enough to prove that SP is unchanged.
 /// ARM64 fixed-width decode path; variable-length streams require architecture-aware decode.
 pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, function_end: u64) -> bool {
+    stack_pointer_is_stable_with_pcs(code, base, function_start, function_end, &[], &[])
+}
+
+pub fn stack_pointer_is_stable_with_pcs(
+    code: &[u8],
+    base: u64,
+    function_start: u64,
+    function_end: u64,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+) -> bool {
     if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
-    let Some(start) = usize::try_from(function_start - base).ok() else { return false };
-    let Some(end) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
-    if start > end || end > code.len() { return false }
-    // Fixed-width 4-byte ARM64 instruction stream (default). Variable-length streams need pc/size maps.
-    if (function_start - base) % 4 != 0 || (end - start) % 4 != 0 { return false }
-    let count = (end - start) / 4;
-    for index in 0..count {
-        let pc = function_start.saturating_add(index as u64 * 4);
-        let off = pc.saturating_sub(base) as usize;
+    let fixed_width = insn_pcs.is_empty();
+    if fixed_width {
+        let Some(start) = usize::try_from(function_start - base).ok() else { return false };
+        let Some(end) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
+        if start > end || end > code.len() { return false }
+        if (function_start - base) % 4 != 0 || (end - start) % 4 != 0 { return false }
+    }
+    let pcs: Vec<u64> = if fixed_width {
+        let Some(start) = usize::try_from(function_start - base).ok() else { return false };
+        let Some(end) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
+        (0..((end - start) / 4)).map(|i| function_start.saturating_add(i as u64 * 4)).collect()
+    } else {
+        insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < function_end).collect()
+    };
+    if pcs.is_empty() { return false; }
+    let sizes: Vec<u32> = if !fixed_width && insn_sizes.len() == insn_pcs.len() {
+        // map by original index
+        insn_pcs.iter().zip(insn_sizes.iter()).filter(|(&pc, _)| pc >= function_start && pc < function_end).map(|(_, &sz)| sz).collect()
+    } else {
+        vec![4; pcs.len()]
+    };
+    for (i, &pc) in pcs.iter().enumerate() {
+        let sz = *sizes.get(i).unwrap_or(&4);
+        if sz != 4 { return false; } // conservative: unknown variable-length instruction may affect SP
+        let off = match pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) { Some(o) => o, None => return false };
         if off + 4 > code.len() { return false; }
         let operation = decode(u32::from_le_bytes(code[off..off + 4].try_into().unwrap()), pc);
         let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
