@@ -8722,8 +8722,8 @@ fn call_scan_window_pcs(
 /// entire result because its target could skip definitions; calls and opaque
 /// operations clear state so caller side effects are not carried forward.
 /// ARM64 4-byte decode path for now; non-4-byte instruction sizes are treated conservatively.
-fn known_call_flow_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Option<Flow> {
-    known_call_flow_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+fn known_call_flow_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Option<Flow> {
+    known_call_flow_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, architecture)
 }
 
 fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Option<Flow> {
@@ -8769,15 +8769,15 @@ fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64
 }
 
 fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Option<Flow> {
-    known_call_flow_with_pcs(code, base, function_start, callsite, &[], &[])
+    known_call_flow_with_pcs(code, base, function_start, callsite, &[], &[], "arm64")
 }
 
 pub fn known_call_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u64, String)> {
-    known_call_argument_values_with_pcs(code, base, function_start, callsite, &[], &[])
+    known_call_argument_values_with_pcs(code, base, function_start, callsite, &[], &[], "arm64")
 }
 
-pub fn known_call_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(u8, u64, String)> {
-    known_call_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+pub fn known_call_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(u8, u64, String)> {
+    known_call_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, architecture)
 }
 
 pub fn known_call_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(u8, u64, String)> {
@@ -8792,11 +8792,11 @@ pub fn known_call_argument_values_with_arch_and_pcs(code: &[u8], base: u64, func
 /// vector flow state. The callee prototype determines whether those bits are
 /// interpreted as `float` or `double` by the caller.
 pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u128, String)> {
-    known_call_float_argument_values_with_pcs(code, base, function_start, callsite, &[], &[])
+    known_call_float_argument_values_with_pcs(code, base, function_start, callsite, &[], &[], "arm64")
 }
 
-pub fn known_call_float_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(u8, u128, String)> {
-    known_call_float_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+pub fn known_call_float_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(u8, u128, String)> {
+    known_call_float_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, architecture)
 }
 
 pub fn known_call_float_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(u8, u128, String)> {
@@ -8810,11 +8810,11 @@ pub fn known_call_float_argument_values_with_arch_and_pcs(code: &[u8], base: u64
 /// operation, or SP update discards earlier stores. The caller supplies the
 /// formal width; a wider store proves its low bytes at the same offset.
 pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(usize, u8, u64, String)> {
-    known_call_stack_argument_values_with_pcs(code, base, function_start, callsite, &[], &[])
+    known_call_stack_argument_values_with_pcs(code, base, function_start, callsite, &[], &[], "arm64")
 }
 
-pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(usize, u8, u64, String)> {
-    known_call_stack_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(usize, u8, u64, String)> {
+    known_call_stack_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, architecture)
 }
 
 pub fn known_call_stack_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(usize, u8, u64, String)> {
@@ -9136,11 +9136,11 @@ pub fn object_member_accesses(code:&[u8], base:u64, start:u64, end:u64, file_off
 /// successor PCs (e.g. complete bounded jump-table cases). Unresolved indirect
 /// branches still withhold results to avoid unsound re-entry assumptions.
 pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
-    object_member_accesses_with_resolved_indirects_and_pcs(code, base, start, end, file_offset, data_ranges, slots, resolved_indirect_targets, &[], &[])
+    object_member_accesses_with_resolved_indirects_and_pcs(code, base, start, end, file_offset, data_ranges, slots, resolved_indirect_targets, &[], &[], "arm64")
 }
 
-pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>, insn_pcs: &[u64], insn_sizes: &[u32]) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
-    object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code, base, start, end, file_offset, data_ranges, slots, resolved_indirect_targets, insn_pcs, insn_sizes, "arm64")
+pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
+    object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code, base, start, end, file_offset, data_ranges, slots, resolved_indirect_targets, insn_pcs, insn_sizes, architecture)
 }
 
 pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
@@ -9349,7 +9349,7 @@ mod object_member_tests {
 /// Uses architecture-gated decode/lift and PC/size maps when available; explicit ARM64 fixed-width
 /// fallback is used only for ARM64 without a PC map. Unsupported/undecodable/opaque effects are conservative.
 pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, function_end: u64) -> bool {
-    stack_pointer_is_stable_with_pcs(code, base, function_start, function_end, &[], &[])
+    stack_pointer_is_stable_with_pcs(code, base, function_start, function_end, &[], &[], "arm64")
 }
 
 pub fn stack_pointer_is_stable_with_pcs(
@@ -9359,8 +9359,9 @@ pub fn stack_pointer_is_stable_with_pcs(
     function_end: u64,
     insn_pcs: &[u64],
     insn_sizes: &[u32],
+    architecture: &str,
 ) -> bool {
-    stack_pointer_is_stable_with_arch_and_pcs(code, base, function_start, function_end, insn_pcs, insn_sizes, "arm64")
+    stack_pointer_is_stable_with_arch_and_pcs(code, base, function_start, function_end, insn_pcs, insn_sizes, architecture)
 }
 
 pub fn stack_pointer_is_stable_with_arch_and_pcs(
