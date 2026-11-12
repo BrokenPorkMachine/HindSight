@@ -2318,10 +2318,21 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(8,"mapping","Source hash verified; reading bounded Mach-O layout and metadata.");
  let window=read_window(&mut file,size)?;let map=mapping(&window,size).map_err(|e|io::Error::new(io::ErrorKind::InvalidData,e))?;let relocations=parse_text_relocations(&mut file,&window,size)?;let metadata=platform_metadata(&window);let runtime_records=runtime_records(&mut file,&window,size)?;let swift_types=swift_nominal_types(&mut file,&window,size)?;let runtime_graph=runtime_reference_graph(&mut file,&window,size)?;let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  analysis_progress(20,"metadata","Mach-O, symbol, runtime, relocation, and data-in-code metadata recovered.");
+ let analyze_arch = {
+  let cputype = if window.len() >= 8 { le32(&window[4..8]) } else { 0x0100_000c };
+  let cpusubtype = if window.len() >= 12 { le32(&window[8..12]) } else { 0 };
+  match cputype {
+   0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e".to_string() } else { "arm64".to_string() },
+   0x0100_0007 => "x86_64".to_string(),
+   0x0000_000c => "arm".to_string(),
+   0x0000_0007 => "i386".to_string(),
+   _ => "unknown".to_string(),
+  }
+ };
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
  let mut fb_facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
- if !map.encrypted { merge_runtime_objc(&mut fb_facts,path,&window,map.address,scan_end,"arm64"); }
+ if !map.encrypted { merge_runtime_objc(&mut fb_facts,path,&window,map.address,scan_end,&analyze_arch); }
  let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=fb_facts;
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
  for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
@@ -2334,6 +2345,9 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  if boundary_sources.get(&map.address).map_or(true,std::collections::BTreeSet::is_empty){boundary_sources.entry(map.address).or_default().insert("section-start fallback");}
  let mut functions=String::new();
  let mut leaders=starts.clone();let mut edges:Vec<(u64,u64,&str)>=Vec::new();let mut calls:Vec<(u64,u64,u64)>=Vec::new();let mut ir=String::new();let mut dataflow=String::new();let mut ssa=String::new();let mut jump_tables=String::new();let mut semantic_resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();let mut decoded=0usize;let mut data_words=0usize;let mut versions=[0u32;32];let mut data_index=0usize;
+
+ let analyze_is_arm64 = super::semantic::is_arm64_arch(&analyze_arch);
+ if analyze_is_arm64 {
  let mut i=0usize;while i*4+4<=code.len(){let ch=&code[i*4..i*4+4];let pc=map.address+(i as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];i+=1;continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));i+=1;}
   if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end)?{
     // Collect proven complete in-function targets for semantic CFG/rendering.
@@ -2362,9 +2376,18 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
   if let Some((target,k,split))=branch_target(w,pc){if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&pc+4<scan_end{leaders.push(pc+4);edges.push((pc,pc+4,"fallthrough"));}}
   else if is_terminal(w)&&pc+4<scan_end{leaders.push(pc+4);}
  }
+ } else if !code.is_empty() {
+  // Non-ARM64 instruction decode/CFG/dataflow/SSA/jump-table analysis in this path is not yet implemented.
+  // Keep metadata/linkage/runtime outputs and avoid fabricating ARM64-decoded instruction semantics.
+  ir.push_str("/* ARM64-specific instruction decode/IR scan skipped for non-ARM64 architecture; variable-length decode/lift/render/CFG/analysis not yet implemented in this path. */\n");
+  dataflow.push_str("/* ARM64-specific dataflow scan skipped for non-ARM64 architecture. */\n");
+  ssa.push_str("/* ARM64-specific SSA scan skipped for non-ARM64 architecture. */\n");
+  jump_tables.push_str("/* ARM64-specific jump-table scan skipped for non-ARM64 architecture. */\n");
+ }
+
  let stack_slots=stack_slot_candidates(&ir);if dataflow.len().saturating_add(stack_slots.len())<60_000{dataflow.push('\n');dataflow.push_str(&stack_slots);}
  analysis_progress(44,"decode","Instruction scan completed; constructing bounded control-flow topology.");
- leaders.retain(|x|*x>=map.address&&*x<scan_end&&(*x-map.address)%4==0);leaders.sort_unstable();leaders.dedup();let block_count=leaders.len();let cfg_limit=leaders.len().min(4000);let mut cfg_edges=vec![Vec::<(u64,u64,&str)>::new();cfg_limit];for &(from,to,k) in &edges{if let Some(block)=block_index(&leaders,from){if block<cfg_limit&&cfg_edges[block].len()<16{cfg_edges[block].push((from,to,k));}}}let mut cfg=String::new();for n in 0..cfg_limit{let start=leaders[n];let end=leaders.get(n+1).copied().unwrap_or(scan_end);cfg.push_str(&format!("block B{n:04} {start:#018x}..{end:#018x}\n"));for &(from,to,k) in &cfg_edges[n]{cfg.push_str(&format!("    {k:<11} {from:#018x} -> {to:#018x}\n"));}if cfg.len()>60_000{break}}
+ leaders.retain(|x|*x>=map.address&&*x<scan_end&&(if analyze_is_arm64 { (*x-map.address)%4==0 } else { true }));leaders.sort_unstable();leaders.dedup();let block_count=leaders.len();let cfg_limit=leaders.len().min(4000);let mut cfg_edges=vec![Vec::<(u64,u64,&str)>::new();cfg_limit];for &(from,to,k) in &edges{if let Some(block)=block_index(&leaders,from){if block<cfg_limit&&cfg_edges[block].len()<16{cfg_edges[block].push((from,to,k));}}}let mut cfg=String::new();for n in 0..cfg_limit{let start=leaders[n];let end=leaders.get(n+1).copied().unwrap_or(scan_end);cfg.push_str(&format!("block B{n:04} {start:#018x}..{end:#018x}\n"));for &(from,to,k) in &cfg_edges[n]{cfg.push_str(&format!("    {k:<11} {from:#018x} -> {to:#018x}\n"));}if cfg.len()>60_000{break}}
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");
  let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end);
  analysis_progress(61,"structure","Bounded dominator, phi, and SSA structure completed.");
@@ -2430,17 +2453,6 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address);
  let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
  let prototype_conflicts=super::semantic::artifact::constraint_report(&solved);
- let analyze_arch = {
-  let cputype = if window.len() >= 8 { le32(&window[4..8]) } else { 0x0100_000c };
-  let cpusubtype = if window.len() >= 12 { le32(&window[8..12]) } else { 0 };
-  match cputype {
-   0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e".to_string() } else { "arm64".to_string() },
-   0x0100_0007 => "x86_64".to_string(),
-   0x0000_000c => "arm".to_string(),
-   0x0000_0007 => "i386".to_string(),
-   _ => "arm64".to_string(),
-  }
- };
  let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes,&objc_layouts,&analyze_arch);
  let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_records=format!("{objc_classes}\n{objc_protocols}");let conformance_signatures=super::signatures::objc_conformance_declarations(&conformance_records);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
  if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
