@@ -8377,18 +8377,38 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
             None
         }
         M::Movzx => {
-            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Register { return None; }
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register { return None; }
             let dst = x86_to_ir_register(instr.op0_register())?;
-            let src = x86_to_ir_register(instr.op1_register())?;
-            let from = match src.bits { 8 | 16 | 32 => src.bits, _ => return None };
-            Some(IrOperation::Extend { destination: dst, source: src, signed: false, from })
+            match instr.op1_kind() {
+                OpKind::Register => {
+                    let src = x86_to_ir_register(instr.op1_register())?;
+                    let from = match src.bits { 8 | 16 | 32 => src.bits, _ => return None };
+                    Some(IrOperation::Extend { destination: dst, source: src, signed: false, from })
+                }
+                OpKind::Memory => {
+                    let (address, bytes) = x86_memory_address(instr, 1)?;
+                    // Zero-extend load from memory into destination register.
+                    Some(IrOperation::Load { destination: dst, address, bytes, signed: false, writeback: None })
+                }
+                _ => None,
+            }
         }
         M::Movsx | M::Movsxd => {
-            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Register { return None; }
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register { return None; }
             let dst = x86_to_ir_register(instr.op0_register())?;
-            let src = x86_to_ir_register(instr.op1_register())?;
-            let from = match src.bits { 8 | 16 | 32 => src.bits, _ => return None };
-            Some(IrOperation::Extend { destination: dst, source: src, signed: true, from })
+            match instr.op1_kind() {
+                OpKind::Register => {
+                    let src = x86_to_ir_register(instr.op1_register())?;
+                    let from = match src.bits { 8 | 16 | 32 => src.bits, _ => return None };
+                    Some(IrOperation::Extend { destination: dst, source: src, signed: true, from })
+                }
+                OpKind::Memory => {
+                    let (address, bytes) = x86_memory_address(instr, 1)?;
+                    // Sign-extend load from memory into destination register.
+                    Some(IrOperation::Load { destination: dst, address, bytes, signed: true, writeback: None })
+                }
+                _ => None,
+            }
         }
         M::Add | M::Sub | M::And | M::Or | M::Xor => {
             if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register { return None; }
