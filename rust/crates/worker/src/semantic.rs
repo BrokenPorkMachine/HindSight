@@ -8567,6 +8567,18 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
                 else_op: IrSelectElse::None,
             })
         }
+        M::Cdqe => {
+            // RAX = sign_extend(EAX) (64-bit destination, from 32 bits).
+            let dst = IrRegister { class: IrRegisterClass::General, index: 0, bits: 64 };
+            let src = IrRegister { class: IrRegisterClass::General, index: 0, bits: 32 };
+            Some(IrOperation::Extend { destination: dst, source: src, signed: true, from: 32 })
+        }
+        M::Cdq | M::Cqo | M::Cwd | M::Cbw | M::Cwde => {
+            // Multi-register sign-extension forms (CDQ/CQO/CWD) or other single-dest forms not
+            // yet modeled precisely in shared IR; keep conservative.
+            // (CWDE/CBW are single-dest in effect but require careful width/register modeling; conservative for now.)
+            None
+        }
         _ => None,
     }
 }
