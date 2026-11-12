@@ -1152,38 +1152,67 @@ impl Tree {
 
 
 fn apc_at(index: usize, insn_pcs: &[u64], start: u64) -> u64 {
-    insn_pcs.get(index).copied().unwrap_or(start + index as u64 * 4)
+    apc_at_with_arch(index, insn_pcs, start, "arm64")
+}
+fn apc_at_with_arch(index: usize, insn_pcs: &[u64], start: u64, architecture: &str) -> u64 {
+    if let Some(&pc) = insn_pcs.get(index) {
+        pc
+    } else if insn_pcs.is_empty() && super::is_arm64_arch(architecture) {
+        start.saturating_add((index as u64).saturating_mul(super::ARM64_INSN_BYTES))
+    } else {
+        start
+    }
 }
 fn aindex_of(pc: u64, insn_pcs: &[u64], start: u64, count: usize) -> Option<usize> {
+    aindex_of_with_arch(pc, insn_pcs, start, count, "arm64")
+}
+fn aindex_of_with_arch(pc: u64, insn_pcs: &[u64], start: u64, count: usize, architecture: &str) -> Option<usize> {
     if insn_pcs.is_empty() {
+        if !super::is_arm64_arch(architecture) {
+            return None;
+        }
         let delta = pc.checked_sub(start)?;
-        if delta % 4 != 0 { return None; }
-        let i = (delta / 4) as usize;
+        let insn = super::ARM64_INSN_BYTES;
+        if delta % insn != 0 { return None; }
+        let i = usize::try_from(delta / insn).ok()?;
         (i < count).then_some(i)
-    } else { insn_pcs.binary_search(&pc).ok() }
+    } else {
+        insn_pcs.binary_search(&pc).ok()
+    }
 }
 fn aspan_end_pc(pc: u64, insn_pcs: &[u64], start: u64, count: usize, fallback_end: u64) -> u64 {
-    aspan_end_pc_with_sizes(pc, insn_pcs, &[], start, count, fallback_end)
+    aspan_end_pc_with_sizes_and_arch(pc, insn_pcs, &[], start, count, fallback_end, "arm64")
 }
 fn aspan_end_pc_with_sizes(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, count: usize, fallback_end: u64) -> u64 {
-    if let Some(i) = aindex_of(pc, insn_pcs, start, count) {
-        if !insn_sizes.is_empty() && i < insn_sizes.len() {
+    aspan_end_pc_with_sizes_and_arch(pc, insn_pcs, insn_sizes, start, count, fallback_end, "arm64")
+}
+fn aspan_end_pc_with_sizes_and_arch(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, count: usize, fallback_end: u64, architecture: &str) -> u64 {
+    let paired = insn_sizes.len() == insn_pcs.len();
+    if let Some(i) = aindex_of_with_arch(pc, insn_pcs, start, count, architecture) {
+        if paired && i < insn_sizes.len() {
             return pc.saturating_add(insn_sizes[i] as u64);
         }
-        if insn_pcs.is_empty() { return start + (i as u64 + 1) * 4; }
-        return insn_pcs.get(i + 1).copied().unwrap_or(fallback_end);
+        if insn_pcs.is_empty() && super::is_arm64_arch(architecture) {
+            return start.saturating_add(((i as u64) + 1).saturating_mul(super::ARM64_INSN_BYTES));
+        }
+        if let Some(&next) = insn_pcs.get(i + 1) {
+            return next;
+        }
+        return fallback_end;
     }
     if insn_pcs.is_empty() {
-        pc + 4
-    } else {
-        // Variable-length stream: try known PC index for size; otherwise next PC or fallback.
-        match insn_pcs.binary_search(&pc) {
-            Ok(i) => {
-                if !insn_sizes.is_empty() && i < insn_sizes.len() { pc.saturating_add(insn_sizes[i] as u64) }
-                else { insn_pcs.get(i + 1).copied().unwrap_or(fallback_end) }
-            }
-            Err(i) => insn_pcs.get(i).copied().unwrap_or(fallback_end),
+        if super::is_arm64_arch(architecture) {
+            return pc.saturating_add(super::ARM64_INSN_BYTES);
         }
+        return pc;
+    }
+    // Variable-length stream: try known PC index for size; otherwise next PC or fallback.
+    match insn_pcs.binary_search(&pc) {
+        Ok(i) => {
+            if paired && i < insn_sizes.len() { pc.saturating_add(insn_sizes[i] as u64) }
+            else { insn_pcs.get(i + 1).copied().unwrap_or(fallback_end) }
+        }
+        Err(i) => insn_pcs.get(i).copied().unwrap_or(fallback_end),
     }
 }
 
@@ -1480,7 +1509,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ));
     }
     let fixed_width_4 = is_arm64 && _input_instruction_pcs.is_empty();
-    if start < base || end <= start || (fixed_width_4 && ((start - base) % 4 != 0 || (end - start) % 4 != 0)) {
+    let arm64_insn = super::ARM64_INSN_BYTES;
+    if start < base || end <= start || (fixed_width_4 && ((start - base) % arm64_insn != 0 || (end - start) % arm64_insn != 0)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Invalid reconstruction function bounds",
@@ -1490,7 +1520,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // ARM64: fixed 4-byte instructions, preserve existing 128-instruction byte window behavior.
     // x86_64: variable-length instructions (1-15 bytes); decode boundaries up to 128 instructions / 15*128 bytes conservatively.
     let high = if is_arm64 {
-        available_end.min(start.saturating_add(128 * 4))
+        available_end.min(start.saturating_add(128 * arm64_insn))
     } else {
         available_end.min(start.saturating_add(128 * 15))
     };
@@ -1520,7 +1550,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             vec![] // unknown variable-length sizes; conservative handling below
         };
         let se = if !sizes.is_empty() && sizes.len() == pcs.len() {
-            pcs.last().copied().unwrap_or(start).saturating_add(*sizes.last().unwrap_or(&4) as u64)
+            pcs.last().copied().unwrap_or(start).saturating_add(sizes.last().copied().unwrap_or(0) as u64)
         } else if !pcs.is_empty() {
             high.min(end)
         } else {
@@ -1528,9 +1558,11 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         };
         (pcs, sizes, se)
     } else if is_arm64 {
-        let pcs: Vec<u64> = (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect();
-        let se = pcs.last().map(|p| p + 4).unwrap_or(start);
-        let sizes = vec![4u32; pcs.len()];
+        // Explicit ARM64 fixed-width fallback when no PC/size map is provided.
+        let insn = super::ARM64_INSN_BYTES as usize;
+        let pcs: Vec<u64> = (0..(body.len() / insn)).map(|i| start + i as u64 * super::ARM64_INSN_BYTES).collect();
+        let se = pcs.last().map(|p| p.saturating_add(super::ARM64_INSN_BYTES)).unwrap_or(start);
+        let sizes = vec![u32::try_from(super::ARM64_INSN_BYTES).unwrap_or(4); pcs.len()];
         (pcs, sizes, se)
     } else {
         // x86_64/x86-64: sound, evidence-backed instruction boundary decoding for PC/size maps.
@@ -1557,7 +1589,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     };
     let instructions = insn_pcs.len() as u64;
     let instruction_extent = if is_arm64 {
-        (end.saturating_sub(start)) / 4
+        (end.saturating_sub(start)) / super::ARM64_INSN_BYTES
     } else {
         insn_pcs.len() as u64
     };
@@ -1567,23 +1599,14 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         insn_pcs.len() >= 128 && stream_end < end.min(available_end)
     };
     let truncated = high < end || (is_x86_64 && stream_end < end.min(available_end));
-    let direct_targets = if is_arm64 {
-        insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
-            let size = *insn_sizes.get(index).unwrap_or(&4) as usize;
-            // ARM64 fixed-width decode path for direct-call discovery today; variable-length decode remains conservative.
-            if size != 4 { return None; }
-            let off = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok())?;
-            let bytes = code.get(off..off + 4)?;
-            let word = u32::from_le_bytes(bytes.try_into().ok()?);
-            match lift_operation(decode(word, pc), pc) {
-                IrOperation::DirectCall { target } => Some(target),
-                _ => None,
-            }
-        }).collect::<BTreeSet<_>>()
-    } else {
-        // x86_64 direct-call lifting/discovery not yet implemented; conservative.
-        BTreeSet::new()
-    };
+    let direct_targets = insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
+        let sz = if insn_sizes.len() == insn_pcs.len() { insn_sizes.get(index).copied()? } else if is_arm64 { 4 } else { return None; };
+        let (_, _op, portable) = super::decode_lift_for_arch(code, base, pc, sz, &arch)?;
+        match portable {
+            IrOperation::DirectCall { target } => Some(target),
+            _ => None,
+        }
+    }).collect::<BTreeSet<_>>();
     let settings = object([
         ("instruction_limit", 128u64.into()),
         ("code_scan_limit", (4 * 1024 * 1024u64).into()),
@@ -1654,7 +1677,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("source", "macho-nlist".into()),
                     ("image_origin", "captured-binary".into()),
                 ]),
-                ranges(*symbol_address, *symbol_address + 4),
+                ranges(*symbol_address, if is_arm64 { symbol_address.saturating_add(super::ARM64_INSN_BYTES) } else { *symbol_address }),
             )?;
             native_symbol_ids.push(id);
         }
@@ -1714,7 +1737,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("source", if runtime_imp(*symbol_address) { "libobjc-runtime-imp" } else { "macho-objc-imp" }.into()),
                     ("image_origin", "captured-binary".into()),
                 ]),
-                ranges(*symbol_address, *symbol_address + 4),
+                ranges(*symbol_address, if is_arm64 { symbol_address.saturating_add(super::ARM64_INSN_BYTES) } else { *symbol_address }),
             )?;
             native_symbol_ids.push(id);
         }
@@ -2110,36 +2133,49 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         }
     }
     let mut resolved_got_load_reg: BTreeMap<u64, (u8, String, Option<u64>)> = BTreeMap::new(); // pc -> (reg, symbol_or_PAGE, slot_addr)
-    let insn_sizes: Vec<u32> = if _input_instruction_sizes.len() == insn_pcs.len() && !insn_pcs.is_empty() {
-        _input_instruction_sizes.clone()
+    // Use the stream-derived PC/size maps. For ARM64 streams without paired sizes, fall back to 4-byte sizes explicitly.
+    let insn_sizes: Vec<u32> = if insn_sizes.len() == insn_pcs.len() {
+        insn_sizes
+    } else if is_arm64 {
+        vec![u32::try_from(super::ARM64_INSN_BYTES).unwrap_or(4); insn_pcs.len()]
     } else {
-        vec![4; insn_pcs.len()]
+        insn_sizes
     };
 
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
     for index in 0..insn_pcs.len() {
-        let pc = apc_at(index, &insn_pcs, start);
-        let size = *insn_sizes.get(index).unwrap_or(&4) as usize;
+        let pc = apc_at_with_arch(index, &insn_pcs, start, &arch);
+        let size_u32 = if insn_sizes.len() == insn_pcs.len() {
+            insn_sizes.get(index).copied().unwrap_or(0)
+        } else if is_arm64 {
+            u32::try_from(super::ARM64_INSN_BYTES).unwrap_or(4)
+        } else {
+            0
+        };
+        if size_u32 == 0 { break; }
+        let size = size_u32 as usize;
         let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { break; };
         if off + size > code.len() { break; }
         let bytes = &code[off..off + size];
-        // ARM64 fixed-width decode path; variable-length decode will dispatch by architecture/size.
-        let word = if size == 4 {
-            u32::from_le_bytes(bytes.try_into().unwrap_or([0,0,0,0]))
-        } else { 0 };
-        let pc_end = aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end);
+        let pc_end = aspan_end_pc_with_sizes_and_arch(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end, &arch);
         let position = file_offset + (pc - base);
         let data = data_ranges
             .iter()
-            .any(|&(lo, hi, _)| position < hi && position + (pc_end - pc) > lo);
-        let operation = if size == 4 { decode(word, pc) } else { Operation::Opaque };
-        let portable = if data || size != 4 {
-            IrOperation::TargetSpecific
+            .any(|&(lo, hi, _)| position < hi && position + (pc_end.saturating_sub(pc)) > lo);
+        // Architecture-gated decode/lift: ARM64 4-byte semantic decode/lift supported today; other sizes/architectures remain conservative.
+        let (word, operation, mut portable) = if data {
+            (0u32, Operation::Opaque, IrOperation::TargetSpecific)
+        } else if let Some((w, op, p)) = super::decode_lift_for_arch(code, base, pc, size_u32, &arch) {
+            (w, op, p)
+        } else if size == 4 && is_arm64 {
+            let w = u32::from_le_bytes(bytes.try_into().unwrap_or([0, 0, 0, 0]));
+            let op = decode(w, pc);
+            (w, op, lift_operation(op, pc))
         } else {
-            lift_operation(operation, pc)
+            (0u32, Operation::Opaque, IrOperation::TargetSpecific)
         };
-        // Track simple GOT loads: adrp xn, page; ldr xn, [xn, #off] -> slot = page+off
-        if !data {
+        // Track simple GOT loads: adrp xn, page; ldr xn, [xn, #off] -> slot = page+off (ARM64-only word-pattern evidence)
+        if !data && is_arm64 && size == 4 {
             let is_adrp = (word & 0x9f000000) == 0x90000000;
             if is_adrp {
                 let rd = (word & 0x1f) as u8;
@@ -2171,8 +2207,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 }
             }
         }
-        let mut portable = portable;
-        if !data {
+        if !data && is_arm64 && size == 4 {
             if let IrOperation::IndirectCall { target: dispatch } = portable {
                 let reg_num: Option<u8> = if dispatch.class == IrRegisterClass::General { Some(dispatch.index) } else { None };
                 if let Some(reg) = reg_num {
@@ -2195,7 +2230,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             }
         }
         let mut modeled = instruction_model(operation, portable, word);
-        // Bounded: manyFP-specific SIMD/scalar adaptations (evidenced abi_sample case).
+        // Bounded: manyFP-specific SIMD/scalar adaptations (evidenced abi_sample case, ARM64).
+        if is_arm64 && size == 4 {
         match word {
             0x4ea21c41 => { // mov v1.16b, v2.16b
                 let reg_node = |name: &str| tree("fp-register", Some("uint64_t".into()), object([("name", name.into()), ("bits", 64u64.into())]), vec![]);
@@ -2215,6 +2251,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 modeled = Some(tree("assignment", None, object([("write_policy","fp-scalar-write".into())]), vec![dst, expr]));
             }
             _ => {}
+        }
         }
         // A complete, proven jump-table resolves an indirect branch's in-function
         // successors (or proves no in-function re-entry). Model it explicitly so
@@ -2541,7 +2578,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 let upper = native.lc_function_starts.iter().chain(native.export_starts.iter())
                     .chain(native.unwind_starts.iter()).copied().chain(call_prototypes.keys().copied())
                     .filter(|boundary| *boundary > target).min().unwrap_or(base + code.len() as u64)
-                    .min(target.saturating_add(CALLEE_WINDOW as u64 * 4));
+                    .min(target.saturating_add(CALLEE_WINDOW as u64 * if is_arm64 { super::ARM64_INSN_BYTES } else { 15 }));
                 let window = target.checked_sub(base).zip(upper.checked_sub(base))
                     .and_then(|(lo, hi)| code.get(lo as usize..hi as usize));
                 let data_free = data_ranges.iter().all(|(lo, hi, _)| {
