@@ -2617,12 +2617,6 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address,&analyze_arch);
  let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
  let prototype_conflicts=super::semantic::artifact::constraint_report(&solved);
- let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes,&objc_layouts,&analyze_arch);
- let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_records=format!("{objc_classes}\n{objc_protocols}");let conformance_signatures=super::signatures::objc_conformance_declarations(&conformance_records);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
- if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
- call_values.push_str("\n\n");
- let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
- for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
  let (sem_pcs, sem_sizes) = if starts.len() == 1 {
   let s = starts[0];
   let e = scan_end.min(map.address + code.len() as u64);
@@ -2668,6 +2662,12 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
    (Vec::new(), Vec::new())
   }
  } else { (Vec::new(), Vec::new()) };
+ let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64_with_pcs(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes,&objc_layouts,&analyze_arch,&sem_pcs,&sem_sizes);
+ let mut protocol_signatures=super::signatures::protocol_signatures(&objc_protocols);let conformance_records=format!("{objc_classes}\n{objc_protocols}");let conformance_signatures=super::signatures::objc_conformance_declarations(&conformance_records);if !conformance_signatures.is_empty(){if !protocol_signatures.is_empty(){protocol_signatures.push('\n')}protocol_signatures.push_str(&conformance_signatures)}
+ if !protocol_signatures.is_empty(){if signature_report.len()+protocol_signatures.len()+2<=60_000{signature_report.push_str("\n\n");signature_report.push_str(&protocol_signatures);}else if signature_report.len()+80<60_000{signature_report.push_str("\nProtocol prototypes withheld because signature output budget was exhausted.\n");}}
+ call_values.push_str("\n\n");
+ let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
+ for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
  let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects_and_arch_and_pcs(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets,&sem_pcs,&sem_sizes,&analyze_arch),&reconstructed_pseudocode);
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;

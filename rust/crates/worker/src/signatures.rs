@@ -1286,6 +1286,8 @@ struct Arm64RenderContext<'a> {
     objc_selectors: &'a BTreeMap<u64,String>,
     objc_layouts: &'a [super::objc::ClassLayout],
     architecture: &'a str,
+    insn_pcs: &'a [u64],
+    insn_sizes: &'a [u32],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1295,8 +1297,18 @@ pub fn recover_arm64(
     file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
     tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, external_prototypes:&BTreeMap<String,Signature>, objc_layouts:&[super::objc::ClassLayout], architecture: &str,
 ) -> (String, String) {
+    recover_arm64_with_pcs(starts, symbols, objc_records, calls, scan_end, code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors, external_prototypes, objc_layouts, architecture, &[], &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recover_arm64_with_pcs(
+    starts: &[u64], symbols: &[(u64, String)], objc_records: &str,
+    calls: &[(u64,u64,u64)], scan_end: u64, code: &[u8], base: u64,
+    file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, external_prototypes:&BTreeMap<String,Signature>, objc_layouts:&[super::objc::ClassLayout], architecture: &str, insn_pcs: &[u64], insn_sizes: &[u32],
+) -> (String, String) {
     recover_internal(starts, symbols, objc_records, calls, scan_end, external_prototypes,
-        Some(Arm64RenderContext { code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors, objc_layouts, architecture }))
+        Some(Arm64RenderContext { code, base, file_offset, data_ranges, parameter_evidence, tail_calls, jump_tables, objc_selectors, objc_layouts, architecture, insn_pcs, insn_sizes }))
 }
 
 #[derive(Default)]
@@ -2588,7 +2600,7 @@ fn recover_internal(
         if let Some(context) = &arm64 {
             let end = starts.get(i+1).copied().unwrap_or(scan_end);
             let layout=object_layout_for_imp(context.objc_layouts,start,name,signature);
-            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors,layout,&[],&[],context.architecture) {
+            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors,layout,context.insn_pcs,context.insn_sizes,context.architecture) {
                 if pseudo.len() + body.len() > 58_000 { break; }
                 pseudo.push_str(&body);
                 pseudo.push('\n');
