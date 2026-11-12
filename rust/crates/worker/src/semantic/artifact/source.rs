@@ -4305,7 +4305,7 @@ impl Recovery {
             let origins = array(
                 node.origins
                     .iter()
-                    .map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end(*pc, insn_pcs, insn_sizes, start, trees_len)))])),
+                    .map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end_with_arch(*pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])),
             );
             let machine_type = if node.kind == "source-call" && node.source_type.as_ref().is_some_and(|ty| ty.bits == 0) {
                 "void"
@@ -4416,7 +4416,7 @@ impl Recovery {
                     None,
                     vec![asts[&variable.value].clone(), asts[&variable.initial].clone()],
                     &index_of_pc(loop_pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
-                    array([object([("start", address(loop_pc)), ("end", address(semit_span_end(loop_pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                    array([object([("start", address(loop_pc)), ("end", address(semit_span_end_with_arch(loop_pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                     object([("template", "uint64_t $0 = $1".into()), ("role", self.dag.nodes[variable.value].role.into())]),
                 )?;
                 loop_children.push(binding);
@@ -4450,7 +4450,7 @@ impl Recovery {
                             None,
                             vec![asts[&load.address].clone(), asts[&load.expression].clone(), asts[&load.guard].clone()],
                             &evidence,
-                            array([object([("start", address(load.pc)), ("end", address(semit_span_end(load.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                            array([object([("start", address(load.pc)), ("end", address(semit_span_end_with_arch(load.pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                             object([
                                 ("bytes", load.bytes.into()),
                                 ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
@@ -4468,7 +4468,7 @@ impl Recovery {
                             ("guard_ast", asts[&load.guard].clone().into()),
                             ("address_ast", asts[&load.address].clone().into()),
                             ("read_ast", asts[&load.expression].clone().into()),
-                        ]), ranges(load.pc, semit_span_end(load.pc, insn_pcs, insn_sizes, start, trees_len))));
+                        ]), ranges(load.pc, semit_span_end_with_arch(load.pc, insn_pcs, insn_sizes, start, trees_len, architecture))));
                     }
                     LoopBodyEvent::Assignment(assignment) => {
                         let target = &rendered[&assignment.destination];
@@ -4481,7 +4481,7 @@ impl Recovery {
                             None,
                             vec![asts[&assignment.destination].clone(), asts[&assignment.value].clone()],
                             &evidence,
-                            array([object([("start", address(assignment.pc)), ("end", address(semit_span_end(assignment.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                            array([object([("start", address(assignment.pc)), ("end", address(semit_span_end_with_arch(assignment.pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                             object([("template", "$0 = $1".into())]),
                         )?;
                         loop_children.push(ast);
@@ -4517,7 +4517,7 @@ impl Recovery {
                             None,
                             vec![asts[&store.address].clone(), asts[&store.value].clone(), asts[&store.guard].clone()],
                             &evidence,
-                            array([object([("start", address(store.pc)), ("end", address(semit_span_end(store.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                            array([object([("start", address(store.pc)), ("end", address(semit_span_end_with_arch(store.pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                             object([
                                 ("bytes", store.bytes.into()),
                                 ("partition", partition.into()),
@@ -4535,14 +4535,14 @@ impl Recovery {
                             ("bytes", store.bytes.into()),
                             ("ordering", ordering.into()),
                             ("guard_ast", asts[&store.guard].clone().into()),
-                        ]), ranges(store.pc, semit_span_end(store.pc, insn_pcs, insn_sizes, start, trees_len))));
+                        ]), ranges(store.pc, semit_span_end_with_arch(store.pc, insn_pcs, insn_sizes, start, trees_len, architecture))));
                     }
                 }
             }
             loop_code.push_str("    }\n");
             let evidence = source_loop.pcs.iter().filter_map(|pc| index_of_pc(*pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).cloned())
                 .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
-            let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end(*pc, insn_pcs, insn_sizes, start, trees_len)))])));
+            let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end_with_arch(*pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])));
             let ast = builder.ast_spans(
                 "source-while",
                 None,
@@ -4588,7 +4588,7 @@ impl Recovery {
                     None,
                     vec![asts[&call.expression].clone(), asts[&call.guard].clone()],
                     &evidence,
-                    array([object([("start", address(call.pc)), ("end", address(semit_span_end(call.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                    array([object([("start", address(call.pc)), ("end", address(semit_span_end_with_arch(call.pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                     object([("template", "call-result = call(arguments)".into()), ("ordering", "instruction order with caller memory effects".into())]),
                 )?);
                 continue;
@@ -4628,7 +4628,7 @@ impl Recovery {
                     ("guard_ast", asts[&load.guard].clone().into()),
                     ("address_ast", asts[&load.address].clone().into()),
                     ("read_ast", asts[&load.expression].clone().into()),
-                ]), ranges(pc, semit_span_end(pc, insn_pcs, insn_sizes, start, trees_len))));
+                ]), ranges(pc, semit_span_end_with_arch(pc, insn_pcs, insn_sizes, start, trees_len, architecture))));
                 let mut evidence = index_of_pc(load.pc, insn_pcs, start, trees_len)
                     .and_then(|i| ir.get(i))
                     .into_iter()
@@ -4642,7 +4642,7 @@ impl Recovery {
                     None,
                     vec![asts[&load.address].clone(), asts[&load.expression].clone(), asts[&load.guard].clone()],
                     &evidence,
-                    array([object([("start", address(load.pc)), ("end", address(semit_span_end(load.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                    array([object([("start", address(load.pc)), ("end", address(semit_span_end_with_arch(load.pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                     object([
                         ("bytes", load.bytes.into()),
                         ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
@@ -4689,7 +4689,7 @@ impl Recovery {
                 None,
                 vec![asts[&effect.address].clone(), asts[&effect.value].clone(), asts[&effect.guard].clone()],
                 &evidence,
-                array([object([("start", address(effect.pc)), ("end", address(semit_span_end(effect.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
+                array([object([("start", address(effect.pc)), ("end", address(semit_span_end_with_arch(effect.pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                 object([
                     ("bytes", effect.bytes.into()),
                     ("partition", partition.into()),
@@ -4707,7 +4707,7 @@ impl Recovery {
                 ("bytes", effect.bytes.into()),
                 ("ordering", ordering.into()),
                 ("guard_ast", asts[&effect.guard].clone().into()),
-            ]), ranges(pc, semit_span_end(pc, insn_pcs, insn_sizes, start, trees_len))));
+            ]), ranges(pc, semit_span_end_with_arch(pc, insn_pcs, insn_sizes, start, trees_len, architecture))));
         }
         let return_code = if s.result_bits == 0 {
             "    return;\n".to_owned()
