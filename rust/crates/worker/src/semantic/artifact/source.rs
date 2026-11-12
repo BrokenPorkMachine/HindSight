@@ -4049,10 +4049,11 @@ pub(super) fn canonical_boolean_callee_with_pcs(
     if code.is_empty() { return false; }
     // ARM64 fixed-width 4-byte decode path for now; variable-length streams require architecture-aware decode.
     if insn_pcs.is_empty() {
-        if code.len() > 128 * 4 || code.len() % 4 != 0 { return false; }
+        if code.len() > 128 * 4 { return false; }
+        let count = code.len() / 4;
+        if count == 0 { return false; }
         let mut trees = Vec::new();
         let mut operations = Vec::new();
-        let count = code.len() / 4;
         for index in 0..count {
             let off = index * 4;
             let Some(bytes) = code.get(off..off + 4) else { return false; };
