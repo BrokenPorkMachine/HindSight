@@ -2550,7 +2550,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     a >= *hi || b <= *lo
                 });
                 let proven = source_supported_call && target != start && data_free
-                    && window.is_some_and(|bytes| source::canonical_boolean_callee(bytes, target, prototype));
+                    && window.is_some_and(|bytes| source::canonical_boolean_callee_with_pcs_and_arch(bytes, target, prototype, &[], &[], &arch));
                 if let V::Object(attributes) = &mut tree.attributes {
                     if let Some(V::Object(effects)) = attributes.get_mut("call_effects") {
                         effects.insert("canonical_boolean_result".into(), proven.into());
@@ -3074,7 +3074,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let (name, signature) = &signatures[0];
             crate::signatures::source_signature_with_project_types(name, signature, &project_types)
                 .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
-                .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types, &insn_pcs, &insn_sizes))
+                .and_then(|signature| source::recover_with_types_and_arch(start, &trees, &models, signature, &call_prototypes, &project_types, &insn_pcs, &insn_sizes, &arch))
         } else {
             Err(if signatures.is_empty() {
                 "no exact source signature"

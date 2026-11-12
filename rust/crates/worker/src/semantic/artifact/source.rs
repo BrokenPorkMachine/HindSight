@@ -2912,25 +2912,49 @@ pub(super) fn recover(
 }
 
 fn pc_at(index: usize, insn_pcs: &[u64], start: u64) -> u64 {
-    insn_pcs.get(index).copied().unwrap_or_else(|| start + index as u64 * 4)
+    pc_at_with_arch(index, insn_pcs, start, "arm64")
+}
+fn pc_at_with_arch(index: usize, insn_pcs: &[u64], start: u64, architecture: &str) -> u64 {
+    if let Some(&pc) = insn_pcs.get(index) {
+        pc
+    } else if insn_pcs.is_empty() && super::super::is_arm64_arch(architecture) {
+        // Explicit ARM64 fixed-width fallback when no PC map is provided.
+        start.saturating_add((index as u64).saturating_mul(super::super::ARM64_INSN_BYTES))
+    } else {
+        start
+    }
 }
 fn index_of_pc(target: u64, insn_pcs: &[u64], start: u64, count: usize) -> Option<usize> {
+    index_of_pc_with_arch(target, insn_pcs, start, count, "arm64")
+}
+fn index_of_pc_with_arch(target: u64, insn_pcs: &[u64], start: u64, count: usize, architecture: &str) -> Option<usize> {
     if insn_pcs.is_empty() {
+        if !super::super::is_arm64_arch(architecture) {
+            return None;
+        }
         let delta = target.checked_sub(start)?;
-        if delta % 4 != 0 { return None; }
-        let idx = (delta / 4) as usize;
+        let insn = super::super::ARM64_INSN_BYTES;
+        if delta % insn != 0 { return None; }
+        let idx = usize::try_from(delta / insn).ok()?;
         (idx < count).then_some(idx)
     } else {
         insn_pcs.binary_search(&target).ok()
     }
 }
 fn end_pc(start: u64, trees_len: usize, insn_pcs: &[u64], insn_sizes: &[u32]) -> u64 {
+    end_pc_with_arch(start, trees_len, insn_pcs, insn_sizes, "arm64")
+}
+fn end_pc_with_arch(start: u64, trees_len: usize, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> u64 {
     if insn_pcs.is_empty() {
-        start + trees_len as u64 * 4
+        if super::super::is_arm64_arch(architecture) {
+            start.saturating_add((trees_len as u64).saturating_mul(super::super::ARM64_INSN_BYTES))
+        } else {
+            start
+        }
     } else if let (Some(&last_pc), Some(&last_sz)) = (insn_pcs.last(), insn_sizes.get(insn_pcs.len().saturating_sub(1))) {
-        last_pc + last_sz as u64
+        last_pc.saturating_add(last_sz as u64)
     } else if let Some(&last_pc) = insn_pcs.last() {
-        semit_span_end(last_pc, insn_pcs, insn_sizes, start, trees_len)
+        semit_span_end_with_arch(last_pc, insn_pcs, insn_sizes, start, trees_len, architecture)
     } else {
         start
     }
@@ -2946,7 +2970,21 @@ pub(super) fn recover_with_types(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> Result<Recovery, String> {
-    let _end = end_pc(start, trees.len(), insn_pcs, insn_sizes);
+    recover_with_types_and_arch(start, trees, operations, signature, call_prototypes, project_types, insn_pcs, insn_sizes, "arm64")
+}
+
+pub(super) fn recover_with_types_and_arch(
+    start: u64,
+    trees: &[Tree],
+    operations: &[IrOperation],
+    signature: SourceSignature,
+    call_prototypes: &BTreeMap<u64, SourceSignature>,
+    project_types: &[crate::reconstruction::ProjectTypeDependency],
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+    architecture: &str,
+) -> Result<Recovery, String> {
+    let _end = end_pc_with_arch(start, trees.len(), insn_pcs, insn_sizes, architecture);
     // Address operations carry concrete computed values in this IR; do not
     // reject solely on their presence. Unresolved relocatable dependencies are
     // reported separately when evidence is insufficient.
@@ -4036,7 +4074,7 @@ pub(super) fn recover_with_types(
 /// memory-free leaf has canonical Boolean representation. Callers separately
 /// establish the callee's complete return/effect/ABI summary.
 pub(super) fn canonical_boolean_callee(code: &[u8], start: u64, signature: &SourceSignature) -> bool {
-    canonical_boolean_callee_with_pcs(code, start, signature, &[], &[])
+    canonical_boolean_callee_with_pcs_and_arch(code, start, signature, &[], &[], "arm64")
 }
 
 pub(super) fn canonical_boolean_callee_with_pcs(
@@ -4046,23 +4084,32 @@ pub(super) fn canonical_boolean_callee_with_pcs(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> bool {
+    canonical_boolean_callee_with_pcs_and_arch(code, start, signature, insn_pcs, insn_sizes, "arm64")
+}
+
+pub(super) fn canonical_boolean_callee_with_pcs_and_arch(
+    code: &[u8],
+    start: u64,
+    signature: &SourceSignature,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+    architecture: &str,
+) -> bool {
     if code.is_empty() { return false; }
-    // ARM64 fixed-width 4-byte decode path for now; variable-length streams require architecture-aware decode.
     if insn_pcs.is_empty() {
-        if code.len() > 128 * 4 { return false; }
-        let count = code.len() / 4;
+        // Explicit ARM64 fixed-width fallback when no PC/size map is provided.
+        if !super::super::is_arm64_arch(architecture) { return false; }
+        let max_bytes = 128usize.saturating_mul(super::super::ARM64_INSN_BYTES as usize);
+        if code.len() > max_bytes { return false; }
+        let count = code.len() / super::super::ARM64_INSN_BYTES as usize;
         if count == 0 { return false; }
         let mut trees = Vec::new();
         let mut operations = Vec::new();
         let mut pcs = Vec::with_capacity(count);
         let mut sizes = Vec::with_capacity(count);
         for index in 0..count {
-            let off = index * 4;
-            let Some(bytes) = code.get(off..off + 4) else { return false; };
-            let word = u32::from_le_bytes(bytes.try_into().unwrap());
-            let pc = start + index as u64 * 4;
-            let decoded = decode(word, pc);
-            let operation = lift_operation(decoded, pc);
+            let pc = start.saturating_add((index as u64).saturating_mul(super::super::ARM64_INSN_BYTES));
+            let Some((word, decoded, operation)) = super::super::decode_lift_for_arch(code, start, pc, 4, architecture) else { return false; };
             trees.push(instruction_model(decoded, operation, word).unwrap_or_else(|| {
                 tree("unsupported-operation", None, object([]), vec![])
             }));
@@ -4070,7 +4117,7 @@ pub(super) fn canonical_boolean_callee_with_pcs(
             pcs.push(pc);
             sizes.push(4);
         }
-        return recover_with_types(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], &pcs, &sizes).is_ok();
+        return recover_with_types_and_arch(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], &pcs, &sizes, architecture).is_ok();
     }
     if insn_pcs.len() > 128 { return false; }
     let sizes_ok = insn_sizes.is_empty() || insn_sizes.len() == insn_pcs.len();
@@ -4078,35 +4125,52 @@ pub(super) fn canonical_boolean_callee_with_pcs(
     let mut trees = Vec::new();
     let mut operations = Vec::new();
     for (i, &pc) in insn_pcs.iter().enumerate() {
-        let sz = *insn_sizes.get(i).unwrap_or(&4);
-        if sz != 4 { return false; } // conservative until variable-length decode/lift exists
-        let Some(off) = pc.checked_sub(start).and_then(|d| usize::try_from(d).ok()) else { return false; };
-        let Some(bytes) = code.get(off..off + 4) else { return false; };
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
-        let decoded = decode(word, pc);
-        let operation = lift_operation(decoded, pc);
+        let sz = if insn_sizes.len() == insn_pcs.len() { insn_sizes.get(i).copied().unwrap_or(0) } else { 0 };
+        if sz == 0 { return false; }
+        let Some((word, decoded, operation)) = super::super::decode_lift_for_arch(code, start, pc, sz, architecture) else { return false; };
         trees.push(instruction_model(decoded, operation, word).unwrap_or_else(|| {
             tree("unsupported-operation", None, object([]), vec![])
         }));
         operations.push(operation);
     }
-    recover_with_types(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], insn_pcs, insn_sizes).is_ok()
+    recover_with_types_and_arch(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], insn_pcs, insn_sizes, architecture).is_ok()
 }
 
 fn semit_span_end(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, trees_len: usize) -> u64 {
-    if let Some(i) = index_of_pc(pc, insn_pcs, start, trees_len) {
-        if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
-        if insn_pcs.is_empty() { return start + (i as u64 + 1) * 4; }
-        return insn_pcs.get(i + 1).copied().unwrap_or_else(|| pc.saturating_add(4));
+    semit_span_end_with_arch(pc, insn_pcs, insn_sizes, start, trees_len, "arm64")
+}
+fn semit_span_end_with_arch(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, trees_len: usize, architecture: &str) -> u64 {
+    if let Some(i) = index_of_pc_with_arch(pc, insn_pcs, start, trees_len, architecture) {
+        if insn_sizes.len() == insn_pcs.len() && i < insn_sizes.len() {
+            return pc.saturating_add(insn_sizes[i] as u64);
+        }
+        if insn_pcs.is_empty() && super::super::is_arm64_arch(architecture) {
+            return start.saturating_add(((i as u64) + 1).saturating_mul(super::super::ARM64_INSN_BYTES));
+        }
+        if let Some(&next) = insn_pcs.get(i + 1) {
+            return next;
+        }
+        if super::super::is_arm64_arch(architecture) {
+            return pc.saturating_add(super::super::ARM64_INSN_BYTES);
+        }
+        return pc;
     }
     if !insn_pcs.is_empty() {
         // Variable-length stream: try to resolve size/index for pc even if index_of_pc used different count semantics.
         if let Ok(i) = insn_pcs.binary_search(&pc) {
-            if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
-            return insn_pcs.get(i + 1).copied().unwrap_or_else(|| pc.saturating_add(4));
+            if insn_sizes.len() == insn_pcs.len() && i < insn_sizes.len() {
+                return pc.saturating_add(insn_sizes[i] as u64);
+            }
+            if let Some(&next) = insn_pcs.get(i + 1) {
+                return next;
+            }
         }
     }
-    pc.saturating_add(4)
+    if super::super::is_arm64_arch(architecture) {
+        pc.saturating_add(super::super::ARM64_INSN_BYTES)
+    } else {
+        pc
+    }
 }
 
 impl Recovery {
