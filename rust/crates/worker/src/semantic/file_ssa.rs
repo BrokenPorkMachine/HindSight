@@ -525,8 +525,16 @@ pub(super) fn build_file_ssa(function: &FunctionIr) -> FileSsa {
 }
 
 /// The index of the instruction at an address.
+/// Uses instruction addresses when available (PC/size-map aware) with fixed-width ARM64 fallback.
 fn instruction_index(function: &FunctionIr, pc: u64) -> usize {
-    ((pc - function.start) / 4) as usize
+    if let Some(index) = function.instructions.iter().position(|instruction| instruction.address == pc) {
+        return index;
+    }
+    if pc >= function.start {
+        ((pc - function.start) / 4) as usize
+    } else {
+        0
+    }
 }
 
 /// The location a slot belongs to.
