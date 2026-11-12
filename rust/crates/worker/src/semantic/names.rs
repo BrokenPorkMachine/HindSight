@@ -791,10 +791,8 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
     if start < base || end <= start {
         return fail("function bounds or instruction budget");
     }
-    if fixed_width {
-        if (start - base) % 4 != 0 || (end - start) % 4 != 0 || ((end - start) / 4) as usize > MAX_NAME_ANALYSIS_WORDS {
-            return fail("function bounds or instruction budget");
-        }
+    if fixed_width && (start - base) % 4 != 0 {
+        return fail("function bounds or instruction budget");
     }
     let Some(body_end) = end.checked_sub(base).and_then(|d| usize::try_from(d).ok()).map(|e| e.min(code.len())) else {
         return fail("function bytes unavailable");
@@ -805,20 +803,28 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
     if body_start >= body_end || body_end > code.len() {
         return fail("function bytes unavailable");
     }
-    let body = &code[body_start..body_end];
-    let pcs: Vec<u64> = if fixed_width {
-        (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect()
+    let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
+        let count = (body_end - body_start) / 4;
+        if count == 0 || count > MAX_NAME_ANALYSIS_WORDS {
+            return fail("function bounds or instruction budget");
+        }
+        let pcs = (0..count).map(|i| start + i as u64 * 4).collect();
+        let sizes = vec![4; count];
+        (pcs, sizes)
     } else {
-        insn_pcs.to_vec()
+        let mut pcs = Vec::new();
+        let mut sizes = Vec::new();
+        for (index, &pc) in insn_pcs.iter().enumerate() {
+            if pc < start || pc >= end { continue; }
+            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(index).unwrap_or(&4) } else { 4 };
+            pcs.push(pc);
+            sizes.push(sz);
+        }
+        (pcs, sizes)
     };
     if pcs.is_empty() || pcs.len() > MAX_NAME_ANALYSIS_WORDS {
         return fail("function bounds or instruction budget");
     }
-    let sizes: Vec<u32> = if !insn_sizes.is_empty() && insn_sizes.len() == pcs.len() {
-        insn_sizes.to_vec()
-    } else {
-        vec![4; pcs.len()]
-    };
     if seeds.len() > 32
         || seeds.iter().any(|seed| {
             seed.register >= if seed.floating { 32 } else { 31 }
@@ -858,11 +864,11 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
         .map(|(index, &pc)| {
             let position = file_offset.saturating_add(pc.saturating_sub(base));
             let sz = *sizes.get(index).unwrap_or(&4) as u64;
-            let pc_end = if fixed_width { pcs.get(index + 1).copied().unwrap_or(pc + 4) } else { pc.saturating_add(sz) };
+            let pc_end = pc.saturating_add(sz);
             let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
             let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return IrOperation::TargetSpecific; };
             // ARM64 4-byte decode only for now; variable-length decode remains conservative.
-            if *sizes.get(index).unwrap_or(&4) != 4 || off + 4 > code.len() {
+            if *sizes.get(index).unwrap_or(&4) != 4 || off.saturating_add(sz as usize) > code.len() {
                 return IrOperation::TargetSpecific;
             }
             let word = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
