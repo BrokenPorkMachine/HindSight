@@ -1162,6 +1162,14 @@ fn aindex_of(pc: u64, insn_pcs: &[u64], start: u64, count: usize) -> Option<usiz
         (i < count).then_some(i)
     } else { insn_pcs.binary_search(&pc).ok() }
 }
+fn aspan_end_pc(pc: u64, insn_pcs: &[u64], start: u64, count: usize, fallback_end: u64) -> u64 {
+    if let Some(i) = aindex_of(pc, insn_pcs, start, count) {
+        if insn_pcs.is_empty() { start + (i as u64 + 1) * 4 }
+        else { insn_pcs.get(i + 1).copied().unwrap_or(fallback_end) }
+    } else {
+        pc + 4
+    }
+}
 
 pub fn build(input: Input<'_>) -> io::Result<String> {
     build_mode(input, None)
@@ -1222,6 +1230,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ));
     }
     let insn_pcs: Vec<u64> = (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect();
+    let stream_end: u64 = insn_pcs.last().map(|p| p + 4).unwrap_or(start);
     let instructions = (end - start) / 4;
     let exhausted = instructions > 128;
     let truncated = high < end;
@@ -2388,13 +2397,13 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         if block.predecessors.len() != 1 { break; }
                         let predecessor = block.predecessors[0];
                         let previous = &function.cfg.blocks[predecessor];
-                        if previous.successors.as_slice() != [current] || previous.instructions.last().copied().map(|pc| pc + 4) != block.instructions.first().copied() { break; }
+                        if previous.successors.as_slice() != [current] || previous.instructions.last().copied().map(|pc| aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)) != block.instructions.first().copied() { break; }
                         predecessor
                     } else {
                         if block.successors.len() != 1 { break; }
                         let successor = block.successors[0];
                         let next = &function.cfg.blocks[successor];
-                        if next.predecessors.as_slice() != [current] || block.instructions.last().copied().map(|pc| pc + 4) != next.instructions.first().copied() { break; }
+                        if next.predecessors.as_slice() != [current] || block.instructions.last().copied().map(|pc| aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)) != next.instructions.first().copied() { break; }
                         successor
                     };
                     current = adjacent;

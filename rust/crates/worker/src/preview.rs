@@ -129,6 +129,18 @@ fn data_in_code_ranges(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<(u6
  for _ in 0..ncmd{if at+8>window.len(){break}let cmd=le32(&window[at..at+4]);let cs=le32(&window[at+4..at+8]) as usize;if cs<8||at+cs>window.len(){break}if cmd==0x29&&cs>=16{let off=le32(&window[at+8..at+12]) as u64;let len=le32(&window[at+12..at+16]) as usize;if len<=8*1024*1024&&len%8==0&&off<=size&&len as u64<=size-off{let data=read_exact_range(file,off,len)?;for e in data.chunks_exact(8).take(200_000){let start=le32(&e[0..4]) as u64;let bytes=u16::from_le_bytes(e[4..6].try_into().unwrap()) as u64;let kind=u16::from_le_bytes(e[6..8].try_into().unwrap());if bytes>0&&start<size&&bytes<=size-start{ranges.push((start,start+bytes,kind));}}}}at+=cs;}
  ranges.sort_unstable_by_key(|r|r.0);ranges.dedup();Ok(ranges)
 }
+fn ppc_at(index: usize, pcs: &[u64], base: u64) -> u64 {
+    pcs.get(index).copied().unwrap_or(base + index as u64 * 4)
+}
+fn pindex_of(pc: u64, pcs: &[u64], base: u64, count: usize) -> Option<usize> {
+    if pcs.is_empty() {
+        let d = pc.checked_sub(base)?;
+        if d % 4 != 0 { return None; }
+        let i = (d / 4) as usize;
+        (i < count).then_some(i)
+    } else { pcs.binary_search(&pc).ok() }
+}
+
 fn branch_target(w:u32,pc:u64)->Option<(u64,&'static str,bool)>{
  let signed=|value:u32,bits:u32|->i64{let shift=64-bits;((value as i64)<<shift)>>shift};
  let add=|off:i64|->Option<u64>{if off<0{pc.checked_sub((-off) as u64)}else{pc.checked_add(off as u64)}};
@@ -493,7 +505,7 @@ fn selector_call_xrefs(relocations:&[(u64,String,u32,bool,u32,Option<u64>)],call
 fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
  let mut out=String::new();let mut global=[0u32;32];
  for (bi,&start) in leaders.iter().enumerate().take(4000){let stop=leaders.get(bi+1).copied().unwrap_or(end);let lo=start.saturating_sub(base) as usize;let hi=stop.saturating_sub(base).min(code.len() as u64) as usize;if lo>=hi||hi>code.len(){continue}out.push_str(&format!("B{bi:04} {start:#018x}\n"));let mut local=global;
-  for (ii,ch) in code[lo..hi].chunks_exact(4).enumerate(){let pc=start+ii as u64*4;let w=le32(ch);if let Some(line)=ssa_hint(w,&mut local){out.push_str(&format!("  {pc:#018x}  {line}\n"));}else{let mut b=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,b.as_mut_ptr(),b.len())};if known!=1{out.push_str(&format!("  {pc:#018x}  opaque barrier: incoming versions not propagated past unknown semantics\n"));local=[0u32;32];}}if out.len()>60_000{return out}}
+  for (ii,ch) in code[lo..hi].chunks_exact(4).enumerate(){let pc=start+ii as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);if let Some(line)=ssa_hint(w,&mut local){out.push_str(&format!("  {pc:#018x}  {line}\n"));}else{let mut b=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,b.as_mut_ptr(),b.len())};if known!=1{out.push_str(&format!("  {pc:#018x}  opaque barrier: incoming versions not propagated past unknown semantics\n"));local=[0u32;32];}}if out.len()>60_000{return out}}
   for r in 0..32{global[r]=global[r].max(local[r]);}
  }
  if out.is_empty(){out.push_str("No modeled instructions were available for SSA renaming.\n");}out
@@ -809,7 +821,7 @@ fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u6
 
 fn explicit_cast_evidence(code:&[u8],base:u64)->String{
  let mut out=String::new();let mut found=0usize;
- for (index,chunk) in code.chunks_exact(4).enumerate(){let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{continue};let pc=base+index as u64*4;out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}}
+ for (index,chunk) in code.chunks_exact(4).enumerate(){let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{continue};let pc=base+index as u64*4; /* fixed-width ARM64; variable-length streams need pc map */out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}}
  if found==0{out.push_str("No explicit UXTB/UXTH/UXTW/SXTB/SXTH/SXTW encodings were recovered.\n")}
  out
 }
@@ -928,7 +940,7 @@ fn call_argument_provenance(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base
 }
 
 fn annotated_disassembly(code:&[u8],base:u64,symbols:&[(u64,String)],relocations:&[(u64,String,u32,bool,u32,Option<u64>)])->String{
- let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();for (i,ch) in code.chunks_exact(4).enumerate().take(4000){let pc=base+i as u64*4;if let Some(name)=symbol_name_at(symbols,pc){out.push_str(&format!("\n{pc:#018x} <{name}>:\n"));}let w=le32(ch);let mut asm_buf=[0 as c_char;192];unsafe{re_arm64_decode(w,pc,asm_buf.as_mut_ptr(),asm_buf.len())};let asm=unsafe{CStr::from_ptr(asm_buf.as_ptr())}.to_string_lossy();out.push_str(&format!("  {pc:#018x}  {w:08x}  {asm}"));if let Some(r)=reloc_by_site.get(&pc).copied(){let (_,name,_,_,_,target)=r;out.push_str(&format!("  ; reloc -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}}else if let Some((target,kind,_))=branch_target(w,pc){if let Some(name)=symbol_name_at(symbols,target){out.push_str(&format!("  ; {kind} -> {name}"));}}out.push('\n');if out.len()>60_000{break}}out
+ let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();for (i,ch) in code.chunks_exact(4).enumerate().take(4000){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */if let Some(name)=symbol_name_at(symbols,pc){out.push_str(&format!("\n{pc:#018x} <{name}>:\n"));}let w=le32(ch);let mut asm_buf=[0 as c_char;192];unsafe{re_arm64_decode(w,pc,asm_buf.as_mut_ptr(),asm_buf.len())};let asm=unsafe{CStr::from_ptr(asm_buf.as_ptr())}.to_string_lossy();out.push_str(&format!("  {pc:#018x}  {w:08x}  {asm}"));if let Some(r)=reloc_by_site.get(&pc).copied(){let (_,name,_,_,_,target)=r;out.push_str(&format!("  ; reloc -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}}else if let Some((target,kind,_))=branch_target(w,pc){if let Some(name)=symbol_name_at(symbols,target){out.push_str(&format!("  ; {kind} -> {name}"));}}out.push('\n');if out.len()>60_000{break}}out
 }
 
 fn classify_jump_candidate(code:&[u8],base:u64,pc:u64,reg:u32)->&'static str{
@@ -1425,7 +1437,7 @@ fn iterative_value_flow(code:&[u8],base:u64,leaders:&[u64],edges:&[(u64,u64,&str
 }
 
 fn indirect_call_resolution(code:&[u8],base:u64,leaders:&[u64],relocations:&[(u64,String,u32,bool,u32,Option<u64>)],symbols:&[(u64,String)])->String{
- let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();for (i,ch) in code.chunks_exact(4).enumerate(){let pc=base+i as u64*4;let w=le32(ch);if w&0xffff_fc1f!=0xd63f_0000{continue}let reg=((w>>5)&31) as usize;let b=block_index(leaders,pc).unwrap_or(0);let bs=leaders.get(b).copied().unwrap_or(base);let defs=last_defs_for_block(code,base,bs,pc);let def=if reg<8{defs[reg]}else{None};let resolved=def.and_then(|d|reloc_by_site.get(&d).copied()).and_then(|x|x.5).map(|t|{let name=symbol_name_at(symbols,t).unwrap_or("<resolved-target>");format!("resolved {t:#018x} {name}")}).unwrap_or_else(||def.map(|d|format!("definition {d:#018x}; target unresolved")).unwrap_or_else(||"no modeled reaching definition".into()));out.push_str(&format!("BLR x{reg} @ {pc:#018x} B{b:04}: {resolved}\n"));if out.len()>60_000{break}}
+ let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();for (i,ch) in code.chunks_exact(4).enumerate(){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);if w&0xffff_fc1f!=0xd63f_0000{continue}let reg=((w>>5)&31) as usize;let b=block_index(leaders,pc).unwrap_or(0);let bs=leaders.get(b).copied().unwrap_or(base);let defs=last_defs_for_block(code,base,bs,pc);let def=if reg<8{defs[reg]}else{None};let resolved=def.and_then(|d|reloc_by_site.get(&d).copied()).and_then(|x|x.5).map(|t|{let name=symbol_name_at(symbols,t).unwrap_or("<resolved-target>");format!("resolved {t:#018x} {name}")}).unwrap_or_else(||def.map(|d|format!("definition {d:#018x}; target unresolved")).unwrap_or_else(||"no modeled reaching definition".into()));out.push_str(&format!("BLR x{reg} @ {pc:#018x} B{b:04}: {resolved}\n"));if out.len()>60_000{break}}
  if out.is_empty(){out.push_str("No indirect BLR call sites were found in the bounded code scan.\n");}out
 }
 
@@ -1859,7 +1871,7 @@ fn mapped_reference_label(file:&mut File,secs:&[SectionInfo],target:u64)->io::Re
 /// avoiding speculative value propagation across unknown instructions or control flow.
 fn pc_relative_data_references(file:&mut File,window:&[u8],code:&[u8],base:u64)->io::Result<String>{
  let secs=sections(window);let mut pending:[Option<(u64,u64,usize)>;32]=[None;32];let mut out=String::new();let mut proven=0usize;
- for (i,ch) in code.chunks_exact(4).enumerate(){let pc=base+i as u64*4;let w=le32(ch);for slot in pending.iter_mut(){if let Some((_,_,born))=*slot{if i.saturating_sub(born)>1{*slot=None;}}}
+ for (i,ch) in code.chunks_exact(4).enumerate(){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);for slot in pending.iter_mut(){if let Some((_,_,born))=*slot{if i.saturating_sub(born)>1{*slot=None;}}}
   let rd=(w&31) as usize;
   if (w&0x9f000000)==0x10000000{let imm=((w as u64>>5)&0x7ffff)<<2|((w as u64>>29)&3);let rel=sign_extend_u64(imm,21);if let Some(target)=resolve(pc,rel){if let Some(label)=mapped_reference_label(file,&secs,target)?{out.push_str(&format!("{pc:#018x} ADR  x{rd} -> {target:#018x}  {label}  provenance=instruction-immediate\n"));proven+=1;}}pending[rd]=None;}
   else if (w&0x9f000000)==0x90000000{let imm=((w as u64>>5)&0x7ffff)<<2|((w as u64>>29)&3);let rel_pages=sign_extend_u64(imm,21).saturating_mul(4096);let page=pc&!0xfffu64;if let Some(target)=resolve(page,rel_pages){pending[rd]=Some((pc,target,i));}else{pending[rd]=None;}}
@@ -1893,7 +1905,7 @@ fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,cod
  let scan_end=map.address+code.len() as u64;
  if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
  let mut direct_call_starts=std::collections::BTreeSet::new();
- if !map.encrypted{for (index,chunk) in code.chunks_exact(4).enumerate(){let pc=map.address+(index as u64)*4;let position=map.offset+(index as u64)*4;if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}}}
+ if !map.encrypted{for (index,chunk) in code.chunks_exact(4).enumerate(){let pc=map.address+(index as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let position=map.offset+(index as u64)*4;if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}}}
  starts.extend(direct_call_starts.iter().copied());
  let unwind_starts=if map.encrypted{Vec::new()}else{unwind_info_function_starts(file,window,size,map.address,scan_end)?};starts.extend(unwind_starts.iter().copied());
  let (objc_classes,objc_layouts)=objc_class_graph(file,window,size)?;
@@ -2231,7 +2243,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  if boundary_sources.get(&map.address).map_or(true,std::collections::BTreeSet::is_empty){boundary_sources.entry(map.address).or_default().insert("section-start fallback");}
  let mut functions=String::new();
  let mut leaders=starts.clone();let mut edges:Vec<(u64,u64,&str)>=Vec::new();let mut calls:Vec<(u64,u64,u64)>=Vec::new();let mut ir=String::new();let mut dataflow=String::new();let mut ssa=String::new();let mut jump_tables=String::new();let mut semantic_resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();let mut decoded=0usize;let mut data_words=0usize;let mut versions=[0u32;32];let mut data_index=0usize;
- for (i,ch) in code.chunks_exact(4).enumerate(){let pc=map.address+(i as u64)*4;let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));}
+ for (i,ch) in code.chunks_exact(4).enumerate(){let pc=map.address+(i as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));}
   if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end)?{
     // Collect proven complete in-function targets for semantic CFG/rendering.
     let mut has_unresolved=false; let mut stopped_at_proven_bound=false; let mut validated=0usize; let mut cases:Vec<u64>=Vec::new();
