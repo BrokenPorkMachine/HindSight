@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 
 mod names;
-pub use names::{parameter_value_names, parameter_value_names_with_resolved_indirects, ParameterNameSeed, ParameterNameAnalysis};
+pub use names::{parameter_value_names, parameter_value_names_with_resolved_indirects, parameter_value_names_with_resolved_indirects_and_pcs, ParameterNameSeed, ParameterNameAnalysis};
 mod files;
 mod file_ssa;
 #[cfg(test)]

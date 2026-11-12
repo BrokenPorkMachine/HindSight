@@ -2210,7 +2210,7 @@ fn render_arm64_body(
         if !statement.is_empty() { instructions.push((address, statement.into())); }
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
-    let parameter_names: super::semantic::ParameterNameAnalysis = super::semantic::parameter_value_names_with_resolved_indirects(code, base, start, end, file_offset, data_ranges, &name_seeds, &resolved_indirect_targets);
+    let parameter_names: super::semantic::ParameterNameAnalysis = super::semantic::parameter_value_names_with_resolved_indirects_and_pcs(code, base, start, end, file_offset, data_ranges, &name_seeds, &resolved_indirect_targets, &insn_pcs, &insn_sizes);
     let object_statements=object_layout.map(|layout|object_member_statements(code,base,start,end,file_offset,data_ranges,layout,&resolved_indirect_targets,&insn_pcs,&insn_sizes)).unwrap_or_default();
     let no_aliases = BTreeMap::new();
     // Structured regions render their statements through
