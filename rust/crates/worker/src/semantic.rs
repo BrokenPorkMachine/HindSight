@@ -8382,6 +8382,10 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
                     right: IrOperand::Constant(disp as u64),
                 });
             }
+            // Absolute displacement-only effective address (no base/index).
+            if index_reg == iced_x86::Register::None && base_reg == iced_x86::Register::None {
+                return Some(IrOperation::Address { destination: dst, value: instr.memory_displacement64(), page: false });
+            }
             // base + index*scale + disp and other complex forms are not yet modeled soundly in shared IR.
             None
         }
