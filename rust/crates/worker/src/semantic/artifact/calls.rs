@@ -819,8 +819,8 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch_and_pcs(
         };
 
         let lifted = super::super::LiftedInstruction { address: pc, word, operation, portable, data: false };
-        let flag_effects = super::super::files::instruction_flag_effects(&lifted);
-        let vector_effects = super::super::files::instruction_vector_effects(&lifted);
+        let flag_effects = super::super::files::instruction_flag_effects_with_arch(&lifted, architecture);
+        let vector_effects = super::super::files::instruction_vector_effects_with_arch(&lifted, architecture);
         summary.instructions += 1;
         if flag_effects.defines != 0 { summary.defines_flags = true; }
         for range in &vector_effects.writes {

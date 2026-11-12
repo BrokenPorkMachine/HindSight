@@ -9748,7 +9748,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
 
         // SSA construction: place phi nodes and rename registers.
         let ssa = build_ssa(&function_ir);
-        let file_ssa = file_ssa::build_file_ssa(&function_ir);
+        let file_ssa = file_ssa::build_file_ssa_with_arch(&function_ir, architecture);
         let mut ssa_budget = SsaOutputBudget { remaining: 4_000, exhausted: false };
         out.push_str("  // GPR SSA: W/X share an identity; entry/unknown values carry no source type; memory SSA is path-sensitive over bounded alias partitions; implicit call arguments unresolved\n");
         out.push_str("  // Flag SSA is per NZCV bit; vector SSA is per byte range, preserving partial writes and joins\n");
@@ -9867,7 +9867,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                 // Publish the exact flag effects. A flag write is partial:
                 // `ANDS` leaves the carry and overflow alone, so a consumer
                 // can tell which flags the instruction really replaced.
-                let flag_effects = files::instruction_flag_effects(instruction);
+                let flag_effects = files::instruction_flag_effects_with_arch(instruction, architecture);
                 if flag_effects.touches() {
                     let defines = files::flag_names(flag_effects.defines).join(",");
                     let uses = files::flag_names(flag_effects.uses).join(",");
@@ -9876,7 +9876,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                 // Publish the exact vector effects. A narrow write preserves
                 // the rest of its register, so the published width tells a
                 // consumer whether the whole value was replaced.
-                let vector_effects = files::instruction_vector_effects(instruction);
+                let vector_effects = files::instruction_vector_effects_with_arch(instruction, architecture);
                 if vector_effects.touches() {
                     let writes = vector_effects.writes.iter()
                         .map(|range| range.name())

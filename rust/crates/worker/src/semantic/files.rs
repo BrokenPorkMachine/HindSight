@@ -148,7 +148,15 @@ pub(super) fn condition_code_flags(code: u8) -> u8 {
 /// the logical group are the architectural source of the write, so they are
 /// read from the encoding rather than re-parsed from rendered text.
 pub(super) fn instruction_flag_effects(instruction: &LiftedInstruction) -> FlagEffects {
+    instruction_flag_effects_with_arch(instruction, "arm64")
+}
+
+/// NZCV bit effects are ARM64-specific; for non-ARM64 architectures, flag semantics
+/// are not modeled in this NZCV register-file and effects are kept conservative/empty
+/// except for explicit barriers where no narrower claim is sound.
+pub(super) fn instruction_flag_effects_with_arch(instruction: &LiftedInstruction, architecture: &str) -> FlagEffects {
     let mut effects = FlagEffects::default();
+    let is_arm64 = super::is_arm64_arch(architecture);
     // Data-in-code and target-specific operations are not decoded into an
     // architectural effect set, so no narrower flag claim is sound. Preserve
     // the prior identities as inputs and invalidate every result.
@@ -157,66 +165,68 @@ pub(super) fn instruction_flag_effects(instruction: &LiftedInstruction) -> FlagE
         effects.uses = FLAG_ALL;
         return effects;
     }
-    // `ADDS`/`SUBS` write every flag. The `S` bit is bit 29 of the
-    // add/subtract group, and the decoder keeps the form when the
-    // destination is a real register.
-    match instruction.operation {
-        Operation::AddImmediate { .. } | Operation::AddRegister { .. }
-            if instruction.word & (1 << 29) != 0 =>
-        {
-            effects.defines |= FLAG_ALL;
+    if is_arm64 {
+        // `ADDS`/`SUBS` write every flag. The `S` bit is bit 29 of the
+        // add/subtract group, and the decoder keeps the form when the
+        // destination is a real register.
+        match instruction.operation {
+            Operation::AddImmediate { .. } | Operation::AddRegister { .. }
+                if instruction.word & (1 << 29) != 0 =>
+            {
+                effects.defines |= FLAG_ALL;
+            }
+            // `ANDS`/`BICS` write `N` and `Z` only. `C` and `V` are preserved.
+            // The logical group carries the operation in bits 30 and 29, and
+            // `opc == 0b11` is the flag-setting form.
+            Operation::LogicalImmediate { .. } | Operation::LogicalRegister { .. }
+                if instruction.word & 0x6000_0000 == 0x6000_0000 =>
+            {
+                effects.defines |= FLAG_N | FLAG_Z;
+            }
+            _ => {}
         }
-        // `ANDS`/`BICS` write `N` and `Z` only. `C` and `V` are preserved.
-        // The logical group carries the operation in bits 30 and 29, and
-        // `opc == 0b11` is the flag-setting form.
-        Operation::LogicalImmediate { .. } | Operation::LogicalRegister { .. }
-            if instruction.word & 0x6000_0000 == 0x6000_0000 =>
-        {
-            effects.defines |= FLAG_N | FLAG_Z;
-        }
-        _ => {}
     }
     match instruction.portable {
         // `CMP`/`CMN` write every flag. `TST` is `ANDS` with a zero
-        // destination, so it writes `N` and `Z` only.
-        IrOperation::Compare { kind, .. } => {
+        // destination, so it writes `N` and `Z` only. (ARM64 NZCV semantics)
+        IrOperation::Compare { kind, .. } if is_arm64 => {
             effects.defines |= match kind {
                 IrCompareKind::Test => FLAG_N | FLAG_Z,
                 IrCompareKind::Compare | IrCompareKind::CompareNegative => FLAG_ALL,
             };
         }
         // A conditional compare writes every flag, and reads the flags its
-        // condition names.
-        IrOperation::ConditionalCompare { condition, .. } => {
+        // condition names. (ARM64 NZCV semantics)
+        IrOperation::ConditionalCompare { condition, .. } if is_arm64 => {
             effects.defines |= FLAG_ALL;
             effects.uses |= condition_code_flags(condition);
         }
         // `MRS Xt, NZCV` consumes all four condition bits to produce Xt.
-        IrOperation::ReadNZCV { .. } => {
+        IrOperation::ReadNZCV { .. } if is_arm64 => {
             effects.uses |= FLAG_ALL;
         }
         // `MSR NZCV, Xt` replaces all four PSTATE condition bits. The source
         // register read is carried separately by the GPR effects.
-        IrOperation::WriteNZCV { .. } => {
+        IrOperation::WriteNZCV { .. } if is_arm64 => {
             effects.defines |= FLAG_ALL;
         }
-        // A floating-point compare writes every flag.
-        IrOperation::ScalarFloatCompare { .. } => {
+        // A floating-point compare writes every flag (ARM64 NZCV semantics).
+        IrOperation::ScalarFloatCompare { .. } if is_arm64 => {
             effects.defines |= FLAG_ALL;
         }
         // `ADC`/`SBC` consume C. `ADCS`/`SBCS` additionally define all NZCV
         // bits, and their carry input is an explicit flag-file use.
-        IrOperation::AddCarry { set_flags, .. } => {
+        IrOperation::AddCarry { set_flags, .. } if is_arm64 => {
             effects.uses |= FLAG_C;
             if set_flags { effects.defines |= FLAG_ALL; }
         }
-        // A conditional select reads the flags its predicate names.
+        // A conditional select reads the flags its predicate names (ARM64 NZCV).
         IrOperation::ConditionalSelect { condition, .. }
-        | IrOperation::ScalarFloatSelect { condition, .. } => {
+        | IrOperation::ScalarFloatSelect { condition, .. } if is_arm64 => {
             effects.uses |= predicate_flags(condition);
         }
-        // A conditional branch reads the flags its condition names.
-        IrOperation::ConditionalBranch { condition: IrCondition::Flags(condition), .. } => {
+        // A conditional branch reads the flags its condition names (ARM64 NZCV).
+        IrOperation::ConditionalBranch { condition: IrCondition::Flags(condition), .. } if is_arm64 => {
             effects.uses |= predicate_flags(condition);
         }
         // A call does not preserve the flags. AAPCS64 makes the condition
@@ -242,17 +252,30 @@ pub(super) fn instruction_flag_effects(instruction: &LiftedInstruction) -> FlagE
 /// change them completely. `v8`-`v15` are callee-saved, but only their bottom
 /// 64 bits are preserved, so the callee may change the top 64 bits.
 pub(super) fn call_vector_clobbers() -> Vec<VectorRange> {
-    (0..32u8).map(|register| {
-        if (8..=15).contains(&register) {
-            VectorRange { register, offset: 8, bytes: 8 }
-        } else {
-            VectorRange::low(register, 16)
-        }
-    }).collect()
+    call_vector_clobbers_with_arch("arm64")
+}
+
+pub(super) fn call_vector_clobbers_with_arch(architecture: &str) -> Vec<VectorRange> {
+    if super::is_arm64_arch(architecture) {
+        (0..32u8).map(|register| {
+            if (8..=15).contains(&register) {
+                VectorRange { register, offset: 8, bytes: 8 }
+            } else {
+                VectorRange::low(register, 16)
+            }
+        }).collect()
+    } else {
+        // Non-ARM64 vector/SIMD register preservation is not modeled here; be conservative.
+        (0..32u8).map(|register| VectorRange::low(register, 16)).collect()
+    }
 }
 
 /// The vector registers an instruction writes and reads.
 pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> VectorEffects {
+    instruction_vector_effects_with_arch(instruction, "arm64")
+}
+
+pub(super) fn instruction_vector_effects_with_arch(instruction: &LiftedInstruction, architecture: &str) -> VectorEffects {
     let mut effects = VectorEffects::default();
     // Data-in-code and target-specific operations may read or write any
     // vector register. Treat them as whole-file barriers; otherwise a later
@@ -398,7 +421,7 @@ pub(super) fn instruction_vector_effects(instruction: &LiftedInstruction) -> Vec
         }
         // A call does not preserve the caller-saved vector registers.
         IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. } => {
-            effects.writes.extend(call_vector_clobbers());
+            effects.writes.extend(call_vector_clobbers_with_arch(architecture));
         }
         _ => {}
     }

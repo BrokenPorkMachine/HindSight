@@ -2692,7 +2692,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         cfg: FunctionCfg { blocks },
     };
     let ssa = build_ssa(&function);
-    let file_ssa = super::file_ssa::build_file_ssa(&function);
+    let file_ssa = super::file_ssa::build_file_ssa_with_arch(&function, architecture);
     let mut block_ids = Vec::new();
     for (index, block) in function.cfg.blocks.iter().enumerate() {
         let id = builder.record(

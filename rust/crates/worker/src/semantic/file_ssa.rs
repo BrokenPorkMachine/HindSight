@@ -236,9 +236,9 @@ impl InstructionEffects {
 }
 
 /// The flag and vector effects of one instruction.
-fn instruction_effects(instruction: &LiftedInstruction) -> InstructionEffects {
-    let flags = files::instruction_flag_effects(instruction);
-    let vectors = files::instruction_vector_effects(instruction);
+fn instruction_effects(instruction: &LiftedInstruction, architecture: &str) -> InstructionEffects {
+    let flags = files::instruction_flag_effects_with_arch(instruction, architecture);
+    let vectors = files::instruction_vector_effects_with_arch(instruction, architecture);
     let mut flag_uses = Vec::new();
     let mut flag_defines = Vec::new();
     // The published flag order is the architectural one: `N`, `Z`, `C`, `V`.
@@ -260,6 +260,11 @@ fn instruction_effects(instruction: &LiftedInstruction) -> InstructionEffects {
 
 /// The value identity of the flag file and the vector file.
 pub(super) fn build_file_ssa(function: &FunctionIr) -> FileSsa {
+    build_file_ssa_with_arch(function, "arm64")
+}
+
+/// The value identity of the flag file and the vector file, interpreted for `architecture`.
+pub(super) fn build_file_ssa_with_arch(function: &FunctionIr, architecture: &str) -> FileSsa {
     let blocks = &function.cfg.blocks;
     let mut result = FileSsa {
         phis: (0..blocks.len()).map(|_| Vec::new()).collect(),
@@ -268,7 +273,7 @@ pub(super) fn build_file_ssa(function: &FunctionIr) -> FileSsa {
     };
     if blocks.is_empty() { return result; }
 
-    let effects: Vec<InstructionEffects> = function.instructions.iter().map(instruction_effects).collect();
+    let effects: Vec<InstructionEffects> = function.instructions.iter().map(|insn| instruction_effects(insn, architecture)).collect();
     let mut block_defines: Vec<SlotMask> = blocks.iter().map(|_| SlotMask::new()).collect();
     let mut block_uses: Vec<SlotMask> = blocks.iter().map(|_| SlotMask::new()).collect();
     for (index, block) in blocks.iter().enumerate().filter(|(_, block)| block.reachable) {
