@@ -2409,15 +2409,52 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let (sem_pcs, sem_sizes) = if starts.len() == 1 {
   let s = starts[0];
   let e = scan_end.min(map.address + code.len() as u64);
-  let mut pcs_v = Vec::new();
-  let mut sz_v = Vec::new();
-  let mut pc = s;
-  while pc.saturating_add(4) <= e && pcs_v.len() < 128 {
-   pcs_v.push(pc);
-   sz_v.push(4u32);
-   pc = pc.saturating_add(4);
+  let cputype = if window.len() >= 8 { le32(&window[4..8]) } else { 0x0100_000c };
+  let cpusubtype = if window.len() >= 12 { le32(&window[8..12]) } else { 0 };
+  let arch_lc = match cputype {
+   0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e" } else { "arm64" },
+   0x0100_0007 => "x86_64",
+   0x0000_000c => "arm",
+   0x0000_0007 => "i386",
+   _ => "arm64",
+  }.to_ascii_lowercase();
+  if matches!(arch_lc.as_str(), "x86_64" | "x86-64" | "amd64") {
+   let high = e.min(s.saturating_add(128 * 15));
+   if s >= map.address && high > s {
+    let lo = (s - map.address) as usize;
+    let hi = (high - map.address) as usize;
+    if hi <= code.len() && lo < hi {
+     let body = &code[lo..hi];
+     let mut decoder = iced_x86::Decoder::with_ip(64, body, s, iced_x86::DecoderOptions::NONE);
+     let mut pcs_v = Vec::new();
+     let mut sz_v = Vec::new();
+     while decoder.can_decode() && pcs_v.len() < 128 {
+      let ip = decoder.ip();
+      if ip >= e { break; }
+      let instr = decoder.decode();
+      let sz = instr.len() as u32;
+      if sz == 0 { break; }
+      pcs_v.push(ip);
+      sz_v.push(sz);
+     }
+     (pcs_v, sz_v)
+    } else {
+     (Vec::new(), Vec::new())
+    }
+   } else {
+    (Vec::new(), Vec::new())
+   }
+  } else {
+   let mut pcs_v = Vec::new();
+   let mut sz_v = Vec::new();
+   let mut pc = s;
+   while pc.saturating_add(4) <= e && pcs_v.len() < 128 {
+    pcs_v.push(pc);
+    sz_v.push(4u32);
+    pc = pc.saturating_add(4);
+   }
+   (pcs_v, sz_v)
   }
-  (pcs_v, sz_v)
  } else { (Vec::new(), Vec::new()) };
  let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects_and_pcs(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets,&sem_pcs,&sem_sizes),&reconstructed_pseudocode);
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
