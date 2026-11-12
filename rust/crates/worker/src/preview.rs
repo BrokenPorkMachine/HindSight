@@ -1875,7 +1875,7 @@ fn mapped_reference_label(file:&mut File,secs:&[SectionInfo],target:u64)->io::Re
 /// avoiding speculative value propagation across unknown instructions or control flow.
 fn pc_relative_data_references(file:&mut File,window:&[u8],code:&[u8],base:u64)->io::Result<String>{
  let secs=sections(window);let mut pending:[Option<(u64,u64,usize)>;32]=[None;32];let mut out=String::new();let mut proven=0usize;
- for (i,ch) in code.chunks_exact(4).enumerate(){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);for slot in pending.iter_mut(){if let Some((_,_,born))=*slot{if i.saturating_sub(born)>1{*slot=None;}}}
+ let mut i=0usize;while i*4+4<=code.len(){let ch=&code[i*4..i*4+4];let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);for slot in pending.iter_mut(){if let Some((_,_,born))=*slot{if i.saturating_sub(born)>1{*slot=None;}}}
   let rd=(w&31) as usize;
   if (w&0x9f000000)==0x10000000{let imm=((w as u64>>5)&0x7ffff)<<2|((w as u64>>29)&3);let rel=sign_extend_u64(imm,21);if let Some(target)=resolve(pc,rel){if let Some(label)=mapped_reference_label(file,&secs,target)?{out.push_str(&format!("{pc:#018x} ADR  x{rd} -> {target:#018x}  {label}  provenance=instruction-immediate\n"));proven+=1;}}pending[rd]=None;}
   else if (w&0x9f000000)==0x90000000{let imm=((w as u64>>5)&0x7ffff)<<2|((w as u64>>29)&3);let rel_pages=sign_extend_u64(imm,21).saturating_mul(4096);let page=pc&!0xfffu64;if let Some(target)=resolve(page,rel_pages){pending[rd]=Some((pc,target,i));}else{pending[rd]=None;}}
@@ -1884,6 +1884,7 @@ fn pc_relative_data_references(file:&mut File,window:&[u8],code:&[u8],base:u64)-
   else if let Some(def)=modeled_def_reg(w){pending[def]=None;}
   if branch_target(w,pc).is_some()||is_terminal(w){pending=[None;32];}
   if out.len()>60_000{break}
+  i+=1;
  }
  if proven==0{out.push_str("No ADR, validated ADRP+ADD, or literal-load reference in the bounded code scan resolved into a parsed Mach-O section.\n");}else{out.push_str(&format!("\nValidated PC-relative data-reference records: {proven}. Unmapped targets and non-adjacent/incomplete ADRP chains are intentionally omitted.\n"));}Ok(out)
 }
