@@ -8929,18 +8929,16 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                 if (start - base) % 4 != 0 {
                     (Vec::new(), std::collections::BTreeMap::new())
                 } else {
-                    let mut pcs_v: Vec<u64> = Vec::new();
-                    let mut j = 0usize;
-                    while low + (j + 1) * 4 <= high { pcs_v.push(start + (j as u64) * 4); j += 1; }
+                    let count = (high.saturating_sub(low)) / 4;
+                    let pcs_v = (0..count).map(|j| start.saturating_add(j as u64 * 4)).collect();
                     (pcs_v, std::collections::BTreeMap::new())
                 }
             } else {
                 (list, map)
             }
         } else {
-            let mut pcs_v: Vec<u64> = Vec::new();
-            let mut j = 0usize;
-            while low + (j + 1) * 4 <= high { pcs_v.push(start + (j as u64) * 4); j += 1; }
+            let count = (high.saturating_sub(low)) / 4;
+            let pcs_v = (0..count).map(|j| start.saturating_add(j as u64 * 4)).collect();
             (pcs_v, std::collections::BTreeMap::new())
         };
         if pcs.is_empty() {
