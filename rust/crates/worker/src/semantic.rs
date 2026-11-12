@@ -8128,6 +8128,12 @@ impl SsaOutputBudget {
     }
 }
 
+fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
+    let off = usize::try_from(pc.checked_sub(base)?).ok()?;
+    let bytes = code.get(off..off.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
 fn arm64_fixed_width_pcs_in_range(start: u64, end: u64, base: u64, limit: usize) -> Option<Vec<u64>> {
     if start < base || end < start { return None; }
     let start_off = start.checked_sub(base)?;
@@ -8188,9 +8194,7 @@ fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64
             insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
         } else { 4 };
         if sz != 4 { return None; } // conservative for variable-length until arch-aware decode
-        let off = pc.checked_sub(base)? as usize;
-        let bytes = code.get(off..off + 4)?;
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        let word = read_arm64_u32(code, base, pc)?;
         let operation = decode(word, pc);
         let portable = lift_operation(operation, pc);
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) {
@@ -8275,9 +8279,8 @@ pub fn known_call_stack_argument_values_with_arch_and_pcs(code: &[u8], base: u64
             insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
         } else { 4 };
         if sz != 4 { return Vec::new(); } // conservative for variable-length until arch-aware decode
-        let off = pc.saturating_sub(base) as usize;
-        let Some(bytes) = code.get(off..off + 4) else { return Vec::new() };
-        let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
+        let Some(word) = read_arm64_u32(code, base, pc) else { return Vec::new() };
+        let operation = decode(word, pc);
         let portable = lift_operation(operation, pc);
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) { return Vec::new(); }
         if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) { flow.clear(); stack.clear(); stack_aliases.clear(); continue; }
@@ -8832,10 +8835,8 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     for (i, &pc) in pcs.iter().enumerate() {
         let sz = *sizes.get(i).unwrap_or(&4);
         if sz != 4 { return false; } // conservative: unknown variable-length/non-ARM64 instruction may affect SP
-        let off = match pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) { Some(o) => o, None => return false };
-        if off.saturating_add(4) > code.len() { return false; }
-        let Some(bytes) = code.get(off..off + 4) else { return false; };
-        let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
+        let Some(word) = read_arm64_u32(code, base, pc) else { return false };
+        let operation = decode(word, pc);
         let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
         match operation {
             Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
@@ -8959,10 +8960,8 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
 
         let size_of = |pc: u64| -> u32 { insn_size_map.get(&pc).copied().unwrap_or(4) };
         let word_at = |pc: u64| -> u32 {
-            let off = (pc - base) as usize;
             // ARM64 fixed-width decode path for 4-byte instructions; other sizes not yet decoded.
-            if off + 4 > code.len() { return 0; }
-            u32::from_le_bytes(code[off..off + 4].try_into().unwrap())
+            read_arm64_u32(code, base, pc).unwrap_or(0)
         };
         let span_end = |pc: u64| -> u64 {
             if let Some(i) = pcs.iter().position(|&p| p == pc) {
