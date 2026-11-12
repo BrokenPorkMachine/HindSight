@@ -1192,24 +1192,86 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
         tree("unsupported-operation", Some(format!("x86_64 {:?} not yet lifted", instr.mnemonic())), object([("architecture", "x86_64".into()), ("mnemonic", format!("{:?}", instr.mnemonic()).into()), ("size", (sz as u64).into()), ("status", "unsupported".into())]), vec![]),
         ir_text.clone(),
     );
-    let xreg = |r: Register| -> Option<IrRegister> {
+    let xreg = |r: Register| -> Option<(IrRegister, u32)> {
+        // Returns (normalized 64-bit register identity, operand bit width). Conservative mapping.
         Some(match r {
-            Register::RAX|Register::EAX|Register::AX|Register::AL|Register::AH => IrRegister{class: IrRegisterClass::General, index: 0, bits: 64},
-            Register::RCX|Register::ECX|Register::CX|Register::CL|Register::CH => IrRegister{class: IrRegisterClass::General, index: 1, bits: 64},
-            Register::RDX|Register::EDX|Register::DX|Register::DL|Register::DH => IrRegister{class: IrRegisterClass::General, index: 2, bits: 64},
-            Register::RBX|Register::EBX|Register::BX|Register::BL|Register::BH => IrRegister{class: IrRegisterClass::General, index: 3, bits: 64},
-            Register::RSP|Register::ESP|Register::SP|Register::SPL => IrRegister{class: IrRegisterClass::StackPointer, index: 31, bits: 64},
-            Register::RBP|Register::EBP|Register::BP|Register::BPL => IrRegister{class: IrRegisterClass::General, index: 5, bits: 64},
-            Register::RSI|Register::ESI|Register::SI|Register::SIL => IrRegister{class: IrRegisterClass::General, index: 6, bits: 64},
-            Register::RDI|Register::EDI|Register::DI|Register::DIL => IrRegister{class: IrRegisterClass::General, index: 7, bits: 64},
-            Register::R8|Register::R8D|Register::R8W|Register::R8L => IrRegister{class: IrRegisterClass::General, index: 8, bits: 64},
-            Register::R9|Register::R9D|Register::R9W|Register::R9L => IrRegister{class: IrRegisterClass::General, index: 9, bits: 64},
-            Register::R10|Register::R10D|Register::R10W|Register::R10L => IrRegister{class: IrRegisterClass::General, index: 10, bits: 64},
-            Register::R11|Register::R11D|Register::R11W|Register::R11L => IrRegister{class: IrRegisterClass::General, index: 11, bits: 64},
-            Register::R12|Register::R12D|Register::R12W|Register::R12L => IrRegister{class: IrRegisterClass::General, index: 12, bits: 64},
-            Register::R13|Register::R13D|Register::R13W|Register::R13L => IrRegister{class: IrRegisterClass::General, index: 13, bits: 64},
-            Register::R14|Register::R14D|Register::R14W|Register::R14L => IrRegister{class: IrRegisterClass::General, index: 14, bits: 64},
-            Register::R15|Register::R15D|Register::R15W|Register::R15L => IrRegister{class: IrRegisterClass::General, index: 15, bits: 64},
+            Register::RAX => (IrRegister{class: IrRegisterClass::General, index: 0, bits: 64}, 64),
+            Register::EAX => (IrRegister{class: IrRegisterClass::General, index: 0, bits: 64}, 32),
+            Register::AX  => (IrRegister{class: IrRegisterClass::General, index: 0, bits: 64}, 16),
+            Register::AL|Register::AH => (IrRegister{class: IrRegisterClass::General, index: 0, bits: 64}, 8),
+            Register::RCX => (IrRegister{class: IrRegisterClass::General, index: 1, bits: 64}, 64),
+            Register::ECX => (IrRegister{class: IrRegisterClass::General, index: 1, bits: 64}, 32),
+            Register::CX  => (IrRegister{class: IrRegisterClass::General, index: 1, bits: 64}, 16),
+            Register::CL|Register::CH => (IrRegister{class: IrRegisterClass::General, index: 1, bits: 64}, 8),
+            Register::RDX => (IrRegister{class: IrRegisterClass::General, index: 2, bits: 64}, 64),
+            Register::EDX => (IrRegister{class: IrRegisterClass::General, index: 2, bits: 64}, 32),
+            Register::DX  => (IrRegister{class: IrRegisterClass::General, index: 2, bits: 64}, 16),
+            Register::DL|Register::DH => (IrRegister{class: IrRegisterClass::General, index: 2, bits: 64}, 8),
+            Register::RBX => (IrRegister{class: IrRegisterClass::General, index: 3, bits: 64}, 64),
+            Register::EBX => (IrRegister{class: IrRegisterClass::General, index: 3, bits: 64}, 32),
+            Register::BX  => (IrRegister{class: IrRegisterClass::General, index: 3, bits: 64}, 16),
+            Register::BL|Register::BH => (IrRegister{class: IrRegisterClass::General, index: 3, bits: 64}, 8),
+            Register::RSP => (IrRegister{class: IrRegisterClass::StackPointer, index: 31, bits: 64}, 64),
+            Register::ESP => (IrRegister{class: IrRegisterClass::StackPointer, index: 31, bits: 64}, 32),
+            Register::SP  => (IrRegister{class: IrRegisterClass::StackPointer, index: 31, bits: 64}, 16),
+            Register::SPL => (IrRegister{class: IrRegisterClass::StackPointer, index: 31, bits: 64}, 8),
+            Register::RBP => (IrRegister{class: IrRegisterClass::General, index: 5, bits: 64}, 64),
+            Register::EBP => (IrRegister{class: IrRegisterClass::General, index: 5, bits: 64}, 32),
+            Register::BP  => (IrRegister{class: IrRegisterClass::General, index: 5, bits: 64}, 16),
+            Register::BPL => (IrRegister{class: IrRegisterClass::General, index: 5, bits: 64}, 8),
+            Register::RSI => (IrRegister{class: IrRegisterClass::General, index: 6, bits: 64}, 64),
+            Register::ESI => (IrRegister{class: IrRegisterClass::General, index: 6, bits: 64}, 32),
+            Register::SI  => (IrRegister{class: IrRegisterClass::General, index: 6, bits: 64}, 16),
+            Register::SIL => (IrRegister{class: IrRegisterClass::General, index: 6, bits: 64}, 8),
+            Register::RDI => (IrRegister{class: IrRegisterClass::General, index: 7, bits: 64}, 64),
+            Register::EDI => (IrRegister{class: IrRegisterClass::General, index: 7, bits: 64}, 32),
+            Register::DI  => (IrRegister{class: IrRegisterClass::General, index: 7, bits: 64}, 16),
+            Register::DIL => (IrRegister{class: IrRegisterClass::General, index: 7, bits: 64}, 8),
+            Register::R8  => (IrRegister{class: IrRegisterClass::General, index: 8, bits: 64}, 64),
+            Register::R8D => (IrRegister{class: IrRegisterClass::General, index: 8, bits: 64}, 32),
+            Register::R8W => (IrRegister{class: IrRegisterClass::General, index: 8, bits: 64}, 16),
+            Register::R8L => (IrRegister{class: IrRegisterClass::General, index: 8, bits: 64}, 8),
+            Register::R9  => (IrRegister{class: IrRegisterClass::General, index: 9, bits: 64}, 64),
+            Register::R9D => (IrRegister{class: IrRegisterClass::General, index: 9, bits: 64}, 32),
+            Register::R9W => (IrRegister{class: IrRegisterClass::General, index: 9, bits: 64}, 16),
+            Register::R9L => (IrRegister{class: IrRegisterClass::General, index: 9, bits: 64}, 8),
+            Register::R10  => (IrRegister{class: IrRegisterClass::General, index: 10, bits: 64}, 64),
+            Register::R10D => (IrRegister{class: IrRegisterClass::General, index: 10, bits: 64}, 32),
+            Register::R10W => (IrRegister{class: IrRegisterClass::General, index: 10, bits: 64}, 16),
+            Register::R10L => (IrRegister{class: IrRegisterClass::General, index: 10, bits: 64}, 8),
+            Register::R11  => (IrRegister{class: IrRegisterClass::General, index: 11, bits: 64}, 64),
+            Register::R11D => (IrRegister{class: IrRegisterClass::General, index: 11, bits: 64}, 32),
+            Register::R11W => (IrRegister{class: IrRegisterClass::General, index: 11, bits: 64}, 16),
+            Register::R11L => (IrRegister{class: IrRegisterClass::General, index: 11, bits: 64}, 8),
+            Register::R12  => (IrRegister{class: IrRegisterClass::General, index: 12, bits: 64}, 64),
+            Register::R12D => (IrRegister{class: IrRegisterClass::General, index: 12, bits: 64}, 32),
+            Register::R12W => (IrRegister{class: IrRegisterClass::General, index: 12, bits: 64}, 16),
+            Register::R12L => (IrRegister{class: IrRegisterClass::General, index: 12, bits: 64}, 8),
+            Register::R13  => (IrRegister{class: IrRegisterClass::General, index: 13, bits: 64}, 64),
+            Register::R13D => (IrRegister{class: IrRegisterClass::General, index: 13, bits: 64}, 32),
+            Register::R13W => (IrRegister{class: IrRegisterClass::General, index: 13, bits: 64}, 16),
+            Register::R13L => (IrRegister{class: IrRegisterClass::General, index: 13, bits: 64}, 8),
+            Register::R14  => (IrRegister{class: IrRegisterClass::General, index: 14, bits: 64}, 64),
+            Register::R14D => (IrRegister{class: IrRegisterClass::General, index: 14, bits: 64}, 32),
+            Register::R14W => (IrRegister{class: IrRegisterClass::General, index: 14, bits: 64}, 16),
+            Register::R14L => (IrRegister{class: IrRegisterClass::General, index: 14, bits: 64}, 8),
+            Register::R15  => (IrRegister{class: IrRegisterClass::General, index: 15, bits: 64}, 64),
+            Register::R15D => (IrRegister{class: IrRegisterClass::General, index: 15, bits: 64}, 32),
+            Register::R15W => (IrRegister{class: IrRegisterClass::General, index: 15, bits: 64}, 16),
+            Register::R15L => (IrRegister{class: IrRegisterClass::General, index: 15, bits: 64}, 8),
+            _ => return None,
+        })
+    };
+    let imm_operand = |kind: OpKind, instr: &iced_x86::Instruction| -> Option<u64> {
+        Some(match kind {
+            OpKind::Immediate8 => instr.immediate8() as u64,
+            OpKind::Immediate16 => instr.immediate16() as u64,
+            OpKind::Immediate32 => instr.immediate32() as u64,
+            OpKind::Immediate64 => instr.immediate64(),
+            OpKind::Immediate8to16 => (instr.immediate8to16() as i64 as u64),
+            OpKind::Immediate8to32 => (instr.immediate8to32() as i64 as u64),
+            OpKind::Immediate8to64 => (instr.immediate8to64() as i64 as u64),
+            OpKind::Immediate32to64 => (instr.immediate32to64() as i64 as u64),
             _ => return None,
         })
     };
@@ -1243,16 +1305,68 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
         }
         Mnemonic::Push => {
             if instr.op_count() == 1 && instr.op0_kind() == OpKind::Register {
-                if let Some(src) = xreg(instr.op0_register()) {
+                if let Some((src, _)) = xreg(instr.op0_register()) {
                     (IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8 }, value: IrOperand::Register(src), bytes: 8, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8, pre_index: true}) }, tree("unsupported-operation", Some("x86_64 push (stack write+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","push".into()),("status","partial".into())]), vec![]), ir_text)
                 } else { unsupported() }
             } else { unsupported() }
         }
         Mnemonic::Pop => {
             if instr.op_count() == 1 && instr.op0_kind() == OpKind::Register {
-                if let Some(dst) = xreg(instr.op0_register()) {
+                if let Some((dst, _)) = xreg(instr.op0_register()) {
                     (IrOperation::Load { destination: dst, address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 0 }, bytes: 8, signed: false, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 8, pre_index: false}) }, tree("unsupported-operation", Some("x86_64 pop (stack read+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","pop".into()),("status","partial".into())]), vec![]), ir_text)
                 } else { unsupported() }
+            } else { unsupported() }
+        }
+        // xor reg, reg (same register) -> zero idiom. Only sound for 32/64-bit where x86 zero-extends/full-writes.
+        Mnemonic::Xor if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register => {
+            if instr.op0_register() == instr.op1_register() {
+                if let Some((dst, bits)) = xreg(instr.op0_register()) {
+                    if bits >= 32 {
+                        (IrOperation::Assign { destination: dst, value: IrOperand::Constant(0) },
+                         tree("move", Some("x86_64 xor zero-idiom (conservative 64-bit value model)".to_string()), object([("architecture","x86_64".into()),("mnemonic","xor".into()),("status","partial".into())]), vec![]),
+                         ir_text)
+                    } else { unsupported() } // 8/16-bit partial register writes not safely modeled here
+                } else { unsupported() }
+            } else { unsupported() } // general xor semantics/flags not modeled
+        }
+        // mov reg, imm / mov reg, reg (limited, conservative). 32-bit GPR writes zero-extend on x86-64.
+        Mnemonic::Mov if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register => {
+            if let Some((dst, dst_bits)) = xreg(instr.op0_register()) {
+                match instr.op1_kind() {
+                    k if matches!(k, OpKind::Immediate8|OpKind::Immediate16|OpKind::Immediate32|OpKind::Immediate64|OpKind::Immediate8to16|OpKind::Immediate8to32|OpKind::Immediate8to64|OpKind::Immediate32to64) => {
+                        if let Some(imm) = imm_operand(instr.op1_kind(), &instr) {
+                            if dst_bits >= 32 {
+                                let value = if dst_bits == 32 { imm & 0xffff_ffff } else { imm };
+                                (IrOperation::Assign { destination: dst, value: IrOperand::Constant(value) },
+                                 tree("move", Some("x86_64 mov immediate (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
+                                 ir_text)
+                            } else { unsupported() }
+                        } else { unsupported() }
+                    }
+                    OpKind::Register => {
+                        if let Some((src, src_bits)) = xreg(instr.op1_register()) {
+                            if dst_bits == 64 && src_bits == 64 {
+                                (IrOperation::Assign { destination: dst, value: IrOperand::Register(src) },
+                                 tree("move", Some("x86_64 mov reg,reg 64-bit (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
+                                 ir_text)
+                            } else { unsupported() } // sub-64 or mixed-width moves have x86-specific semantics
+                        } else { unsupported() }
+                    }
+                    _ => unsupported(), // memory operands, etc. not yet lifted
+                }
+            } else { unsupported() }
+        }
+        // sub/add rsp, imm: common stack adjustment (flags not modeled). Only when destination is SP and 64-bit form.
+        Mnemonic::Sub | Mnemonic::Add if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register => {
+            if let Some((dst, dst_bits)) = xreg(instr.op0_register()) {
+                if dst.class == IrRegisterClass::StackPointer && dst_bits == 64 {
+                    if let Some(imm) = imm_operand(instr.op1_kind(), &instr) {
+                        let (op, rhs) = match instr.mnemonic() { Mnemonic::Sub => (IrBinaryOp::Subtract, imm), Mnemonic::Add => (IrBinaryOp::Add, imm), _ => return unsupported() };
+                        (IrOperation::Binary { destination: dst, operator: op, left: IrOperand::Register(dst), right: IrOperand::Constant(rhs) },
+                         tree("move", Some("x86_64 stack pointer adjustment (flags not modeled)".to_string()), object([("architecture","x86_64".into()),("mnemonic",format!("{:?}",instr.mnemonic()).into()),("status","partial".into())]), vec![]),
+                         ir_text)
+                    } else { unsupported() }
+                } else { unsupported() } // general add/sub with flags/effects not safely modeled yet
             } else { unsupported() }
         }
         _ => unsupported(),
