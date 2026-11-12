@@ -8526,6 +8526,38 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
             }
             None
         }
+        M::Cmova | M::Cmovae | M::Cmovb | M::Cmovbe | M::Cmove | M::Cmovg | M::Cmovge | M::Cmovl | M::Cmovle | M::Cmovne | M::Cmovno | M::Cmovnp | M::Cmovns | M::Cmovo | M::Cmovp | M::Cmovs => {
+            // Conditional move reg, reg: dst = cond ? src : dst. Flag-condition mapping is conservative
+            // (parity predicates not modeled in shared IrFlagPredicate remain unsupported).
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let src = x86_to_ir_register(instr.op1_register())?;
+            let condition = match instr.mnemonic() {
+                M::Cmove => IrFlagPredicate::Equal,
+                M::Cmovne => IrFlagPredicate::NotEqual,
+                M::Cmovb => IrFlagPredicate::CarrySet,
+                M::Cmovae => IrFlagPredicate::CarryClear,
+                M::Cmovs => IrFlagPredicate::Negative,
+                M::Cmovns => IrFlagPredicate::NonNegative,
+                M::Cmovo => IrFlagPredicate::Overflow,
+                M::Cmovno => IrFlagPredicate::NoOverflow,
+                M::Cmova => IrFlagPredicate::UnsignedHigher,
+                M::Cmovbe => IrFlagPredicate::UnsignedLowerOrSame,
+                M::Cmovge => IrFlagPredicate::SignedGreaterOrEqual,
+                M::Cmovl => IrFlagPredicate::SignedLess,
+                M::Cmovg => IrFlagPredicate::SignedGreater,
+                M::Cmovle => IrFlagPredicate::SignedLessOrEqual,
+                M::Cmovp | M::Cmovnp => return None, // parity flag not represented
+                _ => return None,
+            };
+            Some(IrOperation::ConditionalSelect {
+                destination: dst,
+                if_true: src,
+                if_false: dst,
+                condition,
+                else_op: IrSelectElse::None,
+            })
+        }
         _ => None,
     }
 }
