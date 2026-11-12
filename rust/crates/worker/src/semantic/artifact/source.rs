@@ -1951,7 +1951,7 @@ fn natural_loop_backedge(
         vec![test_value]
     };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template, condition_children, start + tail as u64 * 4
+        "source-loop-condition", "condition", condition_template, condition_children, pc_at(tail, insn_pcs, start)
     )?;
     dag.type_node(condition, None);
 
