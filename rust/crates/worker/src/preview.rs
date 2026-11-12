@@ -2417,7 +2417,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
       let fn_end=starts.iter().copied().find(|&s| s>fn_start).unwrap_or(scan_end);
       let mut in_function_targets=Vec::new(); let mut external_cases=0usize;
       for target in cases.iter().copied() {
-        if target>=fn_start && target<fn_end && (target-fn_start)%4==0 { in_function_targets.push(target); } else { external_cases+=1; }
+        if target>=fn_start && target<fn_end && (target-fn_start)%super::semantic::ARM64_INSN_BYTES==0 { in_function_targets.push(target); } else { external_cases+=1; }
       }
       let in_function_case_count = cases.len().saturating_sub(external_cases);
       in_function_targets.sort_unstable(); in_function_targets.dedup();
@@ -2425,8 +2425,8 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
     }
     if jump_tables.len()<60_000{jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  bounded indexed-table evidence\n{entries}\n"));}}
    else{if jump_tables.len()<60_000{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}}
-  if let Some((target,k,split))=branch_target(w,pc){if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&pc+4<scan_end{leaders.push(pc+4);edges.push((pc,pc+4,"fallthrough"));}}
-  else if is_terminal(w)&&pc+4<scan_end{leaders.push(pc+4);}
+  if let Some((target,k,split))=branch_target(w,pc){let next=pc.saturating_add(super::semantic::ARM64_INSN_BYTES);if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&next<scan_end{leaders.push(next);edges.push((pc,next,"fallthrough"));}}
+  else if is_terminal(w){let next=pc.saturating_add(super::semantic::ARM64_INSN_BYTES);if next<scan_end{leaders.push(next);}}
  }
  } else if super::semantic::is_x86_64_arch(&analyze_arch) && !code.is_empty() {
   // Architecture-aware variable-length x86-64 decode/lift scan (bounded, conservative).
@@ -2536,7 +2536,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
 
  let stack_slots=stack_slot_candidates(&ir);if dataflow.len().saturating_add(stack_slots.len())<60_000{dataflow.push('\n');dataflow.push_str(&stack_slots);}
  analysis_progress(44,"decode","Instruction scan completed; constructing bounded control-flow topology.");
- leaders.retain(|x|*x>=map.address&&*x<scan_end&&(if analyze_is_arm64 { (*x-map.address)%4==0 } else { true }));leaders.sort_unstable();leaders.dedup();let block_count=leaders.len();let cfg_limit=leaders.len().min(4000);let mut cfg_edges=vec![Vec::<(u64,u64,&str)>::new();cfg_limit];for &(from,to,k) in &edges{if let Some(block)=block_index(&leaders,from){if block<cfg_limit&&cfg_edges[block].len()<16{cfg_edges[block].push((from,to,k));}}}let mut cfg=String::new();for n in 0..cfg_limit{let start=leaders[n];let end=leaders.get(n+1).copied().unwrap_or(scan_end);cfg.push_str(&format!("block B{n:04} {start:#018x}..{end:#018x}\n"));for &(from,to,k) in &cfg_edges[n]{cfg.push_str(&format!("    {k:<11} {from:#018x} -> {to:#018x}\n"));}if cfg.len()>60_000{break}}
+ leaders.retain(|x|*x>=map.address&&*x<scan_end&&(if analyze_is_arm64 { (*x-map.address)%super::semantic::ARM64_INSN_BYTES==0 } else { true }));leaders.sort_unstable();leaders.dedup();let block_count=leaders.len();let cfg_limit=leaders.len().min(4000);let mut cfg_edges=vec![Vec::<(u64,u64,&str)>::new();cfg_limit];for &(from,to,k) in &edges{if let Some(block)=block_index(&leaders,from){if block<cfg_limit&&cfg_edges[block].len()<16{cfg_edges[block].push((from,to,k));}}}let mut cfg=String::new();for n in 0..cfg_limit{let start=leaders[n];let end=leaders.get(n+1).copied().unwrap_or(scan_end);cfg.push_str(&format!("block B{n:04} {start:#018x}..{end:#018x}\n"));for &(from,to,k) in &cfg_edges[n]{cfg.push_str(&format!("    {k:<11} {from:#018x} -> {to:#018x}\n"));}if cfg.len()>60_000{break}}
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");
  let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end,&analyze_arch);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end,&analyze_arch);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end,&analyze_arch);
  analysis_progress(61,"structure","Bounded dominator, phi, and SSA structure completed.");
