@@ -1252,33 +1252,30 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         // Variable-length stream without explicit size map: use analyzed byte bound conservatively.
         high.min(end)
     };
-    let instructions = if _input_instruction_pcs.is_empty() || is_arm64 { (end - start) / 4 } else { insn_pcs.len() as u64 };
-    let exhausted = instructions > 128;
-    let truncated = high < end;
-    let direct_targets = if _input_instruction_pcs.is_empty() {
-        (0..(body.len() / 4)).filter_map(|index| {
-            let off = index * 4;
-            if off + 4 > body.len() { return None; }
-            let pc = apc_at(index, &insn_pcs, start);
-            let word = u32::from_le_bytes(body[off..off + 4].try_into().ok()?);
-            match lift_operation(decode(word, pc), pc) {
-                IrOperation::DirectCall { target } => Some(target),
-                _ => None,
-            }
-        }).collect::<BTreeSet<_>>()
+    let instructions = insn_pcs.len() as u64;
+    let instruction_extent = if is_arm64 {
+        (end.saturating_sub(start)) / 4
+    } else if !_input_instruction_pcs.is_empty() {
+        _input_instruction_pcs.len() as u64
     } else {
-        insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
-            let size = *_input_instruction_sizes.get(index).unwrap_or(&4) as usize;
-            if size != 4 { return None; }
-            let off = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok())?;
-            let bytes = code.get(off..off+4)?;
-            let word = u32::from_le_bytes(bytes.try_into().ok()?);
-            match lift_operation(decode(word, pc), pc) {
-                IrOperation::DirectCall { target } => Some(target),
-                _ => None,
-            }
-        }).collect::<BTreeSet<_>>()
+        (end.saturating_sub(start)) / 4
     };
+    let exhausted = instruction_extent > 128;
+    let truncated = high < end;
+    let direct_targets = insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
+        let size = if !_input_instruction_sizes.is_empty() && _input_instruction_sizes.len() == insn_pcs.len() {
+            *_input_instruction_sizes.get(index).unwrap_or(&4) as usize
+        } else { 4 };
+        // ARM64 fixed-width decode path for direct-call discovery today; variable-length decode remains conservative.
+        if size != 4 { return None; }
+        let off = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok())?;
+        let bytes = code.get(off..off + 4)?;
+        let word = u32::from_le_bytes(bytes.try_into().ok()?);
+        match lift_operation(decode(word, pc), pc) {
+            IrOperation::DirectCall { target } => Some(target),
+            _ => None,
+        }
+    }).collect::<BTreeSet<_>>();
     let settings = object([
         ("instruction_limit", 128u64.into()),
         ("code_scan_limit", (4 * 1024 * 1024u64).into()),
