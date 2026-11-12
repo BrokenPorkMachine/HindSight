@@ -1233,19 +1233,41 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             "Function bytes unavailable",
         ));
     }
-    let insn_pcs: Vec<u64> = (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect();
-    let stream_end: u64 = insn_pcs.last().map(|p| p + 4).unwrap_or(start);
-    let instructions = (end - start) / 4;
+    let insn_pcs: Vec<u64> = if !_input_instruction_pcs.is_empty() {
+        _input_instruction_pcs.clone()
+    } else {
+        (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect()
+    };
+    let stream_end: u64 = if !_input_instruction_sizes.is_empty() && _input_instruction_sizes.len() == insn_pcs.len() {
+        insn_pcs.last().copied().unwrap_or(start).saturating_add(*_input_instruction_sizes.last().unwrap_or(&4) as u64)
+    } else {
+        insn_pcs.last().map(|p| p + 4).unwrap_or(start)
+    };
+    let instructions = if !_input_instruction_pcs.is_empty() { insn_pcs.len() as u64 } else { (end - start) / 4 };
     let exhausted = instructions > 128;
     let truncated = high < end;
-    let direct_targets = body.chunks_exact(4).enumerate().filter_map(|(index, bytes)| {
-        let pc = apc_at(index, &insn_pcs, start);
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
-        match lift_operation(decode(word, pc), pc) {
-            IrOperation::DirectCall { target } => Some(target),
-            _ => None,
-        }
-    }).collect::<BTreeSet<_>>();
+    let direct_targets = if _input_instruction_pcs.is_empty() {
+        body.chunks_exact(4).enumerate().filter_map(|(index, bytes)| {
+            let pc = apc_at(index, &insn_pcs, start);
+            let word = u32::from_le_bytes(bytes.try_into().unwrap());
+            match lift_operation(decode(word, pc), pc) {
+                IrOperation::DirectCall { target } => Some(target),
+                _ => None,
+            }
+        }).collect::<BTreeSet<_>>()
+    } else {
+        insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
+            let size = *_input_instruction_sizes.get(index).unwrap_or(&4) as usize;
+            if size != 4 { return None; }
+            let off = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok())?;
+            let bytes = code.get(off..off+4)?;
+            let word = u32::from_le_bytes(bytes.try_into().ok()?);
+            match lift_operation(decode(word, pc), pc) {
+                IrOperation::DirectCall { target } => Some(target),
+                _ => None,
+            }
+        }).collect::<BTreeSet<_>>()
+    };
     let settings = object([
         ("instruction_limit", 128u64.into()),
         ("code_scan_limit", (4 * 1024 * 1024u64).into()),
@@ -1618,17 +1640,30 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         }
     }
     let mut resolved_got_load_reg: BTreeMap<u64, (u8, String, Option<u64>)> = BTreeMap::new(); // pc -> (reg, symbol_or_PAGE, slot_addr)
+    let insn_sizes: Vec<u32> = if _input_instruction_sizes.len() == insn_pcs.len() && !insn_pcs.is_empty() {
+        _input_instruction_sizes.clone()
+    } else {
+        vec![4; insn_pcs.len()]
+    };
 
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
-    for (index, bytes) in body.chunks_exact(4).enumerate() {
+    for index in 0..insn_pcs.len() {
         let pc = apc_at(index, &insn_pcs, start);
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        let size = *insn_sizes.get(index).unwrap_or(&4) as usize;
+        let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { break; };
+        if off + size > code.len() { break; }
+        let bytes = &code[off..off + size];
+        // ARM64 fixed-width decode path; variable-length decode will dispatch by architecture/size.
+        let word = if size == 4 {
+            u32::from_le_bytes(bytes.try_into().unwrap_or([0,0,0,0]))
+        } else { 0 };
+        let pc_end = aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end);
         let position = file_offset + (pc - base);
         let data = data_ranges
             .iter()
-            .any(|&(lo, hi, _)| position < hi && position + 4 > lo);
-        let operation = decode(word, pc);
-        let portable = if data {
+            .any(|&(lo, hi, _)| position < hi && position + (pc_end - pc) > lo);
+        let operation = if size == 4 { decode(word, pc) } else { Operation::Opaque };
+        let portable = if data || size != 4 {
             IrOperation::TargetSpecific
         } else {
             lift_operation(operation, pc)
@@ -2062,7 +2097,6 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 builder.edge(&proof, &ir, "supports")?;
             }
         }
-        let pc_end = aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end);
         let (ast, mirror) = tree.emit(&mut builder, &ir, pc, pc_end)?;
         statements.push(ast);
         statement_mirrors.push(mirror);
