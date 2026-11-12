@@ -1925,17 +1925,37 @@ struct FunctionBoundaryFacts{
 }
 
 /// Shared admission path for ordinary reports and reconstruction artifacts.
-fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,code:&[u8],data_ranges:&[(u64,u64,u16)])->io::Result<FunctionBoundaryFacts>{
+/// ARM64-specific fixed-width scans/alignment checks are gated by architecture;
+/// non-ARM64 paths remain conservative (no unsound 4-byte instruction assumptions).
+fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,code:&[u8],data_ranges:&[(u64,u64,u16)],architecture:&str)->io::Result<FunctionBoundaryFacts>{
+ let is_arm64 = super::semantic::is_arm64_arch(architecture);
  let (symbols,mut starts,lc_function_starts)=parse_metadata(file,window,map,size)?;
  let scan_end=map.address+code.len() as u64;
  if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
  let mut direct_call_starts=std::collections::BTreeSet::new();
- if !map.encrypted{let mut index=0usize;while index*4+4<=code.len(){let chunk=&code[index*4..index*4+4];let pc=map.address+(index as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let position=map.offset+(index as u64)*4;if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){index+=1;continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}index+=1}}
+ if !map.encrypted && is_arm64 {
+  let insn = super::semantic::ARM64_INSN_BYTES as usize;
+  let mut index=0usize;
+  while index.saturating_mul(insn).saturating_add(insn)<=code.len(){
+   let off=index*insn;
+   let chunk=&code[off..off+insn];
+   let pc=map.address+(index as u64)*super::semantic::ARM64_INSN_BYTES; /* fixed-width ARM64 only */
+   let position=map.offset+(index as u64)*super::semantic::ARM64_INSN_BYTES;
+   if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(super::semantic::ARM64_INSN_BYTES)>lo){index+=1;continue}
+   let word=u32::from_le_bytes(chunk.try_into().unwrap());
+   if let Some((target,"call",_))=branch_target(word,pc){
+    if target>=map.address&&target<scan_end&&(target-map.address)%super::semantic::ARM64_INSN_BYTES==0{direct_call_starts.insert(target);}
+   }
+   index+=1
+  }
+ }
  starts.extend(direct_call_starts.iter().copied());
  let unwind_starts=if map.encrypted{Vec::new()}else{unwind_info_function_starts(file,window,size,map.address,scan_end)?};starts.extend(unwind_starts.iter().copied());
  let (objc_classes,objc_layouts)=objc_class_graph(file,window,size)?;
  let objc_function_names=objc_imp_names(&objc_classes);
- let objc_starts=objc_function_names.keys().copied().filter(|address|*address>=map.address&&*address<scan_end&&(*address-map.address)%4==0).collect::<Vec<_>>();
+ let objc_starts=objc_function_names.keys().copied().filter(|address|{
+  *address>=map.address&&*address<scan_end && if is_arm64 { (*address-map.address)%super::semantic::ARM64_INSN_BYTES==0 } else { true }
+ }).collect::<Vec<_>>();
  if !map.encrypted{starts.extend(objc_starts.iter().copied());}
  let export_trie=export_trie_records(file,window,size)?;
  let export_starts=if map.encrypted{Vec::new()}else{export_function_starts(&export_trie,window,map.address,scan_end)};
@@ -1974,7 +1994,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let map=mapping(&window,size).map_err(|message|io::Error::new(io::ErrorKind::InvalidData,message))?;if map.encrypted{return Err(invalid("Encrypted code cannot be reconstructed"));}
  let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
- let mut facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let mut facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges,"arm64")?;
  merge_runtime_objc(&mut facts,path,&window,map.address,map.address+code.len() as u64,"arm64");
  let export_names=export_function_names(&facts.export_trie,&window,&facts.starts,map.address+code.len() as u64);
  // Use the same validated export/stub names as analysis. Undefined nlist
@@ -2333,7 +2353,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  };
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
- let mut fb_facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
+ let mut fb_facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges,&analyze_arch)?;
  if !map.encrypted { merge_runtime_objc(&mut fb_facts,path,&window,map.address,scan_end,&analyze_arch); }
  let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=fb_facts;
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
