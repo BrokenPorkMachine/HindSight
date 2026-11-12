@@ -2511,16 +2511,19 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
    } else {
     (Vec::new(), Vec::new())
    }
-  } else {
+  } else if super::semantic::is_arm64_arch(&analyze_arch) {
    let mut pcs_v = Vec::new();
    let mut sz_v = Vec::new();
    let mut pc = s;
-   while pc.saturating_add(4) <= e && pcs_v.len() < 128 {
+   let insn = super::semantic::ARM64_INSN_BYTES;
+   while pc.saturating_add(insn) <= e && pcs_v.len() < 128 {
     pcs_v.push(pc);
-    sz_v.push(4u32);
-    pc = pc.saturating_add(4);
+    sz_v.push(u32::try_from(insn).unwrap_or(4));
+    pc = pc.saturating_add(insn);
    }
    (pcs_v, sz_v)
+  } else {
+   (Vec::new(), Vec::new())
   }
  } else { (Vec::new(), Vec::new()) };
  let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects_and_arch_and_pcs(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets,&sem_pcs,&sem_sizes,&analyze_arch),&reconstructed_pseudocode);
