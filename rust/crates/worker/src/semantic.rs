@@ -8136,7 +8136,8 @@ fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -
     let mut flow = Flow::new();
     for index in start_index..call_index {
         let pc = base.saturating_add(index as u64 * 4);
-        let bytes = code.get(index * 4..index * 4 + 4)?;
+        let off = pc.checked_sub(base)? as usize;
+        let bytes = code.get(off..off + 4)?;
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         let operation = decode(word, pc);
         let portable = lift_operation(operation, pc);
@@ -8190,8 +8191,9 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
     let mut stack_aliases = std::collections::BTreeMap::<u8, Vec<u64>>::new();
     let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
     for index in call_index.saturating_sub(64).max(function_index)..call_index {
-        let Some(bytes) = code.get(index * 4..index * 4 + 4) else { return Vec::new() };
         let pc = base + index as u64 * 4;
+        let off = pc.saturating_sub(base) as usize;
+        let Some(bytes) = code.get(off..off + 4) else { return Vec::new() };
         let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
         let portable = lift_operation(operation, pc);
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) { return Vec::new(); }
@@ -8668,7 +8670,7 @@ pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, func
     let count = (end - start) / 4;
     for index in 0..count {
         let pc = function_start.saturating_add(index as u64 * 4);
-        let off = start + index * 4;
+        let off = pc.saturating_sub(base) as usize;
         if off + 4 > code.len() { return false; }
         let operation = decode(u32::from_le_bytes(code[off..off + 4].try_into().unwrap()), pc);
         let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
