@@ -1246,8 +1246,11 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     };
     let stream_end: u64 = if !_input_instruction_sizes.is_empty() && _input_instruction_sizes.len() == insn_pcs.len() {
         insn_pcs.last().copied().unwrap_or(start).saturating_add(*_input_instruction_sizes.last().unwrap_or(&4) as u64)
-    } else {
+    } else if _input_instruction_pcs.is_empty() {
         insn_pcs.last().map(|p| p + 4).unwrap_or(start)
+    } else {
+        // Variable-length stream without explicit size map: use analyzed byte bound conservatively.
+        high.min(end)
     };
     let instructions = if _input_instruction_pcs.is_empty() || is_arm64 { (end - start) / 4 } else { insn_pcs.len() as u64 };
     let exhausted = instructions > 128;
