@@ -8762,13 +8762,12 @@ pub fn render_with_resolved_indirects(
         let mut block_starts: Vec<u64> = vec![start];
         for (idx, &pc) in pcs.iter().enumerate() {
             if let Some(t) = lifted_instructions[idx].portable.direct_branch_target() {
-                if t >= start && t < function_end && (t - start) % 4 == 0 && pcs.contains(&t) {
+                if pcs.contains(&t) {
                     block_starts.push(t);
                 }
             }
             if lifted_instructions[idx].portable.is_control_flow() {
-                let next = pc + 4;
-                if next >= start && next < function_end && pcs.contains(&next) {
+                if let Some(&next) = pcs.get(idx + 1) {
                     block_starts.push(next);
                 }
             }
@@ -8818,6 +8817,7 @@ pub fn render_with_resolved_indirects(
 
         let block_of = |p: u64| -> Option<usize> { pc_to_block.get(&p).copied() };
 
+        let next_sequential = |idx: usize| -> Option<u64> { pcs.get(idx + 1).copied() };
         #[allow(clippy::needless_range_loop)]
         for bi in 0..blocks.len() {
             let last_pc = *blocks[bi].instructions.last().unwrap();
@@ -8848,8 +8848,9 @@ pub fn render_with_resolved_indirects(
                         if let Some(target) = block_of(target) { successors.push(target); }
                     }
                     if outcome != Some(true) {
-                        let nt = last_pc + 4;
-                        if let Some(fallthrough) = block_of(nt) { successors.push(fallthrough); }
+                        if let Some(nt) = next_sequential(last_idx) {
+                            if let Some(fallthrough) = block_of(nt) { successors.push(fallthrough); }
+                        }
                     }
                 }
                 IrOperation::IndirectBranch { .. } => {
@@ -8862,16 +8863,18 @@ pub fn render_with_resolved_indirects(
                     }
                 }
                 IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. } => {
-                    let nt = last_pc + 4;
-                    if let Some(fallthrough) = block_of(nt) {
-                        successors.push(fallthrough);
+                    if let Some(nt) = next_sequential(last_idx) {
+                        if let Some(fallthrough) = block_of(nt) {
+                            successors.push(fallthrough);
+                        }
                     }
                 }
                 IrOperation::Return { .. } => {}
                 _ => {
-                    let nt = last_pc + 4;
-                    if let Some(fallthrough) = block_of(nt) {
-                        successors.push(fallthrough);
+                    if let Some(nt) = next_sequential(last_idx) {
+                        if let Some(fallthrough) = block_of(nt) {
+                            successors.push(fallthrough);
+                        }
                     }
                 }
             }
