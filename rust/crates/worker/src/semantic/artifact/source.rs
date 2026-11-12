@@ -4036,17 +4036,48 @@ pub(super) fn recover_with_types(
 /// memory-free leaf has canonical Boolean representation. Callers separately
 /// establish the callee's complete return/effect/ABI summary.
 pub(super) fn canonical_boolean_callee(code: &[u8], start: u64, signature: &SourceSignature) -> bool {
-    // ARM64 fixed-width 4-byte decode path. Variable-length streams require architecture-aware decode.
-    if code.is_empty() || code.len() > 128 * 4 || code.len() % 4 != 0 {
-        return false;
+    canonical_boolean_callee_with_pcs(code, start, signature, &[], &[])
+}
+
+pub(super) fn canonical_boolean_callee_with_pcs(
+    code: &[u8],
+    start: u64,
+    signature: &SourceSignature,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+) -> bool {
+    if code.is_empty() { return false; }
+    // ARM64 fixed-width 4-byte decode path for now; variable-length streams require architecture-aware decode.
+    if insn_pcs.is_empty() {
+        if code.len() > 128 * 4 || code.len() % 4 != 0 { return false; }
+        let mut trees = Vec::new();
+        let mut operations = Vec::new();
+        let count = code.len() / 4;
+        for index in 0..count {
+            let off = index * 4;
+            let Some(bytes) = code.get(off..off + 4) else { return false; };
+            let word = u32::from_le_bytes(bytes.try_into().unwrap());
+            let pc = start + index as u64 * 4;
+            let decoded = decode(word, pc);
+            let operation = lift_operation(decoded, pc);
+            trees.push(instruction_model(decoded, operation, word).unwrap_or_else(|| {
+                tree("unsupported-operation", None, object([]), vec![])
+            }));
+            operations.push(operation);
+        }
+        return recover_with_types(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], &[], &[]).is_ok();
     }
+    if insn_pcs.len() > 128 { return false; }
+    let sizes_ok = insn_sizes.is_empty() || insn_sizes.len() == insn_pcs.len();
+    if !sizes_ok { return false; }
     let mut trees = Vec::new();
     let mut operations = Vec::new();
-    let count = code.len() / 4;
-    for index in 0..count {
-        let off = index * 4;
-        let word = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
-        let pc = start + index as u64 * 4;
+    for (i, &pc) in insn_pcs.iter().enumerate() {
+        let sz = *insn_sizes.get(i).unwrap_or(&4);
+        if sz != 4 { return false; } // conservative until variable-length decode/lift exists
+        let Some(off) = pc.checked_sub(start).and_then(|d| usize::try_from(d).ok()) else { return false; };
+        let Some(bytes) = code.get(off..off + 4) else { return false; };
+        let word = u32::from_le_bytes(bytes.try_into().unwrap());
         let decoded = decode(word, pc);
         let operation = lift_operation(decoded, pc);
         trees.push(instruction_model(decoded, operation, word).unwrap_or_else(|| {
@@ -4054,7 +4085,7 @@ pub(super) fn canonical_boolean_callee(code: &[u8], start: u64, signature: &Sour
         }));
         operations.push(operation);
     }
-    recover(start, &trees, &operations, signature.clone(), &BTreeMap::new()).is_ok()
+    recover_with_types(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], insn_pcs, insn_sizes).is_ok()
 }
 
 fn semit_span_end(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, trees_len: usize) -> u64 {
