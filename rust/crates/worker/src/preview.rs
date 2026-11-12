@@ -2153,12 +2153,14 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let scan_end_jt = map.address + code.len() as u64;
  let arch_lc_jt = architecture.to_ascii_lowercase();
  let is_arm64_jt = matches!(arch_lc_jt.as_str(), "arm64" | "arm64e" | "aarch64");
- // Jump-table/indirect-branch word scan is currently ARM64-specific (4-byte instructions, ARM64 BR patterns).
+ // Jump-table/indirect-branch word scan is currently ARM64-specific (fixed-width instructions, ARM64 BR patterns).
  if is_arm64_jt {
+  let insn = super::semantic::ARM64_INSN_BYTES as usize;
   let mut index=0usize;
-  while index*4+4<=code.len() {
-   let chunk=&code[index*4..index*4+4];
-   let pc = map.address + index as u64 * 4;
+  while index.saturating_mul(insn).saturating_add(insn) <= code.len() {
+   let off = index * insn;
+   let chunk=&code[off..off + insn];
+   let pc = map.address + (index as u64).saturating_mul(super::semantic::ARM64_INSN_BYTES);
    if pc < start || pc >= end { index+=1; continue; }
    let word=u32::from_le_bytes(chunk.try_into().unwrap());
    let Some(reg)=indirect_branch_reg(word) else { index+=1; continue };
@@ -2203,7 +2205,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
    let mut in_function_cases=Vec::new();
    let mut external_cases=0usize;
    for (case_index,target) in case_targets.iter().copied() {
-    let aligned = if is_arm64_jt { (target-fn_start) % 4 == 0 } else { true };
+    let aligned = if is_arm64_jt { (target-fn_start) % super::semantic::ARM64_INSN_BYTES == 0 } else { true };
     if target>=fn_start && target<fn_end && aligned {
      in_function_targets.push(target);
      in_function_cases.push((case_index,target));
