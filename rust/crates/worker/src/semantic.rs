@@ -8205,19 +8205,28 @@ fn decode_lift_x86_64(code: &[u8], base: u64, pc: u64, size_hint: u32) -> Option
     let is_near = instr.op_count() >= 1 && matches!(instr.op0_kind(), iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64);
     let near_target = if is_near { Some(instr.near_branch64()) } else { None };
 
+    let indirect_target_reg = || -> IrRegister {
+        if instr.op_count() >= 1 && instr.op0_kind() == iced_x86::OpKind::Register {
+            x86_to_ir_register(instr.op0_register()).unwrap_or(unknown_gpr)
+        } else {
+            // Memory-indirect targets not representable as a single register; keep conservative.
+            unknown_gpr
+        }
+    };
+
     let portable = match instr.mnemonic() {
         iced_x86::Mnemonic::Jmp => {
             if let Some(target) = near_target {
                 IrOperation::Branch { target }
             } else {
-                IrOperation::IndirectBranch { target: unknown_gpr }
+                IrOperation::IndirectBranch { target: indirect_target_reg() }
             }
         }
         iced_x86::Mnemonic::Call => {
             if let Some(target) = near_target {
                 IrOperation::DirectCall { target }
             } else {
-                IrOperation::IndirectCall { target: unknown_gpr }
+                IrOperation::IndirectCall { target: indirect_target_reg() }
             }
         }
         iced_x86::Mnemonic::Ret | iced_x86::Mnemonic::Iret | iced_x86::Mnemonic::Iretd | iced_x86::Mnemonic::Iretq => {
