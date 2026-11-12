@@ -8501,10 +8501,13 @@ pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, star
         let i = (d / 4) as usize;
         (i < pcs.len()).then_some(i)
     };
-    let operations=body.chunks_exact(4).enumerate().map(|(index,word)|{
-        let pc=pcs[index]; let position=file_offset.saturating_add(pc-base);
+    let operations=pcs.iter().enumerate().map(|(index,&pc)|{
+        let position=file_offset.saturating_add(pc-base);
+        let Some(off)=pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return IrOperation::TargetSpecific; };
+        if off+4>code.len() { return IrOperation::TargetSpecific; }
+        let word=u32::from_le_bytes(code[off..off+4].try_into().unwrap());
         if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){IrOperation::TargetSpecific}
-        else{lift_operation(decode(u32::from_le_bytes(word.try_into().unwrap()),pc),pc)}
+        else{lift_operation(decode(word,pc),pc)}
     }).collect::<Vec<_>>();
     // A present entry means targets are proven complete (possibly all
     // external exits, i.e. no in-function successors).
@@ -8660,9 +8663,12 @@ pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, func
     if start > end || end > code.len() { return false }
     // Fixed-width 4-byte ARM64 instruction stream (default). Variable-length streams need pc/size maps.
     if (function_start - base) % 4 != 0 || (end - start) % 4 != 0 { return false }
-    for (index, bytes) in code[start..end].chunks_exact(4).enumerate() {
+    let count = (end - start) / 4;
+    for index in 0..count {
         let pc = function_start.saturating_add(index as u64 * 4);
-        let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
+        let off = start + index * 4;
+        if off + 4 > code.len() { return false; }
+        let operation = decode(u32::from_le_bytes(code[off..off + 4].try_into().unwrap()), pc);
         let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
         match operation {
             Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
