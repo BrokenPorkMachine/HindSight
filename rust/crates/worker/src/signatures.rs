@@ -881,15 +881,13 @@ pub fn objc_header_for_imp(address:u64, records:&str, layouts:&[super::objc::Cla
             .map(|values|values.split(',').filter(|value|super::objc::identifier(value)).take(32).map(str::to_owned).collect::<std::collections::BTreeSet<_>>()).unwrap_or_default();
         relationships.insert((parent,protocols));
     }
-    let mut adopted_protocols=std::collections::BTreeSet::new();
     if relationships.len()==1{
         let (parent,protocols)=relationships.iter().next()?;
-        adopted_protocols=protocols.clone();
         let inheritance=parent.as_ref().map(|name|format!(" : {name}")).unwrap_or_default();
         let adoption=if protocols.is_empty(){String::new()}else{format!(" <{}>",protocols.iter().cloned().collect::<Vec<_>>().join(", "))};
         declaration=declaration.replacen(&format!("@interface {} {{",owner.name),&format!("@interface {}{inheritance}{adoption} {{",owner.name),1);
         if !protocols.is_empty(){
-            let defs=objc_protocol_definitions(records,&adopted_protocols);
+            let defs=objc_protocol_definitions(records,protocols);
             declaration=if defs.is_empty(){format!("@protocol {};\n{declaration}",protocols.iter().cloned().collect::<Vec<_>>().join(", "))}
                 else{format!("{defs}{declaration}")};
         }

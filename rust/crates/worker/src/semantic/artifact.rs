@@ -2172,7 +2172,6 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             }
         }
         let mut portable = portable;
-        let mut resolved_got_call = false;
         if !data {
             if let IrOperation::IndirectCall { target: dispatch } = portable {
                 let reg_num: Option<u8> = if dispatch.class == IrRegisterClass::General { Some(dispatch.index) } else { None };
@@ -2186,7 +2185,6 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                                         if let Some(proto) = crate::signatures::source_signature_with_project_types(&sym, &sig, &project_types) {
                                             call_prototypes.entry(target_slot).or_insert(proto);
                                             portable = IrOperation::DirectCall { target: target_slot };
-                                            resolved_got_call = true;
                                         }
                                     }
                                 }

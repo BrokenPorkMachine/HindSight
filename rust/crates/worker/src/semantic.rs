@@ -8128,6 +8128,16 @@ impl SsaOutputBudget {
     }
 }
 
+fn arm64_fixed_width_pcs_in_range(start: u64, end: u64, base: u64, limit: usize) -> Option<Vec<u64>> {
+    if start < base || end < start { return None; }
+    let start_off = start.checked_sub(base)?;
+    let end_off = end.checked_sub(base)?;
+    if start_off % 4 != 0 { return None; }
+    let byte_len = end_off.saturating_sub(start_off);
+    let count = usize::try_from(byte_len / 4).ok()?.min(limit);
+    Some((0..count).map(|i| start.saturating_add(i as u64 * 4)).collect())
+}
+
 fn call_scan_window_pcs(
     base: u64,
     function_start: u64,
@@ -8141,14 +8151,12 @@ fn call_scan_window_pcs(
     if insn_pcs.is_empty() {
         // Fixed-width ARM64 fallback only.
         if !is_arm64 { return None; }
-        if (function_start - base) % 4 != 0 { return None; }
         let call_off = callsite.checked_sub(base)?;
         if call_off % 4 != 0 { return None; }
-        let call_index = usize::try_from(call_off / 4).ok()?;
-        let function_index = usize::try_from((function_start - base) / 4).ok()?;
-        if call_index < function_index { return None; }
-        let start_index = call_index.saturating_sub(64).max(function_index);
-        return Some((start_index..call_index).map(|i| base.saturating_add(i as u64 * 4)).collect());
+        let all = arm64_fixed_width_pcs_in_range(function_start, callsite, base, usize::MAX)?;
+        if all.is_empty() { return None; }
+        let take = all.len().min(64);
+        return Some(all[all.len().saturating_sub(take)..].to_vec());
     }
     // Use provided PC map (must be in ascending order for the function stream context).
     let mut in_fn: Vec<u64> = insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < callsite).collect();
@@ -8174,7 +8182,7 @@ fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64
     if !is_arm64 { return None; }
     let pcs = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture)?;
     let mut flow = Flow::new();
-    for (i, &pc) in pcs.iter().enumerate() {
+    for (_i, &pc) in pcs.iter().enumerate() {
         let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
             // map by position in provided full pc list if possible
             insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
@@ -8587,10 +8595,10 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     let Some(body_start)=start.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return result; };
     if body_start >= body_end || body_end > code.len() { return result; }
     let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
-        let count = (body_end - body_start) / 4;
-        if count > MAX_WORDS_PER_FUNCTION { return result; }
-        let pcs = (0..count).map(|i| start + i as u64 * 4).collect::<Vec<_>>();
-        (pcs, vec![4; count])
+        let Some(pcs) = arm64_fixed_width_pcs_in_range(start, start.saturating_add((body_end - body_start) as u64), base, MAX_WORDS_PER_FUNCTION) else { return result; };
+        if pcs.is_empty() { return result; }
+        let sizes = vec![4; pcs.len()];
+        (pcs, sizes)
     } else {
         let mut pcs = Vec::new();
         let mut sizes = Vec::new();
@@ -8607,7 +8615,7 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
         if fixed_width {
             let d = target.checked_sub(start)?;
             if d % 4 != 0 { return None; }
-            let i = (d / 4) as usize;
+            let i = usize::try_from(d / 4).ok()?;
             (i < pcs.len()).then_some(i)
         } else {
             pcs.binary_search(&target).ok()
@@ -8806,11 +8814,9 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
         if (function_start - base) % 4 != 0 { return false; }
     }
     let pcs: Vec<u64> = if fixed_width {
-        let Some(start_off) = usize::try_from(function_start - base).ok() else { return false };
-        let Some(end_off) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
-        if start_off > end_off || end_off > code.len() { return false; }
-        let count = (end_off - start_off) / 4;
-        (0..count).map(|i| function_start.saturating_add(i as u64 * 4)).collect()
+        let bounded_end = function_end.min(base.saturating_add(code.len() as u64));
+        let Some(pcs) = arm64_fixed_width_pcs_in_range(function_start, bounded_end, base, MAX_WORDS_PER_FUNCTION) else { return false };
+        pcs
     } else {
         insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < function_end).collect()
     };
@@ -8929,16 +8935,16 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                 if (start - base) % 4 != 0 {
                     (Vec::new(), std::collections::BTreeMap::new())
                 } else {
-                    let count = (high.saturating_sub(low)) / 4;
-                    let pcs_v = (0..count).map(|j| start.saturating_add(j as u64 * 4)).collect();
+                    let high_addr = base.saturating_add(high as u64);
+                    let pcs_v = arm64_fixed_width_pcs_in_range(start, high_addr, base, MAX_WORDS_PER_FUNCTION).unwrap_or_default();
                     (pcs_v, std::collections::BTreeMap::new())
                 }
             } else {
                 (list, map)
             }
         } else {
-            let count = (high.saturating_sub(low)) / 4;
-            let pcs_v = (0..count).map(|j| start.saturating_add(j as u64 * 4)).collect();
+            let high_addr = base.saturating_add(high as u64);
+            let pcs_v = arm64_fixed_width_pcs_in_range(start, high_addr, base, MAX_WORDS_PER_FUNCTION).unwrap_or_default();
             (pcs_v, std::collections::BTreeMap::new())
         };
         if pcs.is_empty() {
@@ -9003,7 +9009,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         // Build basic-block starts: function start, branch targets, and the
         // instruction after every control-flow instruction.
         let mut block_starts: Vec<u64> = vec![start];
-        for (idx, &pc) in pcs.iter().enumerate() {
+        for (idx, &_pc) in pcs.iter().enumerate() {
             if let Some(t) = lifted_instructions[idx].portable.direct_branch_target() {
                 if pcs.contains(&t) {
                     block_starts.push(t);

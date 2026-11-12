@@ -2129,7 +2129,7 @@ fn natural_loop(
         // conditional backedge fallthrough to exit.
         let trailing_untargeted_noop = |noop_index: usize| -> bool {
             trees.get(noop_index).is_some_and(is_noop_tree)
-                && !trees.iter().enumerate().any(|(i, tree)| {
+                && !trees.iter().enumerate().any(|(_i, tree)| {
                     matches!(tree.kind, "goto" | "conditional-goto")
                         && target_index(number(tree, "target")) == Some(noop_index)
                 })
@@ -2946,7 +2946,7 @@ pub(super) fn recover_with_types(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> Result<Recovery, String> {
-    let end = end_pc(start, trees.len(), insn_pcs, insn_sizes);
+    let _end = end_pc(start, trees.len(), insn_pcs, insn_sizes);
     // Address operations carry concrete computed values in this IR; do not
     // reject solely on their presence. Unresolved relocatable dependencies are
     // reported separately when evidence is insufficient.
