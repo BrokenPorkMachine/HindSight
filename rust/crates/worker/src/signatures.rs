@@ -2087,6 +2087,7 @@ fn render_linear_statement(
     statement:&str,address:u64,start:u64,
     symbols:&[(u64,String)],signatures:&BTreeMap<u64,(String,Signature)>,
     signature:Option<&Signature>,parameter_evidence:&str,code:&[u8],base:u64,stable_stack:bool,objc_selectors:&BTreeMap<u64,String>,
+    insn_pcs:&[u64], insn_sizes:&[u32],
 )->String{
     if let Some(rest)=statement.strip_prefix("call(0x"){
         if let Some((hex,_))=rest.split_once(')'){
@@ -2101,9 +2102,9 @@ fn render_linear_statement(
                         return format!("{dispatch}(x0, x1, /* message arguments unresolved */); /* {} {target:#x}; x0 points to objc_super; x1 is the selector; receiver, class, and argument types unresolved */{target_evidence}", if indirect { "indirect target resolved through a register" } else { "direct call target" });
                     }
                 }
-                let known=super::semantic::known_call_argument_values(code,base,start,address);
-                let known_float=super::semantic::known_call_float_argument_values(code,base,start,address);
-                let known_stack=super::semantic::known_call_stack_argument_values(code,base,start,address);
+                let known=super::semantic::known_call_argument_values_with_pcs(code,base,start,address,insn_pcs,insn_sizes);
+                let known_float=super::semantic::known_call_float_argument_values_with_pcs(code,base,start,address,insn_pcs,insn_sizes);
+                let known_stack=super::semantic::known_call_stack_argument_values_with_pcs(code,base,start,address,insn_pcs,insn_sizes);
                 if let Some(selector)=objc_selectors.get(&address){
                     let parts=selector.split(':').collect::<Vec<_>>();
                     let argument_count=parts.len().saturating_sub(1);
@@ -2349,7 +2350,7 @@ fn render_arm64_body(
                             &&(instruction_index+1..backedge).all(|index|is_linear_statement(&instructions[index].1)){
                             out.push_str(&format!("    {header:#018x}: while (!({})) {{ /* natural loop */\n",substitute_at(header,condition)));
                             for (body_address,body_statement) in &instructions[instruction_index+1..backedge]{
-                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors,&insn_pcs,&insn_sizes);
                                 let rendered=substitute_at(*body_address,&rendered);
                                 out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
                             }
@@ -2379,7 +2380,7 @@ fn render_arm64_body(
                 if let Some(condition)=condition.filter(|_|single_backedge&&no_interior_entries&&linear_body){
                     out.push_str(&format!("    {loop_header:#018x}: do {{ /* natural loop */\n"));
                     for (body_address,body_statement) in &instructions[instruction_index..loop_tail]{
-                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                let rendered=render_linear_statement(body_statement,*body_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors,&insn_pcs,&insn_sizes);
                                 let rendered=substitute_at(*body_address,&rendered);
                         out.push_str(&format!("        {body_address:#018x}: {rendered}\n"));
                     }
@@ -2415,13 +2416,13 @@ fn render_arm64_body(
                                         &&arm_is_linear(else_index..join_index){
                                         out.push_str(&format!("    {address:#018x}: if (!({})) {{ /* structured diamond; else={else_start:#x}, join={join:#x} */\n",substitute_at(*address,condition)));
                                         for (arm_address,arm_statement) in &instructions[instruction_index+1..then_branch]{
-                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors,&insn_pcs,&insn_sizes);
                                             let rendered=substitute_at(*arm_address,&rendered);
                                             out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
                                         }
                                         out.push_str("    } else {\n");
                                         for (arm_address,arm_statement) in &instructions[else_index..join_index]{
-                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors);
+                                            let rendered=render_linear_statement(arm_statement,*arm_address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors,&insn_pcs,&insn_sizes);
                                             let rendered=substitute_at(*arm_address,&rendered);
                                             out.push_str(&format!("        {arm_address:#018x}: {rendered}\n"));
                                         }
@@ -2463,7 +2464,7 @@ fn render_arm64_body(
         let (address, statement) = (*address, statement.as_str());
         if labels.contains(&address) { out.push_str(&format!("loc_{address:x}:\n")); }
         let statement = if statement.starts_with("call(0x") {
-            render_linear_statement(statement,address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors)
+            render_linear_statement(statement,address,start,symbols,signatures,signature,parameter_evidence,code,base,stable_stack,objc_selectors,&insn_pcs,&insn_sizes)
         } else if let Some(rest) = statement.strip_prefix("if (") {
             if let Some((condition,target)) = rest.split_once(") goto 0x") {
                 if let Ok(target) = u64::from_str_radix(target.trim_end_matches(';'),16) {
@@ -2480,9 +2481,9 @@ fn render_arm64_body(
                     if let Some(name) = target_name {
                         let target_signature = signatures.get(&target).map(|(_,signature)| signature);
                         let args = abi_parameters(target_signature);
-                        let known = super::semantic::known_call_argument_values(code, base, start, address);
-                        let known_float = super::semantic::known_call_float_argument_values(code, base, start, address);
-                        let known_stack = super::semantic::known_call_stack_argument_values(code, base, start, address);
+                        let known = super::semantic::known_call_argument_values_with_pcs(code, base, start, address, &insn_pcs, &insn_sizes);
+                        let known_float = super::semantic::known_call_float_argument_values_with_pcs(code, base, start, address, &insn_pcs, &insn_sizes);
+                        let known_stack = super::semantic::known_call_stack_argument_values_with_pcs(code, base, start, address, &insn_pcs, &insn_sizes);
                         let (mut rendered, evidence) = render_call_arguments(&args, &known, &known_float, &known_stack);
                         let evidence_note = if evidence.is_empty() { String::new() } else { format!("; constant argument evidence: {}", evidence.join(", ")) };
                         let arguments = if args.is_empty() && target_signature.is_none() {
@@ -3003,7 +3004,7 @@ fn recover_internal(
         let signature = Signature { language: "C", source: "test prototype", declaration: "void consume(int negative, uint8_t byte, void *pointer);".into() };
         let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
         let code = [0x12800000u32, 0x52803fe1, 0xd2800002].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("consume((int)-1, (uint8_t)0xff, (void *)0);"), "{call}");
         assert!(call.contains("source-cast=signed<int>; low-bits=32; raw-register=0xffffffff"), "{call}");
         assert!(call.contains("proven_by=[0x1000]"), "{call}");
@@ -3014,7 +3015,7 @@ fn recover_internal(
         let signatures=BTreeMap::from([(0x2000,("_consume".into(),signature))]);
         let words=[0x5280_1fe9u32,0xb900_03e9]; // movz w9,#0xff; str w9,[sp]
         let code=words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call=render_linear_statement("call(0x2000);",0x1008,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new());
+        let call=render_linear_statement("call(0x2000);",0x1008,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("consume(x0, x1, x2, x3, x4, x5, x6, x7, (int)0xff);"),"{call}");
         assert!(call.contains("ninth(sp+0x0, 4 bytes)=0xff"),"{call}");
         assert!(call.contains("stack_store=0x1004"),"{call}");
@@ -3023,14 +3024,14 @@ fn recover_internal(
         let packed_signatures=BTreeMap::from([(0x2000,("_packed".into(),packed))]);
         let packed_words=[0x5280_1fe9u32,0x3900_03e9,0x529f_ffea,0x7900_07ea,0x5280_1feb,0xb900_07eb];
         let packed_code=packed_words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let packed_call=render_linear_statement("call(0x2000);",0x1018,0x1000,&[],&packed_signatures,None,"",&packed_code,0x1000,false,&BTreeMap::new());
+        let packed_call=render_linear_statement("call(0x2000);",0x1018,0x1000,&[],&packed_signatures,None,"",&packed_code,0x1000,false,&BTreeMap::new(), &[], &[]);
         assert!(packed_call.starts_with("packed(x0, x1, x2, x3, x4, x5, x6, x7, (signed char)-1, (short)-1, (int)0xff);"),"{packed_call}");
         for offset in ["sp+0x0, 1 bytes", "sp+0x2, 2 bytes", "sp+0x4, 4 bytes"] {
             assert!(packed_call.contains(offset),"{packed_call}");
         }
         for (barrier, description) in [(0xf900_0020u32,"possible alias"),(0xd100_43ff,"SP update"),(0x9400_0000,"prior call")] {
             let code=[words[0],words[1],barrier].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-            let call=render_linear_statement("call(0x2000);",0x100c,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new());
+            let call=render_linear_statement("call(0x2000);",0x100c,0x1000,&[],&signatures,None,"",&code,0x1000,false,&BTreeMap::new(), &[], &[]);
             assert!(call.contains("load_stack_argument<int>(sp + 0x0, 4)"),"{description}: {call}");
         }
     }
@@ -3046,7 +3047,7 @@ fn recover_internal(
             let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
             for barrier in [None, Some(0xf900_0020u32), Some(0xd100_43ff), Some(0x9400_0000), Some(0xb900_03e9)] {
                 let code = [materialize, store].into_iter().chain(barrier).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-                let call = render_linear_statement("call(0x2000);", 0x1000 + code.len() as u64, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+                let call = render_linear_statement("call(0x2000);", 0x1000 + code.len() as u64, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
                 if barrier.is_none() {
                     assert!(call.starts_with(&format!("consume(d0, d1, d2, d3, d4, d5, d6, d7, {literal});")), "{call}");
                     assert!(call.contains("stack_store=0x1004"), "{call}");
@@ -3063,7 +3064,7 @@ fn recover_internal(
         for barrier in [None, Some(0xd280_0008u32), Some(0x5280_0008), Some(0xd100_43ff), Some(0x9400_0000)] {
             // mov x8,sp; optional clobber; fmov s8,#1; str s8,[x8]
             let code = [0x9100_03e8u32].into_iter().chain(barrier).chain([0x1e2e_1008, 0xbd00_0108]).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-            let call = render_linear_statement("call(0x2000);", 0x1000 + code.len() as u64, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+            let call = render_linear_statement("call(0x2000);", 0x1000 + code.len() as u64, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
             if barrier.is_none() {
                 assert!(call.contains(", 1.0);"), "{call}");
                 assert!(call.contains("base_proven_by=[0x1000]"), "{call}");
@@ -3198,7 +3199,7 @@ fn recover_internal(
         assert!(args[7].register.contains("sp+0x0, 16 bytes"), "{:?}", args[7]);
         assert!(args[8].register.contains("sp+0x10"), "{:?}", args[8]);
         let signatures = BTreeMap::from([(0x2000, ("_f".into(), boundary))]);
-        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.contains("wide_integer_from_stack<__int128>(sp + 0x0)"), "{call}");
         let result = Signature { language: "C", source: "test", declaration: "unsigned __int128 f(void);".into() };
         assert!(render_signature_return(Some(&result)).starts_with("return wide_integer<unsigned __int128>(x0, x1);"));
@@ -3234,7 +3235,7 @@ fn recover_internal(
         assert!(args[9].register.contains("sp+0x8"), "{:?}", args[9]);
         let signatures = BTreeMap::from([(0x2000, ("_f".into(), signature))]);
         let code = [0x528000e9u32, 0xf90007e9].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.contains("aggregate_from_pointer<CGAffineTransform>(load64(sp + 0x0)), (long)0x7"), "{call}");
     }
     #[test] fn indirect_aggregate_pointer_is_not_a_source_value_seed() {
@@ -3248,7 +3249,7 @@ fn recover_internal(
         let signature = Signature { language: "C", source: "test prototype", declaration: "void consume(CGAffineTransform value, long next);".into() };
         let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
         let code = [0xd2802460u32, 0xd28000e1].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("consume(aggregate_from_pointer<CGAffineTransform>(x0),"), "{call}");
         assert!(call.contains("(long)0x7"), "{call}");
         assert!(call.contains("by-pointer aggregate<CGAffineTransform>"), "{call}");
@@ -3272,7 +3273,7 @@ fn recover_internal(
         for (ty, prefix) in [("int", "w0 = "), ("void *", "x0 = "), ("double", "d0 = "), ("float", "s0 = "), ("void", ""), ("Unknown", "")] {
             let signature = Signature { language: "C", source: "test", declaration: format!("{ty} produce(void);") };
             let signatures = BTreeMap::from([(0x2000, ("_produce".into(), signature))]);
-            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
             assert!(call.starts_with(&format!("{prefix}produce();")), "{call}");
         }
         assert_eq!(scalar_call_result(Some(&objc_method("-[NSNumber doubleValue]", "d16@0:8").unwrap())), Some("d0"));
@@ -3290,7 +3291,7 @@ fn recover_internal(
     #[test] fn calls_expose_hidden_result_buffer_without_shifting_arguments() {
         let signature = Signature { language:"C", source:"test", declaration:"CGAffineTransform make(long value);".into() };
         let signatures = BTreeMap::from([(0x2000,("_make".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);",0x1000,0x1000,&[],&signatures,None,"",&[],0x1000,false,&BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);",0x1000,0x1000,&[],&signatures,None,"",&[],0x1000,false,&BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("make(x0, /* hidden result buffer */ result_buffer<CGAffineTransform>(x8));"), "{call}");
         let branch=0x14000400u32.to_le_bytes();
         let tail=render_arm64_body(0x1000,0x1004,"_caller",None,&[],&signatures,&branch,0x1000,0,&[],"",&[(0x1000,0x1000,0x2000)],"",&BTreeMap::new(),None).unwrap();
@@ -3299,14 +3300,14 @@ fn recover_internal(
     #[test] fn variadic_calls_show_fixed_prototype_and_unknown_anonymous_arguments() {
         let signature = symbol("_printf").unwrap();
         let signatures = BTreeMap::from([(0x2000, ("_printf".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("w0 = printf(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */);"), "{call}");
         for (mangled, expected) in [
             ("__Z3fooiz", "foo(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */);"),
             ("__Z3fooz", "foo(/* variadic arguments unresolved; Apple arm64 stack ABI */);")
         ] {
             let signatures = BTreeMap::from([(0x2000, (mangled.into(), symbol(mangled).unwrap()))]);
-            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
             assert!(call.starts_with(expected), "{call}");
         }
     }
@@ -3363,7 +3364,7 @@ fn recover_internal(
             ("__Znwm", "operator new(x0)"),
         ] {
             let signatures = BTreeMap::from([(0x2000, (mangled.into(), symbol(mangled).unwrap()))]);
-            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
             assert!(call.starts_with(expected), "{call}");
         }
     }
@@ -3413,7 +3414,7 @@ fn recover_internal(
     #[test] fn stack_scalar_arguments_render_typed_loads_in_calls_and_tail_calls() {
         let signature = Signature { language: "C", source: "test", declaration: "void take(long a,long b,long c,long d,long e,long f,long g,long h,signed char i,short j,int k,double f0,double f1,double f2,double f3,double f4,double f5,double f6,double f7,float f8);".into() };
         let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         let branch = 0x14000400u32.to_le_bytes();
         let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None).unwrap();
         for output in [call, tail] {
@@ -3425,7 +3426,7 @@ fn recover_internal(
     #[test] fn spilled_aggregates_render_as_direct_stack_values() {
         let signature = Signature { language: "C", source: "test", declaration: "void take(long a,long b,long c,long d,long e,long f,long g,long h,NSRange range,double f0,double f1,double f2,double f3,double f4,double f5,double f6,double f7,CGPoint point,CGAffineTransform transform);".into() };
         let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         let branch = 0x14000400u32.to_le_bytes();
         let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None).unwrap();
         for output in [call, tail] {
@@ -3437,33 +3438,33 @@ fn recover_internal(
     #[test] fn selector_arity_does_not_prove_argument_registers() {
         let selectors = BTreeMap::from([(0x1004, "setValue:".into())]);
         let code = 0xd28000e2u32.to_le_bytes(); // x2 = 7; selector might take a double in d0 instead
-        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &selectors);
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &selectors, &[], &[]);
         assert!(call.contains("setValue:argument_0 /* ABI location unresolved */"), "{call}");
         assert!(!call.contains("setValue:0x7"), "{call}");
         let long = BTreeMap::from([(0x1004, "a:b:c:d:e:f:g:".into())]);
-        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &long);
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &long, &[], &[]);
         assert!(call.contains("g:argument_6 /* ABI location unresolved */"), "{call}");
         for (selector, expected) in [("foo::", " :argument_1"), (":", " :argument_0")] {
             let selectors = BTreeMap::from([(0x1004, selector.into())]);
-            let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &selectors);
+            let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &selectors, &[], &[]);
             assert!(call.contains(expected), "{call}");
         }
         let empty = BTreeMap::from([(0x1004, String::new())]);
-        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &empty);
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &BTreeMap::new(), None, "", &code, 0x1000, false, &empty, &[], &[]);
         assert!(!call.contains("objc_msgSend selector validated"), "{call}");
     }
     #[test] fn super_dispatch_keeps_its_structure_pointer_explicit() {
         for name in ["_objc_msgSendSuper", "_objc_msgSendSuper2"] {
-            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[(0x2000, name.into())], &BTreeMap::new(), None, "", &[], 0x1000, false, &BTreeMap::new());
+            let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[(0x2000, name.into())], &BTreeMap::new(), None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
             assert!(call.contains("(x0, x1, /* message arguments unresolved */)"), "{call}");
             assert!(call.contains("x0 points to objc_super"), "{call}");
             assert!(call.contains("direct call target 0x2000"), "{call}");
         }
-        let other = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[(0x2000, "__objc_msgSendSuper".into())], &BTreeMap::new(), None, "", &[], 0x1000, false, &BTreeMap::new());
+        let other = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[(0x2000, "__objc_msgSendSuper".into())], &BTreeMap::new(), None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(!other.contains("x0 points to objc_super"), "{other}");
         let signature = Signature { language: "C", declaration: "id objc_msgSendSuper2(void *super, SEL selector);".into(), source: "test" };
         let signatures = BTreeMap::from([(0x2000, ("_objc_msgSendSuper2".into(), signature))]);
-        let call = render_linear_statement("call(0x2000); /* indirect via x9; proven_by=[0x1000] */", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000); /* indirect via x9; proven_by=[0x1000] */", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.contains("indirect target resolved through a register 0x2000"), "{call}");
         assert!(call.contains("indirect via x9; proven_by=[0x1000]"), "{call}");
         assert!(call.contains("indirect via x9; proven_by=[0x1000]"), "{call}");
@@ -3690,7 +3691,7 @@ fn recover_internal(
             .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         let signature = Signature { language: "C", declaration: "void consume(double estimate, double input);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.contains("consume(d0, 1.0);"), "{call}");
         assert!(!call.contains("estimate(d0)=1.0"), "{call}");
     }
@@ -3699,14 +3700,14 @@ fn recover_internal(
         let code = words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
         let signature = Signature { language: "C", declaration: "void consume(double value);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_consume".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);", 0x1010, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1010, 0x1000, &[], &signatures, None, "", &code, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.contains("consume(1.0);"), "{call}");
         assert!(call.contains("proven_by=[0x1000,0x1004,0x1008,0x100c]"), "{call}");
     }
     #[test] fn direct_calls_render_prototype_parameter_bindings() {
         let signature = symbol("_CFRelease").unwrap();
         let signatures = BTreeMap::from([(0x2000, ("_CFRelease".into(), signature))]);
-        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("CFRelease(x0);"), "{call}");
         assert!(call.contains("argument bindings: cf=x0"), "{call}");
     }
@@ -3714,12 +3715,12 @@ fn recover_internal(
         let signature = Signature { language: "C", declaration: "void take_values(float ratio, double scale);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_take_values".into(), signature))]);
         let movi_v0_zero = 0x6f00_e400u32.to_le_bytes();
-        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &movi_v0_zero, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &[], &signatures, None, "", &movi_v0_zero, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("take_values(0.0, d1);"), "{call}");
         assert!(call.contains("constant argument evidence: ratio(s0)=0.0 proven_by=[0x1000]"), "{call}");
 
         let overwritten = [0x6f00_e400u32, 0x1e202800u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &overwritten, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &overwritten, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("take_values(s0, d1);"), "{call}");
         assert!(call.contains("no argument constants proven"), "{call}");
     }
@@ -3727,21 +3728,21 @@ fn recover_internal(
         let signature = Signature { language: "C", declaration: "void take_value(double value);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_take_value".into(), signature))]);
         let instructions = [0xd280_0009u32, 0x9e67_0120u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("take_value(0.0);"), "{call}");
         assert!(call.contains("constant argument evidence: value(d0)=0.0 proven_by=[0x1000,0x1004]"), "{call}");
 
         let signature = Signature { language: "C", declaration: "void take_ratio(float ratio);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_take_ratio".into(), signature))]);
         let instructions = [0x5280_0009u32, 0x1e27_0120u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("take_ratio(0.0);"), "{call}");
         assert!(call.contains("constant argument evidence: ratio(s0)=0.0 proven_by=[0x1000,0x1004]"), "{call}");
 
         let signature = Signature { language: "C", declaration: "void take_copy(double spare, double value);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_take_copy".into(), signature))]);
         let instructions = [0xd280_0009u32, 0x9e67_0120u32, 0x1e60_4001u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x100c, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("take_copy(0.0, 0.0);"), "{call}");
         assert!(call.contains("value(d1)=0.0 proven_by=[0x1000,0x1004,0x1008]"), "{call}");
     }
@@ -3749,7 +3750,7 @@ fn recover_internal(
         let signature = Signature { language: "C", declaration: "void take_literals(float single, double wide);".into(), source: "test prototype" };
         let signatures = BTreeMap::from([(0x2000, ("_take_literals".into(), signature))]);
         let instructions = [0x1e2e_1000u32, 0x1e6e_1001u32].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1008, 0x1000, &[], &signatures, None, "", &instructions, 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("take_literals(1.0, 1.0);"), "{call}");
         assert!(call.contains("single(s0)=1.0 proven_by=[0x1000]"), "{call}");
         assert!(call.contains("wide(d1)=1.0 proven_by=[0x1004]"), "{call}");
@@ -3760,14 +3761,14 @@ fn recover_internal(
         let call = render_linear_statement(
             "call(0x2000); /* indirect via x9; proven_by=[0x1000]; signature, arguments, result and side effects unresolved */",
             0x1004, 0x1000, &[(0x2000, "_CFRelease_data_symbol".into())], &signatures,
-            None, "", &[], 0x1000, false, &BTreeMap::new(),
+            None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[],
         );
         assert!(call.starts_with("CFRelease(x0);"), "{call}");
         assert!(call.contains("indirect target resolved through a register 0x2000"), "{call}");
         let data_only = render_linear_statement(
             "call(0x3000); /* indirect via x9; proven_by=[0x1000] */",
             0x1004, 0x1000, &[(0x3000, "_CFRelease_data_symbol".into())], &BTreeMap::new(),
-            None, "", &[], 0x1000, false, &BTreeMap::new(),
+            None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[],
         );
         assert!(data_only.contains("unnamed target 0x3000"), "{data_only}");
         assert!(data_only.contains("indirect via x9; proven_by=[0x1000]"), "{data_only}");
@@ -3776,7 +3777,7 @@ fn recover_internal(
         assert_eq!(callable_name("__exit", None), "_exit");
         let symbols = [(0x2000, "_consume".into())];
         let evidence = "function 0x0000000000002000 _consume parameter-registers=[x0, x2] highest-abi-position=3 classification=incoming-parameter-candidate\n";
-        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &symbols, &BTreeMap::new(), None, evidence, &[], 0x1000, false, &BTreeMap::new());
+        let call = render_linear_statement("call(0x2000);", 0x1004, 0x1000, &symbols, &BTreeMap::new(), None, evidence, &[], 0x1000, false, &BTreeMap::new(), &[], &[]);
         assert!(call.starts_with("consume(x0, x1, x2);"), "{call}");
         assert!(call.contains("arity candidate from callee entry-register uses"), "{call}");
         assert!(call.contains("candidate ABI argument bindings: arg0=x0, arg1=x1, arg2=x2; callee types unresolved"), "{call}");

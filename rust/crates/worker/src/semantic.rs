@@ -8122,20 +8122,43 @@ impl SsaOutputBudget {
     }
 }
 
+fn call_scan_window_pcs(
+    base: u64,
+    function_start: u64,
+    callsite: u64,
+    insn_pcs: &[u64],
+) -> Option<Vec<u64>> {
+    if function_start < base || callsite < function_start { return None; }
+    if insn_pcs.is_empty() {
+        if (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return None; }
+        let call_index = usize::try_from(callsite - base).ok()?.checked_div(4)?;
+        let function_index = usize::try_from(function_start - base).ok()?.checked_div(4)?;
+        if call_index < function_index { return None; }
+        let start_index = call_index.saturating_sub(64).max(function_index);
+        return Some((start_index..call_index).map(|i| base.saturating_add(i as u64 * 4)).collect());
+    }
+    // Use provided PC map (must be in ascending order for the function stream context).
+    let mut in_fn: Vec<u64> = insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < callsite).collect();
+    in_fn.sort_unstable();
+    in_fn.dedup();
+    let take = in_fn.len().min(64);
+    Some(in_fn[in_fn.len().saturating_sub(take)..].to_vec())
+}
+
 /// Resolve only call argument registers defined by modeled instructions in the
 /// same bounded straight-line region. A branch in the scan window rejects the
 /// entire result because its target could skip definitions; calls and opaque
 /// operations clear state so caller side effects are not carried forward.
-fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Option<Flow> {
-    if function_start < base || callsite < function_start || (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return None; }
-    let call_index = usize::try_from(callsite - base).ok().map(|offset| offset / 4);
-    let call_index = call_index.filter(|index| index.saturating_mul(4) <= code.len())?;
-    let function_index = usize::try_from(function_start - base).ok().map(|offset|offset / 4);
-    let function_index = function_index?;
-    let start_index = call_index.saturating_sub(64).max(function_index);
+/// ARM64 4-byte decode path for now; non-4-byte instruction sizes are treated conservatively.
+fn known_call_flow_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Option<Flow> {
+    let pcs = call_scan_window_pcs(base, function_start, callsite, insn_pcs)?;
     let mut flow = Flow::new();
-    for index in start_index..call_index {
-        let pc = base.saturating_add(index as u64 * 4);
+    for (i, &pc) in pcs.iter().enumerate() {
+        let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
+            // map by position in provided full pc list if possible
+            insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
+        } else { 4 };
+        if sz != 4 { return None; } // conservative for variable-length until arch-aware decode
         let off = pc.checked_sub(base)? as usize;
         let bytes = code.get(off..off + 4)?;
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
@@ -8161,8 +8184,16 @@ fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -
     Some(flow)
 }
 
+fn known_call_flow(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Option<Flow> {
+    known_call_flow_with_pcs(code, base, function_start, callsite, &[], &[])
+}
+
 pub fn known_call_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u64, String)> {
-    let Some(flow) = known_call_flow(code, base, function_start, callsite) else { return Vec::new() };
+    known_call_argument_values_with_pcs(code, base, function_start, callsite, &[], &[])
+}
+
+pub fn known_call_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(u8, u64, String)> {
+    let Some(flow) = known_call_flow_with_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes) else { return Vec::new() };
     (0..8u8).filter_map(|index| {
         let register = Register { index: index as u32, wide: true, stack_pointer: false };
         flow.read(register).map(|value| (index, value.value, proven_by(&value)))
@@ -8173,7 +8204,11 @@ pub fn known_call_argument_values(code: &[u8], base: u64, function_start: u64, c
 /// vector flow state. The callee prototype determines whether those bits are
 /// interpreted as `float` or `double` by the caller.
 pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(u8, u128, String)> {
-    let Some(flow) = known_call_flow(code, base, function_start, callsite) else { return Vec::new() };
+    known_call_float_argument_values_with_pcs(code, base, function_start, callsite, &[], &[])
+}
+
+pub fn known_call_float_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(u8, u128, String)> {
+    let Some(flow) = known_call_flow_with_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes) else { return Vec::new() };
     (0..8u8).filter_map(|index| flow.read_v(index as u32).map(|value| (index, value.value, format!("proven_by=[{}]", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(",")) ))).collect()
 }
 
@@ -8183,15 +8218,25 @@ pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: 
 /// operation, or SP update discards earlier stores. The caller supplies the
 /// formal width; a wider store proves its low bytes at the same offset.
 pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: u64, callsite: u64) -> Vec<(usize, u8, u64, String)> {
-    if function_start < base || callsite < function_start || (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return Vec::new(); }
-    let Some(call_index) = usize::try_from(callsite - base).ok().map(|offset| offset / 4) else { return Vec::new() };
-    let Some(function_index) = usize::try_from(function_start - base).ok().map(|offset| offset / 4) else { return Vec::new() };
-    if call_index.saturating_mul(4) > code.len() { return Vec::new(); }
+    known_call_stack_argument_values_with_pcs(code, base, function_start, callsite, &[], &[])
+}
+
+pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(usize, u8, u64, String)> {
+    let Some(pcs) = call_scan_window_pcs(base, function_start, callsite, insn_pcs) else { return Vec::new(); };
+    if insn_pcs.is_empty() {
+        // preserve existing fixed-width bounds behavior
+        if (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return Vec::new(); }
+        let Some(call_index) = usize::try_from(callsite - base).ok().map(|offset| offset / 4) else { return Vec::new() };
+        if call_index.saturating_mul(4) > code.len() { return Vec::new(); }
+    }
     let mut flow = Flow::new();
     let mut stack_aliases = std::collections::BTreeMap::<u8, Vec<u64>>::new();
     let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
-    for index in call_index.saturating_sub(64).max(function_index)..call_index {
-        let pc = base + index as u64 * 4;
+    for &pc in &pcs {
+        let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
+            insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
+        } else { 4 };
+        if sz != 4 { return Vec::new(); } // conservative for variable-length until arch-aware decode
         let off = pc.saturating_sub(base) as usize;
         let Some(bytes) = code.get(off..off + 4) else { return Vec::new() };
         let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
