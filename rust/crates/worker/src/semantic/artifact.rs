@@ -1163,15 +1163,25 @@ fn aindex_of(pc: u64, insn_pcs: &[u64], start: u64, count: usize) -> Option<usiz
     } else { insn_pcs.binary_search(&pc).ok() }
 }
 fn aspan_end_pc(pc: u64, insn_pcs: &[u64], start: u64, count: usize, fallback_end: u64) -> u64 {
+    aspan_end_pc_with_sizes(pc, insn_pcs, &[], start, count, fallback_end)
+}
+fn aspan_end_pc_with_sizes(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, count: usize, fallback_end: u64) -> u64 {
     if let Some(i) = aindex_of(pc, insn_pcs, start, count) {
-        if insn_pcs.is_empty() { start + (i as u64 + 1) * 4 }
-        else { insn_pcs.get(i + 1).copied().unwrap_or(fallback_end) }
-    } else if insn_pcs.is_empty() {
+        if !insn_sizes.is_empty() && i < insn_sizes.len() {
+            return pc.saturating_add(insn_sizes[i] as u64);
+        }
+        if insn_pcs.is_empty() { return start + (i as u64 + 1) * 4; }
+        return insn_pcs.get(i + 1).copied().unwrap_or(fallback_end);
+    }
+    if insn_pcs.is_empty() {
         pc + 4
     } else {
-        // Variable-length stream: unknown size without explicit size map; use next known PC or fallback.
+        // Variable-length stream: try known PC index for size; otherwise next PC or fallback.
         match insn_pcs.binary_search(&pc) {
-            Ok(i) => insn_pcs.get(i + 1).copied().unwrap_or(fallback_end),
+            Ok(i) => {
+                if !insn_sizes.is_empty() && i < insn_sizes.len() { pc.saturating_add(insn_sizes[i] as u64) }
+                else { insn_pcs.get(i + 1).copied().unwrap_or(fallback_end) }
+            }
             Err(i) => insn_pcs.get(i).copied().unwrap_or(fallback_end),
         }
     }
@@ -2117,7 +2127,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         let word = if size == 4 {
             u32::from_le_bytes(bytes.try_into().unwrap_or([0,0,0,0]))
         } else { 0 };
-        let pc_end = aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end);
+        let pc_end = aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end);
         let position = file_offset + (pc - base);
         let data = data_ranges
             .iter()
@@ -2308,7 +2318,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ),
                 ("file_offset", address(position)),
             ]),
-            ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
+            ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
         )?;
         let decoded = builder.record(
             "decode",
@@ -2321,7 +2331,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     (!matches!(portable, IrOperation::TargetSpecific)).into(),
                 ),
             ]),
-            ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
+            ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
         )?;
         builder.edge(&raw, &decoded, "decodes-to")?;
         let effects = portable.gpr_effects();
@@ -2346,7 +2356,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ),
                 ("barrier", effects.barrier.into()),
             ]),
-            ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
+            ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
         )?;
         builder.edge(&decoded, &ir, "lifts-to")?;
         let mut reasons = Vec::new();
@@ -2378,7 +2388,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             IrOperation::DirectCall { target } if target == start => self_prototype.is_some(),
             IrOperation::DirectCall { target } => {
                 call_prototypes.contains_key(&target)
-                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee_with_resolved_indirects(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets).is_some_and(|summary| {
+                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, "arm64").is_some_and(|summary| {
                         let callee_saved_gprs = 0x7ff8_0000; // x19 through x30
                         let callee_saved_vectors = 0x0000_ff00; // low 64-bit v8 through v15
                         summary.complete
@@ -2473,7 +2483,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         "conservative whole captured function".into(),
                     ),
                 ]),
-                ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
+                ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
             )?;
             builder.edge(&ir, &unknown, "derives")?;
         }
@@ -2502,7 +2512,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         // of what the callee does. The observation is capped and explicitly
         // scoped; it never replaces the caller-visible ABI contract.
         let tree = match portable {
-            IrOperation::DirectCall { target } => match calls::analyze_callee_with_resolved_indirects(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets) {
+            IrOperation::DirectCall { target } => match calls::analyze_callee_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, "arm64") {
                 Some(summary) => {
                     let mut tree = tree;
                     tree.attributes = calls::with_callee_payload(tree.attributes, &summary);
@@ -2520,7 +2530,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 let mut tree = tree;
                 tree.attributes = calls::with_non_returning_payload(
                     tree.attributes,
-                    calls::prove_non_returning_with_resolved_indirects(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets),
+                    calls::prove_non_returning_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, "arm64"),
                 );
                 tree
             }
@@ -2670,7 +2680,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     array(block.dominators.iter().map(|index| (*index as u64).into())),
                 ),
             ]),
-            ranges(block.start, aspan_end_pc(block.start, &insn_pcs, start, insn_pcs.len(), stream_end)),
+            ranges(block.start, aspan_end_pc_with_sizes(block.start, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
         )?;
         builder.edge(&ir_ids[index], &id, "controls")?;
         block_ids.push(id);
@@ -2684,7 +2694,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("source", address(block.start)),
                     ("target", address(function.cfg.blocks[successor].start)),
                 ]),
-                ranges(block.start, aspan_end_pc(block.start, &insn_pcs, start, insn_pcs.len(), stream_end)),
+                ranges(block.start, aspan_end_pc_with_sizes(block.start, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
             )?;
             builder.edge(&block_ids[index], &edge, "controls")?;
             builder.edge(&edge, &block_ids[successor], "flows-to")?;
@@ -2714,7 +2724,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 "definition",
                 "derived",
                 ssa_payload(value),
-                ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
+                ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)),
             )?;
             builder.edge(&ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "defines")?;
             definitions.insert(value.name(), id);
@@ -2738,7 +2748,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 })),
             );
             let pc = function.cfg.blocks[index].start;
-            let id = builder.record("phi", "derived", payload, ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+            let id = builder.record("phi", "derived", payload, ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
             definitions.insert(phi.value.name(), id);
         }
     }
@@ -2751,12 +2761,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     "definition",
                     "derived",
                     ssa_payload(value),
-                    ranges(start, aspan_end_pc(start, &insn_pcs, start, insn_pcs.len(), stream_end.max(start+4))),
+                    ranges(start, aspan_end_pc_with_sizes(start, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end.max(start+4))),
                 )?;
                 definitions.insert(value.name(), id.clone());
                 id
             };
-            let id = builder.record("use", "derived", ssa_payload(value), ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+            let id = builder.record("use", "derived", ssa_payload(value), ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
             builder.edge(&definition, &id, "flows-to")?;
             builder.edge(&id, &ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses")?;
         }
@@ -2772,7 +2782,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         "definition",
                         "derived",
                         ssa_payload(*value),
-                        ranges(start, aspan_end_pc(start, &insn_pcs, start, insn_pcs.len(), stream_end.max(start+4))),
+                        ranges(start, aspan_end_pc_with_sizes(start, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end.max(start+4))),
                     )?;
                     definitions.insert(value.name(), id.clone());
                     id
@@ -2805,7 +2815,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("predecessor", predecessor.map(|index| (index as u64).into()).unwrap_or(V::Null)),
                 ("version", u64::from(*version).into()),
             ])))),
-        ]), ranges(function.cfg.blocks[phi.block].start, aspan_end_pc(function.cfg.blocks[phi.block].start, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+        ]), ranges(function.cfg.blocks[phi.block].start, aspan_end_pc_with_sizes(function.cfg.blocks[phi.block].start, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
         builder.edge(&block_ids[phi.block], &id, "merges-memory")?;
         memory_definitions.insert((phi.partition, phi.version), id);
     }
@@ -2815,7 +2825,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("partition", version.partition.name().into()),
                 ("version", u64::from(written).into()),
                 ("origin", "instruction".into()),
-            ]), ranges(version.pc, aspan_end_pc(version.pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+            ]), ranges(version.pc, aspan_end_pc_with_sizes(version.pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
             builder.edge(&ir_ids[aindex_of(version.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "defines-memory")?;
             memory_evidence_by_pc.entry(version.pc).or_default().push(id.clone());
             memory_definitions.insert((version.partition, written), id);
@@ -2838,7 +2848,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("version", u64::from(version.read_version).into()),
             ("ordered", version.ordered.into()),
             ("exclusive", version.exclusive.into()),
-        ]), ranges(version.pc, aspan_end_pc(version.pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+        ]), ranges(version.pc, aspan_end_pc_with_sizes(version.pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
         builder.edge(definition, &id, "flows-to")?;
         builder.edge(&id, &ir_ids[aindex_of(version.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses-memory")?;
         memory_evidence_by_pc.entry(version.pc).or_default().push(id);
@@ -2860,7 +2870,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("writes", array(writes.into_iter().map(V::from))),
             ("ordered", versions.iter().any(|version| version.ordered).into()),
             ("exclusive", versions.iter().any(|version| version.exclusive).into()),
-        ]), ranges(*pc, aspan_end_pc(*pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+        ]), ranges(*pc, aspan_end_pc_with_sizes(*pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
         builder.edge(&ir_ids[aindex_of(*pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "accesses-memory")?;
         access_ids.insert(*pc, id);
     }
@@ -2877,7 +2887,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("mnemonic", event.mnemonic.into()),
             ("domain", event.domain.map(V::from).unwrap_or(V::Null)),
             ("memory_values_changed", false.into()),
-        ]), ranges(event.pc, aspan_end_pc(event.pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+        ]), ranges(event.pc, aspan_end_pc_with_sizes(event.pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
         builder.edge(&ir_ids[aindex_of(event.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, relation)?;
         if let Some(block_index) = function.cfg.blocks.iter().position(|block| block.instructions.contains(&event.pc)) {
             let nearest = |before: bool| -> Option<u64> {
@@ -2896,13 +2906,13 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         if block.predecessors.len() != 1 { break; }
                         let predecessor = block.predecessors[0];
                         let previous = &function.cfg.blocks[predecessor];
-                        if previous.successors.as_slice() != [current] || previous.instructions.last().copied().map(|pc| aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)) != block.instructions.first().copied() { break; }
+                        if previous.successors.as_slice() != [current] || previous.instructions.last().copied().map(|pc| aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)) != block.instructions.first().copied() { break; }
                         predecessor
                     } else {
                         if block.successors.len() != 1 { break; }
                         let successor = block.successors[0];
                         let next = &function.cfg.blocks[successor];
-                        if next.predecessors.as_slice() != [current] || block.instructions.last().copied().map(|pc| aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)) != next.instructions.first().copied() { break; }
+                        if next.predecessors.as_slice() != [current] || block.instructions.last().copied().map(|pc| aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)) != next.instructions.first().copied() { break; }
                         successor
                     };
                     current = adjacent;
@@ -2977,7 +2987,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let use_id = builder.record("file-use", "derived", object([
                 ("location", location_name(FileLocation::Flag(*bit)).into()),
                 ("value", value.name(FileLocation::Flag(*bit)).into()),
-            ]), ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+            ]), ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
             for segment in &value.segments {
                 if let Some(definition) = file_definitions.get(&(FileLocation::Flag(*bit), segment.origin)) {
                     builder.edge(definition, &use_id, "flows-to")?;
@@ -3002,7 +3012,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("byte_ranges", array(value.segments.iter().map(|segment| object([
                     ("offset", segment.offset.into()), ("bytes", segment.bytes.into()),
                 ])))),
-            ]), ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+            ]), ranges(pc, aspan_end_pc_with_sizes(pc, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
             for segment in &value.segments {
                 if let Some(definition) = file_definitions.get(&(location, segment.origin)) {
                     builder.edge(definition, &use_id, "flows-to")?;
@@ -3031,7 +3041,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("predecessor", predecessor.map(|index| (index as u64).into()).unwrap_or(V::Null)),
                     ("value", value.name(phi.location).into()),
                 ])))),
-            ]), ranges(function.cfg.blocks[block_index].start, aspan_end_pc(function.cfg.blocks[block_index].start, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
+            ]), ranges(function.cfg.blocks[block_index].start, aspan_end_pc_with_sizes(function.cfg.blocks[block_index].start, &insn_pcs, &insn_sizes, start, insn_pcs.len(), stream_end)))?;
             for (_, incoming) in &phi.incoming {
                 for segment in &incoming.segments {
                     if let Some(definition) = file_definitions.get(&(phi.location, segment.origin)) {
