@@ -479,8 +479,10 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch(
 }
 
 /// Architecture- and PC/size-map-aware non-return proof.
-/// When instruction PCs/sizes are provided they drive iteration; decode/lift remains ARM64 4-byte only
-/// (non-ARM64 or non-4-byte instructions bail conservatively).
+/// Instruction iteration/next-PC uses provided PC/size maps when available; ARM64 fixed-width
+/// synthesis is used only as an explicit ARM64 fallback when no map is provided. Decode/lift is
+/// architecture-gated via `decode_lift_for_arch` and unsupported/undecodable instructions bail
+/// conservatively (no unsound non-returning claim).
 pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch_and_pcs(
     code: &[u8],
     base: u64,
@@ -491,30 +493,29 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch_and_pcs(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> bool {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
-    if !is_arm64 {
-        // x86_64 and other architectures: variable-length decode/flow analysis not yet implemented.
-        // Bail conservatively - no unsound non-returning claim.
-        return false;
-    }
-    // Decode the bounded window once, keeping each instruction's control
-    // flow. A word that does not decode stops the proof: the callee's
-    // behaviour past that point is unknown.
-    let mut window: Vec<(u64, Flow)> = Vec::new();
+    let is_arm64 = super::super::is_arm64_arch(architecture);
+    let mut window: Vec<(u64, u32, Flow)> = Vec::new();
+    let mut window_order: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut window_size: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+
     if !insn_pcs.is_empty() {
+        let paired = insn_sizes.len() == insn_pcs.len();
+        if !paired && !is_arm64 {
+            return false; // variable-length stream requires explicit per-instruction sizes
+        }
         let mut started = false;
         for (i, &pc) in insn_pcs.iter().enumerate() {
             if !started {
                 if pc == target { started = true; } else { continue; }
             }
             if window.len() >= budget { break; }
-            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(i).unwrap_or(&4) } else { 4 };
-            if sz != 4 { break; }
-            let Some(off) = pc.checked_sub(base).and_then(|v| usize::try_from(v).ok()) else { break; };
-            let Some(bytes) = code.get(off..off + 4) else { break; };
-            let word = u32::from_le_bytes(bytes.try_into().unwrap());
-            let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
+            let sz = if paired {
+                insn_sizes.get(i).copied().unwrap_or(0)
+            } else {
+                u32::try_from(super::super::ARM64_INSN_BYTES).unwrap_or(4)
+            };
+            if sz == 0 { break; }
+            let Some((_word, _op, portable)) = super::super::decode_lift_for_arch(code, base, pc, sz, architecture) else { break; };
             let flow = match portable {
                 super::super::IrOperation::Branch { target } => Flow::Direct(target),
                 super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
@@ -531,46 +532,56 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch_and_pcs(
                 super::super::IrOperation::TargetSpecific => Flow::Unknown,
                 _ => Flow::FallsThrough,
             };
-            window.push((pc, flow));
+            window_order.insert(pc, window.len());
+            window_size.insert(pc, sz);
+            window.push((pc, sz, flow));
+        }
+    } else if is_arm64 {
+        // Explicit ARM64 fixed-width fallback when no PC/size map is provided.
+        if !super::super::arm64_is_aligned(base, target) {
+            return false;
+        }
+        let mut pc = target;
+        while window.len() < budget {
+            let Some((_word, _op, portable)) = super::super::decode_lift_for_arch(code, base, pc, 4, architecture) else { break; };
+            let flow = match portable {
+                super::super::IrOperation::Branch { target } => Flow::Direct(target),
+                super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
+                super::super::IrOperation::IndirectBranch { .. } => {
+                    if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                        Flow::ResolvedIndirect(targets.clone())
+                    } else {
+                        Flow::Unknown
+                    }
+                }
+                super::super::IrOperation::Return { .. } => Flow::Returns,
+                super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
+                super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
+                super::super::IrOperation::TargetSpecific => Flow::Unknown,
+                _ => Flow::FallsThrough,
+            };
+            window_order.insert(pc, window.len());
+            window_size.insert(pc, 4);
+            window.push((pc, 4, flow));
+            pc = pc.saturating_add(u64::try_from(super::super::ARM64_INSN_BYTES).unwrap_or(4));
         }
     } else {
-        let Some(offset) = target.checked_sub(base).map(|value| value as usize) else {
-            return false;
-        };
-        if offset % 4 != 0 {
-            return false;
-        }
-        let mut cursor = offset;
-        while window.len() < budget {
-            let Some(bytes) = code.get(cursor..cursor + 4) else {
-                break;
-            };
-            let word = u32::from_le_bytes(bytes.try_into().unwrap());
-            let pc = base + cursor as u64;
-            let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
-            let flow = match portable {
-                super::super::IrOperation::Branch { target } => Flow::Direct(target),
-                super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
-                super::super::IrOperation::IndirectBranch { .. } => {
-                    if let Some(targets) = resolved_indirect_targets.get(&pc) {
-                        Flow::ResolvedIndirect(targets.clone())
-                    } else {
-                        Flow::Unknown
-                    }
-                }
-                super::super::IrOperation::Return { .. } => Flow::Returns,
-                super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
-                super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
-                super::super::IrOperation::TargetSpecific => Flow::Unknown,
-                _ => Flow::FallsThrough,
-            };
-            window.push((pc, flow));
-            cursor += 4;
-        }
+        return false;
     }
+
     if window.is_empty() {
         return false;
     }
+
+    let fallthrough_of = |pc: u64| -> Option<u64> {
+        let idx = *window_order.get(&pc)?;
+        if idx + 1 < window.len() {
+            Some(window[idx + 1].0)
+        } else {
+            Some(pc.saturating_add(u64::from(*window_size.get(&pc)?)))
+        }
+    };
+
     // Walk the reachable instructions. Reaching a return, a conditional
     // branch, or an unresolved indirect transfer means the callee may come
     // back, so the proof fails.
@@ -580,72 +591,54 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch_and_pcs(
         if !visited.insert(pc) {
             continue;
         }
-        let Some((_, flow)) = window.iter().find(|(address, _)| *address == pc).cloned() else {
-            // A branch outside the decoded window leaves the callee's fate
-            // unknown.
+        let Some(&idx) = window_order.get(&pc) else {
+            // A branch outside the decoded window leaves the callee's fate unknown.
             return false;
         };
+        let flow = window[idx].2.clone();
         match flow {
             Flow::Returns | Flow::Unknown => return false,
             Flow::Conditional(target) => {
-                // Both arms are reachable; every path must be non-returning.
-                if target <= pc {
-                    // Backward taken edge is a loop on that path.
-                } else {
+                if target > pc {
                     pending.push(target);
                 }
-                pending.push(pc + 4);
+                let Some(next) = fallthrough_of(pc) else { return false; };
+                pending.push(next);
             }
             Flow::ResolvedIndirect(targets) => {
-                // Proven complete indirect dispatch: follow all in-function
-                // targets. An empty set means no in-function continuation, but
-                // control may exit to unanalyzed code, so non-returning is not
-                // provable from this window alone.
                 if targets.is_empty() {
                     return false;
                 }
                 for target in targets {
                     if target <= pc {
-                        // Treat a backward resolved target as a loop edge.
-                        // Conservatively require that all other paths also prove
-                        // non-returning; continue exploring this path's loop is
-                        // insufficient alone, so mark as non-returning only if
-                        // the whole reachable graph has no return path. Following
-                        // a backward edge is equivalent to reaching a visited/loop
-                        // state in this proof; do not enqueue it as progress.
                         continue;
                     }
                     pending.push(target);
                 }
             }
             Flow::Calls(target) => {
-                // The callee calls onward. It still returns to this frame
-                // unless that callee never returns.
-                if !prove_non_returning_with_resolved_indirects_and_arch(code, base, target, budget.min(64), resolved_indirect_targets, architecture) {
+                if !prove_non_returning_with_resolved_indirects_and_arch_and_pcs(code, base, target, budget.min(64), resolved_indirect_targets, architecture, &[], &[]) {
                     return false;
                 }
+                let Some(next) = fallthrough_of(pc) else { return false; };
+                pending.push(next);
             }
             Flow::Direct(target) => {
-                // A backward branch is an infinite loop: control never
-                // reaches a return from that point.
                 if target <= pc {
                     continue;
                 }
                 pending.push(target);
             }
             Flow::FallsThrough => {
-                let next = pc + 4;
-                match window.iter().find(|(address, _)| *address == next) {
-                    Some(_) => pending.push(next),
-                    None => return false,
+                let Some(next) = fallthrough_of(pc) else { return false; };
+                if window_order.contains_key(&next) {
+                    pending.push(next);
+                } else {
+                    return false;
                 }
             }
         }
     }
-    // Every reachable path in the decoded window either loops, reaches a
-    // proven non-returning call, or exits the analyzed region without a
-    // return. Exiting the window is unresolved, but exits were rejected above;
-    // an exhausted worklist with no return/unknown means no returning path.
     true
 }
 
@@ -737,8 +730,10 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch(
 }
 
 /// Architecture- and PC/size-map-aware callee summary.
-/// When instruction PCs/sizes are provided they drive fallthrough/next-PC computation; decode/lift
-/// remains ARM64 4-byte only (non-ARM64 or non-4-byte instructions bail conservatively).
+/// Instruction iteration/next-PC uses provided PC/size maps when available; ARM64 fixed-width
+/// synthesis is used only as an explicit ARM64 fallback when no map is provided. Decode/lift is
+/// architecture-gated via `decode_lift_for_arch`; unsupported/undecodable instructions produce a
+/// conservative, incomplete observation (no unsound claims).
 pub(super) fn analyze_callee_with_resolved_indirects_and_arch_and_pcs(
     code: &[u8],
     base: u64,
@@ -749,39 +744,46 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch_and_pcs(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> Option<CalleeSummary> {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
-    if !is_arm64 {
-        // x86_64 and other architectures: variable-length decode/flow/SSA-effect analysis not yet implemented.
-        return None;
-    }
+    let is_arm64 = super::super::is_arm64_arch(architecture);
     let pc_info: Option<std::collections::BTreeMap<u64, (usize, u32)>> = if !insn_pcs.is_empty() {
+        let paired = insn_sizes.len() == insn_pcs.len();
+        if !paired && !is_arm64 {
+            return None; // variable-length stream requires explicit per-instruction sizes
+        }
         let mut map = std::collections::BTreeMap::new();
         for (i, &pc) in insn_pcs.iter().enumerate() {
-            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(i).unwrap_or(&4) } else { 4 };
+            let sz = if paired {
+                insn_sizes.get(i).copied().unwrap_or(0)
+            } else {
+                u32::try_from(super::super::ARM64_INSN_BYTES).unwrap_or(4)
+            };
+            if sz == 0 { continue; }
             map.insert(pc, (i, sz));
         }
         Some(map)
     } else { None };
+
     let next_pc_of = |pc: u64| -> Option<u64> {
         if let Some(ref map) = pc_info {
-            if let Some(&(i, sz)) = map.get(&pc) {
-                if insn_pcs.get(i + 1).copied().is_some() { return insn_pcs.get(i + 1).copied(); }
-                return Some(pc.saturating_add(sz as u64));
-            }
-            None
+            let &(i, sz) = map.get(&pc)?;
+            insn_pcs.get(i + 1).copied().or(Some(pc.saturating_add(u64::from(sz))))
+        } else if is_arm64 {
+            Some(pc.saturating_add(u64::try_from(super::super::ARM64_INSN_BYTES).unwrap_or(4)))
         } else {
-            Some(pc + 4)
+            None
         }
     };
-    // A target outside the decodable region has no window at all.
+
+    // A target outside the decodable/known region has no window at all.
     if let Some(ref map) = pc_info {
         if !map.contains_key(&target) { return None; }
+    } else if is_arm64 {
+        if !super::super::arm64_is_aligned(base, target) { return None; }
+        let _ = read_word(code, base, target)?;
     } else {
-        let offset = target.checked_sub(base)? as usize;
-        if offset % 4 != 0 { return None; }
-        code.get(offset..offset + 4)?;
+        return None;
     }
+
     let mut summary = CalleeSummary::default();
     let mut visited: BTreeSet<u64> = BTreeSet::new();
     let mut pending: Vec<u64> = vec![target];
@@ -795,16 +797,27 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch_and_pcs(
         }
         let sz = if let Some(ref map) = pc_info {
             match map.get(&pc) { Some(&(_, sz)) => sz, None => { summary.escaped = true; continue; } }
-        } else { 4 };
-        if sz != 4 {
-            summary.opaque = true;
+        } else if is_arm64 {
+            u32::try_from(super::super::ARM64_INSN_BYTES).unwrap_or(4)
+        } else {
+            summary.escaped = true;
             continue;
-        }
-        let Some(off) = pc.checked_sub(base).and_then(|v| usize::try_from(v).ok()) else { summary.escaped = true; continue; };
-        let Some(bytes) = code.get(off..off + 4) else { summary.escaped = true; continue; };
-        let word = u32::from_le_bytes(bytes.try_into().ok()?);
-        let operation = super::super::decode(word, pc);
-        let portable = super::super::lift_operation(operation, pc);
+        };
+
+        let Some((word, operation, portable)) = super::super::decode_lift_for_arch(code, base, pc, sz, architecture) else {
+            // If the instruction bytes are outside the captured/known region, control escaped; otherwise decoding/lifting is unsupported (opaque).
+            let in_bounds = pc.checked_sub(base)
+                .and_then(|off| usize::try_from(off).ok())
+                .and_then(|off| off.checked_add(sz as usize))
+                .is_some_and(|end| end <= code.len());
+            if !in_bounds {
+                summary.escaped = true;
+            } else {
+                summary.opaque = true;
+            }
+            continue;
+        };
+
         let lifted = super::super::LiftedInstruction { address: pc, word, operation, portable, data: false };
         let flag_effects = super::super::files::instruction_flag_effects(&lifted);
         let vector_effects = super::super::files::instruction_vector_effects(&lifted);
@@ -862,14 +875,12 @@ pub(super) fn analyze_callee_with_resolved_indirects_and_arch_and_pcs(
     Some(summary)
 }
 
-/// Read the instruction word at `pc` from the captured image text.
+/// Read an ARM64 fixed-width instruction word at `pc` from the captured image text.
 fn read_word(code: &[u8], base: u64, pc: u64) -> Option<u32> {
-    let offset = pc.checked_sub(base)? as usize;
-    if offset % 4 != 0 {
+    if !super::super::arm64_is_aligned(base, pc) {
         return None;
     }
-    let bytes = code.get(offset..offset + 4)?;
-    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    super::super::read_arm64_u32(code, base, pc)
 }
 
 /// Attach a bounded callee observation to a rendered call summary payload.
