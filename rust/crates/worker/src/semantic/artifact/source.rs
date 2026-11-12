@@ -3108,6 +3108,7 @@ pub(super) fn recover_with_types(
     }
     let mut pending = vec![(0usize, state, BTreeMap::<usize, State>::new())];
     let mut returned = Vec::new();
+    let mut noreturn_effects: Vec<(Vec<ExternalLoad>, Vec<ExternalStore>, Vec<CallResult>, bool)> = Vec::new();
     let mut source_loops = Vec::new();
     let mut visits = 0;
     // The proven frame objects, keyed by their exact extent. A later write to
@@ -3466,6 +3467,7 @@ pub(super) fn recover_with_types(
                                     let entry = objects.entry((offset, bytes)).or_insert(version);
                                     if *entry < version { *entry = version; }
                                 }
+                                noreturn_effects.push((state.external_loads.clone(), state.external_stores.clone(), state.calls.clone(), state.has_call));
                                 break;
                             }
                             return Err("source branch outside function".into());
@@ -3498,6 +3500,7 @@ pub(super) fn recover_with_types(
                                 let entry = objects.entry((offset, bytes)).or_insert(version);
                                 if *entry < version { *entry = version; }
                             }
+                            noreturn_effects.push((taken.external_loads.clone(), taken.external_stores.clone(), taken.calls.clone(), taken.has_call));
                             // Fallthrough path continues with negated condition.
                             state.path = dag.add(
                                 "source-path",
@@ -3914,8 +3917,12 @@ pub(super) fn recover_with_types(
     // Calls are execution events regardless of result liveness. Materialize
     // each result once so expression reuse cannot duplicate an invocation,
     // and dead results cannot erase a call from the executed path.
-    let ordered_call_memory = returned.iter().any(|path| !path.6.is_empty());
-    let ordered_volatile_accesses = returned.iter().any(|(_, _, loads, stores, has_call, _, _)| {
+    let mut ordered_call_memory = returned.iter().any(|path| !path.6.is_empty())
+        || noreturn_effects.iter().any(|(_, _, calls, _)| !calls.is_empty());
+    let mut ordered_volatile_accesses = returned.iter().any(|(_, _, loads, stores, has_call, _, _)| {
+        let volatile = loads.iter().any(|load| load.volatile) || stores.iter().any(|store| store.volatile);
+        volatile && (*has_call || loads.len() + stores.len() > 1)
+    }) || noreturn_effects.iter().any(|(loads, stores, _, has_call)| {
         let volatile = loads.iter().any(|load| load.volatile) || stores.iter().any(|store| store.volatile);
         volatile && (*has_call || loads.len() + stores.len() > 1)
     });
@@ -3951,6 +3958,22 @@ pub(super) fn recover_with_types(
         )?;
         dag.type_node(select, joined);
         result = select;
+    }
+    for (path_loads, path_stores, path_calls, has_call) in noreturn_effects {
+        let volatile = path_loads.iter().any(|load| load.volatile) || path_stores.iter().any(|store| store.volatile);
+        if volatile && (has_call || path_loads.len() + path_stores.len() > 1) {
+            ordered_volatile_accesses = true;
+        }
+        if !path_calls.is_empty() { ordered_call_memory = true; }
+        for access in path_loads {
+            if !external_loads.contains(&access) { external_loads.push(access); }
+        }
+        for effect in path_stores {
+            if !external_stores.contains(&effect) { external_stores.push(effect); }
+        }
+        for call in path_calls {
+            if !calls.contains(&call) { calls.push(call); }
+        }
     }
     let mut called_prototypes = Vec::new();
     for target in operations.iter().filter_map(|operation| match operation {
