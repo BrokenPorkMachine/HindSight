@@ -2428,13 +2428,110 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
   if let Some((target,k,split))=branch_target(w,pc){if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&pc+4<scan_end{leaders.push(pc+4);edges.push((pc,pc+4,"fallthrough"));}}
   else if is_terminal(w)&&pc+4<scan_end{leaders.push(pc+4);}
  }
+ } else if super::semantic::is_x86_64_arch(&analyze_arch) && !code.is_empty() {
+  // Architecture-aware variable-length x86-64 decode/lift scan (bounded, conservative).
+  // Uses iced-x86 instruction boundaries and arch-gated portable lift/control-flow where evidenced;
+  // does not fabricate ARM64-specific dataflow/SSA/jump-table semantics.
+  use iced_x86::Decoder;
+  let mut pc = map.address;
+  let mut data_i = 0usize;
+  let max_instrs = 4000usize;
+  let mut count = 0usize;
+  while pc < scan_end && count < max_instrs {
+   let off = (pc - map.address) as usize;
+   if off >= code.len() { break; }
+   let file_position = map.offset.saturating_add(pc.saturating_sub(map.address));
+   while data_i < data_ranges.len() && data_ranges[data_i].1 <= file_position { data_i += 1; }
+   if data_i < data_ranges.len() && file_position < data_ranges[data_i].1 && file_position < data_ranges[data_i].0.saturating_add((data_ranges[data_i].1 - data_ranges[data_i].0).max(1)) {
+    // Conservative: if current PC starts inside a data-in-code range, skip one byte to resync.
+    let kind = data_ranges[data_i].2;
+    if ir.len() < 60_000 { ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n")); }
+    if dataflow.len() < 60_000 { dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n")); }
+    if ssa.len() < 60_000 { ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n")); }
+    data_words += 1;
+    pc = pc.saturating_add(1);
+    count += 1;
+    continue;
+   }
+   let slice = &code[off..];
+   if slice.is_empty() { break; }
+   let decode_end = (scan_end.saturating_sub(pc) as usize).min(slice.len()).min(15);
+   if decode_end == 0 { break; }
+   let mut dec = Decoder::with_ip(64, &slice[..decode_end], pc, iced_x86::DecoderOptions::NONE);
+   let instr = dec.decode();
+   if instr.is_invalid() || instr.len() == 0 {
+    if ir.len() < 60_000 { ir.push_str(&format!("{pc:#018x}  opaque   invalid/undecodable x86-64 instruction\n")); }
+    pc = pc.saturating_add(1);
+    count += 1;
+    continue;
+   }
+   let size = instr.len() as u32;
+   let next_pc = pc.saturating_add(size as u64);
+   // Skip if instruction spans into a data-in-code range start.
+   let insn_file_end = file_position.saturating_add(size as u64);
+   if data_i < data_ranges.len() && file_position < data_ranges[data_i].1 && insn_file_end > data_ranges[data_i].0 {
+    let kind = data_ranges[data_i].2;
+    if ir.len() < 60_000 { ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind} (overlap)\n")); }
+    data_words += 1;
+    pc = data_ranges[data_i].1.saturating_sub(map.offset).saturating_add(map.address);
+    count += 1;
+    continue;
+   }
+   let mut kind = "opaque";
+   let asm_text = format!("{instr:?}");
+   let lifted = super::semantic::decode_lift_for_arch(&code, map.address, pc, size, &analyze_arch);
+   if let Some((_, _op, portable)) = lifted {
+    decoded += 1;
+    use super::semantic::IrOperation;
+    match portable {
+     IrOperation::Branch { target } => {
+      kind = "branch";
+      if target >= map.address && target < scan_end { leaders.push(target); edges.push((pc, target, "branch")); }
+      if next_pc < scan_end { leaders.push(next_pc); }
+     }
+     IrOperation::ConditionalBranch { target, .. } => {
+      kind = "cbranch";
+      if target >= map.address && target < scan_end { leaders.push(target); edges.push((pc, target, "branch")); }
+      if next_pc < scan_end { leaders.push(next_pc); edges.push((pc, next_pc, "fallthrough")); }
+     }
+     IrOperation::DirectCall { target } => {
+      kind = "call";
+      calls.push((function_for(&starts, pc), pc, target));
+      if next_pc < scan_end { leaders.push(next_pc); edges.push((pc, next_pc, "fallthrough")); }
+     }
+     IrOperation::IndirectCall { .. } => {
+      kind = "call";
+      if next_pc < scan_end { leaders.push(next_pc); edges.push((pc, next_pc, "fallthrough")); }
+     }
+     IrOperation::Return { .. } => {
+      kind = "term";
+      if next_pc < scan_end { leaders.push(next_pc); }
+     }
+     IrOperation::IndirectBranch { .. } => {
+      kind = "term";
+      if next_pc < scan_end { leaders.push(next_pc); }
+     }
+     IrOperation::Nop => { kind = "op"; }
+     IrOperation::TargetSpecific => { kind = "opaque"; }
+     _ => { kind = "op"; }
+    }
+   }
+   if ir.len() < 60_000 {
+    ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm_text}\n"));
+   }
+   pc = next_pc;
+   count += 1;
+  }
+  dataflow.push_str("/* ARM64-specific modeled dataflow scan skipped for x86-64 in this pass; architecture-aware lifted/control-flow evidence recorded where available. */\n");
+  ssa.push_str("/* ARM64-specific SSA scan skipped for x86-64 in this pass; architecture-aware SSA/value-flow parity pending. */\n");
+  jump_tables.push_str("/* ARM64-specific jump-table scan skipped for x86-64 in this pass. */\n");
  } else if !code.is_empty() {
-  // Non-ARM64 instruction decode/CFG/dataflow/SSA/jump-table analysis in this path is not yet implemented.
-  // Keep metadata/linkage/runtime outputs and avoid fabricating ARM64-decoded instruction semantics.
-  ir.push_str("/* ARM64-specific instruction decode/IR scan skipped for non-ARM64 architecture; variable-length decode/lift/render/CFG/analysis not yet implemented in this path. */\n");
-  dataflow.push_str("/* ARM64-specific dataflow scan skipped for non-ARM64 architecture. */\n");
-  ssa.push_str("/* ARM64-specific SSA scan skipped for non-ARM64 architecture. */\n");
-  jump_tables.push_str("/* ARM64-specific jump-table scan skipped for non-ARM64 architecture. */\n");
+  // Non-ARM64/x86-64 instruction decode/CFG/dataflow/SSA/jump-table analysis in this path is not yet implemented.
+  // Keep metadata/linkage/runtime outputs and avoid fabricating decoded instruction semantics.
+  ir.push_str("/* Architecture-specific instruction decode/IR scan skipped for unsupported architecture in this path; variable-length decode/lift/render/CFG/analysis not yet implemented. */\n");
+  dataflow.push_str("/* Architecture-specific dataflow scan skipped for unsupported architecture. */\n");
+  ssa.push_str("/* Architecture-specific SSA scan skipped for unsupported architecture. */\n");
+  jump_tables.push_str("/* Architecture-specific jump-table scan skipped for unsupported architecture. */\n");
  }
 
  let stack_slots=stack_slot_candidates(&ir);if dataflow.len().saturating_add(stack_slots.len())<60_000{dataflow.push('\n');dataflow.push_str(&stack_slots);}

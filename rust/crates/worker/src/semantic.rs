@@ -584,7 +584,7 @@ fn render_int_float_conversion(destination: IrConversionRegister, source: IrConv
 /// Architecture-neutral effects for operations shared by the supported lifters.
 /// Target-only semantics remain in `Operation` and are explicitly marked here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IrOperation {
+pub(crate) enum IrOperation {
     Nop,
     Marker { mnemonic: &'static str, domain: Option<&'static str> },
     ReadNZCV { destination: IrRegister },
@@ -2544,7 +2544,7 @@ enum LseOrder {
 }
 
 #[derive(Clone, Copy)]
-enum Operation {
+pub(crate) enum Operation {
     Nop,
     Return(Register),
     Call(u64),
@@ -8153,7 +8153,7 @@ pub(crate) fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
 ///   portable IR where evidence is clear (branches, calls, returns, nop); other semantics remain
 ///   conservatively `TargetSpecific`/`Opaque` (no fabricated values/effects/equivalence).
 /// - Unsupported architectures/sizes are conservatively unsupported for semantic lifting.
-fn decode_lift_for_arch(code: &[u8], base: u64, pc: u64, size: u32, architecture: &str) -> Option<(u32, Operation, IrOperation)> {
+pub(crate) fn decode_lift_for_arch(code: &[u8], base: u64, pc: u64, size: u32, architecture: &str) -> Option<(u32, Operation, IrOperation)> {
     if is_arm64_arch(architecture) {
         if size == 4 {
             let word = read_arm64_u32(code, base, pc)?;
