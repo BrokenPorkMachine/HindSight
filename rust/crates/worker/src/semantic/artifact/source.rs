@@ -3217,13 +3217,15 @@ pub(super) fn recover_with_types(
                 }
                 // If no differences were found in mergeable components and all
                 // unhandled components matched, this is a fixed-point join.
-                if can_merge && any_diff {
+                let path_differs = saved.path != state.path;
+                if can_merge && (any_diff || path_differs) {
                     // Bounded convergence: if the saved join state was already a
                     // merged path state, a further differing merge would create
                     // non-convergent phi chains in this representation; bail.
                     let saved_already_merged = dag.nodes.get(saved.path)
                         .is_some_and(|n| n.kind == "source-path" && n.template == "(($0) || ($1))");
-                    if saved_already_merged {
+                    if saved_already_merged && any_diff {
+                        // Data-state differs on an already-merged join: phi chains may diverge.
                         can_merge = false;
                     }
                     if can_merge {
@@ -3240,7 +3242,7 @@ pub(super) fn recover_with_types(
                     } else {
                         return Err(format!("loop region requires canonical loop/phi recovery at index {index} (pc {pc:#x})"));
                     }
-                } else if can_merge && !any_diff {
+                } else if can_merge && !any_diff && !path_differs {
                     break;
                 } else {
                     return Err(format!("loop region requires canonical loop/phi recovery at index {index} (pc {pc:#x})"));
