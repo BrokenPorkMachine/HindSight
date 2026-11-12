@@ -131,15 +131,33 @@ fn data_in_code_ranges(file:&mut File,window:&[u8],size:u64)->io::Result<Vec<(u6
  ranges.sort_unstable_by_key(|r|r.0);ranges.dedup();Ok(ranges)
 }
 fn ppc_at(index: usize, pcs: &[u64], base: u64) -> u64 {
-    pcs.get(index).copied().unwrap_or(base + index as u64 * 4)
+    ppc_at_with_arch(index, pcs, base, "arm64")
+}
+fn ppc_at_with_arch(index: usize, pcs: &[u64], base: u64, architecture: &str) -> u64 {
+    if let Some(&pc) = pcs.get(index) {
+        pc
+    } else if pcs.is_empty() && super::semantic::is_arm64_arch(architecture) {
+        base.saturating_add((index as u64).saturating_mul(super::semantic::ARM64_INSN_BYTES))
+    } else {
+        base
+    }
 }
 fn pindex_of(pc: u64, pcs: &[u64], base: u64, count: usize) -> Option<usize> {
+    pindex_of_with_arch(pc, pcs, base, count, "arm64")
+}
+fn pindex_of_with_arch(pc: u64, pcs: &[u64], base: u64, count: usize, architecture: &str) -> Option<usize> {
     if pcs.is_empty() {
+        if !super::semantic::is_arm64_arch(architecture) {
+            return None;
+        }
         let d = pc.checked_sub(base)?;
-        if d % 4 != 0 { return None; }
-        let i = (d / 4) as usize;
+        let insn = super::semantic::ARM64_INSN_BYTES;
+        if d % insn != 0 { return None; }
+        let i = usize::try_from(d / insn).ok()?;
         (i < count).then_some(i)
-    } else { pcs.binary_search(&pc).ok() }
+    } else {
+        pcs.binary_search(&pc).ok()
+    }
 }
 
 fn branch_target(w:u32,pc:u64)->Option<(u64,&'static str,bool)>{
@@ -1955,7 +1973,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
  let mut facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
- merge_runtime_objc(&mut facts,path,&window,map.address,map.address+code.len() as u64);
+ merge_runtime_objc(&mut facts,path,&window,map.address,map.address+code.len() as u64,"arm64");
  let export_names=export_function_names(&facts.export_trie,&window,&facts.starts,map.address+code.len() as u64);
  // Use the same validated export/stub names as analysis. Undefined nlist
  // symbols alone do not identify the address of an imported call target.
@@ -2212,7 +2230,8 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  // Rewind? not necessary; further reads use absolute offsets
  let arch_lc = architecture.to_ascii_lowercase();
  let (instruction_pcs, instruction_sizes) = if matches!(arch_lc.as_str(), "arm64" | "arm64e" | "aarch64") {
-  let fn_end = end.min(map.address + code.len() as u64).min(start.saturating_add(128 * 4));
+  let bound_stride = if is_arm64_jt { 4u64 } else { 16u64 };
+  let fn_end = end.min(map.address + code.len() as u64).min(start.saturating_add(128u64.saturating_mul(bound_stride)));
   let mut pcs = Vec::new();
   let mut sizes = Vec::new();
   let mut pc = start;
@@ -2300,7 +2319,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let scan_bytes=if map.encrypted{0}else{map.bytes.min(4*1024*1024)};let truncated=map.encrypted||scan_bytes<map.bytes;let code=if scan_bytes==0{Vec::new()}else{read_exact_range(&mut file,map.offset,scan_bytes as usize)?};let scan_end=map.address+scan_bytes;
  let parsed_sections=sections(&window);
  let mut fb_facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges)?;
- if !map.encrypted { merge_runtime_objc(&mut fb_facts,path,&window,map.address,scan_end); }
+ if !map.encrypted { merge_runtime_objc(&mut fb_facts,path,&window,map.address,scan_end,"arm64"); }
  let FunctionBoundaryFacts{symbols,starts,lc_function_starts,direct_call_starts,unwind_starts,objc_classes,objc_layouts,objc_function_names,objc_starts,export_trie,export_starts}=fb_facts;
  let mut boundary_sources=std::collections::BTreeMap::<u64,std::collections::BTreeSet<&'static str>>::new();
  for address in &lc_function_starts{boundary_sources.entry(*address).or_default().insert("LC_FUNCTION_STARTS");}
@@ -2552,14 +2571,14 @@ fn image_base_address(window: &[u8]) -> Option<u64> {
 /// and the captured image really carries Objective-C metadata. Static
 /// superclass/protocol text stays authoritative; runtime-only classes are
 /// appended so the header and ABI passes can use exact offsets and IMPs.
-fn merge_runtime_objc(facts: &mut FunctionBoundaryFacts, path: &str, window: &[u8], scan_start: u64, scan_end: u64) {
+fn merge_runtime_objc(facts: &mut FunctionBoundaryFacts, path: &str, window: &[u8], scan_start: u64, scan_end: u64, architecture: &str) {
     if !facts.objc_layouts.is_empty() || !image_declares_objc(window) { return; }
     // Runtime dlopen executes initializers/+load; require explicit opt-in for
     // untrusted artifacts.
     if std::env::var_os("HINDSIGHT_TRUSTED_RUNTIME_OBJC").is_none() { return; }
     let Some(image_base) = image_base_address(window) else { return; };
     let Some(classes) = isolated_runtime_objc_classes(path, image_base) else { return; };
-    apply_runtime_objc(facts, classes, scan_start, scan_end);
+    apply_runtime_objc(facts, classes, scan_start, scan_end, architecture);
 }
 
 /// Runtime introspection runs in a short-lived copy of this worker. A malformed
@@ -2743,12 +2762,13 @@ pub(crate) fn runtime_objc_child(path: &str, base: &str) -> String {
 
 /// Merge runtime classes into static evidence: static superclass/protocol text
 /// stays authoritative for classes it already described, runtime-only classes
-/// are appended, and only in-range 4-byte-aligned IMPs become boundaries.
+/// are appended, and only in-range IMPs become boundaries. ARM64 IMPs are
+/// additionally required to be 4-byte aligned; other architectures use range only.
 ///
 /// Layouts are admitted even when static text already names the class: static
 /// text can survive a member/record budget failure that discards the structured
 /// layouts, and the runtime layout is then the only exact member evidence.
-fn apply_runtime_objc(facts: &mut FunctionBoundaryFacts, classes: Vec<RuntimeObjcClass>, scan_start: u64, scan_end: u64) {
+fn apply_runtime_objc(facts: &mut FunctionBoundaryFacts, classes: Vec<RuntimeObjcClass>, scan_start: u64, scan_end: u64, architecture: &str) {
     let known_text = facts.objc_classes.lines()
         .filter(|line| line.starts_with("reconstructed class "))
         .filter_map(|line| line.split_whitespace().find_map(|field| field.strip_prefix("name=")))
@@ -2758,9 +2778,11 @@ fn apply_runtime_objc(facts: &mut FunctionBoundaryFacts, classes: Vec<RuntimeObj
         .map(|layout| (layout.name.clone(), layout.address))
         .collect::<std::collections::BTreeSet<_>>();
     let mut text = String::new();
+    let is_arm64 = super::semantic::is_arm64_arch(architecture);
     for class in classes {
         for (address, name) in class.methods {
-            if address < scan_start || address >= scan_end || (address - scan_start) % 4 != 0 { continue; }
+            if address < scan_start || address >= scan_end { continue; }
+            if is_arm64 && (address - scan_start) % super::semantic::ARM64_INSN_BYTES != 0 { continue; }
             facts.objc_function_names.entry(address).or_insert(name);
             if !facts.objc_starts.contains(&address) { facts.objc_starts.push(address); }
             if !facts.starts.contains(&address) { facts.starts.push(address); }
@@ -3375,7 +3397,7 @@ mod tests {
    runtime_class("Known",0x1100,vec![(0x2000,"-[Known a]".into())]),
    runtime_class("Novel",0x1200,vec![(0x2004,"-[Novel b]".into()),(0x2002,"-[Novel misaligned]".into()),(0x9000,"-[Novel outside]".into())]),
   ];
-  super::apply_runtime_objc(&mut facts,classes,0x1000,0x3000);
+  super::apply_runtime_objc(&mut facts,classes,0x1000,0x3000,"arm64");
   // Static relationship text is retained, runtime-only classes are appended.
   assert!(facts.objc_classes.contains("name=Known"));
   assert!(facts.objc_classes.contains("conforms=NSCopying"));
@@ -3394,7 +3416,7 @@ mod tests {
   super::apply_runtime_objc(&mut facts,vec![
    runtime_class("Known",0x1100,vec![(0x2000,"-[Known a]".into())]),
    runtime_class("Novel",0x1200,vec![(0x2004,"-[Novel b]".into())]),
-  ],0x1000,0x3000);
+  ],0x1000,0x3000,"arm64");
   assert_eq!(facts.starts,starts);
   assert_eq!(facts.objc_layouts.len(),2);
   assert_eq!(facts.objc_classes.matches("name=Novel").count(),1);
