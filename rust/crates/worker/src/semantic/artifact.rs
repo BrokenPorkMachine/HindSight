@@ -2614,7 +2614,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let (name, signature) = &signatures[0];
             crate::signatures::source_signature_with_project_types(name, signature, &project_types)
                 .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
-                .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types, &[]))
+                .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types, &insn_pcs, &insn_sizes))
         } else {
             Err(if signatures.is_empty() {
                 "no exact source signature"

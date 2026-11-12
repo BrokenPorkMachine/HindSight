@@ -2908,7 +2908,7 @@ pub(super) fn recover(
     signature: SourceSignature,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
 ) -> Result<Recovery, String> {
-    recover_with_types(start, trees, operations, signature, call_prototypes, &[], &[])
+    recover_with_types(start, trees, operations, signature, call_prototypes, &[], &[], &[])
 }
 
 fn pc_at(index: usize, insn_pcs: &[u64], start: u64) -> u64 {
@@ -2944,8 +2944,9 @@ pub(super) fn recover_with_types(
     call_prototypes: &BTreeMap<u64, SourceSignature>,
     project_types: &[crate::reconstruction::ProjectTypeDependency],
     insn_pcs: &[u64],
+    insn_sizes: &[u32],
 ) -> Result<Recovery, String> {
-    let end = end_pc(start, trees.len(), insn_pcs, &[]);
+    let end = end_pc(start, trees.len(), insn_pcs, insn_sizes);
     // Address operations carry concrete computed values in this IR; do not
     // reject solely on their presence. Unresolved relocatable dependencies are
     // reported separately when evidence is insufficient.
@@ -5018,6 +5019,7 @@ mod tests {
             signature,
             &BTreeMap::new(),
             project_types,
+            &[],
             &[],
         )
     }
