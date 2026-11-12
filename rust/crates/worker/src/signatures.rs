@@ -951,9 +951,9 @@ fn refine_property_signatures(signatures:&mut BTreeMap<u64,(String,Signature)>, 
     }
 }
 
-fn object_member_statements(code:&[u8],base:u64,start:u64,end:u64,file_offset:u64,data_ranges:&[(u64,u64,u16)],layout:&super::objc::ClassLayout,resolved_indirect_targets:&std::collections::BTreeMap<u64,Vec<u64>>) -> BTreeMap<u64,String> {
+fn object_member_statements(code:&[u8],base:u64,start:u64,end:u64,file_offset:u64,data_ranges:&[(u64,u64,u16)],layout:&super::objc::ClassLayout,resolved_indirect_targets:&std::collections::BTreeMap<u64,Vec<u64>>, insn_pcs:&[u64], insn_sizes:&[u32]) -> BTreeMap<u64,String> {
     let slots=layout.ivars.iter().map(|ivar|ivar.offset_pointer).collect();
-    super::semantic::object_member_accesses_with_resolved_indirects(code,base,start,end,file_offset,data_ranges,&slots,resolved_indirect_targets).into_iter().filter_map(|(site,access)|{
+    super::semantic::object_member_accesses_with_resolved_indirects_and_pcs(code,base,start,end,file_offset,data_ranges,&slots,resolved_indirect_targets,insn_pcs,insn_sizes).into_iter().filter_map(|(site,access)|{
         let offset=if let Some(slot)=access.offset_pointer {
             let mut candidates=layout.ivars.iter().filter(|ivar|ivar.offset_pointer==slot);
             let field=candidates.next()?;if candidates.next().is_some(){return None}u64::from(field.offset)
@@ -2160,12 +2160,16 @@ fn render_arm64_body(
     code: &[u8], base: u64, file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
     tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, object_layout:Option<&super::objc::ClassLayout>,
 ) -> Option<String> {
+    // ARM64 fixed-width decode path for current signature rendering; variable-length streams need pc/size maps and arch-aware decode.
     if start < base || start >= end || (start - base) % 4 != 0 { return None; }
     let lo = usize::try_from(start - base).ok()?;
     let hi = usize::try_from(end.min(base.saturating_add(code.len() as u64)) - base).ok()?;
     if lo >= hi || hi > code.len() { return None; }
     let body_code = &code[lo..hi];
     let stable_stack=super::semantic::stack_pointer_is_stable(code,base,start,end);
+    let insn_pcs: Vec<u64> = (0..(body_code.len() / 4)).map(|i| start + i as u64 * 4).collect();
+    let insn_sizes: Vec<u32> = vec![4; insn_pcs.len()];
+    let pc_set: std::collections::BTreeSet<u64> = insn_pcs.iter().copied().collect();
     let switch_evidence=parse_switch_evidence(jump_tables);
     let name_seeds = parameter_name_seeds(signature, parameter_evidence, start);
     let mut resolved_indirect_targets: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
@@ -2179,7 +2183,7 @@ fn render_arm64_body(
         let mut in_function_case_count = 0usize;
         let mut external_cases = 0usize;
         for &(_, _, target) in &evidence.cases {
-            if target >= start && target < end && (target - start) % 4 == 0 {
+            if target >= start && target < end && pc_set.contains(&target) {
                 in_function_targets.push(target);
                 in_function_case_count += 1;
             } else {
@@ -2196,7 +2200,7 @@ fn render_arm64_body(
             resolved_indirect_targets.insert(pc, in_function_targets);
         }
     }
-    let machine = super::semantic::render_with_resolved_indirects(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges, &resolved_indirect_targets);
+    let machine = super::semantic::render_with_resolved_indirects_and_pcs(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges, &resolved_indirect_targets, &insn_pcs, &insn_sizes);
     let mut instructions = Vec::<(u64,String)>::new();
     for line in machine.lines() {
         let Some(line) = line.trim_start().strip_prefix("0x") else { continue };
@@ -2207,7 +2211,7 @@ fn render_arm64_body(
     }
     let instruction_addresses = instructions.iter().map(|(address,_)| *address).collect::<std::collections::BTreeSet<_>>();
     let parameter_names: super::semantic::ParameterNameAnalysis = super::semantic::parameter_value_names_with_resolved_indirects(code, base, start, end, file_offset, data_ranges, &name_seeds, &resolved_indirect_targets);
-    let object_statements=object_layout.map(|layout|object_member_statements(code,base,start,end,file_offset,data_ranges,layout,&resolved_indirect_targets)).unwrap_or_default();
+    let object_statements=object_layout.map(|layout|object_member_statements(code,base,start,end,file_offset,data_ranges,layout,&resolved_indirect_targets,&insn_pcs,&insn_sizes)).unwrap_or_default();
     let no_aliases = BTreeMap::new();
     // Structured regions render their statements through
     // `render_linear_statement`, which keeps the raw registers; apply the same
