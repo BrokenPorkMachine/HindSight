@@ -8756,15 +8756,14 @@ pub fn stack_pointer_is_stable_with_pcs(
     if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
     let fixed_width = insn_pcs.is_empty();
     if fixed_width {
-        let Some(start) = usize::try_from(function_start - base).ok() else { return false };
-        let Some(end) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
-        if start > end || end > code.len() { return false }
-        if (function_start - base) % 4 != 0 || (end - start) % 4 != 0 { return false }
+        if (function_start - base) % 4 != 0 { return false; }
     }
     let pcs: Vec<u64> = if fixed_width {
-        let Some(start) = usize::try_from(function_start - base).ok() else { return false };
-        let Some(end) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
-        (0..((end - start) / 4)).map(|i| function_start.saturating_add(i as u64 * 4)).collect()
+        let Some(start_off) = usize::try_from(function_start - base).ok() else { return false };
+        let Some(end_off) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
+        if start_off > end_off || end_off > code.len() { return false; }
+        let count = (end_off - start_off) / 4;
+        (0..count).map(|i| function_start.saturating_add(i as u64 * 4)).collect()
     } else {
         insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < function_end).collect()
     };
