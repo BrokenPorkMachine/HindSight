@@ -3398,8 +3398,14 @@ pub(super) fn recover_with_types(
                         delta % 4 != 0 || delta / 4 >= trees.len() as u64
                     };
                     if outside {
+                        let helper = call_prototypes.get(&target).map(|p| p.name.as_str());
+                        let is_noreturn_void = helper.is_some_and(|n| {
+                            let b = n.strip_prefix('_').unwrap_or(n);
+                            matches!(b, "__stack_chk_fail" | "abort")
+                        }) && call_prototypes.get(&target).is_some_and(|proto| {
+                            proto.parameters.is_empty() && proto.result_bits == 0
+                        });
                         if t.kind == "goto" {
-                            let helper = call_prototypes.get(&target).map(|p| p.name.as_str());
                             // Bounded tail-call: unconditional branch outside the
                             // recovered function to a known return-forwarding runtime
                             // helper (e.g. objc_autoreleaseReturnValue) after epilogue.
@@ -3443,33 +3449,64 @@ pub(super) fn recover_with_types(
                             // Bounded noreturn external exit: unconditional branch to a
                             // known void(void) noreturn helper (e.g. stack protector / abort)
                             // terminates this path without a normal return value.
-                            let is_noreturn_void = helper.is_some_and(|n| {
-                                let b = n.strip_prefix('_').unwrap_or(n);
-                                matches!(b, "__stack_chk_fail" | "abort")
-                            });
                             if is_noreturn_void {
                                 let proto = call_prototypes.get(&target).unwrap();
-                                if proto.parameters.is_empty() && proto.result_bits == 0 {
-                                    let call_expr = dag.add_role(
-                                        "source-call",
-                                        "value",
-                                        format!("{}()", proto.name),
-                                        vec![],
-                                        pc,
-                                    )?;
-                                    dag.type_node(call_expr, Some(SourceType { spelling: "void".into(), bits: 0, signed: false, pointer: false }));
-                                    state.has_call = true;
-                                    state.call_pcs.push(pc);
-                                    state.calls.push(CallResult { expression: call_expr, guard: state.path, pc });
-                                    // Path does not return; preserve frame objects observed on this path.
-                                    for ((offset, bytes), version) in frame_objects(&state) {
-                                        let entry = objects.entry((offset, bytes)).or_insert(version);
-                                        if *entry < version { *entry = version; }
-                                    }
-                                    break;
+                                let call_expr = dag.add_role(
+                                    "source-call",
+                                    "value",
+                                    format!("{}()", proto.name),
+                                    vec![],
+                                    pc,
+                                )?;
+                                dag.type_node(call_expr, Some(SourceType { spelling: "void".into(), bits: 0, signed: false, pointer: false }));
+                                state.has_call = true;
+                                state.call_pcs.push(pc);
+                                state.calls.push(CallResult { expression: call_expr, guard: state.path, pc });
+                                for ((offset, bytes), version) in frame_objects(&state) {
+                                    let entry = objects.entry((offset, bytes)).or_insert(version);
+                                    if *entry < version { *entry = version; }
                                 }
+                                break;
                             }
                             return Err("source branch outside function".into());
+                        }
+                        // Conditional branch to a known void(void) noreturn helper:
+                        // taken path terminates in noreturn call, fallthrough continues.
+                        if t.kind == "conditional-goto" && is_noreturn_void {
+                            let condition = read(&t.children[0], &mut state, &mut dag, pc)?;
+                            let condition = dag.value(condition, 64, pc)?;
+                            let mut taken = state.clone();
+                            taken.path = dag.add(
+                                "source-path",
+                                "(($0) && ($1))".into(),
+                                vec![state.path, condition],
+                                pc,
+                            )?;
+                            let proto = call_prototypes.get(&target).unwrap();
+                            let call_expr = dag.add_role(
+                                "source-call",
+                                "value",
+                                format!("{}()", proto.name),
+                                vec![],
+                                pc,
+                            )?;
+                            dag.type_node(call_expr, Some(SourceType { spelling: "void".into(), bits: 0, signed: false, pointer: false }));
+                            taken.has_call = true;
+                            taken.call_pcs.push(pc);
+                            taken.calls.push(CallResult { expression: call_expr, guard: taken.path, pc });
+                            for ((offset, bytes), version) in frame_objects(&taken) {
+                                let entry = objects.entry((offset, bytes)).or_insert(version);
+                                if *entry < version { *entry = version; }
+                            }
+                            // Fallthrough path continues with negated condition.
+                            state.path = dag.add(
+                                "source-path",
+                                "(($0) && !($1))".into(),
+                                vec![state.path, condition],
+                                pc,
+                            )?;
+                            index += 1;
+                            continue;
                         }
                         return Err("source branch outside function".into());
                     }
@@ -3704,7 +3741,7 @@ pub(super) fn recover_with_types(
                         index = single_index;
                         continue;
                     }
-                    if target_indices.len() > 32 {
+                    if target_indices.len() > 64 {
                         return Err("resolved indirect dispatch has too many targets for bounded source recovery".into());
                     }
                     let dispatch = read(&t.children[0], &mut state, &mut dag, pc)?;
