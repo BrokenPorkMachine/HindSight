@@ -12,3 +12,4 @@ path = "src/main.rs"
 reworkbench-protocol = { path = "../protocol" }
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 lzvn = "0.1.1"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
