@@ -70,9 +70,10 @@ fn page(file:&mut File,map:&Mapping,start:u64,data_ranges:&[(u64,u64,u16)])->io:
  file.seek(SeekFrom::Start(position))?;
  let mut code=vec![0u8;count as usize*4];file.read_exact(&mut code)?;
  let mut report=String::from("VA (unslid)        File offset       Word      Instruction\n");let mut known=0;
- for (index,chunk) in code.chunks_exact(4).enumerate(){
+ for index in 0..(code.len()/4){
   // Native range planning has checked the complete mapped extent before these additions.
   let delta=(index*4) as u64;let pc=address+delta;let file_position=position+delta;
+  let chunk=&code[index*4..index*4+4];
   let word=u32::from_le_bytes(chunk.try_into().unwrap());
   if let Some((_,_,kind))=data_ranges.iter().find(|(lo,hi,_)|file_position<*hi&&file_position.saturating_add(4)>*lo){
    report.push_str(&format!("{pc:016x}  {file_position:016x}  {word:08x}  .data-in-code kind={kind}\n"));continue;
@@ -1905,7 +1906,7 @@ fn function_boundary_facts(file:&mut File,window:&[u8],map:&Mapping,size:u64,cod
  let scan_end=map.address+code.len() as u64;
  if map.encrypted{starts.clear();}else{starts.retain(|&x|x>=map.address&&x<scan_end);if starts.is_empty(){starts.push(map.address)}}
  let mut direct_call_starts=std::collections::BTreeSet::new();
- if !map.encrypted{for (index,chunk) in code.chunks_exact(4).enumerate(){let pc=map.address+(index as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let position=map.offset+(index as u64)*4;if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}}}
+ if !map.encrypted{let mut index=0usize;while index*4+4<=code.len(){let chunk=&code[index*4..index*4+4];let pc=map.address+(index as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let position=map.offset+(index as u64)*4;if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){index+=1;continue}let word=u32::from_le_bytes(chunk.try_into().unwrap());if let Some((target,"call",_))=branch_target(word,pc){if target>=map.address&&target<scan_end&&(target-map.address)%4==0{direct_call_starts.insert(target);}}index+=1}}
  starts.extend(direct_call_starts.iter().copied());
  let unwind_starts=if map.encrypted{Vec::new()}else{unwind_info_function_starts(file,window,size,map.address,scan_end)?};starts.extend(unwind_starts.iter().copied());
  let (objc_classes,objc_layouts)=objc_class_graph(file,window,size)?;
