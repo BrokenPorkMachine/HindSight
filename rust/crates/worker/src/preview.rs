@@ -2086,41 +2086,44 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
   Some(super::signatures::Signature { language: "C", declaration: decl.to_owned(), source: "known Objective-C runtime ABI contract" })
  };
  let fn_code=code.get(start.saturating_sub(map.address) as usize .. end.saturating_sub(map.address).min(code.len() as u64) as usize).unwrap_or(&[]);
- let mut index=0usize;
- while index*4+4<=fn_code.len() {
-  let chunk=&fn_code[index*4..index*4+4];
-  let _pc=start + index as u64*4;
-  let word=u32::from_le_bytes(chunk.try_into().unwrap());
-  let Some((target,"call",_))=branch_target(word,_pc) else { index+=1; continue };
-  let mut stub_symbol: Option<String> = None;
-  if let Ok(Some(selector))=objc_msgsend_stub_selector(&mut file,&window,size,target,&indirect_facts) {
-   stub_symbol = Some(format!("_objc_msgSend${selector}"));
-   if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
-    if let Some(encodings)=selector_encoding_map.get(&selector) {
-     if encodings.len()==1 {
-      let encoding=encodings.iter().next().unwrap();
-      let synthetic=format!("-[__hs_objc_msgsend__ {selector}]");
-      if let Some(signature)=super::signatures::objc_method(&synthetic,encoding) {
-       call_prototypes.push((target, stub_symbol.clone().unwrap(), signature));
+ let arch_lc_proto = architecture.to_ascii_lowercase();
+ if matches!(arch_lc_proto.as_str(), "arm64" | "arm64e" | "aarch64") {
+  let mut index=0usize;
+  while index*4+4<=fn_code.len() {
+   let chunk=&fn_code[index*4..index*4+4];
+   let _pc=start + index as u64*4;
+   let word=u32::from_le_bytes(chunk.try_into().unwrap());
+   let Some((target,"call",_))=branch_target(word,_pc) else { index+=1; continue };
+   let mut stub_symbol: Option<String> = None;
+   if let Ok(Some(selector))=objc_msgsend_stub_selector(&mut file,&window,size,target,&indirect_facts) {
+    stub_symbol = Some(format!("_objc_msgSend${selector}"));
+    if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
+     if let Some(encodings)=selector_encoding_map.get(&selector) {
+      if encodings.len()==1 {
+       let encoding=encodings.iter().next().unwrap();
+       let synthetic=format!("-[__hs_objc_msgsend__ {selector}]");
+       if let Some(signature)=super::signatures::objc_method(&synthetic,encoding) {
+        call_prototypes.push((target, stub_symbol.clone().unwrap(), signature));
+       }
       }
      }
     }
    }
-  }
-  if let Some(name)=stub_symbol.clone() {
-   if !native.symbols.iter().any(|(a,_)|*a==target) { native.symbols.push((target,name)); }
-  }
-  if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
-   let resolved_name = stub_symbol.or_else(|| recovery_symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.clone()))
-    .or_else(|| native.symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.clone()))
-    .or_else(|| indirect_facts.iter().find(|(_,_,a)|*a==target).map(|(n,_,_)|n.clone()));
-   if let Some(name)=resolved_name {
-    if let Some(signature)=known_runtime_proto(&name) {
-     call_prototypes.push((target,name,signature));
+   if let Some(name)=stub_symbol.clone() {
+    if !native.symbols.iter().any(|(a,_)|*a==target) { native.symbols.push((target,name)); }
+   }
+   if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
+    let resolved_name = stub_symbol.or_else(|| recovery_symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.clone()))
+     .or_else(|| native.symbols.iter().find(|(a,_)|*a==target).map(|(_,n)|n.clone()))
+     .or_else(|| indirect_facts.iter().find(|(_,_,a)|*a==target).map(|(n,_,_)|n.clone()));
+    if let Some(name)=resolved_name {
+     if let Some(signature)=known_runtime_proto(&name) {
+      call_prototypes.push((target,name,signature));
+     }
     }
    }
+   index+=1;
   }
-  index+=1;
  }
  call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
  call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
@@ -2130,75 +2133,81 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let mut resolved_indirect_cases: std::collections::BTreeMap<u64, Vec<(u64, u64)>> = std::collections::BTreeMap::new();
  let mut resolved_indirect_index_info: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
  let scan_end_jt = map.address + code.len() as u64;
- let mut index=0usize;
- while index*4+4<=code.len() {
-  let chunk=&code[index*4..index*4+4];
-  let pc = map.address + index as u64 * 4;
-  if pc < start || pc >= end { index+=1; continue; }
-  let word=u32::from_le_bytes(chunk.try_into().unwrap());
-  let Some(reg)=indirect_branch_reg(word) else { index+=1; continue };
-  let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { index+=1; continue };
-  // Parse completeness and targets from the jump-table report.
-  let mut has_unresolved=false;
-  let mut stopped_at_proven_bound=false;
-  let mut validated=0usize;
-  let mut case_targets: Vec<(u64,u64)> = Vec::new();
-  let mut index_register: Option<u8> = None;
-  let mut case_range: Option<String> = None;
-  let mut normalization: Option<String> = None;
-  for line in entries.lines() {
-   if let Some(reg)=line.split("table_index=x").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<u8>().ok()) {
-    index_register=Some(reg);
-    if let Some(range)=line.split("case-range=").nth(1).and_then(|s|s.split(" proven-entry-count=").next()) {
-     case_range=Some(range.to_owned());
+ let arch_lc_jt = architecture.to_ascii_lowercase();
+ let is_arm64_jt = matches!(arch_lc_jt.as_str(), "arm64" | "arm64e" | "aarch64");
+ // Jump-table/indirect-branch word scan is currently ARM64-specific (4-byte instructions, ARM64 BR patterns).
+ if is_arm64_jt {
+  let mut index=0usize;
+  while index*4+4<=code.len() {
+   let chunk=&code[index*4..index*4+4];
+   let pc = map.address + index as u64 * 4;
+   if pc < start || pc >= end { index+=1; continue; }
+   let word=u32::from_le_bytes(chunk.try_into().unwrap());
+   let Some(reg)=indirect_branch_reg(word) else { index+=1; continue };
+   let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { index+=1; continue };
+   // Parse completeness and targets from the jump-table report.
+   let mut has_unresolved=false;
+   let mut stopped_at_proven_bound=false;
+   let mut validated=0usize;
+   let mut case_targets: Vec<(u64,u64)> = Vec::new();
+   let mut index_register: Option<u8> = None;
+   let mut case_range: Option<String> = None;
+   let mut normalization: Option<String> = None;
+   for line in entries.lines() {
+    if let Some(reg)=line.split("table_index=x").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<u8>().ok()) {
+     index_register=Some(reg);
+     if let Some(range)=line.split("case-range=").nth(1).and_then(|s|s.split(" proven-entry-count=").next()) {
+      case_range=Some(range.to_owned());
+     }
+     if let Some(norm)=line.split("index-normalization=").nth(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+      normalization=Some(norm);
+     }
     }
-    if let Some(norm)=line.split("index-normalization=").nth(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-     normalization=Some(norm);
+    if line.trim_start().starts_with("case-index=") {
+     let trimmed = line.trim_start();
+     let case_index = trimmed.strip_prefix("case-index=").and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<u64>().ok());
+     let target = trimmed.split("target=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
+     if let (Some(case_index), Some(target)) = (case_index, target) {
+      case_targets.push((case_index, target));
+     }
+    }
+    if line.trim_start().starts_with("unresolved-entry") { has_unresolved=true; }
+    if line.trim_start().starts_with("enumeration stopped at proven unsigned index bound") { stopped_at_proven_bound=true; }
+    if line.starts_with("validated_entries=") {
+     validated=line.split("validated_entries=").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);
     }
    }
-   if line.trim_start().starts_with("case-index=") {
-    let trimmed = line.trim_start();
-    let case_index = trimmed.strip_prefix("case-index=").and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<u64>().ok());
-    let target = trimmed.split("target=").nth(1).and_then(|s|s.split_whitespace().next()).and_then(|s|u64::from_str_radix(s.trim_start_matches("0x"),16).ok());
-    if let (Some(case_index), Some(target)) = (case_index, target) {
-     case_targets.push((case_index, target));
+   let complete=!has_unresolved && stopped_at_proven_bound && validated==case_targets.len() && !case_targets.is_empty();
+   if !complete { index+=1; continue; }
+   let fn_start = function_for(&facts.starts, pc);
+   let fn_end = facts.starts.iter().copied().find(|&s| s > fn_start).unwrap_or(scan_end_jt);
+   let mut in_function_targets=Vec::new();
+   let mut in_function_cases=Vec::new();
+   let mut external_cases=0usize;
+   for (case_index,target) in case_targets.iter().copied() {
+    let aligned = if is_arm64_jt { (target-fn_start) % 4 == 0 } else { true };
+    if target>=fn_start && target<fn_end && aligned {
+     in_function_targets.push(target);
+     in_function_cases.push((case_index,target));
+    } else { external_cases+=1; }
+   }
+   in_function_targets.sort_unstable(); in_function_targets.dedup();
+   in_function_cases.sort_unstable_by_key(|(case,target)|(*target,*case));
+   in_function_cases.dedup();
+   if in_function_cases.len()+external_cases>=case_targets.len() {
+    resolved_indirect_targets.insert(pc,in_function_targets);
+    if !in_function_cases.is_empty() {
+     resolved_indirect_cases.insert(pc,in_function_cases);
     }
+    let mut parts = Vec::new();
+    if let Some(reg)=index_register { parts.push(format!("table_index=x{reg}")); }
+    if let Some(range)=case_range { parts.push(format!("case-range={range}")); }
+    if let Some(norm)=normalization { parts.push(format!("index-normalization={norm}")); }
+    if external_cases > 0 { parts.push(format!("external-cases={external_cases}")); }
+    if !parts.is_empty() { resolved_indirect_index_info.insert(pc, parts.join(" ")); }
    }
-   if line.trim_start().starts_with("unresolved-entry") { has_unresolved=true; }
-   if line.trim_start().starts_with("enumeration stopped at proven unsigned index bound") { stopped_at_proven_bound=true; }
-   if line.starts_with("validated_entries=") {
-    validated=line.split("validated_entries=").nth(1).and_then(|s|s.split(|c:char|!c.is_ascii_digit()).next()).and_then(|s|s.parse::<usize>().ok()).unwrap_or(0);
-   }
+   index+=1;
   }
-  let complete=!has_unresolved && stopped_at_proven_bound && validated==case_targets.len() && !case_targets.is_empty();
-  if !complete { index+=1; continue; }
-  let fn_start = function_for(&facts.starts, pc);
-  let fn_end = facts.starts.iter().copied().find(|&s| s > fn_start).unwrap_or(scan_end_jt);
-  let mut in_function_targets=Vec::new();
-  let mut in_function_cases=Vec::new();
-  let mut external_cases=0usize;
-  for (case_index,target) in case_targets.iter().copied() {
-   if target>=fn_start && target<fn_end && (target-fn_start)%4==0 {
-    in_function_targets.push(target);
-    in_function_cases.push((case_index,target));
-   } else { external_cases+=1; }
-  }
-  in_function_targets.sort_unstable(); in_function_targets.dedup();
-  in_function_cases.sort_unstable_by_key(|(case,target)|(*target,*case));
-  in_function_cases.dedup();
-  if in_function_cases.len()+external_cases>=case_targets.len() {
-   resolved_indirect_targets.insert(pc,in_function_targets);
-   if !in_function_cases.is_empty() {
-    resolved_indirect_cases.insert(pc,in_function_cases);
-   }
-   let mut parts = Vec::new();
-   if let Some(reg)=index_register { parts.push(format!("table_index=x{reg}")); }
-   if let Some(range)=case_range { parts.push(format!("case-range={range}")); }
-   if let Some(norm)=normalization { parts.push(format!("index-normalization={norm}")); }
-   if external_cases > 0 { parts.push(format!("external-cases={external_cases}")); }
-   if !parts.is_empty() { resolved_indirect_index_info.insert(pc, parts.join(" ")); }
-  }
-  index+=1;
  }
  // Rewind? not necessary; further reads use absolute offsets
  let arch_lc = architecture.to_ascii_lowercase();
