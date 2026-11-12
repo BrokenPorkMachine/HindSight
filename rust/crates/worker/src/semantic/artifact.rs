@@ -1207,8 +1207,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     } = input;
     let arch = architecture.to_ascii_lowercase();
     let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
-    let _is_x86_64 = matches!(arch.as_str(), "x86_64" | "x86-64" | "amd64");
-    if !is_arm64 {
+    let is_x86_64 = matches!(arch.as_str(), "x86_64" | "x86-64" | "amd64");
+    if !is_arm64 && !is_x86_64 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("reconstruction lifting not yet implemented for architecture '{architecture}'"),
@@ -1222,7 +1222,13 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         ));
     }
     let available_end = end.min(base + code.len() as u64);
-    let high = available_end.min(start.saturating_add(128 * 4));
+    // ARM64: fixed 4-byte instructions, preserve existing 128-instruction byte window behavior.
+    // x86_64: variable-length instructions (1-15 bytes); decode boundaries up to 128 instructions / 15*128 bytes conservatively.
+    let high = if is_arm64 {
+        available_end.min(start.saturating_add(128 * 4))
+    } else {
+        available_end.min(start.saturating_add(128 * 15))
+    };
     let Some(body) = usize::try_from(start - base)
         .ok()
         .zip(usize::try_from(high - base).ok())
@@ -1239,43 +1245,80 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             "Function bytes unavailable",
         ));
     }
-    let insn_pcs: Vec<u64> = if !_input_instruction_pcs.is_empty() {
-        _input_instruction_pcs.clone()
+    let (insn_pcs, insn_sizes, stream_end): (Vec<u64>, Vec<u32>, u64) = if !_input_instruction_pcs.is_empty() {
+        let pcs = _input_instruction_pcs.clone();
+        let sizes = if _input_instruction_sizes.len() == pcs.len() {
+            _input_instruction_sizes.clone()
+        } else if is_arm64 {
+            vec![4u32; pcs.len()]
+        } else {
+            vec![] // unknown variable-length sizes; conservative handling below
+        };
+        let se = if !sizes.is_empty() && sizes.len() == pcs.len() {
+            pcs.last().copied().unwrap_or(start).saturating_add(*sizes.last().unwrap_or(&4) as u64)
+        } else if !pcs.is_empty() {
+            high.min(end)
+        } else {
+            start
+        };
+        (pcs, sizes, se)
+    } else if is_arm64 {
+        let pcs: Vec<u64> = (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect();
+        let se = pcs.last().map(|p| p + 4).unwrap_or(start);
+        let sizes = vec![4u32; pcs.len()];
+        (pcs, sizes, se)
     } else {
-        (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect()
-    };
-    let stream_end: u64 = if !_input_instruction_sizes.is_empty() && _input_instruction_sizes.len() == insn_pcs.len() {
-        insn_pcs.last().copied().unwrap_or(start).saturating_add(*_input_instruction_sizes.last().unwrap_or(&4) as u64)
-    } else if _input_instruction_pcs.is_empty() {
-        insn_pcs.last().map(|p| p + 4).unwrap_or(start)
-    } else {
-        // Variable-length stream without explicit size map: use analyzed byte bound conservatively.
-        high.min(end)
+        // x86_64/x86-64: sound, evidence-backed instruction boundary decoding for PC/size maps.
+        // Lifting into shared typed semantic IR/AST/source is not yet implemented; instructions are
+        // treated conservatively as target-specific/unsupported with correct spans.
+        let mut decoder = iced_x86::Decoder::with_ip(64, body, start, iced_x86::DecoderOptions::NONE);
+        let mut pcs = Vec::new();
+        let mut sizes = Vec::new();
+        while decoder.can_decode() && pcs.len() < 128 {
+            let ip = decoder.ip();
+            if ip >= end { break; }
+            let instr = decoder.decode();
+            let sz = instr.len() as u32;
+            if sz == 0 { break; }
+            pcs.push(ip);
+            sizes.push(sz);
+        }
+        let se = if let (Some(&last_pc), Some(&last_sz)) = (pcs.last(), sizes.last()) {
+            last_pc.saturating_add(last_sz as u64)
+        } else {
+            start
+        };
+        (pcs, sizes, se)
     };
     let instructions = insn_pcs.len() as u64;
     let instruction_extent = if is_arm64 {
         (end.saturating_sub(start)) / 4
-    } else if !_input_instruction_pcs.is_empty() {
-        _input_instruction_pcs.len() as u64
     } else {
-        (end.saturating_sub(start)) / 4
+        insn_pcs.len() as u64
     };
-    let exhausted = instruction_extent > 128;
-    let truncated = high < end;
-    let direct_targets = insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
-        let size = if !_input_instruction_sizes.is_empty() && _input_instruction_sizes.len() == insn_pcs.len() {
-            *_input_instruction_sizes.get(index).unwrap_or(&4) as usize
-        } else { 4 };
-        // ARM64 fixed-width decode path for direct-call discovery today; variable-length decode remains conservative.
-        if size != 4 { return None; }
-        let off = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok())?;
-        let bytes = code.get(off..off + 4)?;
-        let word = u32::from_le_bytes(bytes.try_into().ok()?);
-        match lift_operation(decode(word, pc), pc) {
-            IrOperation::DirectCall { target } => Some(target),
-            _ => None,
-        }
-    }).collect::<BTreeSet<_>>();
+    let exhausted = if is_arm64 {
+        instruction_extent > 128
+    } else {
+        insn_pcs.len() >= 128 && stream_end < end.min(available_end)
+    };
+    let truncated = high < end || (is_x86_64 && stream_end < end.min(available_end));
+    let direct_targets = if is_arm64 {
+        insn_pcs.iter().enumerate().filter_map(|(index, &pc)| {
+            let size = *insn_sizes.get(index).unwrap_or(&4) as usize;
+            // ARM64 fixed-width decode path for direct-call discovery today; variable-length decode remains conservative.
+            if size != 4 { return None; }
+            let off = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok())?;
+            let bytes = code.get(off..off + 4)?;
+            let word = u32::from_le_bytes(bytes.try_into().ok()?);
+            match lift_operation(decode(word, pc), pc) {
+                IrOperation::DirectCall { target } => Some(target),
+                _ => None,
+            }
+        }).collect::<BTreeSet<_>>()
+    } else {
+        // x86_64 direct-call lifting/discovery not yet implemented; conservative.
+        BTreeSet::new()
+    };
     let settings = object([
         ("instruction_limit", 128u64.into()),
         ("code_scan_limit", (4 * 1024 * 1024u64).into()),
@@ -1477,6 +1520,63 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     }
     for type_id in &native_type_ids {
         builder.edge(&bounds, type_id, "supports")?;
+    }
+
+    if is_x86_64 {
+        // Bounded, sound x86_64/x86-64 support: instruction boundaries/PCs/sizes are decoded via iced-x86
+        // and propagated, but lifting into the shared typed semantic IR/AST/source pipeline and ABI adaptation
+        // are not yet implemented. Emit conservative, evidence-backed artifacts with no fabricated behavior.
+        let mut rendering = String::from("/* x86_64 instruction boundaries decoded (iced-x86); lifting into shared typed semantic IR/AST/source not yet implemented. Conservative unsupported review only; no source/export/equivalence claim. */\n");
+        let mut statements: Vec<String> = Vec::new();
+        for (index, &pc) in insn_pcs.iter().enumerate() {
+            let sz = *insn_sizes.get(index).unwrap_or(&0) as usize;
+            let pc_end = pc.saturating_add(sz as u64);
+            let evidence = format!("{pc:#x}: <unsupported x86_64 instruction; {sz} bytes>");
+            let ty = format!("x86_64 instruction ({sz} bytes); lifting not implemented");
+            statements.push(builder.ast(
+                "unsupported-operation",
+                Some(ty.as_str()),
+                vec![],
+                &evidence,
+                (pc, pc_end),
+                object([("architecture", "x86_64".into()), ("size", (sz as u64).into()), ("status", "unsupported".into())]),
+            )?);
+            rendering.push_str(&format!("  {pc:#018x}: /* {sz} bytes */ <x86_64 instruction; lifting unsupported>\n"));
+        }
+        let root = builder.ast(
+            "function",
+            name,
+            statements,
+            &rendering,
+            (start, stream_end.max(start)),
+            object([("architecture", "x86_64".into()), ("lifting", "not-implemented".into()), ("contract", "instruction-boundaries-decoded; semantic lifting and source recovery not implemented".into())]),
+        )?;
+        let root_mirror = builder.record(
+            "ast-node",
+            "derived",
+            object([("ast_id", root.clone().into()), ("kind", "function".into()), ("architecture", "x86_64".into())]),
+            ranges(start, stream_end.max(start)),
+        )?;
+        builder.edge(&bounds, &root_mirror, "supports")?;
+        let blocker = builder.record(
+            "unsupported-effect",
+            "derived",
+            object([
+                ("artifact_kind", "unsupported-architecture-lifting".into()),
+                ("architecture", "x86_64".into()),
+                ("reason", "x86_64 instruction boundaries/PC-size maps decoded (iced-x86), but lifting into shared typed semantic IR/AST/source pipeline and ABI adaptation are not implemented".into()),
+                ("conservative", true.into()),
+            ]),
+            ranges(start, stream_end.max(start)),
+        )?;
+        builder.edge(&root_mirror, &blocker, "supports")?;
+        if registers.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Strict interpreter blocked: x86_64 lifting not implemented".to_string(),
+            ));
+        }
+        return Ok(builder.finish(root, rendering, instructions, truncated, exhausted).json());
     }
 
     let mut lifted = Vec::new();
