@@ -1181,7 +1181,8 @@ fn aspan_end_pc(pc: u64, insn_pcs: &[u64], start: u64, count: usize, fallback_en
 /// Sound by construction: only instructions with clear, evidence-backed mappings to the shared IR
 /// are lifted; all others fall back to `IrOperation::TargetSpecific` with unsupported trees.
 /// ABI adaptation and full semantic coverage are incomplete.
-fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String) {
+/// Returns (portable op, tree, ir text, optional conditional-branch target for CFG when condition is unmodeled).
+fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String, Option<u64>) {
     use iced_x86::{Mnemonic, OpKind, Register};
     let mut decoder = iced_x86::Decoder::with_ip(64, bytes, pc, iced_x86::DecoderOptions::NONE);
     let instr = decoder.decode();
@@ -1191,6 +1192,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
         IrOperation::TargetSpecific,
         tree("unsupported-operation", Some(format!("x86_64 {:?} not yet lifted", instr.mnemonic())), object([("architecture", "x86_64".into()), ("mnemonic", format!("{:?}", instr.mnemonic()).into()), ("size", (sz as u64).into()), ("status", "unsupported".into())]), vec![]),
         ir_text.clone(),
+        None,
     );
     let xreg = |r: Register| -> Option<(IrRegister, u32)> {
         // Returns (normalized 64-bit register identity, operand bit width). Conservative mapping.
@@ -1275,45 +1277,67 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
             _ => return None,
         })
     };
+    // Jcc: conditional near branch. Condition depends on x86 flags and is not yet mapped soundly to
+    // the shared flag model, so keep IrOperation as TargetSpecific while exposing CFG target conservatively.
+    let is_jcc = matches!(instr.mnemonic(),
+        Mnemonic::Je|Mnemonic::Jne|Mnemonic::Ja|Mnemonic::Jae|Mnemonic::Jb|Mnemonic::Jbe|Mnemonic::Jg|Mnemonic::Jge|Mnemonic::Jl|Mnemonic::Jle|
+        Mnemonic::Jo|Mnemonic::Jno|Mnemonic::Js|Mnemonic::Jns|Mnemonic::Jp|Mnemonic::Jnp|Mnemonic::Jcxz|Mnemonic::Jecxz|Mnemonic::Jrcxz
+    );
+    if is_jcc {
+        if instr.op_count() == 1 && matches!(instr.op0_kind(), OpKind::NearBranch16|OpKind::NearBranch32|OpKind::NearBranch64) {
+            let target = instr.near_branch64();
+            return (
+                IrOperation::TargetSpecific,
+                tree("conditional-goto", Some("x86_64 conditional branch (condition/flags not yet modeled)".to_string()), object([("architecture","x86_64".into()),("mnemonic",format!("{:?}",instr.mnemonic()).into()),("target",address(target)),("status","partial-cfg".into())]), vec![]),
+                format!("{pc:#x}: {:?} {target:#x} (x86_64 condition unmodeled)", instr.mnemonic()),
+                Some(target),
+            );
+        }
+        return unsupported();
+    }
+
     match instr.mnemonic() {
         Mnemonic::Nop => (
             IrOperation::Nop,
             tree("no-op", None, object([("architecture","x86_64".into())]), vec![]),
             format!("{pc:#x}: nop"),
+            None,
         ),
         Mnemonic::Ret | Mnemonic::Retf => (
             IrOperation::Return { target: None },
             tree("return", None, object([("architecture","x86_64".into()), ("mnemonic", format!("{:?}", instr.mnemonic()).into())]), vec![]),
             ir_text.clone(),
+            None,
         ),
         Mnemonic::Int3 => (
             IrOperation::TargetSpecific,
             tree("trap", Some("int3".to_string()), object([("architecture","x86_64".into()),("mnemonic","int3".into())]), vec![]),
             format!("{pc:#x}: int3"),
+            None,
         ),
         Mnemonic::Jmp => {
             if instr.op_count() == 1 && matches!(instr.op0_kind(), OpKind::NearBranch16|OpKind::NearBranch32|OpKind::NearBranch64) {
                 let target = instr.near_branch64();
-                (IrOperation::Branch { target }, tree("goto", None, object([("architecture","x86_64".into()),("target", address(target))]), vec![]), format!("{pc:#x}: jmp {target:#x}"))
+                (IrOperation::Branch { target }, tree("goto", None, object([("architecture","x86_64".into()),("target", address(target))]), vec![]), format!("{pc:#x}: jmp {target:#x}"), None)
             } else { unsupported() }
         }
         Mnemonic::Call => {
             if instr.op_count() == 1 && matches!(instr.op0_kind(), OpKind::NearBranch16|OpKind::NearBranch32|OpKind::NearBranch64) {
                 let target = instr.near_branch64();
-                (IrOperation::DirectCall { target }, tree("direct-call", None, object([("architecture","x86_64".into()),("target", address(target))]), vec![]), format!("{pc:#x}: call {target:#x}"))
+                (IrOperation::DirectCall { target }, tree("direct-call", None, object([("architecture","x86_64".into()),("target", address(target))]), vec![]), format!("{pc:#x}: call {target:#x}"), None)
             } else { unsupported() }
         }
         Mnemonic::Push => {
             if instr.op_count() == 1 && instr.op0_kind() == OpKind::Register {
                 if let Some((src, _)) = xreg(instr.op0_register()) {
-                    (IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8 }, value: IrOperand::Register(src), bytes: 8, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8, pre_index: true}) }, tree("unsupported-operation", Some("x86_64 push (stack write+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","push".into()),("status","partial".into())]), vec![]), ir_text)
+                    (IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8 }, value: IrOperand::Register(src), bytes: 8, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8, pre_index: true}) }, tree("unsupported-operation", Some("x86_64 push (stack write+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","push".into()),("status","partial".into())]), vec![]), ir_text, None)
                 } else { unsupported() }
             } else { unsupported() }
         }
         Mnemonic::Pop => {
             if instr.op_count() == 1 && instr.op0_kind() == OpKind::Register {
                 if let Some((dst, _)) = xreg(instr.op0_register()) {
-                    (IrOperation::Load { destination: dst, address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 0 }, bytes: 8, signed: false, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 8, pre_index: false}) }, tree("unsupported-operation", Some("x86_64 pop (stack read+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","pop".into()),("status","partial".into())]), vec![]), ir_text)
+                    (IrOperation::Load { destination: dst, address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 0 }, bytes: 8, signed: false, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 8, pre_index: false}) }, tree("unsupported-operation", Some("x86_64 pop (stack read+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","pop".into()),("status","partial".into())]), vec![]), ir_text, None)
                 } else { unsupported() }
             } else { unsupported() }
         }
@@ -1324,7 +1348,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                     if bits >= 32 {
                         (IrOperation::Assign { destination: dst, value: IrOperand::Constant(0) },
                          tree("move", Some("x86_64 xor zero-idiom (conservative 64-bit value model)".to_string()), object([("architecture","x86_64".into()),("mnemonic","xor".into()),("status","partial".into())]), vec![]),
-                         ir_text)
+                         ir_text, None)
                     } else { unsupported() } // 8/16-bit partial register writes not safely modeled here
                 } else { unsupported() }
             } else { unsupported() } // general xor semantics/flags not modeled
@@ -1340,7 +1364,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                                     let value = if dst_bits == 32 { imm & 0xffff_ffff } else { imm };
                                     (IrOperation::Assign { destination: dst, value: IrOperand::Constant(value) },
                                      tree("move", Some("x86_64 mov immediate (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
-                                     ir_text)
+                                     ir_text, None)
                                 } else { unsupported() }
                             } else { unsupported() }
                         }
@@ -1349,7 +1373,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                                 if dst_bits == 64 && src_bits == 64 {
                                     (IrOperation::Assign { destination: dst, value: IrOperand::Register(src) },
                                      tree("move", Some("x86_64 mov reg,reg 64-bit (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
-                                     ir_text)
+                                     ir_text, None)
                                 } else { unsupported() } // sub-64 or mixed-width moves have x86-specific semantics
                             } else { unsupported() }
                         }
@@ -1361,7 +1385,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                                 let offset = (addr as i64).wrapping_sub(next_pc as i64);
                                 (IrOperation::Load { destination: dst, address: IrMemoryAddress::PcRelative { offset, target: addr }, bytes: 8, signed: false, writeback: None },
                                  tree("unsupported-operation", Some("x86_64 rip-relative load (partially lifted)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into()),("address",address(addr))]), vec![]),
-                                 ir_text)
+                                 ir_text, None)
                             } else { unsupported() }
                         }
                         _ => unsupported(),
@@ -1375,7 +1399,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                         let offset = (addr as i64).wrapping_sub(next_pc as i64);
                         (IrOperation::Store { address: IrMemoryAddress::PcRelative { offset, target: addr }, value: IrOperand::Register(src), bytes: 8, writeback: None },
                          tree("unsupported-operation", Some("x86_64 rip-relative store (partially lifted)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into()),("address",address(addr))]), vec![]),
-                         ir_text)
+                         ir_text, None)
                     } else { unsupported() }
                 } else { unsupported() }
             } else { unsupported() }
@@ -1388,7 +1412,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                         let (op, rhs) = match instr.mnemonic() { Mnemonic::Sub => (IrBinaryOp::Subtract, imm), Mnemonic::Add => (IrBinaryOp::Add, imm), _ => return unsupported() };
                         (IrOperation::Binary { destination: dst, operator: op, left: IrOperand::Register(dst), right: IrOperand::Constant(rhs) },
                          tree("move", Some("x86_64 stack pointer adjustment (flags not modeled)".to_string()), object([("architecture","x86_64".into()),("mnemonic",format!("{:?}",instr.mnemonic()).into()),("status","partial".into())]), vec![]),
-                         ir_text)
+                         ir_text, None)
                     } else { unsupported() }
                 } else { unsupported() } // general add/sub with flags/effects not safely modeled yet
             } else { unsupported() }
@@ -1400,7 +1424,7 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                     let addr = instr.memory_displacement64();
                     (IrOperation::Address { destination: dst, value: addr, page: false },
                      tree("move", Some("x86_64 lea rip-relative (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","lea".into()),("status","partial".into()),("address",address(addr))]), vec![]),
-                     ir_text)
+                     ir_text, None)
                 } else { unsupported() } // complex addressing modes need careful modeling
             } else { unsupported() }
         }
@@ -1762,17 +1786,20 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         let mut statements: Vec<String> = Vec::new();
         let mut models: Vec<IrOperation> = Vec::new();
         let mut ir_ids: Vec<String> = Vec::new();
+        let mut cond_branch_targets: Vec<Option<u64>> = vec![None; insn_pcs.len()];
         for (index, &pc) in insn_pcs.iter().enumerate() {
             let sz = *insn_sizes.get(index).unwrap_or(&0) as usize;
             let pc_end = pc.saturating_add(sz as u64);
             let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { continue; };
             let bytes = code.get(off..off.saturating_add(sz).min(code.len())).unwrap_or(&[]);
-            let (op, _node, ir_text) = x86_64_lift_instruction(pc, bytes);
+            let (op, _node, ir_text, cond_target) = x86_64_lift_instruction(pc, bytes);
+            cond_branch_targets[index] = cond_target;
             let evidence = ir_text.clone();
             let ty = match op {
                 IrOperation::Nop | IrOperation::Branch { .. } | IrOperation::DirectCall { .. } | IrOperation::Return { .. } => "x86_64 partially lifted (conservative)",
                 IrOperation::Load { .. } | IrOperation::Store { .. } => "x86_64 partially lifted memory/stack op (conservative)",
                 IrOperation::Assign { .. } | IrOperation::Binary { .. } => "x86_64 partially lifted data op (conservative)",
+                _ if cond_target.is_some() => "x86_64 conditional branch (condition unmodeled, CFG target evidenced)",
                 _ => "x86_64 instruction boundary decoded; lifting incomplete",
             };
             let kind = match op {
@@ -1780,6 +1807,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 IrOperation::Return { .. } => "return",
                 IrOperation::Branch { .. } => "goto",
                 IrOperation::DirectCall { .. } => "direct-call",
+                _ if cond_target.is_some() => "conditional-goto",
                 _ => "unsupported-operation",
             };
             let ast_id = builder.ast(
@@ -1788,7 +1816,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 vec![],
                 &evidence,
                 (pc, pc_end),
-                object([("architecture", "x86_64".into()), ("size", (sz as u64).into()), ("status", match op { IrOperation::TargetSpecific => "unsupported".into(), _ => "partial-lift".into() }), ("ir_text", evidence.clone().into())]),
+                object([("architecture", "x86_64".into()), ("size", (sz as u64).into()), ("status", match op { IrOperation::TargetSpecific if cond_target.is_none() => "unsupported".into(), IrOperation::TargetSpecific => "partial-cfg".into(), _ => "partial-lift".into() }), ("ir_text", evidence.clone().into())]),
             )?;
             let ir = builder.record(
                 "ir",
@@ -1809,28 +1837,32 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ir_ids.push(ir);
             models.push(op);
             rendering.push_str(&format!("  {pc:#018x}: {evidence}\n"));
-            let _ = index;
         }
-        // Conservative CFG from partially lifted control-flow ops only (no fabricated edges).
+        // Conservative CFG from partially lifted control-flow ops and evidenced Jcc targets (condition unmodeled).
         let count = insn_pcs.len();
         let idx_of_pc = |target: u64| -> Option<usize> { insn_pcs.binary_search(&target).ok() };
         let mut successors: Vec<Vec<usize>> = vec![Vec::new(); count];
         for i in 0..count {
-            match models.get(i).copied().unwrap_or(IrOperation::TargetSpecific) {
-                IrOperation::Branch { target } => {
-                    if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
-                }
-                IrOperation::Return { .. } => {}
-                IrOperation::DirectCall { .. } | IrOperation::Nop | IrOperation::Assign { .. } | IrOperation::Binary { .. } | IrOperation::Load { .. } | IrOperation::Store { .. } => {
-                    if i + 1 < count { successors[i].push(i + 1); }
-                }
-                IrOperation::ConditionalBranch { target, .. } => {
-                    if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
-                    if i + 1 < count { successors[i].push(i + 1); }
-                }
-                _ => {
-                    // Unknown/target-specific: conservatively assume fallthrough only when within decoded stream.
-                    if i + 1 < count { successors[i].push(i + 1); }
+            if let Some(target) = cond_branch_targets[i] {
+                if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
+                if i + 1 < count { successors[i].push(i + 1); }
+            } else {
+                match models.get(i).copied().unwrap_or(IrOperation::TargetSpecific) {
+                    IrOperation::Branch { target } => {
+                        if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
+                    }
+                    IrOperation::Return { .. } => {}
+                    IrOperation::DirectCall { .. } | IrOperation::Nop | IrOperation::Assign { .. } | IrOperation::Binary { .. } | IrOperation::Load { .. } | IrOperation::Store { .. } => {
+                        if i + 1 < count { successors[i].push(i + 1); }
+                    }
+                    IrOperation::ConditionalBranch { target, .. } => {
+                        if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
+                        if i + 1 < count { successors[i].push(i + 1); }
+                    }
+                    _ => {
+                        // Unknown/target-specific: conservatively assume fallthrough only when within decoded stream.
+                        if i + 1 < count { successors[i].push(i + 1); }
+                    }
                 }
             }
             successors[i].sort_unstable();
