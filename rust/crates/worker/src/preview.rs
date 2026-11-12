@@ -897,10 +897,13 @@ fn observed_argument_widths(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base
   let start=lo.saturating_sub(16*4).max(function_start.saturating_sub(base) as usize);
   let mut defs:[Option<u64>;8]=[None;8];
   if lo<=code.len(){
-   for (i,ch) in code[start..lo.min(code.len())].chunks_exact(4).enumerate(){
-    let w=le32(ch);
-    if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];continue}
-    if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some(base+start as u64+i as u64*4);}}
+   let scan_hi=lo.min(code.len());
+   let mut si=0usize;
+   while start+si+4<=scan_hi{
+    let w=le32(&code[start+si..start+si+4]);
+    if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];si+=4;continue}
+    if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some(base+start as u64+si as u64);}}
+    si+=4;
    }
   }
   let mut observed=std::collections::BTreeMap::new();
@@ -935,13 +938,13 @@ fn definition_value_width(w:u32)->u8{
 
 fn call_argument_provenance(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
  let mut arguments=String::new();
- for &(func,site,target) in calls.iter().take(2000){let lo=site.saturating_sub(base) as usize;let function_start=func.saturating_sub(base) as usize;let start=lo.saturating_sub(16*4).max(function_start.min(lo));let mut defs:[Option<(u64,u32)>;8]=[None;8];if lo<=code.len(){for (i,ch) in code[start..lo.min(code.len())].chunks_exact(4).enumerate(){let w=le32(ch);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];continue}if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some((base+start as u64+i as u64*4,w));}}}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|(pc,w)|format!("x{r}<-{pc:#x} shape={}",definition_value_shape(w)))).collect::<Vec<_>>();arguments.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee} observed-argument-register-definitions={} args=[{}] return-register=x0\n",args.len(),args.join(", ")));if arguments.len()>18_000{break}}
+ for &(func,site,target) in calls.iter().take(2000){let lo=site.saturating_sub(base) as usize;let function_start=func.saturating_sub(base) as usize;let start=lo.saturating_sub(16*4).max(function_start.min(lo));let mut defs:[Option<(u64,u32)>;8]=[None;8];if lo<=code.len(){let scan_hi=lo.min(code.len());let mut si=0usize;while start+si+4<=scan_hi{let w=le32(&code[start+si..start+si+4]);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];si+=4;continue}if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some((base+start as u64+si as u64,w));}}si+=4}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|(pc,w)|format!("x{r}<-{pc:#x} shape={}",definition_value_shape(w)))).collect::<Vec<_>>();arguments.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee} observed-argument-register-definitions={} args=[{}] return-register=x0\n",args.len(),args.join(", ")));if arguments.len()>18_000{break}}
  if arguments.is_empty(){arguments.push_str("No direct calls were available for bounded argument provenance.\n")}
  format!("AArch64 PCS signature evidence: x0-x7 are integer/pointer argument and result registers. Incoming parameter candidates are entry-block uses before a modeled definition; outgoing arguments are nearby modeled definitions; cast rows require exact extension encodings. Value shapes do not distinguish pointers from same-width integers. No source-level types or callee prototypes are inferred.\n\nIncoming parameter candidates\n=============================\n{}\nOutgoing call arguments\n=======================\n{}\nExplicit integer casts\n======================\n{}",function_parameter_candidates(starts,code,base,symbols),arguments,explicit_cast_evidence(code,base))
 }
 
 fn annotated_disassembly(code:&[u8],base:u64,symbols:&[(u64,String)],relocations:&[(u64,String,u32,bool,u32,Option<u64>)])->String{
- let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();for (i,ch) in code.chunks_exact(4).enumerate().take(4000){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */if let Some(name)=symbol_name_at(symbols,pc){out.push_str(&format!("\n{pc:#018x} <{name}>:\n"));}let w=le32(ch);let mut asm_buf=[0 as c_char;192];unsafe{re_arm64_decode(w,pc,asm_buf.as_mut_ptr(),asm_buf.len())};let asm=unsafe{CStr::from_ptr(asm_buf.as_ptr())}.to_string_lossy();out.push_str(&format!("  {pc:#018x}  {w:08x}  {asm}"));if let Some(r)=reloc_by_site.get(&pc).copied(){let (_,name,_,_,_,target)=r;out.push_str(&format!("  ; reloc -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}}else if let Some((target,kind,_))=branch_target(w,pc){if let Some(name)=symbol_name_at(symbols,target){out.push_str(&format!("  ; {kind} -> {name}"));}}out.push('\n');if out.len()>60_000{break}}out
+ let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();let mut i=0usize;while i*4+4<=code.len() && i<4000{let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */if let Some(name)=symbol_name_at(symbols,pc){out.push_str(&format!("\n{pc:#018x} <{name}>:\n"));}let w=le32(&code[i*4..i*4+4]);let mut asm_buf=[0 as c_char;192];unsafe{re_arm64_decode(w,pc,asm_buf.as_mut_ptr(),asm_buf.len())};let asm=unsafe{CStr::from_ptr(asm_buf.as_ptr())}.to_string_lossy();out.push_str(&format!("  {pc:#018x}  {w:08x}  {asm}"));if let Some(r)=reloc_by_site.get(&pc).copied(){let (_,name,_,_,_,target)=r;out.push_str(&format!("  ; reloc -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}}else if let Some((target,kind,_))=branch_target(w,pc){if let Some(name)=symbol_name_at(symbols,target){out.push_str(&format!("  ; {kind} -> {name}"));}}out.push('\n');if out.len()>60_000{break}i+=1}out
 }
 
 fn classify_jump_candidate(code:&[u8],base:u64,pc:u64,reg:u32)->&'static str{
@@ -1438,7 +1441,7 @@ fn iterative_value_flow(code:&[u8],base:u64,leaders:&[u64],edges:&[(u64,u64,&str
 }
 
 fn indirect_call_resolution(code:&[u8],base:u64,leaders:&[u64],relocations:&[(u64,String,u32,bool,u32,Option<u64>)],symbols:&[(u64,String)])->String{
- let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();for (i,ch) in code.chunks_exact(4).enumerate(){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);if w&0xffff_fc1f!=0xd63f_0000{continue}let reg=((w>>5)&31) as usize;let b=block_index(leaders,pc).unwrap_or(0);let bs=leaders.get(b).copied().unwrap_or(base);let defs=last_defs_for_block(code,base,bs,pc);let def=if reg<8{defs[reg]}else{None};let resolved=def.and_then(|d|reloc_by_site.get(&d).copied()).and_then(|x|x.5).map(|t|{let name=symbol_name_at(symbols,t).unwrap_or("<resolved-target>");format!("resolved {t:#018x} {name}")}).unwrap_or_else(||def.map(|d|format!("definition {d:#018x}; target unresolved")).unwrap_or_else(||"no modeled reaching definition".into()));out.push_str(&format!("BLR x{reg} @ {pc:#018x} B{b:04}: {resolved}\n"));if out.len()>60_000{break}}
+ let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();let mut i=0usize;while i*4+4<=code.len(){let pc=base+i as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(&code[i*4..i*4+4]);if w&0xffff_fc1f!=0xd63f_0000{i+=1;continue}let reg=((w>>5)&31) as usize;let b=block_index(leaders,pc).unwrap_or(0);let bs=leaders.get(b).copied().unwrap_or(base);let defs=last_defs_for_block(code,base,bs,pc);let def=if reg<8{defs[reg]}else{None};let resolved=def.and_then(|d|reloc_by_site.get(&d).copied()).and_then(|x|x.5).map(|t|{let name=symbol_name_at(symbols,t).unwrap_or("<resolved-target>");format!("resolved {t:#018x} {name}")}).unwrap_or_else(||def.map(|d|format!("definition {d:#018x}; target unresolved")).unwrap_or_else(||"no modeled reaching definition".into()));out.push_str(&format!("BLR x{reg} @ {pc:#018x} B{b:04}: {resolved}\n"));if out.len()>60_000{break}i+=1}
  if out.is_empty(){out.push_str("No indirect BLR call sites were found in the bounded code scan.\n");}out
 }
 
