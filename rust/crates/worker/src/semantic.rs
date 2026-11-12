@@ -8990,10 +8990,6 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         }
 
         let size_of = |pc: u64| -> u32 { insn_size_map.get(&pc).copied().unwrap_or(4) };
-        let word_at = |pc: u64| -> u32 {
-            // ARM64 fixed-width decode path for 4-byte instructions; other sizes not yet decoded.
-            read_arm64_u32(code, base, pc).unwrap_or(0)
-        };
         let span_end = |pc: u64| -> u64 {
             if let Some(i) = pcs.iter().position(|&p| p == pc) {
                 if insn_size_map.contains_key(&pc) {
@@ -9018,15 +9014,17 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         let lifted_instructions: Vec<LiftedInstruction> = pcs.iter().map(|&pc| {
             let sz = size_of(pc);
             let data = is_data(pc);
-            if sz == 4 {
-                let operation = decode(word_at(pc), pc);
-                LiftedInstruction {
+            if data {
+                return LiftedInstruction {
                     address: pc,
-                    word: word_at(pc),
-                    portable: lift_operation(operation, pc),
-                    operation,
+                    word: 0,
+                    portable: IrOperation::TargetSpecific,
+                    operation: Operation::Opaque,
                     data,
-                }
+                };
+            }
+            if let Some((word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, &arch) {
+                LiftedInstruction { address: pc, word, portable, operation, data }
             } else {
                 LiftedInstruction {
                     address: pc,
