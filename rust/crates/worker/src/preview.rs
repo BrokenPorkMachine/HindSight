@@ -2121,12 +2121,14 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let mut resolved_indirect_cases: std::collections::BTreeMap<u64, Vec<(u64, u64)>> = std::collections::BTreeMap::new();
  let mut resolved_indirect_index_info: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
  let scan_end_jt = map.address + code.len() as u64;
- for (index,chunk) in code.chunks_exact(4).enumerate() {
+ let mut index=0usize;
+ while index*4+4<=code.len() {
+  let chunk=&code[index*4..index*4+4];
   let pc = map.address + index as u64 * 4;
-  if pc < start || pc >= end { continue; }
+  if pc < start || pc >= end { index+=1; continue; }
   let word=u32::from_le_bytes(chunk.try_into().unwrap());
-  let Some(reg)=indirect_branch_reg(word) else { continue };
-  let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { continue };
+  let Some(reg)=indirect_branch_reg(word) else { index+=1; continue };
+  let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { index+=1; continue };
   // Parse completeness and targets from the jump-table report.
   let mut has_unresolved=false;
   let mut stopped_at_proven_bound=false;
@@ -2160,7 +2162,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
    }
   }
   let complete=!has_unresolved && stopped_at_proven_bound && validated==case_targets.len() && !case_targets.is_empty();
-  if !complete { continue; }
+  if !complete { index+=1; continue; }
   let fn_start = function_for(&facts.starts, pc);
   let fn_end = facts.starts.iter().copied().find(|&s| s > fn_start).unwrap_or(scan_end_jt);
   let mut in_function_targets=Vec::new();
@@ -2187,6 +2189,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
    if external_cases > 0 { parts.push(format!("external-cases={external_cases}")); }
    if !parts.is_empty() { resolved_indirect_index_info.insert(pc, parts.join(" ")); }
   }
+  index+=1;
  }
  // Rewind? not necessary; further reads use absolute offsets
  let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native,resolved_indirect_targets,resolved_indirect_cases,resolved_indirect_index_info,instruction_pcs:Vec::new(),instruction_sizes:Vec::new()};
