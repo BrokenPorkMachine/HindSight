@@ -3553,20 +3553,24 @@ pub(super) fn recover_with_types(
                     }
                     let condition = read(&t.children[0], &mut state, &mut dag, pc)?;
                     let condition = dag.value(condition, 64, pc)?;
-                    let mut taken = state.clone();
-                    taken.path = dag.add(
-                        "source-path",
-                        "(($0) && ($1))".into(),
-                        vec![state.path, condition],
-                        pc,
-                    )?;
-                    state.path = dag.add(
-                        "source-path",
-                        "(($0) && !($1))".into(),
-                        vec![state.path, condition],
-                        pc,
-                    )?;
-                    pending.push((target_index, taken, seen.clone()));
+                    if target_index != index + 1 {
+                        let mut taken = state.clone();
+                        taken.path = dag.add(
+                            "source-path",
+                            "(($0) && ($1))".into(),
+                            vec![state.path, condition],
+                            pc,
+                        )?;
+                        state.path = dag.add(
+                            "source-path",
+                            "(($0) && !($1))".into(),
+                            vec![state.path, condition],
+                            pc,
+                        )?;
+                        pending.push((target_index, taken, seen.clone()));
+                    }
+                    // Redundant conditional branch to fallthrough (target == index + 1):
+                    // no path fork needed; fallthrough continues with unchanged path.
                 }
                 "indirect-goto" => {
                     // Resolved complete dispatch: fork paths for each proven
