@@ -3124,7 +3124,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             Ok(recovery) => {
                 let declaration = source_declaration.as_ref().expect("recovered source has a validated declaration");
                 let objc_method=objc_header.as_deref().map(|header|(signatures[0].0.as_str(),header));
-                let (root, node) = recovery.emit(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method, &insn_pcs, &insn_sizes, trees.len())?;
+                let (root, node) = recovery.emit_with_arch(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method, &insn_pcs, &insn_sizes, trees.len(), &arch)?;
                 statements.push(root);
                 recovered_source = Some(node);
             }

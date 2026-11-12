@@ -4186,6 +4186,22 @@ impl Recovery {
         insn_sizes: &[u32],
         trees_len: usize,
     ) -> io::Result<(String, String)> {
+        self.emit_with_arch(builder, declaration, ir, memory_evidence_by_pc, start, objc_method, insn_pcs, insn_sizes, trees_len, "arm64")
+    }
+
+    pub(super) fn emit_with_arch(
+        &self,
+        builder: &mut Builder,
+        declaration: &str,
+        ir: &[String],
+        memory_evidence_by_pc: &BTreeMap<u64, Vec<String>>,
+        start: u64,
+        objc_method: Option<(&str,&str)>,
+        insn_pcs: &[u64],
+        insn_sizes: &[u32],
+        trees_len: usize,
+        architecture: &str,
+    ) -> io::Result<(String, String)> {
         let ordered_mixed_accesses = !self.external_loads.is_empty() && !self.external_stores.is_empty();
         let loop_memory_effects = self.loops.iter().any(|source_loop| !source_loop.loads.is_empty() || !source_loop.stores.is_empty());
         let ordered_effect_schedule = ordered_mixed_accesses || self.ordered_call_memory || self.ordered_volatile_accesses || loop_memory_effects;
@@ -4876,7 +4892,7 @@ impl Recovery {
                         "exact extent match; distinct extents are distinct objects".into(),
                     ),
                 ]),
-                ranges(frame_object.version, frame_object.version + 4),
+                ranges(frame_object.version, semit_span_end_with_arch(frame_object.version, insn_pcs, insn_sizes, start, trees_len, architecture)),
             )?;
             if let Some(memory_versions) = memory_evidence_by_pc.get(&frame_object.version) {
                 for memory_version in memory_versions {
