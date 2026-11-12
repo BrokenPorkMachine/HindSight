@@ -9127,7 +9127,8 @@ mod object_member_tests {
 
 /// Stack-relative slot names are safe only when every instruction in the
 /// recovered function is understood well enough to prove that SP is unchanged.
-/// ARM64 fixed-width decode path; variable-length streams require architecture-aware decode.
+/// Uses architecture-gated decode/lift and PC/size maps when available; explicit ARM64 fixed-width
+/// fallback is used only for ARM64 without a PC map. Unsupported/undecodable/opaque effects are conservative.
 pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, function_end: u64) -> bool {
     stack_pointer_is_stable_with_pcs(code, base, function_start, function_end, &[], &[])
 }
@@ -9153,9 +9154,12 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     architecture: &str,
 ) -> bool {
     let is_arm64 = is_arm64_arch(architecture);
-    if !is_arm64 { return false; }
     if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
     let fixed_width = insn_pcs.is_empty();
+    if fixed_width && !is_arm64 {
+        // Variable-length/unknown architectures require explicit PC/size maps.
+        return false;
+    }
     if fixed_width && !arm64_is_aligned(base, function_start) {
         return false;
     }
@@ -9170,7 +9174,6 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     let sizes: Vec<u32> = if fixed_width {
         vec![4; pcs.len()]
     } else if insn_sizes.len() == insn_pcs.len() {
-        // map by original index
         let mapped: Vec<u32> = insn_pcs.iter().zip(insn_sizes.iter()).filter(|(&pc, _)| pc >= function_start && pc < function_end).map(|(_, &sz)| sz).collect();
         if mapped.len() != pcs.len() { return false; }
         mapped
@@ -9180,20 +9183,83 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     for (i, &pc) in pcs.iter().enumerate() {
         let sz = sizes.get(i).copied().unwrap_or(0);
         if sz == 0 { return false; }
-        let Some((_word, operation, _portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
-            return false; // conservative: unknown variable-length/non-decodable instruction may affect SP
+        let Some((_word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
+            return false; // conservative: unknown/unsupported instruction may affect SP
         };
-        let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
-        match operation {
-            Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
-            Operation::Load { base, address: AddressForm::ImmediateSigned(_, writeback), .. }
-            | Operation::Store { base, address: AddressForm::ImmediateSigned(_, writeback), .. } if writeback_changes_sp(base, writeback) => return false,
-            Operation::LoadPair { base, writeback, .. } | Operation::StorePair { base, writeback, .. } if writeback_changes_sp(base, writeback) => return false,
-            Operation::Opaque => return false,
-            _ => {}
+        if portable_modifies_stack_pointer(portable) {
+            return false;
+        }
+        // ARM64-specific operation forms may carry SP effects not fully represented portably.
+        if is_arm64 {
+            let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
+            match operation {
+                Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
+                Operation::Load { base, address: AddressForm::ImmediateSigned(_, writeback), .. }
+                | Operation::Store { base, address: AddressForm::ImmediateSigned(_, writeback), .. } if writeback_changes_sp(base, writeback) => return false,
+                Operation::LoadPair { base, writeback, .. } | Operation::StorePair { base, writeback, .. } if writeback_changes_sp(base, writeback) => return false,
+                Operation::Opaque => {
+                    // Opaque/unsupported in ARM64 decode path is conservative (already covered if portable TargetSpecific, but keep explicit).
+                    if portable == IrOperation::TargetSpecific { return false; }
+                }
+                _ => {}
+            }
+        } else if portable == IrOperation::TargetSpecific {
+            // Conservative for unsupported x86/other instructions: cannot prove SP unchanged.
+            return false;
         }
     }
     true
+}
+
+fn ir_register_is_sp(r: IrRegister) -> bool {
+    r.class == IrRegisterClass::StackPointer
+}
+
+fn ir_writeback_modifies_sp(wb: Option<IrWriteback>) -> bool {
+    matches!(wb, Some(IrWriteback { base, .. }) if ir_register_is_sp(base))
+}
+
+fn portable_modifies_stack_pointer(portable: IrOperation) -> bool {
+    match portable {
+        IrOperation::Assign { destination, .. }
+        | IrOperation::Address { destination, .. }
+        | IrOperation::Binary { destination, .. }
+        | IrOperation::LogicalRegister { destination, .. }
+        | IrOperation::ShiftedArithmetic { destination, .. }
+        | IrOperation::MoveKeep { destination, .. }
+        | IrOperation::Shift { destination, .. }
+        | IrOperation::VariableShift { destination, .. }
+        | IrOperation::OneSource { destination, .. }
+        | IrOperation::ExtractConcat { destination, .. }
+        | IrOperation::AddCarry { destination, .. }
+        | IrOperation::ConditionalSelect { destination, .. }
+        | IrOperation::Extend { destination, .. }
+        | IrOperation::Extract { destination, .. }
+        | IrOperation::Insert { destination, .. }
+        | IrOperation::AddExtended { destination, .. }
+        | IrOperation::MultiplyAdd { destination, .. }
+        | IrOperation::WideningMultiply { destination, .. }
+        | IrOperation::Divide { destination, .. } => ir_register_is_sp(destination),
+        IrOperation::Load { destination, writeback, .. } => ir_register_is_sp(destination) || ir_writeback_modifies_sp(writeback),
+        IrOperation::AtomicLoad { destination, .. } => ir_register_is_sp(destination),
+        IrOperation::LoadPair { first, second, writeback, .. } => ir_register_is_sp(first) || ir_register_is_sp(second) || ir_writeback_modifies_sp(writeback),
+        IrOperation::SimdLoad { writeback, .. }
+        | IrOperation::SimdStore { writeback, .. }
+        | IrOperation::Store { writeback, .. }
+        | IrOperation::StorePair { writeback, .. }
+        | IrOperation::SimdPairLoad { writeback, .. }
+        | IrOperation::SimdPairStore { writeback, .. } => ir_writeback_modifies_sp(writeback),
+        IrOperation::AtomicStore { status, .. } => status.is_some_and(ir_register_is_sp),
+        // Barriers/unknown/control-flow side effects: cannot prove SP stability.
+        IrOperation::TargetSpecific
+        | IrOperation::DirectCall { .. }
+        | IrOperation::IndirectCall { .. }
+        | IrOperation::Branch { .. }
+        | IrOperation::ConditionalBranch { .. }
+        | IrOperation::IndirectBranch { .. }
+        | IrOperation::Return { .. } => true,
+        _ => false,
+    }
 }
 
 pub fn render(
