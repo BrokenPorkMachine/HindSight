@@ -324,15 +324,29 @@ fn index_of(pc: u64, pcs: &[u64], start: u64, count: usize) -> Option<usize> {
         pcs.binary_search(&pc).ok()
     }
 }
-fn next_of(i: usize, pcs: &[u64], start: u64, end: u64) -> u64 {
+fn next_of(i: usize, pcs: &[u64], sizes: &[u32], start: u64, end: u64) -> u64 {
     if pcs.is_empty() {
         start + (i as u64 + 1) * 4
+    } else if let Some(&next) = pcs.get(i + 1) {
+        next
+    } else if !sizes.is_empty() && sizes.len() == pcs.len() {
+        pcs.get(i).copied().unwrap_or(start).saturating_add(*sizes.get(i).unwrap_or(&4) as u64)
     } else {
-        pcs.get(i + 1).copied().unwrap_or(end)
+        end
     }
 }
-fn end_of(pcs: &[u64], start: u64, count: usize) -> u64 {
-    if pcs.is_empty() { start + count as u64 * 4 } else { pcs.last().copied().map(|p| p + 4).unwrap_or(start) }
+fn end_of(pcs: &[u64], sizes: &[u32], start: u64, count: usize) -> u64 {
+    if pcs.is_empty() {
+        start + count as u64 * 4
+    } else if let Some(&last_pc) = pcs.last() {
+        if !sizes.is_empty() && sizes.len() == pcs.len() {
+            last_pc.saturating_add(*sizes.last().unwrap_or(&4) as u64)
+        } else {
+            last_pc + 4
+        }
+    } else {
+        start
+    }
 }
 
 pub(super) struct Program {
@@ -340,18 +354,22 @@ pub(super) struct Program {
     end: u64,
     body: Vec<Tree>,
     pcs: Vec<u64>,
+    sizes: Vec<u32>,
 }
 
 /// Repair-oriented C retains independently supported instructions, but stops
 /// before every unsupported effect and on leaving the captured prefix. It is
 /// deliberately separate from Program::new and cannot certify strict coverage.
 pub(super) fn review_source(start:u64,body:&[Tree],blocked:&std::collections::BTreeSet<u64>,truncated:bool,pcs:&[u64])->String{
+    review_source_with_sizes(start, body, blocked, truncated, pcs, &[])
+}
+pub(super) fn review_source_with_sizes(start:u64,body:&[Tree],blocked:&std::collections::BTreeSet<u64>,truncated:bool,pcs:&[u64],sizes:&[u32])->String{
     let mut source=format!("/* BEST-EFFORT MACHINE-STATE C RECONSTRUCTION.\n * Not an original prototype or a complete implementation.\n * Status 4 stops BEFORE unresolved effects or outside captured code.\n * Captured instruction tree truncated: {truncated}.\n * Flat 4096-byte private memory model; no host memory or external calls.\n */\n{}\n{}",include_str!("bitvector_runtime.h"),include_str!("machine_runtime.h"));
     writeln!(source,"\nstatic int hs_review_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;(void)hs_add_carry;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(start)).unwrap();
-    let end=end_of(pcs,start,body.len());
+    let end=end_of(pcs,sizes,start,body.len());
     for (index,tree) in body.iter().enumerate(){
         let pc=pc_of(index,pcs,start);
-        let next=next_of(index,pcs,start,end);
+        let next=next_of(index,pcs,sizes,start,end);
         let statement=if blocked.contains(&pc){"return 4;".to_owned()}else{stmt(tree).unwrap_or_else(|_|"return 4;".to_owned())};
         writeln!(source,"case {}:{{/* loc_{pc:x}: instruction */s->steps++;{statement}s->pc={};break;}}",literal(pc),literal(next)).unwrap();
     }
@@ -364,16 +382,22 @@ impl Program {
         Self::new_with_pcs(start, body, Vec::new())
     }
     pub(super) fn new_with_pcs(start: u64, body: Vec<Tree>, pcs: Vec<u64>) -> Result<Self, String> {
+        Self::new_with_pcs_and_sizes(start, body, pcs, Vec::new())
+    }
+    pub(super) fn new_with_pcs_and_sizes(start: u64, body: Vec<Tree>, pcs: Vec<u64>, sizes: Vec<u32>) -> Result<Self, String> {
         if body.is_empty() || body.len() > 128 {
             return Err("incomplete or over-budget function".into());
         }
         if !pcs.is_empty() && pcs.len() != body.len() {
             return Err("instruction pc map length mismatch".into());
         }
+        if !sizes.is_empty() && sizes.len() != pcs.len() {
+            return Err("instruction size map length mismatch".into());
+        }
         for t in &body {
             stmt(t)?;
         }
-        let end = end_of(&pcs, start, body.len());
+        let end = end_of(&pcs, &sizes, start, body.len());
         let mut pending = vec![start];
         let mut visited = std::collections::BTreeSet::new();
         while let Some(pc) = pending.pop() {
@@ -385,7 +409,7 @@ impl Program {
             };
             if pc < start || pc >= end { return Err("unresolved function exit".into()); }
             let t = &body[i];
-            let next = next_of(i, &pcs, start, end);
+            let next = next_of(i, &pcs, &sizes, start, end);
             match t.kind {
                 "machine-return" => {}
                 "goto" => pending.push(num(t, "target")),
@@ -396,7 +420,7 @@ impl Program {
                 _ => pending.push(next),
             }
         }
-        Ok(Self { start, end, body, pcs })
+        Ok(Self { start, end, body, pcs, sizes })
     }
     pub(super) fn source(&self) -> String {
         let mut s = include_str!("bitvector_runtime.h").to_string();
@@ -404,7 +428,7 @@ impl Program {
         writeln!(s,"\nint hs_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;(void)hs_add_carry;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(self.start)).unwrap();
         for (i, t) in self.body.iter().enumerate() {
             let pc = pc_of(i, &self.pcs, self.start);
-            let next = next_of(i, &self.pcs, self.start, self.end);
+            let next = next_of(i, &self.pcs, &self.sizes, self.start, self.end);
             writeln!(
                 s,
                 "case {}:{{/* instruction {pc:#x} */s->steps++;{}s->pc={};break;}}",
@@ -433,7 +457,7 @@ impl Program {
             }
             let Some(i) = index_of(s.pc, &self.pcs, self.start, self.body.len()) else { break 1 };
             let Some(t) = self.body.get(i) else { break 1 };
-            let next = next_of(i, &self.pcs, self.start, self.end);
+            let next = next_of(i, &self.pcs, &self.sizes, self.start, self.end);
             s.steps += 1;
             match s.statement(t) {
                 Ok(Control::Next) => s.pc = next,
