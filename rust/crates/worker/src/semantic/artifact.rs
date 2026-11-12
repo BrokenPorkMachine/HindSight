@@ -2544,7 +2544,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let (name, signature) = &signatures[0];
             crate::signatures::source_signature_with_project_types(name, signature, &project_types)
                 .ok_or_else(|| "unsupported or unsafe source ABI declaration".to_owned())
-                .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types))
+                .and_then(|signature| source::recover_with_types(start, &trees, &models, signature, &call_prototypes, &project_types, &[]))
         } else {
             Err(if signatures.is_empty() {
                 "no exact source signature"
@@ -2557,7 +2557,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             Ok(recovery) => {
                 let declaration = source_declaration.as_ref().expect("recovered source has a validated declaration");
                 let objc_method=objc_header.as_deref().map(|header|(signatures[0].0.as_str(),header));
-                let (root, node) = recovery.emit(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method)?;
+                let (root, node) = recovery.emit(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method, &[], trees.len())?;
                 statements.push(root);
                 recovered_source = Some(node);
             }

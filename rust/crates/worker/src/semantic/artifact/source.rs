@@ -1822,13 +1822,13 @@ fn natural_loop_backedge(
     tail_state: &mut State,
     dag: &mut Dag,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
+    insn_pcs: &[u64],
 ) -> Result<Option<(SourceLoop, usize)>, String> {
     let Some(tail_tree) = trees.get(tail).filter(|tree| tree.kind == "conditional-goto") else {
         return Ok(None);
     };
     let target_index = |target: u64| -> Option<usize> {
-        let delta = target.checked_sub(start)?;
-        (delta % 4 == 0 && delta / 4 < trees.len() as u64).then_some((delta / 4) as usize)
+        index_of_pc(target, insn_pcs, start, trees.len())
     };
     if target_index(number(tail_tree, "target")) != Some(header) {
         return Ok(None);
@@ -1920,7 +1920,7 @@ fn natural_loop_backedge(
 
     let mut state = header_entry.clone();
     let compare_value_id = if let Some(reg) = compare_register {
-        Some(dag.value(state.registers[reg].clone(), 64, start + header as u64 * 4)?)
+        Some(dag.value(state.registers[reg].clone(), 64, pc_at(header, insn_pcs, start))?)
     } else {
         None
     };
@@ -1932,7 +1932,7 @@ fn natural_loop_backedge(
         let role = if register == test_register { "induction" } else { "accumulator" };
         let id = dag.nodes.len();
         let name = format!("hs_{role}_{id}");
-        let value = dag.add_role("source-loop-variable", role, name, vec![], start + header as u64 * 4)?;
+        let value = dag.add_role("source-loop-variable", role, name, vec![], pc_at(header, insn_pcs, start))?;
         dag.nodes[value].boolean_value = dag.nodes[initial].boolean_value
             && dag.type_of(initial).is_some_and(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool"));
         dag.type_node(value, dag.type_of(initial).cloned());
@@ -1960,7 +1960,7 @@ fn natural_loop_backedge(
     let mut stores = Vec::new();
     let mut type_conflicts = BTreeSet::new();
     for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
-        let pc = start + index as u64 * 4;
+        let pc = pc_at(index, insn_pcs, start);
         if tree.kind == "no-op" {
             statement(tree, &mut state, dag, pc, call_prototypes)?;
             continue;
@@ -2081,7 +2081,7 @@ fn natural_loop_backedge(
     // condition expression is evaluated from loop-carried variables.
     let _ = &tail_state; // tail_state is caller-provided current state; loop exit continues from post-loop state
     *tail_state = state;
-    let pcs = (header..=tail).map(|index| start + index as u64 * 4).collect();
+    let pcs = (header..=tail).map(|index| pc_at(index, insn_pcs, start)).collect();
     Ok(Some((SourceLoop { condition, variables, assignments, loads, stores, pcs }, exit)))
 }
 /// Recognize a natural loop with one zero-test preheader, one complementary
@@ -2096,13 +2096,13 @@ fn natural_loop(
     state: &mut State,
     dag: &mut Dag,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
+    insn_pcs: &[u64],
 ) -> Result<Option<(SourceLoop, usize)>, String> {
     let Some(preheader_tree) = trees.get(preheader).filter(|tree| tree.kind == "conditional-goto") else {
         return Ok(None);
     };
     let target_index = |target: u64| -> Option<usize> {
-        let delta = target.checked_sub(start)?;
-        (delta % 4 == 0 && delta / 4 < trees.len() as u64).then_some((delta / 4) as usize)
+        index_of_pc(target, insn_pcs, start, trees.len())
     };
     let Some(exit) = target_index(number(preheader_tree, "target")) else { return Ok(None) };
 
@@ -2350,7 +2350,7 @@ fn natural_loop(
         LoopCompareOperand::Constant(_) => None,
     };
     let compare_value_id = if let Some(reg) = compare_register {
-        Some(dag.value(state.registers[reg].clone(), 64, start + header as u64 * 4)?)
+        Some(dag.value(state.registers[reg].clone(), 64, pc_at(header, insn_pcs, start))?)
     } else {
         None
     };
@@ -2363,7 +2363,7 @@ fn natural_loop(
         let role = if register == test_register { "induction" } else { "accumulator" };
         let id = dag.nodes.len();
         let name = format!("hs_{role}_{id}");
-        let value = dag.add_role("source-loop-variable", role, name, vec![], start + header as u64 * 4)?;
+        let value = dag.add_role("source-loop-variable", role, name, vec![], pc_at(header, insn_pcs, start))?;
         // Inductive {0,1} invariant: seed from the preheader/header, then require
         // every write in the modeled body to preserve the same domain.
         // Never copy a constant fact into a loop-carried variable.
@@ -2385,7 +2385,7 @@ fn natural_loop(
         vec![test_value]
     };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template, condition_children, start + header as u64 * 4
+        "source-loop-condition", "condition", condition_template, condition_children, pc_at(header, insn_pcs, start)
     )?;
     dag.type_node(condition, None);
 
@@ -2394,7 +2394,7 @@ fn natural_loop(
     let mut stores = Vec::new();
     let mut type_conflicts = BTreeSet::new();
     for (index, tree) in trees.iter().enumerate().take(tail).skip(body_start) {
-        let pc = start + index as u64 * 4;
+        let pc = pc_at(index, insn_pcs, start);
         if tree.kind == "no-op" {
             statement(tree, state, dag, pc, call_prototypes)?;
             continue;
@@ -2506,7 +2506,7 @@ fn natural_loop(
         return Err("loop-carried value type changes or becomes unresolved".into());
     }
     let loop_start = if test_at_header { header } else { preheader };
-    let pcs = (loop_start..=tail).map(|index| start + index as u64 * 4).collect();
+    let pcs = (loop_start..=tail).map(|index| pc_at(index, insn_pcs, start)).collect();
     Ok(Some((SourceLoop { condition, variables, assignments, loads, stores, pcs }, exit)))
 }
 fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototypes: &BTreeMap<u64, SourceSignature>) -> Result<(), String> {
@@ -2908,7 +2908,32 @@ pub(super) fn recover(
     signature: SourceSignature,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
 ) -> Result<Recovery, String> {
-    recover_with_types(start, trees, operations, signature, call_prototypes, &[])
+    recover_with_types(start, trees, operations, signature, call_prototypes, &[], &[])
+}
+
+fn pc_at(index: usize, insn_pcs: &[u64], start: u64) -> u64 {
+    insn_pcs.get(index).copied().unwrap_or_else(|| start + index as u64 * 4)
+}
+fn index_of_pc(target: u64, insn_pcs: &[u64], start: u64, count: usize) -> Option<usize> {
+    if insn_pcs.is_empty() {
+        let delta = target.checked_sub(start)?;
+        if delta % 4 != 0 { return None; }
+        let idx = (delta / 4) as usize;
+        (idx < count).then_some(idx)
+    } else {
+        insn_pcs.binary_search(&target).ok()
+    }
+}
+fn end_pc(start: u64, trees_len: usize, insn_pcs: &[u64], insn_sizes: &[u32]) -> u64 {
+    if insn_pcs.is_empty() {
+        start + trees_len as u64 * 4
+    } else if let (Some(&last_pc), Some(&last_sz)) = (insn_pcs.last(), insn_sizes.get(insn_pcs.len().saturating_sub(1))) {
+        last_pc + last_sz as u64
+    } else if let Some(&last_pc) = insn_pcs.last() {
+        last_pc + 4
+    } else {
+        start
+    }
 }
 
 pub(super) fn recover_with_types(
@@ -2918,8 +2943,9 @@ pub(super) fn recover_with_types(
     signature: SourceSignature,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
     project_types: &[crate::reconstruction::ProjectTypeDependency],
+    insn_pcs: &[u64],
 ) -> Result<Recovery, String> {
-    let end = start + trees.len() as u64 * 4;
+    let end = end_pc(start, trees.len(), insn_pcs, &[]);
     // Address operations carry concrete computed values in this IR; do not
     // reject solely on their presence. Unresolved relocatable dependencies are
     // reported separately when evidence is insufficient.
@@ -3122,7 +3148,7 @@ pub(super) fn recover_with_types(
                 return Err("source path budget exhausted".into());
             }
             if seen.contains_key(&index) {
-                let pc = start + index as u64 * 4;
+                let pc = pc_at(index, insn_pcs, start);
                 let saved = seen[&index].clone();
                 // Bounded phi recovery: merge current path with saved state only
                 // when unhandled state components are identical and differing
@@ -3250,7 +3276,7 @@ pub(super) fn recover_with_types(
             }
             seen.insert(index, state.clone());
             let t = trees.get(index).ok_or("unresolved source exit")?;
-            let pc = start + index as u64 * 4;
+            let pc = pc_at(index, insn_pcs, start);
             match t.kind {
                 "machine-return" => {
                     if !source_loops.is_empty()
@@ -3387,7 +3413,7 @@ pub(super) fn recover_with_types(
                 "goto" | "conditional-goto" => {
                     if t.kind == "conditional-goto" {
                         if let Some((source_loop, exit)) = natural_loop(
-                            start, index, trees, &mut state, &mut dag, call_prototypes
+                            start, index, trees, &mut state, &mut dag, call_prototypes, insn_pcs
                         )? {
                             for body_index in index + 1..exit { seen.insert(body_index, state.clone()); }
                             source_loops.push(source_loop);
@@ -3396,10 +3422,7 @@ pub(super) fn recover_with_types(
                         }
                     }
                     let target = number(t, "target");
-                    let outside = target < start || target >= end || {
-                        let delta = target - start;
-                        delta % 4 != 0 || delta / 4 >= trees.len() as u64
-                    };
+                    let outside = index_of_pc(target, insn_pcs, start, trees.len()).is_none();
                     if outside {
                         let helper = call_prototypes.get(&target).map(|p| p.name.as_str());
                         let is_noreturn_void = helper.is_some_and(|n| {
@@ -3515,8 +3538,7 @@ pub(super) fn recover_with_types(
                         }
                         return Err("source branch outside function".into());
                     }
-                    let delta = target - start;
-                    let target_index = (delta / 4) as usize;
+                    let target_index = index_of_pc(target, insn_pcs, start, trees.len()).expect("in-function target index checked above");
                     if t.kind == "goto" {
                         // Bounded backedge loop: unconditional branch back to an
                         // already visited preheader forms a cycle; try recovery
@@ -3526,7 +3548,7 @@ pub(super) fn recover_with_types(
                             if preheader_tree.is_some_and(|t| t.kind == "conditional-goto") {
                                 let mut loop_state = seen[&target_index].clone();
                                 if let Some((source_loop, exit)) = natural_loop(
-                                    start, target_index, trees, &mut loop_state, &mut dag, call_prototypes
+                                    start, target_index, trees, &mut loop_state, &mut dag, call_prototypes, insn_pcs
                                 )? {
                                     for body_index in target_index + 1..exit { seen.insert(body_index, loop_state.clone()); }
                                     source_loops.push(source_loop);
@@ -3544,7 +3566,7 @@ pub(super) fn recover_with_types(
                     if target_index < index && seen.contains_key(&target_index) {
                         let mut tail_state = state.clone();
                         if let Some((source_loop, exit)) = natural_loop_backedge(
-                            start, target_index, index, trees, &seen[&target_index], &mut tail_state, &mut dag, call_prototypes
+                            start, target_index, index, trees, &seen[&target_index], &mut tail_state, &mut dag, call_prototypes, insn_pcs
                         )? {
                             for body_index in target_index..exit { seen.insert(body_index, tail_state.clone()); }
                             source_loops.push(source_loop);
@@ -3649,16 +3671,9 @@ pub(super) fn recover_with_types(
                     });
                     let mut target_indices = Vec::with_capacity(targets.len());
                     for target in targets {
-                        let Some(delta) = target.checked_sub(start) else {
-                            return Err("resolved indirect dispatch target is outside the recovered function".into());
+                        let Some(idx) = index_of_pc(target, insn_pcs, start, trees.len()) else {
+                            return Err("resolved indirect dispatch target is outside the recovered function or not instruction-aligned".into());
                         };
-                        if delta % 4 != 0 {
-                            return Err("resolved indirect dispatch target is not instruction-aligned".into());
-                        }
-                        let idx = (delta / 4) as usize;
-                        if idx >= trees.len() {
-                            return Err("resolved indirect dispatch target is outside the recovered function".into());
-                        }
                         target_indices.push((target, idx));
                     }
                     if target_indices.is_empty() {
@@ -3693,19 +3708,13 @@ pub(super) fn recover_with_types(
                             if tgt_tree.kind == "conditional-goto" {
                                 // Only follow if it targets the next sequential instruction.
                                 let tgt = number(tgt_tree, "target");
-                                let delta = tgt.checked_sub(start)?;
-                                if delta % 4 != 0 { return Some(idx); }
-                                let tgt_idx = (delta / 4) as usize;
-                                if tgt_idx != idx + 1 { return Some(idx); }
+                                if index_of_pc(tgt, insn_pcs, start, trees.len()) != Some(idx + 1) { return Some(idx); }
                                 idx = idx.checked_add(1)?;
                                 steps += 1;
                                 continue;
                             }
                             let tgt = number(tgt_tree, "target");
-                            let delta = tgt.checked_sub(start)?;
-                            if delta % 4 != 0 { return None; }
-                            let tgt_idx = (delta / 4) as usize;
-                            if tgt_idx >= trees.len() { return None; }
+                            let tgt_idx = index_of_pc(tgt, insn_pcs, start, trees.len())?;
                             idx = tgt_idx;
                             steps += 1;
                         }
@@ -4052,6 +4061,8 @@ impl Recovery {
         memory_evidence_by_pc: &BTreeMap<u64, Vec<String>>,
         start: u64,
         objc_method: Option<(&str,&str)>,
+        insn_pcs: &[u64],
+        trees_len: usize,
     ) -> io::Result<(String, String)> {
         let ordered_mixed_accesses = !self.external_loads.is_empty() && !self.external_stores.is_empty();
         let loop_memory_effects = self.loops.iter().any(|source_loop| !source_loop.loads.is_empty() || !source_loop.stores.is_empty());
@@ -4147,7 +4158,7 @@ impl Recovery {
             let evidence = node
                 .origins
                 .iter()
-                .filter_map(|pc| ir.get(((pc - start) / 4) as usize))
+                .filter_map(|pc| index_of_pc(*pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)))
                 .cloned()
                 .chain(std::iter::once(declaration.to_owned()))
                 .collect::<Vec<_>>();
@@ -4264,7 +4275,7 @@ impl Recovery {
                     "source-loop-binding",
                     None,
                     vec![asts[&variable.value].clone(), asts[&variable.initial].clone()],
-                    &ir.get(((loop_pc - start) / 4) as usize).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
+                    &index_of_pc(loop_pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
                     array([object([("start", address(loop_pc)), ("end", address(loop_pc + 4))])]),
                     object([("template", "uint64_t $0 = $1".into()), ("role", self.dag.nodes[variable.value].role.into())]),
                 )?;
@@ -4289,7 +4300,7 @@ impl Recovery {
                         } else {
                             loop_code.push_str(&format!("        if ({}) {{\n{}        }}\n", rendered[&load.guard], statement));
                         }
-                        let mut evidence = ir.get(((load.pc - start) / 4) as usize).into_iter().cloned()
+                        let mut evidence = index_of_pc(load.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
                             .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                         evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
                         let ordering = "per-iteration instruction order under the recovered path guard";
@@ -4323,7 +4334,7 @@ impl Recovery {
                         let target = &rendered[&assignment.destination];
                         let value = &rendered[&assignment.value];
                         loop_code.push_str(&format!("        {target} = {value};\n"));
-                        let evidence = ir.get(((assignment.pc - start) / 4) as usize).into_iter().cloned()
+                        let evidence = index_of_pc(assignment.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
                             .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                         let ast = builder.ast_spans(
                             "source-loop-assignment",
@@ -4356,7 +4367,7 @@ impl Recovery {
                         } else {
                             loop_code.push_str(&format!("        if ({}) {{\n{}        }}\n", rendered[&store.guard], statement));
                         }
-                        let mut evidence = ir.get(((store.pc - start) / 4) as usize).into_iter().cloned()
+                        let mut evidence = index_of_pc(store.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
                             .chain(std::iter::once(declaration.to_owned()))
                             .collect::<Vec<_>>();
                         evidence.extend(memory_evidence_by_pc.get(&store.pc).into_iter().flatten().cloned());
@@ -4389,7 +4400,7 @@ impl Recovery {
                 }
             }
             loop_code.push_str("    }\n");
-            let evidence = source_loop.pcs.iter().filter_map(|pc| ir.get(((*pc - start) / 4) as usize).cloned())
+            let evidence = source_loop.pcs.iter().filter_map(|pc| index_of_pc(*pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).cloned())
                 .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
             let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(*pc + 4))])));
             let ast = builder.ast_spans(
@@ -4430,7 +4441,7 @@ impl Recovery {
                 } else {
                     effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&call.guard], call_assignment));
                 }
-                let evidence = ir.get(((call.pc - start) / 4) as usize).into_iter().cloned()
+                let evidence = index_of_pc(call.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
                     .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                 effect_asts.push(builder.ast_spans(
                     "source-call-event",
@@ -4993,6 +5004,7 @@ mod tests {
             signature,
             &BTreeMap::new(),
             project_types,
+            &[],
         )
     }
     #[test]
@@ -5129,7 +5141,7 @@ mod tests {
         assert_eq!(recovery.project_types.len(),1);
         let mut builder=Builder::new(&"a".repeat(64),0x1000,0x1008,"arm64",Some("hs_test"),Value::Null).expect("artifact builder");
         let ir=vec!["ldr w0, [x0, #4]".to_owned(),"ret".to_owned()];
-        recovery.emit(&mut builder,"int hs_test(Point *point);",&ir,&BTreeMap::new(),0x1000,None)
+        recovery.emit(&mut builder,"int hs_test(Point *point);",&ir,&BTreeMap::new(),0x1000,None,&[],2)
             .expect("source and memory read AST emission");
         let read_ast=builder.ast.values().find(|node|matches!(node,Value::Object(fields)
             if fields.get("kind")==Some(&Value::from("source-memory-read")))).expect("serialized read AST");
@@ -5165,7 +5177,7 @@ mod tests {
         assert_eq!(recovery.project_types.len(),1);
         let mut builder=Builder::new(&"a".repeat(64),0x1000,0x1008,"arm64",Some("hs_test"),Value::Null).expect("artifact builder");
         let ir=vec!["str w1, [x0, #4]".to_owned(),"ret".to_owned()];
-        recovery.emit(&mut builder,"void hs_test(Point *point, int value);",&ir,&BTreeMap::new(),0x1000,None)
+        recovery.emit(&mut builder,"void hs_test(Point *point, int value);",&ir,&BTreeMap::new(),0x1000,None,&[],3)
             .expect("source and memory AST emission");
         let source=builder.nodes.values().find_map(|node|match node {
             Value::Object(fields)=>fields.get("payload").and_then(|payload|match payload {
