@@ -8503,10 +8503,12 @@ pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, star
     };
     let operations=pcs.iter().enumerate().map(|(index,&pc)|{
         let position=file_offset.saturating_add(pc-base);
+        let pc_end = pcs.get(index + 1).copied().unwrap_or(pc + 4);
+        let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
         let Some(off)=pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return IrOperation::TargetSpecific; };
         if off+4>code.len() { return IrOperation::TargetSpecific; }
         let word=u32::from_le_bytes(code[off..off+4].try_into().unwrap());
-        if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){IrOperation::TargetSpecific}
+        if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){IrOperation::TargetSpecific}
         else{lift_operation(decode(word,pc),pc)}
     }).collect::<Vec<_>>();
     // A present entry means targets are proven complete (possibly all
@@ -8735,13 +8737,22 @@ pub fn render_with_resolved_indirects(
 
         let word_at = |pc: u64| -> u32 {
             let off = (pc - base) as usize;
+            // ARM64 fixed-width decode path; variable-length streams need size-aware decode.
             u32::from_le_bytes(code[off..off + 4].try_into().unwrap())
+        };
+        let span_end = |pc: u64| -> u64 {
+            if let Some(i) = pcs.iter().position(|&p| p == pc) {
+                pcs.get(i + 1).copied().unwrap_or(pc + 4)
+            } else {
+                pc + 4
+            }
         };
         let is_data = |pc: u64| -> bool {
             let position = file_offset.saturating_add(pc - base);
+            let end = file_offset.saturating_add(span_end(pc) - base);
             data_ranges
                 .iter()
-                .any(|&(lo, hi, _)| position < hi && position.saturating_add(4) > lo)
+                .any(|&(lo, hi, _)| position < hi && end > lo)
         };
         // Lift every instruction once into a typed, address-bearing IR record.
         // CFG analysis and value propagation consume this representation rather
