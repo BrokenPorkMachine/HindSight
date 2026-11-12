@@ -953,7 +953,7 @@ fn refine_property_signatures(signatures:&mut BTreeMap<u64,(String,Signature)>, 
 
 fn object_member_statements(code:&[u8],base:u64,start:u64,end:u64,file_offset:u64,data_ranges:&[(u64,u64,u16)],layout:&super::objc::ClassLayout,resolved_indirect_targets:&std::collections::BTreeMap<u64,Vec<u64>>, insn_pcs:&[u64], insn_sizes:&[u32]) -> BTreeMap<u64,String> {
     let slots=layout.ivars.iter().map(|ivar|ivar.offset_pointer).collect();
-    super::semantic::object_member_accesses_with_resolved_indirects_and_pcs(code,base,start,end,file_offset,data_ranges,&slots,resolved_indirect_targets,insn_pcs,insn_sizes).into_iter().filter_map(|(site,access)|{
+    super::semantic::object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code,base,start,end,file_offset,data_ranges,&slots,resolved_indirect_targets,insn_pcs,insn_sizes,"arm64").into_iter().filter_map(|(site,access)|{
         let offset=if let Some(slot)=access.offset_pointer {
             let mut candidates=layout.ivars.iter().filter(|ivar|ivar.offset_pointer==slot);
             let field=candidates.next()?;if candidates.next().is_some(){return None}u64::from(field.offset)
@@ -2102,9 +2102,9 @@ fn render_linear_statement(
                         return format!("{dispatch}(x0, x1, /* message arguments unresolved */); /* {} {target:#x}; x0 points to objc_super; x1 is the selector; receiver, class, and argument types unresolved */{target_evidence}", if indirect { "indirect target resolved through a register" } else { "direct call target" });
                     }
                 }
-                let known=super::semantic::known_call_argument_values_with_pcs(code,base,start,address,insn_pcs,insn_sizes);
-                let known_float=super::semantic::known_call_float_argument_values_with_pcs(code,base,start,address,insn_pcs,insn_sizes);
-                let known_stack=super::semantic::known_call_stack_argument_values_with_pcs(code,base,start,address,insn_pcs,insn_sizes);
+                let known=super::semantic::known_call_argument_values_with_arch_and_pcs(code,base,start,address,insn_pcs,insn_sizes,"arm64");
+                let known_float=super::semantic::known_call_float_argument_values_with_arch_and_pcs(code,base,start,address,insn_pcs,insn_sizes,"arm64");
+                let known_stack=super::semantic::known_call_stack_argument_values_with_arch_and_pcs(code,base,start,address,insn_pcs,insn_sizes,"arm64");
                 if let Some(selector)=objc_selectors.get(&address){
                     let parts=selector.split(':').collect::<Vec<_>>();
                     let argument_count=parts.len().saturating_sub(1);
@@ -2169,7 +2169,7 @@ fn render_arm64_body(
     let body_code = &code[lo..hi];
     let insn_pcs: Vec<u64> = (0..(body_code.len() / 4)).map(|i| start + i as u64 * 4).collect();
     let insn_sizes: Vec<u32> = vec![4; insn_pcs.len()];
-    let stable_stack=super::semantic::stack_pointer_is_stable_with_pcs(code,base,start,end,&insn_pcs,&insn_sizes);
+    let stable_stack=super::semantic::stack_pointer_is_stable_with_arch_and_pcs(code,base,start,end,&insn_pcs,&insn_sizes,"arm64");
     let pc_set: std::collections::BTreeSet<u64> = insn_pcs.iter().copied().collect();
     let switch_evidence=parse_switch_evidence(jump_tables);
     let name_seeds = parameter_name_seeds(signature, parameter_evidence, start);
@@ -2201,7 +2201,7 @@ fn render_arm64_body(
             resolved_indirect_targets.insert(pc, in_function_targets);
         }
     }
-    let machine = super::semantic::render_with_resolved_indirects_and_pcs(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges, &resolved_indirect_targets, &insn_pcs, &insn_sizes);
+    let machine = super::semantic::render_with_resolved_indirects_and_arch_and_pcs(body_code, start, file_offset.saturating_add(lo as u64), &[start], data_ranges, &resolved_indirect_targets, &insn_pcs, &insn_sizes, "arm64");
     let mut instructions = Vec::<(u64,String)>::new();
     for line in machine.lines() {
         let Some(line) = line.trim_start().strip_prefix("0x") else { continue };
@@ -2481,9 +2481,9 @@ fn render_arm64_body(
                     if let Some(name) = target_name {
                         let target_signature = signatures.get(&target).map(|(_,signature)| signature);
                         let args = abi_parameters(target_signature);
-                        let known = super::semantic::known_call_argument_values_with_pcs(code, base, start, address, &insn_pcs, &insn_sizes);
-                        let known_float = super::semantic::known_call_float_argument_values_with_pcs(code, base, start, address, &insn_pcs, &insn_sizes);
-                        let known_stack = super::semantic::known_call_stack_argument_values_with_pcs(code, base, start, address, &insn_pcs, &insn_sizes);
+                        let known = super::semantic::known_call_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, "arm64");
+                        let known_float = super::semantic::known_call_float_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, "arm64");
+                        let known_stack = super::semantic::known_call_stack_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, "arm64");
                         let (mut rendered, evidence) = render_call_arguments(&args, &known, &known_float, &known_stack);
                         let evidence_note = if evidence.is_empty() { String::new() } else { format!("; constant argument evidence: {}", evidence.join(", ")) };
                         let arguments = if args.is_empty() && target_signature.is_none() {
