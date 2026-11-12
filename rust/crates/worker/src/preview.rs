@@ -2406,18 +2406,21 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
  for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
+ let analyze_arch = {
+  let cputype = if window.len() >= 8 { le32(&window[4..8]) } else { 0x0100_000c };
+  let cpusubtype = if window.len() >= 12 { le32(&window[8..12]) } else { 0 };
+  match cputype {
+   0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e".to_string() } else { "arm64".to_string() },
+   0x0100_0007 => "x86_64".to_string(),
+   0x0000_000c => "arm".to_string(),
+   0x0000_0007 => "i386".to_string(),
+   _ => "arm64".to_string(),
+  }
+ };
  let (sem_pcs, sem_sizes) = if starts.len() == 1 {
   let s = starts[0];
   let e = scan_end.min(map.address + code.len() as u64);
-  let cputype = if window.len() >= 8 { le32(&window[4..8]) } else { 0x0100_000c };
-  let cpusubtype = if window.len() >= 12 { le32(&window[8..12]) } else { 0 };
-  let arch_lc = match cputype {
-   0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e" } else { "arm64" },
-   0x0100_0007 => "x86_64",
-   0x0000_000c => "arm",
-   0x0000_0007 => "i386",
-   _ => "arm64",
-  }.to_ascii_lowercase();
+  let arch_lc = analyze_arch.to_ascii_lowercase();
   if matches!(arch_lc.as_str(), "x86_64" | "x86-64" | "amd64") {
    let high = e.min(s.saturating_add(128 * 15));
    if s >= map.address && high > s {
@@ -2456,7 +2459,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
    (pcs_v, sz_v)
   }
  } else { (Vec::new(), Vec::new()) };
- let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects_and_pcs(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets,&sem_pcs,&sem_sizes),&reconstructed_pseudocode);
+ let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects_and_arch_and_pcs(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets,&sem_pcs,&sem_sizes,&analyze_arch),&reconstructed_pseudocode);
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;
  for (source,workspace,kind,text,priority) in [

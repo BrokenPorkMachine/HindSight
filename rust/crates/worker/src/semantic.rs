@@ -8133,9 +8133,14 @@ fn call_scan_window_pcs(
     function_start: u64,
     callsite: u64,
     insn_pcs: &[u64],
+    architecture: &str,
 ) -> Option<Vec<u64>> {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
     if function_start < base || callsite < function_start { return None; }
     if insn_pcs.is_empty() {
+        // Fixed-width ARM64 fallback only.
+        if !is_arm64 { return None; }
         if (function_start - base) % 4 != 0 { return None; }
         let call_off = callsite.checked_sub(base)?;
         if call_off % 4 != 0 { return None; }
@@ -8160,7 +8165,14 @@ fn call_scan_window_pcs(
 /// operations clear state so caller side effects are not carried forward.
 /// ARM64 4-byte decode path for now; non-4-byte instruction sizes are treated conservatively.
 fn known_call_flow_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Option<Flow> {
-    let pcs = call_scan_window_pcs(base, function_start, callsite, insn_pcs)?;
+    known_call_flow_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+}
+
+fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Option<Flow> {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 { return None; }
+    let pcs = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture)?;
     let mut flow = Flow::new();
     for (i, &pc) in pcs.iter().enumerate() {
         let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
@@ -8202,7 +8214,11 @@ pub fn known_call_argument_values(code: &[u8], base: u64, function_start: u64, c
 }
 
 pub fn known_call_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(u8, u64, String)> {
-    let Some(flow) = known_call_flow_with_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes) else { return Vec::new() };
+    known_call_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+}
+
+pub fn known_call_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(u8, u64, String)> {
+    let Some(flow) = known_call_flow_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, architecture) else { return Vec::new() };
     (0..8u8).filter_map(|index| {
         let register = Register { index: index as u32, wide: true, stack_pointer: false };
         flow.read(register).map(|value| (index, value.value, proven_by(&value)))
@@ -8217,7 +8233,11 @@ pub fn known_call_float_argument_values(code: &[u8], base: u64, function_start: 
 }
 
 pub fn known_call_float_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(u8, u128, String)> {
-    let Some(flow) = known_call_flow_with_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes) else { return Vec::new() };
+    known_call_float_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+}
+
+pub fn known_call_float_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(u8, u128, String)> {
+    let Some(flow) = known_call_flow_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, architecture) else { return Vec::new() };
     (0..8u8).filter_map(|index| flow.read_v(index as u32).map(|value| (index, value.value, format!("proven_by=[{}]", value.origins.iter().map(|origin| format!("{origin:#x}")).collect::<Vec<_>>().join(",")) ))).collect()
 }
 
@@ -8231,7 +8251,14 @@ pub fn known_call_stack_argument_values(code: &[u8], base: u64, function_start: 
 }
 
 pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32]) -> Vec<(usize, u8, u64, String)> {
-    let Some(pcs) = call_scan_window_pcs(base, function_start, callsite, insn_pcs) else { return Vec::new(); };
+    known_call_stack_argument_values_with_arch_and_pcs(code, base, function_start, callsite, insn_pcs, insn_sizes, "arm64")
+}
+
+pub fn known_call_stack_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(usize, u8, u64, String)> {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 { return Vec::new(); }
+    let Some(pcs) = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture) else { return Vec::new(); };
     let mut flow = Flow::new();
     let mut stack_aliases = std::collections::BTreeMap::<u8, Vec<u64>>::new();
     let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
@@ -8543,8 +8570,15 @@ pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, star
 }
 
 pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>, insn_pcs: &[u64], insn_sizes: &[u32]) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
+    object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code, base, start, end, file_offset, data_ranges, slots, resolved_indirect_targets, insn_pcs, insn_sizes, "arm64")
+}
+
+pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
     use std::collections::{BTreeMap, VecDeque};
     let mut result = BTreeMap::new();
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 { return result; }
     // ARM64 fixed-width decode path when no explicit PC/size map is provided.
     // Variable-length streams can provide `insn_pcs`/`insn_sizes`, but decode remains ARM64 4-byte until x86-64 lifting is implemented.
     let fixed_width = insn_pcs.is_empty();
@@ -8751,6 +8785,21 @@ pub fn stack_pointer_is_stable_with_pcs(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> bool {
+    stack_pointer_is_stable_with_arch_and_pcs(code, base, function_start, function_end, insn_pcs, insn_sizes, "arm64")
+}
+
+pub fn stack_pointer_is_stable_with_arch_and_pcs(
+    code: &[u8],
+    base: u64,
+    function_start: u64,
+    function_end: u64,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+    architecture: &str,
+) -> bool {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 { return false; }
     if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
     let fixed_width = insn_pcs.is_empty();
     if fixed_width {
@@ -8774,10 +8823,11 @@ pub fn stack_pointer_is_stable_with_pcs(
     };
     for (i, &pc) in pcs.iter().enumerate() {
         let sz = *sizes.get(i).unwrap_or(&4);
-        if sz != 4 { return false; } // conservative: unknown variable-length instruction may affect SP
+        if sz != 4 { return false; } // conservative: unknown variable-length/non-ARM64 instruction may affect SP
         let off = match pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) { Some(o) => o, None => return false };
-        if off + 4 > code.len() { return false; }
-        let operation = decode(u32::from_le_bytes(code[off..off + 4].try_into().unwrap()), pc);
+        if off.saturating_add(4) > code.len() { return false; }
+        let Some(bytes) = code.get(off..off + 4) else { return false; };
+        let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
         let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
         match operation {
             Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
@@ -8822,6 +8872,26 @@ pub fn render_with_resolved_indirects_and_pcs(
     _insn_pcs: &[u64],
     _insn_sizes: &[u32],
 ) -> String {
+    render_with_resolved_indirects_and_arch_and_pcs(code, base, file_offset, starts, data_ranges, resolved_indirect_targets, _insn_pcs, _insn_sizes, "arm64")
+}
+
+pub fn render_with_resolved_indirects_and_arch_and_pcs(
+    code: &[u8],
+    base: u64,
+    file_offset: u64,
+    starts: &[u64],
+    data_ranges: &[(u64, u64, u16)],
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    _insn_pcs: &[u64],
+    _insn_sizes: &[u32],
+    architecture: &str,
+) -> String {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 {
+        // Variable-length/non-ARM64 decode+lift render not yet implemented in this path; conservative.
+        return String::new();
+    }
     if code.is_empty() || starts.is_empty() {
         return String::new();
     }
