@@ -8210,7 +8210,6 @@ fn decode_lift_x86_64(code: &[u8], base: u64, pc: u64, size_hint: u32) -> Option
             if let Some(target) = near_target {
                 IrOperation::Branch { target }
             } else {
-                // Indirect target not modeled; keep control-flow barrier conservatively.
                 IrOperation::IndirectBranch { target: unknown_gpr }
             }
         }
@@ -8218,7 +8217,6 @@ fn decode_lift_x86_64(code: &[u8], base: u64, pc: u64, size_hint: u32) -> Option
             if let Some(target) = near_target {
                 IrOperation::DirectCall { target }
             } else {
-                // Indirect target not modeled; keep call/control-flow barrier conservatively.
                 IrOperation::IndirectCall { target: unknown_gpr }
             }
         }
@@ -8237,12 +8235,200 @@ fn decode_lift_x86_64(code: &[u8], base: u64, pc: u64, size_hint: u32) -> Option
                 IrOperation::TargetSpecific
             }
         }
-        _ => IrOperation::TargetSpecific,
+        _ => decode_lift_x86_64_data_op(&instr).unwrap_or(IrOperation::TargetSpecific),
     };
 
     // Operation enum is ARM64-decoder-centric; use Opaque for x86 evidence-backed lifted/control-flow forms.
     let operation = Operation::Opaque;
     Some((word, operation, portable))
+}
+
+fn x86_to_ir_register(reg: iced_x86::Register) -> Option<IrRegister> {
+    use iced_x86::Register as R;
+    Some(match reg {
+        R::RAX | R::EAX | R::AX | R::AL | R::AH => IrRegister { class: IrRegisterClass::General, index: 0, bits: if matches!(reg, R::RAX) { 64 } else if matches!(reg, R::EAX) { 32 } else if matches!(reg, R::AX) { 16 } else { 8 } },
+        R::RCX | R::ECX | R::CX | R::CL | R::CH => IrRegister { class: IrRegisterClass::General, index: 1, bits: if matches!(reg, R::RCX) { 64 } else if matches!(reg, R::ECX) { 32 } else if matches!(reg, R::CX) { 16 } else { 8 } },
+        R::RDX | R::EDX | R::DX | R::DL | R::DH => IrRegister { class: IrRegisterClass::General, index: 2, bits: if matches!(reg, R::RDX) { 64 } else if matches!(reg, R::EDX) { 32 } else if matches!(reg, R::DX) { 16 } else { 8 } },
+        R::RBX | R::EBX | R::BX | R::BL | R::BH => IrRegister { class: IrRegisterClass::General, index: 3, bits: if matches!(reg, R::RBX) { 64 } else if matches!(reg, R::EBX) { 32 } else if matches!(reg, R::BX) { 16 } else { 8 } },
+        R::RSP | R::ESP | R::SP | R::SPL => IrRegister { class: IrRegisterClass::StackPointer, index: 4, bits: if matches!(reg, R::RSP) { 64 } else if matches!(reg, R::ESP) { 32 } else if matches!(reg, R::SP) { 16 } else { 8 } },
+        R::RBP | R::EBP | R::BP | R::BPL => IrRegister { class: IrRegisterClass::General, index: 5, bits: if matches!(reg, R::RBP) { 64 } else if matches!(reg, R::EBP) { 32 } else if matches!(reg, R::BP) { 16 } else { 8 } },
+        R::RSI | R::ESI | R::SI | R::SIL => IrRegister { class: IrRegisterClass::General, index: 6, bits: if matches!(reg, R::RSI) { 64 } else if matches!(reg, R::ESI) { 32 } else if matches!(reg, R::SI) { 16 } else { 8 } },
+        R::RDI | R::EDI | R::DI | R::DIL => IrRegister { class: IrRegisterClass::General, index: 7, bits: if matches!(reg, R::RDI) { 64 } else if matches!(reg, R::EDI) { 32 } else if matches!(reg, R::DI) { 16 } else { 8 } },
+        R::R8 | R::R8D | R::R8W | R::R8L => IrRegister { class: IrRegisterClass::General, index: 8, bits: if matches!(reg, R::R8) { 64 } else if matches!(reg, R::R8D) { 32 } else if matches!(reg, R::R8W) { 16 } else { 8 } },
+        R::R9 | R::R9D | R::R9W | R::R9L => IrRegister { class: IrRegisterClass::General, index: 9, bits: if matches!(reg, R::R9) { 64 } else if matches!(reg, R::R9D) { 32 } else if matches!(reg, R::R9W) { 16 } else { 8 } },
+        R::R10 | R::R10D | R::R10W | R::R10L => IrRegister { class: IrRegisterClass::General, index: 10, bits: if matches!(reg, R::R10) { 64 } else if matches!(reg, R::R10D) { 32 } else if matches!(reg, R::R10W) { 16 } else { 8 } },
+        R::R11 | R::R11D | R::R11W | R::R11L => IrRegister { class: IrRegisterClass::General, index: 11, bits: if matches!(reg, R::R11) { 64 } else if matches!(reg, R::R11D) { 32 } else if matches!(reg, R::R11W) { 16 } else { 8 } },
+        R::R12 | R::R12D | R::R12W | R::R12L => IrRegister { class: IrRegisterClass::General, index: 12, bits: if matches!(reg, R::R12) { 64 } else if matches!(reg, R::R12D) { 32 } else if matches!(reg, R::R12W) { 16 } else { 8 } },
+        R::R13 | R::R13D | R::R13W | R::R13L => IrRegister { class: IrRegisterClass::General, index: 13, bits: if matches!(reg, R::R13) { 64 } else if matches!(reg, R::R13D) { 32 } else if matches!(reg, R::R13W) { 16 } else { 8 } },
+        R::R14 | R::R14D | R::R14W | R::R14L => IrRegister { class: IrRegisterClass::General, index: 14, bits: if matches!(reg, R::R14) { 64 } else if matches!(reg, R::R14D) { 32 } else if matches!(reg, R::R14W) { 16 } else { 8 } },
+        R::R15 | R::R15D | R::R15W | R::R15L => IrRegister { class: IrRegisterClass::General, index: 15, bits: if matches!(reg, R::R15) { 64 } else if matches!(reg, R::R15D) { 32 } else if matches!(reg, R::R15W) { 16 } else { 8 } },
+        R::RIP | R::EIP => IrRegister { class: IrRegisterClass::ProgramCounter, index: 32, bits: if matches!(reg, R::RIP) { 64 } else { 32 } },
+        _ => return None,
+    })
+}
+
+fn x86_imm_operand(instr: &iced_x86::Instruction, op: u32) -> Option<u64> {
+    use iced_x86::OpKind;
+    Some(match instr.op_kind(op) {
+        OpKind::Immediate8 => instr.immediate8() as u64,
+        OpKind::Immediate16 => instr.immediate16() as u64,
+        OpKind::Immediate32 => instr.immediate32() as u64,
+        OpKind::Immediate64 => instr.immediate64(),
+        OpKind::Immediate8to16 => instr.immediate8to16() as u16 as u64,
+        OpKind::Immediate8to32 => instr.immediate8to32() as u32 as u64,
+        OpKind::Immediate8to64 => instr.immediate8to64() as u64,
+        OpKind::Immediate32to64 => instr.immediate32to64() as u64,
+        _ => return None,
+    })
+}
+
+fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperation> {
+    use iced_x86::{Mnemonic as M, OpKind};
+    match instr.mnemonic() {
+        M::Push => {
+            // push reg / push imm (common stack frame ops). Model as stack store with pre-decrement writeback.
+            if instr.op_count() != 1 { return None; }
+            let sp = IrRegister { class: IrRegisterClass::StackPointer, index: 4, bits: 64 };
+            let bytes = match instr.op0_kind() {
+                OpKind::Register => {
+                    let r = x86_to_ir_register(instr.op0_register())?;
+                    (r.bits / 8).max(2) as u8
+                }
+                _ if x86_imm_operand(instr, 0).is_some() => 8,
+                _ => return None,
+            };
+            let value = match instr.op0_kind() {
+                OpKind::Register => IrOperand::Register(x86_to_ir_register(instr.op0_register())?),
+                _ => IrOperand::Constant(x86_imm_operand(instr, 0)?),
+            };
+            Some(IrOperation::Store {
+                address: IrMemoryAddress::BaseOffset { base: sp, offset: -(bytes as i64) },
+                value,
+                bytes,
+                writeback: Some(IrWriteback { base: sp, offset: -(bytes as i64), pre_index: true }),
+            })
+        }
+        M::Pop => {
+            if instr.op_count() != 1 || instr.op0_kind() != OpKind::Register { return None; }
+            let sp = IrRegister { class: IrRegisterClass::StackPointer, index: 4, bits: 64 };
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let bytes = (dst.bits / 8).max(2) as u8;
+            Some(IrOperation::Load {
+                destination: dst,
+                address: IrMemoryAddress::BaseOffset { base: sp, offset: 0 },
+                bytes,
+                signed: false,
+                writeback: Some(IrWriteback { base: sp, offset: bytes as i64, pre_index: false }),
+            })
+        }
+        M::Mov => {
+            if instr.op_count() != 2 { return None; }
+            match (instr.op0_kind(), instr.op1_kind()) {
+                (OpKind::Register, OpKind::Register) => {
+                    let dst = x86_to_ir_register(instr.op0_register())?;
+                    let src = x86_to_ir_register(instr.op1_register())?;
+                    if dst.class == IrRegisterClass::StackPointer || src.class == IrRegisterClass::StackPointer {
+                        // Conservative: model SP moves as assignments (semantics limited).
+                    }
+                    Some(IrOperation::Assign { destination: dst, value: IrOperand::Register(src) })
+                }
+                (OpKind::Register, _) if x86_imm_operand(instr, 1).is_some() => {
+                    let dst = x86_to_ir_register(instr.op0_register())?;
+                    Some(IrOperation::Assign { destination: dst, value: IrOperand::Constant(x86_imm_operand(instr, 1)?) })
+                }
+                (OpKind::Register, OpKind::Memory) => {
+                    let dst = x86_to_ir_register(instr.op0_register())?;
+                    let (address, bytes) = x86_memory_address(instr, 1)?;
+                    Some(IrOperation::Load { destination: dst, address, bytes, signed: false, writeback: None })
+                }
+                (OpKind::Memory, OpKind::Register) => {
+                    let src = x86_to_ir_register(instr.op1_register())?;
+                    let (address, bytes) = x86_memory_address(instr, 0)?;
+                    Some(IrOperation::Store { address, value: IrOperand::Register(src), bytes, writeback: None })
+                }
+                (OpKind::Memory, _) if x86_imm_operand(instr, 1).is_some() => {
+                    let (address, bytes) = x86_memory_address(instr, 0)?;
+                    Some(IrOperation::Store { address, value: IrOperand::Constant(x86_imm_operand(instr, 1)?), bytes, writeback: None })
+                }
+                _ => None,
+            }
+        }
+        M::Lea => {
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Memory { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            if instr.memory_index() != iced_x86::Register::None { return None; } // base+disp only for sound simple mapping
+            let base = x86_to_ir_register(instr.memory_base())?;
+            let disp = instr.memory_displacement64() as i64;
+            Some(IrOperation::Binary {
+                destination: dst,
+                operator: IrBinaryOp::Add,
+                left: IrOperand::Register(base),
+                right: IrOperand::Constant(disp as u64),
+            })
+        }
+        M::Add | M::Sub | M::And | M::Or | M::Xor => {
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let op = match instr.mnemonic() { M::Add => IrBinaryOp::Add, M::Sub => IrBinaryOp::Subtract, M::And => IrBinaryOp::And, M::Or => IrBinaryOp::Or, M::Xor => IrBinaryOp::Xor, _ => return None };
+            let (left, right) = match instr.op1_kind() {
+                OpKind::Register => {
+                    let src = x86_to_ir_register(instr.op1_register())?;
+                    // XOR/other reg,reg with same register -> zero idiom for XOR is exact; others conservative assign-like not modeled here.
+                    if instr.mnemonic() == M::Xor && dst.index == src.index && dst.class == src.class {
+                        return Some(IrOperation::Assign { destination: dst, value: IrOperand::Constant(0) });
+                    }
+                    (IrOperand::Register(dst), IrOperand::Register(src))
+                }
+                _ if x86_imm_operand(instr, 1).is_some() => (IrOperand::Register(dst), IrOperand::Constant(x86_imm_operand(instr, 1)?)),
+                _ => return None,
+            };
+            Some(IrOperation::Binary { destination: dst, operator: op, left, right })
+        }
+        M::Cmp | M::Test => {
+            // Comparisons set flags; without x86 flag SSA/flow modeling, keep conservative.
+            None
+        }
+        _ => None,
+    }
+}
+
+fn x86_memory_address(instr: &iced_x86::Instruction, op: u32) -> Option<(IrMemoryAddress, u8)> {
+    use iced_x86::OpKind;
+    if instr.op_kind(op) != OpKind::Memory { return None; }
+    let base_reg = instr.memory_base();
+    let index_reg = instr.memory_index();
+    let disp = instr.memory_displacement64() as i64;
+    // Determine access size conservatively from the other operand when possible.
+    let size = if instr.op_count() == 2 {
+        let other = if op == 0 { 1 } else { 0 };
+        match instr.op_kind(other) {
+            OpKind::Register => x86_to_ir_register(instr.op_register(other)).map(|r| (r.bits / 8) as u8).unwrap_or(0),
+            OpKind::Immediate8 | OpKind::Immediate8to16 | OpKind::Immediate8to32 | OpKind::Immediate8to64 => 1,
+            OpKind::Immediate16 => 2,
+            OpKind::Immediate32 | OpKind::Immediate32to64 => 4,
+            OpKind::Immediate64 => 8,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    if size == 0 { return None; }
+    if index_reg == iced_x86::Register::None {
+        if base_reg == iced_x86::Register::RIP || base_reg == iced_x86::Register::EIP {
+            let target = instr.memory_displacement64();
+            return Some((IrMemoryAddress::PcRelative { offset: 0, target }, size));
+        }
+        let base = x86_to_ir_register(base_reg)?;
+        Some((IrMemoryAddress::BaseOffset { base, offset: disp }, size))
+    } else if base_reg != iced_x86::Register::None {
+        let base = x86_to_ir_register(base_reg)?;
+        let index = x86_to_ir_register(index_reg)?;
+        let scale = instr.memory_index_scale() as u8;
+        Some((IrMemoryAddress::BaseIndex { base, index, extension: None, scale }, size))
+    } else {
+        // disp + index*scale (no base) - not representable in current IrMemoryAddress forms conservatively.
+        None
+    }
 }
 
 fn is_x86_conditional_branch_mnemonic(m: iced_x86::Mnemonic) -> bool {
