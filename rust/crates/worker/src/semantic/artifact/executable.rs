@@ -311,21 +311,49 @@ fn stmt(t: &Tree) -> Result<String, String> {
         _ => return Err(format!("unqualified statement {}", t.kind)),
     })
 }
+fn pc_of(i: usize, pcs: &[u64], start: u64) -> u64 {
+    pcs.get(i).copied().unwrap_or(start + i as u64 * 4)
+}
+fn index_of(pc: u64, pcs: &[u64], start: u64, count: usize) -> Option<usize> {
+    if pcs.is_empty() {
+        let delta = pc.checked_sub(start)?;
+        if delta % 4 != 0 { return None; }
+        let i = usize::try_from(delta / 4).ok()?;
+        (i < count).then_some(i)
+    } else {
+        pcs.binary_search(&pc).ok()
+    }
+}
+fn next_of(i: usize, pcs: &[u64], start: u64, end: u64) -> u64 {
+    if pcs.is_empty() {
+        start + (i as u64 + 1) * 4
+    } else {
+        pcs.get(i + 1).copied().unwrap_or(end)
+    }
+}
+fn end_of(pcs: &[u64], start: u64, count: usize) -> u64 {
+    if pcs.is_empty() { start + count as u64 * 4 } else { pcs.last().copied().map(|p| p + 4).unwrap_or(start) }
+}
+
 pub(super) struct Program {
     start: u64,
+    end: u64,
     body: Vec<Tree>,
+    pcs: Vec<u64>,
 }
 
 /// Repair-oriented C retains independently supported instructions, but stops
 /// before every unsupported effect and on leaving the captured prefix. It is
 /// deliberately separate from Program::new and cannot certify strict coverage.
-pub(super) fn review_source(start:u64,body:&[Tree],blocked:&std::collections::BTreeSet<u64>,truncated:bool)->String{
+pub(super) fn review_source(start:u64,body:&[Tree],blocked:&std::collections::BTreeSet<u64>,truncated:bool,pcs:&[u64])->String{
     let mut source=format!("/* BEST-EFFORT MACHINE-STATE C RECONSTRUCTION.\n * Not an original prototype or a complete implementation.\n * Status 4 stops BEFORE unresolved effects or outside captured code.\n * Captured instruction tree truncated: {truncated}.\n * Flat 4096-byte private memory model; no host memory or external calls.\n */\n{}\n{}",include_str!("bitvector_runtime.h"),include_str!("machine_runtime.h"));
     writeln!(source,"\nstatic int hs_review_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;(void)hs_add_carry;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(start)).unwrap();
+    let end=end_of(pcs,start,body.len());
     for (index,tree) in body.iter().enumerate(){
-        let pc=start+index as u64*4;
+        let pc=pc_of(index,pcs,start);
+        let next=next_of(index,pcs,start,end);
         let statement=if blocked.contains(&pc){"return 4;".to_owned()}else{stmt(tree).unwrap_or_else(|_|"return 4;".to_owned())};
-        writeln!(source,"case {}:{{/* loc_{pc:x}: instruction */s->steps++;{statement}s->pc={};break;}}",literal(pc),literal(pc+4)).unwrap();
+        writeln!(source,"case {}:{{/* loc_{pc:x}: instruction */s->steps++;{statement}s->pc={};break;}}",literal(pc),literal(next)).unwrap();
     }
     source.push_str("default:return 4;}}}\n");
     writeln!(source,"typedef struct hs_review_context {{ hs_state state; uint64_t limit; int status; }} hs_review_context;\nvoid hs_review_{start:x}(hs_review_context *context){{if(context)context->status=hs_review_run(&context->state,context->limit);}}").unwrap();
@@ -333,47 +361,56 @@ pub(super) fn review_source(start:u64,body:&[Tree],blocked:&std::collections::BT
 }
 impl Program {
     pub(super) fn new(start: u64, body: Vec<Tree>) -> Result<Self, String> {
+        Self::new_with_pcs(start, body, Vec::new())
+    }
+    pub(super) fn new_with_pcs(start: u64, body: Vec<Tree>, pcs: Vec<u64>) -> Result<Self, String> {
         if body.is_empty() || body.len() > 128 {
             return Err("incomplete or over-budget function".into());
+        }
+        if !pcs.is_empty() && pcs.len() != body.len() {
+            return Err("instruction pc map length mismatch".into());
         }
         for t in &body {
             stmt(t)?;
         }
-        let end = start + body.len() as u64 * 4;
+        let end = end_of(&pcs, start, body.len());
         let mut pending = vec![start];
         let mut visited = std::collections::BTreeSet::new();
         while let Some(pc) = pending.pop() {
             if !visited.insert(pc) {
                 continue;
             }
-            if pc < start || pc >= end || (pc - start) % 4 != 0 {
+            let Some(i) = index_of(pc, &pcs, start, body.len()) else {
                 return Err("unresolved function exit".into());
-            }
-            let t = &body[((pc - start) / 4) as usize];
+            };
+            if pc < start || pc >= end { return Err("unresolved function exit".into()); }
+            let t = &body[i];
+            let next = next_of(i, &pcs, start, end);
             match t.kind {
                 "machine-return" => {}
                 "goto" => pending.push(num(t, "target")),
                 "conditional-goto" => {
                     pending.push(num(t, "target"));
-                    pending.push(pc + 4)
+                    pending.push(next)
                 }
-                _ => pending.push(pc + 4),
+                _ => pending.push(next),
             }
         }
-        Ok(Self { start, body })
+        Ok(Self { start, end, body, pcs })
     }
     pub(super) fn source(&self) -> String {
         let mut s = include_str!("bitvector_runtime.h").to_string();
         s.push_str(include_str!("machine_runtime.h"));
         writeln!(s,"\nint hs_run(hs_state *s,uint64_t limit){{(void)hs_mask;(void)hs_extend;(void)hs_shift;(void)hs_div;(void)hs_condition;(void)hs_compare;(void)hs_range;(void)hs_load;(void)hs_store;(void)hs_flags_arith;(void)hs_add_carry;s->pc={};s->steps=0;s->fault=0;for(;;){{if(s->steps==limit)return 2;switch(s->pc){{",literal(self.start)).unwrap();
         for (i, t) in self.body.iter().enumerate() {
-            let pc = self.start + i as u64 * 4;
+            let pc = pc_of(i, &self.pcs, self.start);
+            let next = next_of(i, &self.pcs, self.start, self.end);
             writeln!(
                 s,
                 "case {}:{{/* instruction {pc:#x} */s->steps++;{}s->pc={};break;}}",
                 literal(pc),
                 stmt(t).unwrap(),
-                literal(pc + 4)
+                literal(next)
             )
             .unwrap();
         }
@@ -394,15 +431,12 @@ impl Program {
             if s.steps == limit {
                 break 2;
             }
-            let t =
-                s.pc.checked_sub(self.start)
-                    .filter(|o| o % 4 == 0)
-                    .and_then(|o| usize::try_from(o / 4).ok())
-                    .and_then(|i| self.body.get(i));
-            let Some(t) = t else { break 1 };
+            let Some(i) = index_of(s.pc, &self.pcs, self.start, self.body.len()) else { break 1 };
+            let Some(t) = self.body.get(i) else { break 1 };
+            let next = next_of(i, &self.pcs, self.start, self.end);
             s.steps += 1;
             match s.statement(t) {
-                Ok(Control::Next) => s.pc = s.pc.wrapping_add(4),
+                Ok(Control::Next) => s.pc = next,
                 Ok(Control::Branch(pc)) => s.pc = pc,
                 Ok(Control::Return(pc)) => {
                     s.pc = pc;

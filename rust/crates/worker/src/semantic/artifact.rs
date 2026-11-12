@@ -1150,6 +1150,19 @@ impl Tree {
     }
 }
 
+
+fn apc_at(index: usize, insn_pcs: &[u64], start: u64) -> u64 {
+    insn_pcs.get(index).copied().unwrap_or(start + index as u64 * 4)
+}
+fn aindex_of(pc: u64, insn_pcs: &[u64], start: u64, count: usize) -> Option<usize> {
+    if insn_pcs.is_empty() {
+        let delta = pc.checked_sub(start)?;
+        if delta % 4 != 0 { return None; }
+        let i = (delta / 4) as usize;
+        (i < count).then_some(i)
+    } else { insn_pcs.binary_search(&pc).ok() }
+}
+
 pub fn build(input: Input<'_>) -> io::Result<String> {
     build_mode(input, None)
 }
@@ -1208,11 +1221,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             "Function bytes unavailable",
         ));
     }
+    let insn_pcs: Vec<u64> = (0..(body.len() / 4)).map(|i| start + i as u64 * 4).collect();
     let instructions = (end - start) / 4;
     let exhausted = instructions > 128;
     let truncated = high < end;
     let direct_targets = body.chunks_exact(4).enumerate().filter_map(|(index, bytes)| {
-        let pc = start + index as u64 * 4;
+        let pc = apc_at(index, &insn_pcs, start);
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         match lift_operation(decode(word, pc), pc) {
             IrOperation::DirectCall { target } => Some(target),
@@ -1594,7 +1608,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
 
     let mut rendering=String::from("/* Review-only machine-state AST; declarations, runtime contracts and source result ABI unresolved. */\n");
     for (index, bytes) in body.chunks_exact(4).enumerate() {
-        let pc = start + index as u64 * 4;
+        let pc = apc_at(index, &insn_pcs, start);
         let word = u32::from_le_bytes(bytes.try_into().unwrap());
         let position = file_offset + (pc - base);
         let data = data_ranges
@@ -1623,7 +1637,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 let imm12 = ((word >> 10) & 0xfff) as u64;
                 let off = imm12 * 8;
                 if index > 0 {
-                    let prev_pc = pc - 4;
+                    let prev_pc = if index > 0 { apc_at(index - 1, &insn_pcs, start) } else { pc };
                     if let Some((pr, info, _)) = resolved_got_load_reg.get(&prev_pc).cloned() {
                         if pr == rn {
                             if let Some(page_hex) = info.strip_prefix("PAGE:") {
@@ -2076,8 +2090,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let mut successors = Vec::new();
             match instruction.portable {
                 IrOperation::Branch { target } | IrOperation::ConditionalBranch { target, .. } => {
-                    if target >= start && target < high && (target - start) % 4 == 0 {
-                        successors.push(((target - start) / 4) as usize);
+                    if let Some(ti) = aindex_of(target, &insn_pcs, start, lifted.len()).filter(|&ti| apc_at(ti, &insn_pcs, start) < high) {
+                        successors.push(ti);
                     }
                     if matches!(instruction.portable, IrOperation::ConditionalBranch { .. })
                         && index + 1 < lifted.len()
@@ -2089,8 +2103,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 IrOperation::IndirectBranch { .. } => {
                     if let Some(targets) = resolved_indirect_targets.get(&instruction.address) {
                         for &target in targets {
-                            if target >= start && target < high && (target - start) % 4 == 0 {
-                                successors.push(((target - start) / 4) as usize);
+                            if let Some(ti) = aindex_of(target, &insn_pcs, start, lifted.len()).filter(|&ti| apc_at(ti, &insn_pcs, start) < high) {
+                                successors.push(ti);
                             }
                         }
                     }
@@ -2194,7 +2208,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ssa_payload(value),
                 ranges(pc, pc + 4),
             )?;
-            builder.edge(&ir_ids[((pc - start) / 4) as usize], &id, "defines")?;
+            builder.edge(&ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "defines")?;
             definitions.insert(value.name(), id);
         }
     }
@@ -2236,7 +2250,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             };
             let id = builder.record("use", "derived", ssa_payload(value), ranges(pc, pc + 4))?;
             builder.edge(&definition, &id, "flows-to")?;
-            builder.edge(&id, &ir_ids[((pc - start) / 4) as usize], "uses")?;
+            builder.edge(&id, &ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses")?;
         }
     }
     for phis in &ssa.phis {
@@ -2294,7 +2308,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("version", u64::from(written).into()),
                 ("origin", "instruction".into()),
             ]), ranges(version.pc, version.pc + 4))?;
-            builder.edge(&ir_ids[((version.pc - start) / 4) as usize], &id, "defines-memory")?;
+            builder.edge(&ir_ids[aindex_of(version.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "defines-memory")?;
             memory_evidence_by_pc.entry(version.pc).or_default().push(id.clone());
             memory_definitions.insert((version.partition, written), id);
         }
@@ -2318,7 +2332,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("exclusive", version.exclusive.into()),
         ]), ranges(version.pc, version.pc + 4))?;
         builder.edge(definition, &id, "flows-to")?;
-        builder.edge(&id, &ir_ids[((version.pc - start) / 4) as usize], "uses-memory")?;
+        builder.edge(&id, &ir_ids[aindex_of(version.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses-memory")?;
         memory_evidence_by_pc.entry(version.pc).or_default().push(id);
     }
     // Preserve instruction-level memory accesses as graph nodes so system
@@ -2339,7 +2353,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("ordered", versions.iter().any(|version| version.ordered).into()),
             ("exclusive", versions.iter().any(|version| version.exclusive).into()),
         ]), ranges(*pc, *pc + 4))?;
-        builder.edge(&ir_ids[((pc - start) / 4) as usize], &id, "accesses-memory")?;
+        builder.edge(&ir_ids[aindex_of(*pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "accesses-memory")?;
         access_ids.insert(*pc, id);
     }
     for event in &ssa.system_events {
@@ -2356,7 +2370,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("domain", event.domain.map(V::from).unwrap_or(V::Null)),
             ("memory_values_changed", false.into()),
         ]), ranges(event.pc, event.pc + 4))?;
-        builder.edge(&ir_ids[((event.pc - start) / 4) as usize], &id, relation)?;
+        builder.edge(&ir_ids[aindex_of(event.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, relation)?;
         if let Some(block_index) = function.cfg.blocks.iter().position(|block| block.instructions.contains(&event.pc)) {
             let nearest = |before: bool| -> Option<u64> {
                 let mut current = block_index;
@@ -2461,12 +2475,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     builder.edge(definition, &use_id, "flows-to")?;
                 }
             }
-            builder.edge(&use_id, &ir_ids[((pc - start) / 4) as usize], "uses")?;
+            builder.edge(&use_id, &ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses")?;
         }
         for (bit, value) in &site.defs {
             for segment in &value.segments {
                 if let Some(definition) = file_definitions.get(&(FileLocation::Flag(*bit), segment.origin)) {
-                    builder.edge(&ir_ids[((pc - start) / 4) as usize], definition, "defines")?;
+                    builder.edge(&ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], definition, "defines")?;
                 }
             }
         }
@@ -2486,7 +2500,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     builder.edge(definition, &use_id, "flows-to")?;
                 }
             }
-            builder.edge(&use_id, &ir_ids[((pc - start) / 4) as usize], "uses")?;
+            builder.edge(&use_id, &ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses")?;
         }
         for (register, value) in &site.defs {
             let location = FileLocation::Vector(*register);
@@ -2494,7 +2508,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 if let Some(definition) = file_definitions.get(&(location, segment.origin)) {
                     if matches!(segment.origin, SsaOrigin::Instruction(origin_pc) if origin_pc == pc)
                         || matches!(segment.origin, SsaOrigin::Barrier(origin_pc) if origin_pc == pc) {
-                        builder.edge(&ir_ids[((pc - start) / 4) as usize], definition, "defines")?;
+                        builder.edge(&ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], definition, "defines")?;
                     }
                 }
             }
@@ -2606,7 +2620,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // strict source/ABI proofs fail. This is code for analyst repair, never a
     // substitute proof of compilability or an invented original prototype.
     if !has_recovered_source {
-        let text=executable::review_source(start,&trees,&review_blocked_pcs,truncated);
+        let text=executable::review_source(start,&trees,&review_blocked_pcs,truncated,&[]);
         {
             let review = builder.record("metadata", "derived", object([
                 ("artifact_kind", "best-effort-source".into()), ("source", text.into()),

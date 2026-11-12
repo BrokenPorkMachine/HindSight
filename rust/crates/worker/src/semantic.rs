@@ -7750,7 +7750,13 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
     let blocks = &function.cfg.blocks;
     let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new(), origin_records: Vec::new(), live_ranges: Vec::new(), memory_versions: Vec::new(), memory_phis: Vec::new(), system_events: Vec::new(), call_clobbers: Vec::new() };
     if blocks.is_empty() { return result; }
-    let instruction_at = |pc: u64| &function.instructions[((pc - function.start) / 4) as usize];
+    let instruction_at = |pc: u64| {
+        let idx = if function.instructions.is_empty() { 0 } else {
+            let delta = pc.saturating_sub(function.start);
+            if delta % 4 == 0 { (delta / 4) as usize } else { function.instructions.iter().position(|i| i.address == pc).unwrap_or(0) }
+        };
+        &function.instructions[idx.min(function.instructions.len().saturating_sub(1))]
+    };
     let mut definitions = vec![0u32; blocks.len()];
     let mut uses = vec![0u32; blocks.len()];
     for (index, block) in blocks.iter().enumerate().filter(|(_, block)| block.reachable) {
@@ -8899,7 +8905,9 @@ pub fn render_with_resolved_indirects(
             let bpcs = &blocks[bi].instructions;
             let mut flow = flow0;
             for &p in bpcs {
-                let instruction = &function_ir.instructions[((p - function_ir.start) / 4) as usize];
+                let instruction = &function_ir.instructions[{
+                    let d=p.saturating_sub(function_ir.start); if d%4==0 {(d/4) as usize} else {function_ir.instructions.iter().position(|i| i.address==p).unwrap_or(0)}
+                }.min(function_ir.instructions.len().saturating_sub(1))];
                 if instruction.data {
                     flow.clear();
                 } else {
@@ -8972,7 +8980,9 @@ pub fn render_with_resolved_indirects(
             }
             let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
             for &p in &block.instructions {
-                let instruction = &function_ir.instructions[((p - function_ir.start) / 4) as usize];
+                let instruction = &function_ir.instructions[{
+                    let d=p.saturating_sub(function_ir.start); if d%4==0 {(d/4) as usize} else {function_ir.instructions.iter().position(|i| i.address==p).unwrap_or(0)}
+                }.min(function_ir.instructions.len().saturating_sub(1))];
                 let statement = if instruction.data {
                     flow.clear();
                     "/* data-in-code barrier */".into()
