@@ -8552,13 +8552,25 @@ pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u
     // Variable-length streams can provide `insn_pcs`/`insn_sizes`, but decode remains ARM64 4-byte until x86-64 lifting is implemented.
     let fixed_width = insn_pcs.is_empty();
     if start<base || end<=start || (fixed_width && ((start-base)%4!=0 || (end-start)%4!=0)) || (fixed_width && (end-start)/4>MAX_WORDS_PER_FUNCTION as u64) { return result; }
-    if !fixed_width && insn_pcs.len() > MAX_WORDS_PER_FUNCTION { return result; }
     let Some(body_end)=end.checked_sub(base).and_then(|d| usize::try_from(d).ok()).map(|e| e.min(code.len())) else { return result; };
     let Some(body_start)=start.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return result; };
     if body_start >= body_end || body_end > code.len() { return result; }
-    let body=&code[body_start..body_end];
-    let pcs: Vec<u64> = if fixed_width { (0..(body.len()/4)).map(|i| start + i as u64 * 4).collect() } else { insn_pcs.to_vec() };
-    let sizes: Vec<u32> = if !insn_sizes.is_empty() && insn_sizes.len() == pcs.len() { insn_sizes.to_vec() } else { vec![4; pcs.len()] };
+    let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
+        let count = (body_end - body_start) / 4;
+        let pcs = (0..count).map(|i| start + i as u64 * 4).collect::<Vec<_>>();
+        (pcs, vec![4; count])
+    } else {
+        let mut pcs = Vec::new();
+        let mut sizes = Vec::new();
+        for (index, &pc) in insn_pcs.iter().enumerate() {
+            if pc < start || pc >= end { continue; }
+            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(index).unwrap_or(&4) } else { 4 };
+            pcs.push(pc);
+            sizes.push(sz);
+        }
+        (pcs, sizes)
+    };
+    if pcs.is_empty() || pcs.len() > MAX_WORDS_PER_FUNCTION { return result; }
     let idx_of = |target:u64| -> Option<usize> {
         if fixed_width {
             let d = target.checked_sub(start)?;
@@ -8572,11 +8584,12 @@ pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u
     let operations=pcs.iter().enumerate().map(|(index,&pc)|{
         let position=file_offset.saturating_add(pc-base);
         let sz = *sizes.get(index).unwrap_or(&4) as u64;
-        let pc_end = if fixed_width { pcs.get(index + 1).copied().unwrap_or(pc + 4) } else { pc.saturating_add(sz) };
+        let pc_end = pc.saturating_add(sz);
         let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
         let Some(off)=pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return IrOperation::TargetSpecific; };
         // ARM64 4-byte decode only for now; variable-length decode remains conservative.
-        if *sizes.get(index).unwrap_or(&4) != 4 || off+4>code.len() { return IrOperation::TargetSpecific; }
+        let isz = *sizes.get(index).unwrap_or(&4) as usize;
+        if isz != 4 || off.saturating_add(isz)>code.len() { return IrOperation::TargetSpecific; }
         let word=u32::from_le_bytes(code[off..off+4].try_into().unwrap());
         if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){IrOperation::TargetSpecific}
         else{lift_operation(decode(word,pc),pc)}
