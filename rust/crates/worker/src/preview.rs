@@ -2371,7 +2371,20 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  call_values.push_str("\n\n");
  let mut signature_budget=60_000usize.saturating_sub(call_values.len()+1024);
  for ch in signature_report.chars(){if ch.len_utf8()>signature_budget{break}call_values.push(ch);signature_budget-=ch.len_utf8();}
- let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets),&reconstructed_pseudocode);
+ let (sem_pcs, sem_sizes) = if starts.len() == 1 {
+  let s = starts[0];
+  let e = scan_end.min(map.address + code.len() as u64);
+  let mut pcs_v = Vec::new();
+  let mut sz_v = Vec::new();
+  let mut pc = s;
+  while pc.saturating_add(4) <= e && pcs_v.len() < 128 {
+   pcs_v.push(pc);
+   sz_v.push(4u32);
+   pc = pc.saturating_add(4);
+  }
+  (pcs_v, sz_v)
+ } else { (Vec::new(), Vec::new()) };
+ let semantic_preview=compose_semantic_preview(&super::semantic::render_with_resolved_indirects_and_pcs(&code,map.address,map.offset,&starts,&data_ranges,&semantic_resolved_indirect_targets,&sem_pcs,&sem_sizes),&reconstructed_pseudocode);
  let semantic_evidence=semantic_preview.lines().filter(|line|line.trim_start().starts_with("0x")).collect::<Vec<_>>().join("\n");
  let mut evidence_count=0usize;let evidence_cap=20_000usize;let mut evidence_truncated=false;
  for (source,workspace,kind,text,priority) in [
