@@ -8595,8 +8595,10 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     let Some(body_start)=start.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return result; };
     if body_start >= body_end || body_end > code.len() { return result; }
     let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
-        let Some(pcs) = arm64_fixed_width_pcs_in_range(start, start.saturating_add((body_end - body_start) as u64), base, MAX_WORDS_PER_FUNCTION) else { return result; };
-        if pcs.is_empty() { return result; }
+        let count = (body_end - body_start) / 4;
+        if count > MAX_WORDS_PER_FUNCTION { return result; }
+        let Some(pcs) = arm64_fixed_width_pcs_in_range(start, start.saturating_add((body_end - body_start) as u64), base, count) else { return result; };
+        if pcs.is_empty() || pcs.len() != count { return result; }
         let sizes = vec![4; pcs.len()];
         (pcs, sizes)
     } else {

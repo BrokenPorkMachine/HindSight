@@ -21,7 +21,17 @@ fn main(){
   println!("cargo:rerun-if-changed={}",root.join(format!("{source}.c")).display());
   println!("cargo:rerun-if-changed={}",root.join(format!("{source}.h")).display());
  }
- run(Command::new(env::var("AR").unwrap_or_else(|_|"ar".into())).arg("crs").arg(out.join("libre_macho.a")).arg(out.join("inspect.o")).arg(out.join("capture.o")).arg(out.join("decode.o")).arg(out.join("llvm_decode.o")));
+ let archive=out.join("libre_macho.a");
+ if apple{
+  let libtool=env::var("LIBTOOL").unwrap_or_else(|_|"/usr/bin/libtool".into());
+  let mut cmd=Command::new(libtool);
+  cmd.arg("-static").arg("-o").arg(&archive)
+     .arg(out.join("inspect.o")).arg(out.join("capture.o"))
+     .arg(out.join("decode.o")).arg(out.join("llvm_decode.o"));
+  run(&mut cmd);
+ }else{
+  run(Command::new(env::var("AR").unwrap_or_else(|_|"ar".into())).arg("crs").arg(&archive).arg(out.join("inspect.o")).arg(out.join("capture.o")).arg(out.join("decode.o")).arg(out.join("llvm_decode.o")));
+ }
  println!("cargo:rustc-link-search=native={}",out.display());println!("cargo:rustc-link-lib=static=re_macho");
  if !apple{println!("cargo:rustc-link-lib=crypto");println!("cargo:rustc-link-lib=dl");}
  // Link Objective-C runtime for in-worker dyld/dlfcn Objective-C extraction.
@@ -29,6 +39,6 @@ fn main(){
    println!("cargo:rustc-link-lib=framework=Foundation");
    println!("cargo:rustc-link-lib=dylib=objc");
  }
- println!("cargo:rerun-if-env-changed=CC");println!("cargo:rerun-if-env-changed=AR");
+ println!("cargo:rerun-if-env-changed=CC");println!("cargo:rerun-if-env-changed=AR");println!("cargo:rerun-if-env-changed=LIBTOOL");
  println!("cargo:rerun-if-env-changed=SDKROOT");println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
 }
