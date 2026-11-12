@@ -8356,15 +8356,25 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
         M::Lea => {
             if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Memory { return None; }
             let dst = x86_to_ir_register(instr.op0_register())?;
-            if instr.memory_index() != iced_x86::Register::None { return None; } // base+disp only for sound simple mapping
-            let base = x86_to_ir_register(instr.memory_base())?;
+            let base_reg = instr.memory_base();
+            let index_reg = instr.memory_index();
             let disp = instr.memory_displacement64() as i64;
-            Some(IrOperation::Binary {
-                destination: dst,
-                operator: IrBinaryOp::Add,
-                left: IrOperand::Register(base),
-                right: IrOperand::Constant(disp as u64),
-            })
+            // RIP-relative/absolute effective address: exact constant target when representable.
+            if (base_reg == iced_x86::Register::RIP || base_reg == iced_x86::Register::EIP) && index_reg == iced_x86::Register::None {
+                return Some(IrOperation::Address { destination: dst, value: instr.memory_displacement64(), page: false });
+            }
+            // base + disp (no index/scale): represent as add when base register is representable.
+            if index_reg == iced_x86::Register::None && base_reg != iced_x86::Register::None {
+                let base = x86_to_ir_register(base_reg)?;
+                return Some(IrOperation::Binary {
+                    destination: dst,
+                    operator: IrBinaryOp::Add,
+                    left: IrOperand::Register(base),
+                    right: IrOperand::Constant(disp as u64),
+                });
+            }
+            // base + index*scale + disp and other complex forms are not yet modeled soundly in shared IR.
+            None
         }
         M::Movzx => {
             if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Register { return None; }
