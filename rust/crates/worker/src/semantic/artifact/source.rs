@@ -1823,12 +1823,13 @@ fn natural_loop_backedge(
     dag: &mut Dag,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
     insn_pcs: &[u64],
+    architecture: &str,
 ) -> Result<Option<(SourceLoop, usize)>, String> {
     let Some(tail_tree) = trees.get(tail).filter(|tree| tree.kind == "conditional-goto") else {
         return Ok(None);
     };
     let target_index = |target: u64| -> Option<usize> {
-        index_of_pc(target, insn_pcs, start, trees.len())
+        index_of_pc_with_arch(target, insn_pcs, start, trees.len(), architecture)
     };
     if target_index(number(tail_tree, "target")) != Some(header) {
         return Ok(None);
@@ -1920,7 +1921,7 @@ fn natural_loop_backedge(
 
     let mut state = header_entry.clone();
     let compare_value_id = if let Some(reg) = compare_register {
-        Some(dag.value(state.registers[reg].clone(), 64, pc_at(header, insn_pcs, start))?)
+        Some(dag.value(state.registers[reg].clone(), 64, pc_at_with_arch(header, insn_pcs, start, architecture))?)
     } else {
         None
     };
@@ -1932,7 +1933,7 @@ fn natural_loop_backedge(
         let role = if register == test_register { "induction" } else { "accumulator" };
         let id = dag.nodes.len();
         let name = format!("hs_{role}_{id}");
-        let value = dag.add_role("source-loop-variable", role, name, vec![], pc_at(header, insn_pcs, start))?;
+        let value = dag.add_role("source-loop-variable", role, name, vec![], pc_at_with_arch(header, insn_pcs, start, architecture))?;
         dag.nodes[value].boolean_value = dag.nodes[initial].boolean_value
             && dag.type_of(initial).is_some_and(|ty| matches!(ty.spelling.as_str(), "bool" | "_Bool"));
         dag.type_node(value, dag.type_of(initial).cloned());
@@ -1951,7 +1952,7 @@ fn natural_loop_backedge(
         vec![test_value]
     };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template, condition_children, pc_at(tail, insn_pcs, start)
+        "source-loop-condition", "condition", condition_template, condition_children, pc_at_with_arch(tail, insn_pcs, start, architecture)
     )?;
     dag.type_node(condition, None);
 
@@ -1960,7 +1961,7 @@ fn natural_loop_backedge(
     let mut stores = Vec::new();
     let mut type_conflicts = BTreeSet::new();
     for (index, tree) in trees.iter().enumerate().take(tail).skip(header) {
-        let pc = pc_at(index, insn_pcs, start);
+        let pc = pc_at_with_arch(index, insn_pcs, start, architecture);
         if tree.kind == "no-op" {
             statement(tree, &mut state, dag, pc, call_prototypes)?;
             continue;
@@ -2081,7 +2082,7 @@ fn natural_loop_backedge(
     // condition expression is evaluated from loop-carried variables.
     let _ = &tail_state; // tail_state is caller-provided current state; loop exit continues from post-loop state
     *tail_state = state;
-    let pcs = (header..=tail).map(|index| pc_at(index, insn_pcs, start)).collect();
+    let pcs = (header..=tail).map(|index| pc_at_with_arch(index, insn_pcs, start, architecture)).collect();
     Ok(Some((SourceLoop { condition, variables, assignments, loads, stores, pcs }, exit)))
 }
 /// Recognize a natural loop with one zero-test preheader, one complementary
@@ -2097,12 +2098,13 @@ fn natural_loop(
     dag: &mut Dag,
     call_prototypes: &BTreeMap<u64, SourceSignature>,
     insn_pcs: &[u64],
+    architecture: &str,
 ) -> Result<Option<(SourceLoop, usize)>, String> {
     let Some(preheader_tree) = trees.get(preheader).filter(|tree| tree.kind == "conditional-goto") else {
         return Ok(None);
     };
     let target_index = |target: u64| -> Option<usize> {
-        index_of_pc(target, insn_pcs, start, trees.len())
+        index_of_pc_with_arch(target, insn_pcs, start, trees.len(), architecture)
     };
     let Some(exit) = target_index(number(preheader_tree, "target")) else { return Ok(None) };
 
@@ -2350,7 +2352,7 @@ fn natural_loop(
         LoopCompareOperand::Constant(_) => None,
     };
     let compare_value_id = if let Some(reg) = compare_register {
-        Some(dag.value(state.registers[reg].clone(), 64, pc_at(header, insn_pcs, start))?)
+        Some(dag.value(state.registers[reg].clone(), 64, pc_at_with_arch(header, insn_pcs, start, architecture))?)
     } else {
         None
     };
@@ -2363,7 +2365,7 @@ fn natural_loop(
         let role = if register == test_register { "induction" } else { "accumulator" };
         let id = dag.nodes.len();
         let name = format!("hs_{role}_{id}");
-        let value = dag.add_role("source-loop-variable", role, name, vec![], pc_at(header, insn_pcs, start))?;
+        let value = dag.add_role("source-loop-variable", role, name, vec![], pc_at_with_arch(header, insn_pcs, start, architecture))?;
         // Inductive {0,1} invariant: seed from the preheader/header, then require
         // every write in the modeled body to preserve the same domain.
         // Never copy a constant fact into a loop-carried variable.
@@ -2385,7 +2387,7 @@ fn natural_loop(
         vec![test_value]
     };
     let condition = dag.add_role(
-        "source-loop-condition", "condition", condition_template, condition_children, pc_at(header, insn_pcs, start)
+        "source-loop-condition", "condition", condition_template, condition_children, pc_at_with_arch(header, insn_pcs, start, architecture)
     )?;
     dag.type_node(condition, None);
 
@@ -2394,7 +2396,7 @@ fn natural_loop(
     let mut stores = Vec::new();
     let mut type_conflicts = BTreeSet::new();
     for (index, tree) in trees.iter().enumerate().take(tail).skip(body_start) {
-        let pc = pc_at(index, insn_pcs, start);
+        let pc = pc_at_with_arch(index, insn_pcs, start, architecture);
         if tree.kind == "no-op" {
             statement(tree, state, dag, pc, call_prototypes)?;
             continue;
@@ -2506,7 +2508,7 @@ fn natural_loop(
         return Err("loop-carried value type changes or becomes unresolved".into());
     }
     let loop_start = if test_at_header { header } else { preheader };
-    let pcs = (loop_start..=tail).map(|index| pc_at(index, insn_pcs, start)).collect();
+    let pcs = (loop_start..=tail).map(|index| pc_at_with_arch(index, insn_pcs, start, architecture)).collect();
     Ok(Some((SourceLoop { condition, variables, assignments, loads, stores, pcs }, exit)))
 }
 fn statement(t: &Tree, state: &mut State, dag: &mut Dag, pc: u64, call_prototypes: &BTreeMap<u64, SourceSignature>) -> Result<(), String> {
@@ -3187,7 +3189,7 @@ pub(super) fn recover_with_types_and_arch(
                 return Err("source path budget exhausted".into());
             }
             if seen.contains_key(&index) {
-                let pc = pc_at(index, insn_pcs, start);
+                let pc = pc_at_with_arch(index, insn_pcs, start, architecture);
                 let saved = seen[&index].clone();
                 // Bounded phi recovery: merge current path with saved state only
                 // when unhandled state components are identical and differing
@@ -3315,7 +3317,7 @@ pub(super) fn recover_with_types_and_arch(
             }
             seen.insert(index, state.clone());
             let t = trees.get(index).ok_or("unresolved source exit")?;
-            let pc = pc_at(index, insn_pcs, start);
+            let pc = pc_at_with_arch(index, insn_pcs, start, architecture);
             match t.kind {
                 "machine-return" => {
                     if !source_loops.is_empty()
@@ -3452,7 +3454,7 @@ pub(super) fn recover_with_types_and_arch(
                 "goto" | "conditional-goto" => {
                     if t.kind == "conditional-goto" {
                         if let Some((source_loop, exit)) = natural_loop(
-                            start, index, trees, &mut state, &mut dag, call_prototypes, insn_pcs
+                            start, index, trees, &mut state, &mut dag, call_prototypes, insn_pcs, architecture
                         )? {
                             for body_index in index + 1..exit { seen.insert(body_index, state.clone()); }
                             source_loops.push(source_loop);
@@ -3461,7 +3463,7 @@ pub(super) fn recover_with_types_and_arch(
                         }
                     }
                     let target = number(t, "target");
-                    let outside = index_of_pc(target, insn_pcs, start, trees.len()).is_none();
+                    let outside = index_of_pc_with_arch(target, insn_pcs, start, trees.len(), architecture).is_none();
                     if outside {
                         let helper = call_prototypes.get(&target).map(|p| p.name.as_str());
                         let is_noreturn_void = helper.is_some_and(|n| {
@@ -3577,7 +3579,7 @@ pub(super) fn recover_with_types_and_arch(
                         }
                         return Err("source branch outside function".into());
                     }
-                    let target_index = index_of_pc(target, insn_pcs, start, trees.len()).expect("in-function target index checked above");
+                    let target_index = index_of_pc_with_arch(target, insn_pcs, start, trees.len(), architecture).expect("in-function target index checked above");
                     if t.kind == "goto" {
                         // Bounded backedge loop: unconditional branch back to an
                         // already visited preheader forms a cycle; try recovery
@@ -3587,7 +3589,7 @@ pub(super) fn recover_with_types_and_arch(
                             if preheader_tree.is_some_and(|t| t.kind == "conditional-goto") {
                                 let mut loop_state = seen[&target_index].clone();
                                 if let Some((source_loop, exit)) = natural_loop(
-                                    start, target_index, trees, &mut loop_state, &mut dag, call_prototypes, insn_pcs
+                                    start, target_index, trees, &mut loop_state, &mut dag, call_prototypes, insn_pcs, architecture
                                 )? {
                                     for body_index in target_index + 1..exit { seen.insert(body_index, loop_state.clone()); }
                                     source_loops.push(source_loop);
@@ -3605,7 +3607,7 @@ pub(super) fn recover_with_types_and_arch(
                     if target_index < index && seen.contains_key(&target_index) {
                         let mut tail_state = state.clone();
                         if let Some((source_loop, exit)) = natural_loop_backedge(
-                            start, target_index, index, trees, &seen[&target_index], &mut tail_state, &mut dag, call_prototypes, insn_pcs
+                            start, target_index, index, trees, &seen[&target_index], &mut tail_state, &mut dag, call_prototypes, insn_pcs, architecture
                         )? {
                             for body_index in target_index..exit { seen.insert(body_index, tail_state.clone()); }
                             source_loops.push(source_loop);
@@ -3710,7 +3712,7 @@ pub(super) fn recover_with_types_and_arch(
                     });
                     let mut target_indices = Vec::with_capacity(targets.len());
                     for target in targets {
-                        let Some(idx) = index_of_pc(target, insn_pcs, start, trees.len()) else {
+                        let Some(idx) = index_of_pc_with_arch(target, insn_pcs, start, trees.len(), architecture) else {
                             return Err("resolved indirect dispatch target is outside the recovered function or not instruction-aligned".into());
                         };
                         target_indices.push((target, idx));
