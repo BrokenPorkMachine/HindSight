@@ -8487,6 +8487,29 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
                 _ => None,
             }
         }
+        M::Neg => {
+            // NEG reg: dst = 0 - dst (arithmetic result). Flag semantics remain conservative.
+            if instr.op_count() != 1 || instr.op0_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            Some(IrOperation::Binary {
+                destination: dst,
+                operator: IrBinaryOp::Subtract,
+                left: IrOperand::Constant(0),
+                right: IrOperand::Register(dst),
+            })
+        }
+        M::Not => {
+            // NOT reg: dst = ~dst (bitwise complement). Represent as XOR with all-ones mask for width.
+            if instr.op_count() != 1 || instr.op0_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let mask = if dst.bits >= 64 { u64::MAX } else { (1u64 << dst.bits) - 1 };
+            Some(IrOperation::Binary {
+                destination: dst,
+                operator: IrBinaryOp::Xor,
+                left: IrOperand::Register(dst),
+                right: IrOperand::Constant(mask),
+            })
+        }
         _ => None,
     }
 }
