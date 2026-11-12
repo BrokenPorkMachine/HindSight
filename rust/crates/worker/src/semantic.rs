@@ -8644,9 +8644,11 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     } else {
         let mut pcs = Vec::new();
         let mut sizes = Vec::new();
+        let paired = insn_sizes.len() == insn_pcs.len();
         for (index, &pc) in insn_pcs.iter().enumerate() {
             if pc < start || pc >= end { continue; }
-            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(index).unwrap_or(&4) } else { 4 };
+            let sz = if paired { insn_sizes.get(index).copied().unwrap_or(0) } else { 0 };
+            if sz == 0 { continue; }
             pcs.push(pc);
             sizes.push(sz);
         }
@@ -8663,14 +8665,14 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     };
     let operations=pcs.iter().enumerate().map(|(index,&pc)|{
         let position=file_offset.saturating_add(pc-base);
-        let sz = *sizes.get(index).unwrap_or(&4) as u64;
+        let sz_u32 = *sizes.get(index).unwrap_or(&if is_arm64 { 4 } else { 0 });
+        let sz = sz_u32 as u64;
         let pc_end = pc.saturating_add(sz);
         let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
-        if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){
+        if sz_u32 == 0 || data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){
             return IrOperation::TargetSpecific;
         }
         // Architecture-aware decode+lift; unsupported sizes/architectures are conservative.
-        let sz_u32 = *sizes.get(index).unwrap_or(&4);
         match decode_lift_for_arch(code, base, pc, sz_u32, architecture) {
             Some((_word, _op, portable)) => portable,
             None => IrOperation::TargetSpecific,
@@ -8862,14 +8864,19 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
         insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < function_end).collect()
     };
     if pcs.is_empty() { return false; }
-    let sizes: Vec<u32> = if !fixed_width && insn_sizes.len() == insn_pcs.len() {
-        // map by original index
-        insn_pcs.iter().zip(insn_sizes.iter()).filter(|(&pc, _)| pc >= function_start && pc < function_end).map(|(_, &sz)| sz).collect()
-    } else {
+    let sizes: Vec<u32> = if fixed_width {
         vec![4; pcs.len()]
+    } else if insn_sizes.len() == insn_pcs.len() {
+        // map by original index
+        let mapped: Vec<u32> = insn_pcs.iter().zip(insn_sizes.iter()).filter(|(&pc, _)| pc >= function_start && pc < function_end).map(|(_, &sz)| sz).collect();
+        if mapped.len() != pcs.len() { return false; }
+        mapped
+    } else {
+        return false; // variable-length stream requires paired PC/size map
     };
     for (i, &pc) in pcs.iter().enumerate() {
-        let sz = *sizes.get(i).unwrap_or(&4);
+        let sz = sizes.get(i).copied().unwrap_or(0);
+        if sz == 0 { return false; }
         let Some((_word, operation, _portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
             return false; // conservative: unknown variable-length/non-decodable instruction may affect SP
         };
@@ -8966,9 +8973,17 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         let (pcs, insn_size_map): (Vec<u64>, std::collections::BTreeMap<u64, u32>) = if use_pc_map {
             let mut map = std::collections::BTreeMap::new();
             let mut list = Vec::new();
+            let paired_sizes = _insn_sizes.len() == _insn_pcs.len();
             for (i, &pc) in _insn_pcs.iter().enumerate() {
                 if pc < start || pc >= function_end || list.len() >= MAX_WORDS_PER_FUNCTION { continue; }
-                let sz = if _insn_sizes.len() == _insn_pcs.len() { *_insn_sizes.get(i).unwrap_or(&4) } else { 4 };
+                let sz = if paired_sizes {
+                    _insn_sizes.get(i).copied().unwrap_or(if is_arm64 { 4 } else { 0 })
+                } else if is_arm64 {
+                    4
+                } else {
+                    continue; // variable-length streams require explicit per-instruction sizes
+                };
+                if sz == 0 { continue; }
                 list.push(pc);
                 map.insert(pc, sz);
             }
