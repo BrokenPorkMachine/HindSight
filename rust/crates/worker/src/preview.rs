@@ -991,8 +991,10 @@ fn annotated_disassembly(code:&[u8],base:u64,symbols:&[(u64,String)],relocations
  let reloc_by_site=relocations.iter().map(|r|(r.0,r)).collect::<std::collections::BTreeMap<_,_>>();let mut out=String::new();let mut i=0usize;while i*insn+insn<=code.len() && i<4000{let pc=base+(i as u64)*super::semantic::ARM64_INSN_BYTES;if let Some(name)=symbol_name_at(symbols,pc){out.push_str(&format!("\n{pc:#018x} <{name}>:\n"));}let off=i*insn;let w=le32(&code[off..off+insn]);let mut asm_buf=[0 as c_char;192];unsafe{re_arm64_decode(w,pc,asm_buf.as_mut_ptr(),asm_buf.len())};let asm=unsafe{CStr::from_ptr(asm_buf.as_ptr())}.to_string_lossy();out.push_str(&format!("  {pc:#018x}  {w:08x}  {asm}"));if let Some(r)=reloc_by_site.get(&pc).copied(){let (_,name,_,_,_,target)=r;out.push_str(&format!("  ; reloc -> {name}"));if let Some(t)=target{out.push_str(&format!(" @ {t:#018x}"));}}else if let Some((target,kind,_))=branch_target(w,pc){if let Some(name)=symbol_name_at(symbols,target){out.push_str(&format!("  ; {kind} -> {name}"));}}out.push('\n');if out.len()>60_000{break}i+=1}out
 }
 
-fn classify_jump_candidate(code:&[u8],base:u64,pc:u64,reg:u32)->&'static str{
- let idx=pc.saturating_sub(base) as usize;if idx<4{return "unresolved indirect branch"}let mut strong=false;for back in [4usize,8,12,16]{if idx<back{continue}let w=le32(&code[idx-back..idx-back+4]);let rd=w&31;let is_load=(w&0x3f000000)==0x39000000&&((w>>22)&3)!=0;if is_load&&rd==reg{strong=true;break}}if strong{"strong jump-table candidate: branch register has a nearby modeled load definition; table provenance/bounds still unproven"}else{"unresolved indirect branch; insufficient local provenance for jump-table promotion"}
+fn classify_jump_candidate(code:&[u8],base:u64,pc:u64,reg:u32,architecture:&str)->&'static str{
+ if !super::semantic::is_arm64_arch(architecture){ return "unresolved indirect branch; architecture-specific jump-table candidate analysis not yet implemented"; }
+ let insn=super::semantic::ARM64_INSN_BYTES as usize;
+ let idx=pc.saturating_sub(base) as usize;if idx<insn{return "unresolved indirect branch"}let mut strong=false;for back in [insn,insn*2,insn*3,insn*4]{if idx<back{continue}let w=le32(&code[idx-back..idx-back+insn]);let rd=w&31;let is_load=(w&0x3f000000)==0x39000000&&((w>>22)&3)!=0;if is_load&&rd==reg{strong=true;break}}if strong{"strong jump-table candidate: branch register has a nearby modeled load definition; table provenance/bounds still unproven"}else{"unresolved indirect branch; insufficient local provenance for jump-table promotion"}
 }
 
 fn arm64_address_value(word:u32,pc:u64)->Option<(u32,u64)>{
@@ -1150,7 +1152,8 @@ fn unsigned_switch_case_bound(code:&[u8],base:u64,load_index:usize,index_registe
 /// Recover a tightly bounded ARM64 indexed table only when a scaled indexed
 /// load feeds BR directly or through `ADD base, base, loaded-offset`. Every
 /// emitted target must land in the admitted executable mapping.
-fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],base:u64,pc:u64,branch_reg:u32,scan_end:u64)->io::Result<Option<String>>{
+fn jump_table_entries(file:&mut File,secs:&[SectionInfo],size:u64,code:&[u8],base:u64,pc:u64,branch_reg:u32,scan_end:u64,architecture:&str)->io::Result<Option<String>>{
+ if !super::semantic::is_arm64_arch(architecture){ return Ok(None); }
  let index=pc.saturating_sub(base)as usize/4;if index>=code.len()/4{return Ok(None)}
  let mut load_index=None;let mut relative_base=None;let mut relative_index_is_32=None;
  for candidate in (index.saturating_sub(6)..index).rev(){
@@ -2214,7 +2217,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
    if pc < start || pc >= end { index+=1; continue; }
    let word=u32::from_le_bytes(chunk.try_into().unwrap());
    let Some(reg)=indirect_branch_reg(word) else { index+=1; continue };
-   let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt)? else { index+=1; continue };
+   let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end_jt,&arch_lc_jt)? else { index+=1; continue };
    // Parse completeness and targets from the jump-table report.
    let mut has_unresolved=false;
    let mut stopped_at_proven_bound=false;
@@ -2401,7 +2404,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  let analyze_is_arm64 = super::semantic::is_arm64_arch(&analyze_arch);
  if analyze_is_arm64 {
  let mut i=0usize;while i*4+4<=code.len(){let ch=&code[i*4..i*4+4];let pc=map.address+(i as u64)*4; /* fixed-width ARM64; variable-length streams need pc map */let file_position=map.offset+(i as u64)*4;while data_index<data_ranges.len()&&data_ranges[data_index].1<=file_position{data_index+=1}if data_index<data_ranges.len()&&file_position<data_ranges[data_index].1&&file_position.saturating_add(4)>data_ranges[data_index].0{data_words+=1;let kind=data_ranges[data_index].2;if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  data     .data-in-code kind={kind}\n"));}if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  data-in-code barrier\n"));}if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: LC_DATA_IN_CODE range; versions invalidated\n"));}versions=[0u32;32];i+=1;continue}let w=u32::from_le_bytes(ch.try_into().unwrap());let mut out=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,out.as_mut_ptr(),out.len())};if known==1{decoded+=1}let asm=unsafe{CStr::from_ptr(out.as_ptr())}.to_string_lossy();let kind=if is_terminal(w){"term"}else if is_conditional(w){"cbranch"}else if branch_target(w,pc).is_some(){"branch"}else if known==1{"op"}else{"opaque"};if ir.len()<60_000{ir.push_str(&format!("{pc:#018x}  {kind:<7}  {asm}\n"));i+=1;}
-  if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end)?{
+  if known==1{if let Some(flow)=flow_hint(w){if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  {flow}\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  decoded semantics outside the conservative data-flow model\n"));}}else if dataflow.len()<60_000{dataflow.push_str(&format!("{pc:#018x}  opaque barrier\n"));}if known==1{if let Some(line)=ssa_hint(w,&mut versions){if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  {line}\n"));}}}else{versions=[0u32;32];if ssa.len()<60_000{ssa.push_str(&format!("{pc:#018x}  barrier: unknown semantics; versions invalidated\n"));}}if let Some(reg)=indirect_branch_reg(w){if let Some(entries)=jump_table_entries(&mut file,&parsed_sections,size,&code,map.address,pc,reg,scan_end,&analyze_arch)?{
     // Collect proven complete in-function targets for semantic CFG/rendering.
     let mut has_unresolved=false; let mut stopped_at_proven_bound=false; let mut validated=0usize; let mut cases:Vec<u64>=Vec::new();
     for line in entries.lines() {
@@ -2424,7 +2427,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
       if in_function_case_count+external_cases>=cases.len() { semantic_resolved_indirect_targets.insert(pc,in_function_targets); }
     }
     if jump_tables.len()<60_000{jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  bounded indexed-table evidence\n{entries}\n"));}}
-   else{if jump_tables.len()<60_000{let evidence=classify_jump_candidate(&code,map.address,pc,reg);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}}
+   else{if jump_tables.len()<60_000{let evidence=classify_jump_candidate(&code,map.address,pc,reg,&analyze_arch);jump_tables.push_str(&format!("{pc:#018x}  BR x{reg}  {evidence}\n"));}}}
   if let Some((target,k,split))=branch_target(w,pc){let next=pc.saturating_add(super::semantic::ARM64_INSN_BYTES);if k=="call"{calls.push((function_for(&starts,pc),pc,target));}if target>=map.address&&target<scan_end{leaders.push(target);edges.push((pc,target,k));}if split&&next<scan_end{leaders.push(next);edges.push((pc,next,"fallthrough"));}}
   else if is_terminal(w){let next=pc.saturating_add(super::semantic::ARM64_INSN_BYTES);if next<scan_end{leaders.push(next);}}
  }
@@ -3296,7 +3299,7 @@ mod tests {
             size: table.len() as u64, offset: 0, flags: 0, reserved1: 0, reserved2: 0,
         };
         let report = super::jump_table_entries(&mut file, &[section.clone()], table.len() as u64,
-            &code, 0x1000, 0x101c, 12, 0x1100).unwrap().expect("bounded table candidate");
+            &code, 0x1000, 0x101c, 12, 0x1100, "arm64").unwrap().expect("bounded table candidate");
         assert!(report.contains("case-range=CMP/B.HI x8<=3 proven-entry-count=4"), "{report}");
         assert!(report.contains("format=table-relative signed offsets"), "{report}");
         assert!(report.contains("index-provenance=SUB-imm x0-0x5"), "{report}");
@@ -3310,13 +3313,13 @@ mod tests {
         clobbered_words.insert(5,0x9100_01aa); // add x10,x13,#0 overwrites the table base
         let clobbered=words(&clobbered_words);
         assert!(super::jump_table_entries(&mut file, &[section.clone()], table.len() as u64,
-            &clobbered, 0x1000, 0x1020, 12, 0x1100).unwrap().is_none(),
+            &clobbered, 0x1000, 0x1020, 12, 0x1100, "arm64").unwrap().is_none(),
             "a base overwrite between setup and indexed load must block table recovery");
         let mut offset_clobbered_words=code_words.to_vec();
         offset_clobbered_words.insert(6,0x9100_01ab); // add x11,x13,#0 overwrites the loaded relative offset
         let offset_clobbered=words(&offset_clobbered_words);
         assert!(super::jump_table_entries(&mut file, &[section], table.len() as u64,
-            &offset_clobbered, 0x1000, 0x1020, 12, 0x1100).unwrap().is_none(),
+            &offset_clobbered, 0x1000, 0x1020, 12, 0x1100, "arm64").unwrap().is_none(),
             "an offset overwrite before the relative ADD must block table recovery");
         std::fs::remove_file(path).unwrap();
     }
@@ -3344,7 +3347,7 @@ mod tests {
         let section=super::SectionInfo{seg:"__DATA".into(),sect:"__const".into(),addr:0x2000,
             size:table.len() as u64,offset:0,flags:0,reserved1:0,reserved2:0};
         let report=super::jump_table_entries(&mut file,&[section.clone()],table.len() as u64,
-            &code,0x1000,0x100c,12,0x1100).unwrap().expect("absolute pointer table candidate");
+            &code,0x1000,0x100c,12,0x1100,"arm64").unwrap().expect("absolute pointer table candidate");
         assert!(report.contains("format=absolute pointers"),"{report}");
         assert!(report.contains("validated_entries=8"),"{report}");
         assert!(!report.contains("case-range="),"{report}");
@@ -3353,7 +3356,7 @@ mod tests {
         signed_words[2]=0xb8a8_594c; // ldrsw x12,[x10,w8,uxtw #2]
         assert_eq!(super::arm64_indexed_jump_load(signed_words[2]),Some((12,10,4,true,true)));
         assert!(super::jump_table_entries(&mut file,&[section],table.len() as u64,
-            &words(&signed_words),0x1000,0x100c,12,0x1100).unwrap().is_none(),
+            &words(&signed_words),0x1000,0x100c,12,0x1100,"arm64").unwrap().is_none(),
             "signed relative entries cannot be treated as direct absolute pointers");
         std::fs::remove_file(path).unwrap();
     }
