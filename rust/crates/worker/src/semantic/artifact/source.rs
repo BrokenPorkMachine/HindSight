@@ -2930,7 +2930,7 @@ fn end_pc(start: u64, trees_len: usize, insn_pcs: &[u64], insn_sizes: &[u32]) ->
     } else if let (Some(&last_pc), Some(&last_sz)) = (insn_pcs.last(), insn_sizes.get(insn_pcs.len().saturating_sub(1))) {
         last_pc + last_sz as u64
     } else if let Some(&last_pc) = insn_pcs.last() {
-        semit_span_end(last_pc, insn_pcs, &[], start, trees_len)
+        semit_span_end(last_pc, insn_pcs, insn_sizes, start, trees_len)
     } else {
         start
     }
@@ -4093,6 +4093,13 @@ fn semit_span_end(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, tre
         if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
         if insn_pcs.is_empty() { return start + (i as u64 + 1) * 4; }
         return insn_pcs.get(i + 1).copied().unwrap_or(pc + 4);
+    }
+    if !insn_pcs.is_empty() {
+        // Variable-length stream: try to resolve size/index for pc even if index_of_pc used different count semantics.
+        if let Ok(i) = insn_pcs.binary_search(&pc) {
+            if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
+            return insn_pcs.get(i + 1).copied().unwrap_or(pc + 4);
+        }
     }
     pc + 4
 }
