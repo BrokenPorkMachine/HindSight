@@ -8128,20 +8128,39 @@ impl SsaOutputBudget {
     }
 }
 
+const ARM64_INSN_BYTES: u64 = 4;
+
 fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
     let off = usize::try_from(pc.checked_sub(base)?).ok()?;
-    let bytes = code.get(off..off.checked_add(4)?)?;
+    let bytes = code.get(off..off.checked_add(usize::try_from(ARM64_INSN_BYTES).ok()?)?)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-fn arm64_fixed_width_pcs_in_range(start: u64, end: u64, base: u64, limit: usize) -> Option<Vec<u64>> {
+fn arm64_is_aligned(base: u64, addr: u64) -> bool {
+    addr >= base && (addr - base) % ARM64_INSN_BYTES == 0
+}
+
+fn arm64_fixed_width_count(start: u64, end: u64, base: u64) -> Option<usize> {
     if start < base || end < start { return None; }
     let start_off = start.checked_sub(base)?;
     let end_off = end.checked_sub(base)?;
-    if start_off % 4 != 0 { return None; }
-    let byte_len = end_off.saturating_sub(start_off);
-    let count = usize::try_from(byte_len / 4).ok()?.min(limit);
-    Some((0..count).map(|i| start.saturating_add(i as u64 * 4)).collect())
+    if start_off % ARM64_INSN_BYTES != 0 { return None; }
+    usize::try_from(end_off.saturating_sub(start_off) / ARM64_INSN_BYTES).ok()
+}
+
+fn arm64_fixed_width_index(start: u64, target: u64) -> Option<usize> {
+    let d = target.checked_sub(start)?;
+    if d % ARM64_INSN_BYTES != 0 { return None; }
+    usize::try_from(d / ARM64_INSN_BYTES).ok()
+}
+
+fn arm64_fixed_width_byte_window(max_insns: usize) -> usize {
+    max_insns.saturating_mul(ARM64_INSN_BYTES as usize)
+}
+
+fn arm64_fixed_width_pcs_in_range(start: u64, end: u64, base: u64, limit: usize) -> Option<Vec<u64>> {
+    let count = arm64_fixed_width_count(start, end, base)?.min(limit);
+    Some((0..count).map(|i| start.saturating_add(i as u64 * ARM64_INSN_BYTES)).collect())
 }
 
 fn call_scan_window_pcs(
@@ -8157,8 +8176,7 @@ fn call_scan_window_pcs(
     if insn_pcs.is_empty() {
         // Fixed-width ARM64 fallback only.
         if !is_arm64 { return None; }
-        let call_off = callsite.checked_sub(base)?;
-        if call_off % 4 != 0 { return None; }
+        if !arm64_is_aligned(base, callsite) { return None; }
         let all = arm64_fixed_width_pcs_in_range(function_start, callsite, base, usize::MAX)?;
         if all.is_empty() { return None; }
         let take = all.len().min(64);
@@ -8593,14 +8611,15 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     // ARM64 fixed-width decode path when no explicit PC/size map is provided.
     // Variable-length streams can provide `insn_pcs`/`insn_sizes`, but decode remains ARM64 4-byte until x86-64 lifting is implemented.
     let fixed_width = insn_pcs.is_empty();
-    if start<base || end<=start || (fixed_width && (start-base)%4!=0) { return result; }
+    if start<base || end<=start || (fixed_width && !arm64_is_aligned(base, start)) { return result; }
     let Some(body_end)=end.checked_sub(base).and_then(|d| usize::try_from(d).ok()).map(|e| e.min(code.len())) else { return result; };
     let Some(body_start)=start.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return result; };
     if body_start >= body_end || body_end > code.len() { return result; }
     let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
-        let count = (body_end - body_start) / 4;
+        let bounded_end = base.saturating_add(body_end as u64);
+        let Some(count) = arm64_fixed_width_count(start, bounded_end, base) else { return result; };
         if count > MAX_WORDS_PER_FUNCTION { return result; }
-        let Some(pcs) = arm64_fixed_width_pcs_in_range(start, start.saturating_add((body_end - body_start) as u64), base, count) else { return result; };
+        let Some(pcs) = arm64_fixed_width_pcs_in_range(start, bounded_end, base, count) else { return result; };
         if pcs.is_empty() || pcs.len() != count { return result; }
         let sizes = vec![4; pcs.len()];
         (pcs, sizes)
@@ -8618,9 +8637,7 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     if pcs.is_empty() || pcs.len() > MAX_WORDS_PER_FUNCTION { return result; }
     let idx_of = |target:u64| -> Option<usize> {
         if fixed_width {
-            let d = target.checked_sub(start)?;
-            if d % 4 != 0 { return None; }
-            let i = usize::try_from(d / 4).ok()?;
+            let i = arm64_fixed_width_index(start, target)?;
             (i < pcs.len()).then_some(i)
         } else {
             pcs.binary_search(&target).ok()
@@ -8815,8 +8832,8 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     if !is_arm64 { return false; }
     if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
     let fixed_width = insn_pcs.is_empty();
-    if fixed_width {
-        if (function_start - base) % 4 != 0 { return false; }
+    if fixed_width && !arm64_is_aligned(base, function_start) {
+        return false;
     }
     let pcs: Vec<u64> = if fixed_width {
         let bounded_end = function_end.min(base.saturating_add(code.len() as u64));
@@ -8913,7 +8930,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             continue;
         }
         let use_pc_map = !_insn_pcs.is_empty();
-        if !use_pc_map && (start - base) % 4 != 0 {
+        if !use_pc_map && !arm64_is_aligned(base, start) {
             continue;
         }
         out.push_str(&format!(
@@ -8921,7 +8938,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         ));
         let low = (start - base) as usize;
         let high =
-            ((function_end - base) as usize).min(low.saturating_add(MAX_WORDS_PER_FUNCTION * 4));
+            ((function_end - base) as usize).min(low.saturating_add(arm64_fixed_width_byte_window(MAX_WORDS_PER_FUNCTION)));
 
         // Collect instruction PCs in range. Prefer provided PC/size maps when available.
         let (pcs, insn_size_map): (Vec<u64>, std::collections::BTreeMap<u64, u32>) = if use_pc_map {
@@ -8935,7 +8952,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             }
             if list.is_empty() {
                 // Fallback: ARM64 fixed-width synthesis when provided map has no entries in range.
-                if (start - base) % 4 != 0 {
+                if !arm64_is_aligned(base, start) {
                     (Vec::new(), std::collections::BTreeMap::new())
                 } else {
                     let high_addr = base.saturating_add(high as u64);
