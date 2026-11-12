@@ -477,8 +477,11 @@ fn objc_msgsend_stub_selector(file:&mut File,window:&[u8],size:u64,target:u64,in
  objc_selector_name(file,&section_list,size,reference,macho_image_base(window))
 }
 
-fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],base:u64,calls:&[(u64,u64,u64)],symbols:&[(u64,String)],indirect_facts:&[(String,String,u64)])->io::Result<std::collections::BTreeMap<u64,String>>{
+fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],base:u64,calls:&[(u64,u64,u64)],symbols:&[(u64,String)],indirect_facts:&[(String,String,u64)],architecture:&str)->io::Result<std::collections::BTreeMap<u64,String>>{
  let mut result=std::collections::BTreeMap::new();
+ if !super::semantic::is_arm64_arch(architecture){ return Ok(result); }
+ let insn = super::semantic::ARM64_INSN_BYTES as usize;
+ let insn_u64 = super::semantic::ARM64_INSN_BYTES;
  let section_list=sections(window);
  let bind_facts=ordinary_dyld_bind_facts(file,window,size)?;
  for &(_,site,target) in calls{
@@ -500,16 +503,18 @@ fn objc_selector_call_evidence(file:&mut File,window:&[u8],size:u64,code:&[u8],b
     }
    }
   }
-  if selector.is_none()&&direct_symbol&&site>=base+4&&(site-base)%4==0{
-   let call_index=((site-base)/4)as usize;let load_index=call_index-1;let load_offset=load_index*4;
-   if let Some(word_bytes)=code.get(load_offset..load_offset+4){let word=le32(word_bytes);
+  if selector.is_none()&&direct_symbol&&site>=base+insn_u64&&(site-base)%insn_u64==0{
+   let call_index=((site-base)/insn_u64)as usize;let load_index=call_index-1;let load_offset=load_index*insn;
+   if let Some(word_bytes)=code.get(load_offset..load_offset+insn){let word=le32(word_bytes);
     if word&0x3b00_0000==0x3900_0000&&(word>>22)&3==1&&word>>30==3&&word&31==1{
      let base_register=(word>>5)&31;let displacement=((word>>10)&0xfff)as u64*8;let mut reference=None;
      for address_index in load_index.saturating_sub(2)..load_index{
-      let address_pc=base+address_index as u64*4;let address_word=le32(&code[address_index*4..address_index*4+4]);
+      let address_pc=base+address_index as u64*insn_u64;let word_off=address_index*insn;
+      let Some(address_word_bytes)=code.get(word_off..word_off+insn) else { continue };
+      let address_word=le32(address_word_bytes);
       if let Some((register,page))=arm64_address_value(address_word,address_pc){if register==base_register&&address_word>>31!=0{
        let mut address=page.checked_add(displacement);if address_index+1==load_index{reference=address;}
-       if address_index+2==load_index{let add_word=le32(&code[(address_index+1)*4..(address_index+2)*4]);if let Some((destination,source,immediate))=arm64_add_immediate(add_word){if destination==base_register&&source==base_register{address=address.and_then(|value|value.checked_add(immediate));reference=address;}}}
+       if address_index+2==load_index{let add_off=(address_index+1)*insn;if let Some(add_word_bytes)=code.get(add_off..add_off+insn){let add_word=le32(add_word_bytes);if let Some((destination,source,immediate))=arm64_add_immediate(add_word){if destination==base_register&&source==base_register{address=address.and_then(|value|value.checked_add(immediate));reference=address;}}}}
       }}
      }
      if let Some(address)=reference{selector=objc_selector_name(file,&section_list,size,address,macho_image_base(window))?;}
@@ -2607,7 +2612,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
          signature_symbols.push((*addr, name.clone()));
      }
  }
- let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols,&indirect_facts)?;
+ let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols,&indirect_facts,&analyze_arch)?;
  let external_prototypes=super::signatures::external_prototype_database(digest)?;
  let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address,&analyze_arch);
  let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
