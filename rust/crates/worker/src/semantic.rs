@@ -9317,47 +9317,15 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             continue;
         }
 
-        if !is_arm64 {
-            // Conservative variable-length/unknown-architecture listing: prefer provided PC/size map.
-            // For x86-64, attempt architecture-gated control-flow decode/lift for evidence-backed listing.
-            for &pc in &pcs {
-                let sz = insn_size_map.get(&pc).copied().unwrap_or(0);
-                let position = file_offset.saturating_add(pc.saturating_sub(base));
-                let end_pos = file_offset.saturating_add(pc.saturating_add(sz as u64).saturating_sub(base));
-                let data = data_ranges.iter().any(|&(lo_r, hi_r, _)| position < hi_r && end_pos > lo_r);
-                let label = if data {
-                    "data".to_string()
-                } else if sz == 0 {
-                    "semantic decode unsupported (conservative)".to_string()
-                } else if let Some((_w, _op, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) {
-                    match portable {
-                        IrOperation::Branch { target } => format!("branch {target:#x}"),
-                        IrOperation::ConditionalBranch { target, condition } => format!("conditional-branch {target:#x} ({condition:?})"),
-                        IrOperation::DirectCall { target } => format!("call {target:#x}"),
-                        IrOperation::IndirectCall { .. } => "indirect-call (conservative)".to_string(),
-                        IrOperation::IndirectBranch { .. } => "indirect-branch (conservative)".to_string(),
-                        IrOperation::Return { .. } => "return".to_string(),
-                        IrOperation::Nop => "nop".to_string(),
-                        _ => "decoded (semantics conservative)".to_string(),
-                    }
-                } else {
-                    "semantic decode unsupported (conservative)".to_string()
-                };
-                out.push_str(&format!("  {pc:#018x}  size={sz} {label}\n"));
-                if out.len() >= MAX_OUTPUT { break; }
-            }
-            out.push_str("}\n");
-            if out.len() >= MAX_OUTPUT { break; }
-            continue;
-        }
-
-        let size_of = |pc: u64| -> u32 { insn_size_map.get(&pc).copied().unwrap_or(4) };
+        let size_of = |pc: u64| -> u32 { insn_size_map.get(&pc).copied().unwrap_or(if is_arm64 { 4 } else { 0 }) };
         let span_end = |pc: u64| -> u64 {
             if let Some(i) = pcs.iter().position(|&p| p == pc) {
                 if insn_size_map.contains_key(&pc) {
                     pc.saturating_add(size_of(pc) as u64)
+                } else if let Some(&next) = pcs.get(i + 1) {
+                    next
                 } else {
-                    pcs.get(i + 1).copied().unwrap_or(pc.saturating_add(size_of(pc) as u64))
+                    pc.saturating_add(size_of(pc) as u64)
                 }
             } else {
                 pc.saturating_add(size_of(pc) as u64)
@@ -9365,7 +9333,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         };
         let is_data = |pc: u64| -> bool {
             let position = file_offset.saturating_add(pc - base);
-            let end = file_offset.saturating_add(span_end(pc) - base);
+            let end = file_offset.saturating_add(span_end(pc).saturating_sub(pc)).saturating_add(pc.saturating_sub(base));
             data_ranges
                 .iter()
                 .any(|&(lo, hi, _)| position < hi && end > lo)
@@ -9376,7 +9344,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         let lifted_instructions: Vec<LiftedInstruction> = pcs.iter().map(|&pc| {
             let sz = size_of(pc);
             let data = is_data(pc);
-            if data {
+            if data || sz == 0 {
                 return LiftedInstruction {
                     address: pc,
                     word: 0,
@@ -9536,6 +9504,44 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         for block in &mut blocks { block.predecessors.sort_unstable(); }
         let mut cfg = FunctionCfg { blocks };
         FunctionCfg::analyze(&mut cfg.blocks);
+
+        if !is_arm64 {
+            // Architecture-aware CFG/control-flow output for x86-64 and other non-ARM64 streams.
+            // Uses lifted portable control flow and PC/size maps conservatively; skips ARM64-specific
+            // semantic SSA/value-flow/register/flag/provenance rendering.
+            out.push_str("  // CFG/control-flow (architecture-aware, conservative): block predecessors/successors, reachability, dominators\n");
+            let _ = writeln!(out, "  // lifted function={:#x}..{:#x} instructions={} architecture={}",
+                start, function_end, lifted_instructions.len(), architecture);
+            for (bi, block) in cfg.blocks.iter().enumerate() {
+                let _ = writeln!(out, "  block B{bi} start={:#x} preds={:?} succs={:?} backedges={:?} reachable={} dom={:?}",
+                    block.start, block.predecessors, block.successors, block.backedges, block.reachable, block.dominators);
+                for &pc in &block.instructions {
+                    let Some(instr) = lifted_instructions.iter().find(|i| i.address == pc) else { continue; };
+                    let sz = insn_size_map.get(&pc).copied().unwrap_or(0);
+                    let label = if instr.data {
+                        "data".to_string()
+                    } else {
+                        match instr.portable {
+                            IrOperation::Branch { target } => format!("branch {target:#x}"),
+                            IrOperation::ConditionalBranch { target, condition } => format!("conditional-branch {target:#x} ({condition:?})"),
+                            IrOperation::DirectCall { target } => format!("call {target:#x}"),
+                            IrOperation::IndirectCall { .. } => "indirect-call (conservative)".to_string(),
+                            IrOperation::IndirectBranch { .. } => "indirect-branch (conservative)".to_string(),
+                            IrOperation::Return { .. } => "return".to_string(),
+                            IrOperation::Nop => "nop".to_string(),
+                            _ => "decoded (semantics conservative)".to_string(),
+                        }
+                    };
+                    let _ = writeln!(out, "    {pc:#018x}  size={sz} {label}");
+                    if out.len() >= MAX_OUTPUT { break; }
+                }
+                if out.len() >= MAX_OUTPUT { break; }
+            }
+            out.push_str("}\n");
+            if out.len() >= MAX_OUTPUT { break; }
+            continue;
+        }
+
         let function_ir = FunctionIr {
             start,
             end: function_end,
