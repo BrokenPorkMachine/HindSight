@@ -3399,14 +3399,10 @@ pub(super) fn recover_with_types(
                     };
                     if outside {
                         if t.kind == "goto" {
+                            let helper = call_prototypes.get(&target).map(|p| p.name.as_str());
                             // Bounded tail-call: unconditional branch outside the
                             // recovered function to a known return-forwarding runtime
                             // helper (e.g. objc_autoreleaseReturnValue) after epilogue.
-                            let helper = call_prototypes.get(&target).map(|p| p.name.as_str())
-                                .or_else(|| {
-                                    // try to recognize by address in common stubs? no names here
-                                    None
-                                });
                             let is_autorelease_tail = helper.is_some_and(|n| {
                                 let b = n.strip_prefix('_').unwrap_or(n);
                                 matches!(
@@ -3443,6 +3439,35 @@ pub(super) fn recover_with_types(
                                     if *entry < version { *entry = version; }
                                 }
                                 break;
+                            }
+                            // Bounded noreturn external exit: unconditional branch to a
+                            // known void(void) noreturn helper (e.g. stack protector / abort)
+                            // terminates this path without a normal return value.
+                            let is_noreturn_void = helper.is_some_and(|n| {
+                                let b = n.strip_prefix('_').unwrap_or(n);
+                                matches!(b, "__stack_chk_fail" | "abort")
+                            });
+                            if is_noreturn_void {
+                                let proto = call_prototypes.get(&target).unwrap();
+                                if proto.parameters.is_empty() && proto.result_bits == 0 {
+                                    let call_expr = dag.add_role(
+                                        "source-call",
+                                        "value",
+                                        format!("{}()", proto.name),
+                                        vec![],
+                                        pc,
+                                    )?;
+                                    dag.type_node(call_expr, Some(SourceType { spelling: "void".into(), bits: 0, signed: false, pointer: false }));
+                                    state.has_call = true;
+                                    state.call_pcs.push(pc);
+                                    state.calls.push(CallResult { expression: call_expr, guard: state.path, pc });
+                                    // Path does not return; preserve frame objects observed on this path.
+                                    for ((offset, bytes), version) in frame_objects(&state) {
+                                        let entry = objects.entry((offset, bytes)).or_insert(version);
+                                        if *entry < version { *entry = version; }
+                                    }
+                                    break;
+                                }
                             }
                             return Err("source branch outside function".into());
                         }
