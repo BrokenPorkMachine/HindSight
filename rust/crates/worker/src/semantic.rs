@@ -9626,6 +9626,13 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                             IrOperation::IndirectBranch { .. } => "indirect-branch (conservative)".to_string(),
                             IrOperation::Return { .. } => "return".to_string(),
                             IrOperation::Nop => "nop".to_string(),
+                            IrOperation::Assign { .. } => "assign (lifted, semantics conservative)".to_string(),
+                            IrOperation::Load { .. } | IrOperation::AtomicLoad { .. } | IrOperation::LoadPair { .. } | IrOperation::SimdLoad { .. } | IrOperation::SimdPairLoad { .. } => "load (lifted, semantics conservative)".to_string(),
+                            IrOperation::Store { .. } | IrOperation::AtomicStore { .. } | IrOperation::StorePair { .. } | IrOperation::SimdStore { .. } | IrOperation::SimdPairStore { .. } => "store (lifted, semantics conservative)".to_string(),
+                            IrOperation::Binary { .. } | IrOperation::LogicalRegister { .. } | IrOperation::Shift { .. } | IrOperation::VariableShift { .. } | IrOperation::ShiftedArithmetic { .. } | IrOperation::AddCarry { .. } | IrOperation::OneSource { .. } => "arithmetic/logic (lifted, semantics conservative)".to_string(),
+                            IrOperation::Compare { .. } | IrOperation::ConditionalCompare { .. } => "compare (lifted, semantics conservative)".to_string(),
+                            IrOperation::Address { .. } => "address (lifted, semantics conservative)".to_string(),
+                            IrOperation::TargetSpecific => "target-specific/unsupported (conservative)".to_string(),
                             _ => "decoded (semantics conservative)".to_string(),
                         }
                     };
