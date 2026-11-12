@@ -846,9 +846,11 @@ pub fn parameter_value_names_with_resolved_indirects_and_arch_and_pcs(
     } else {
         let mut pcs = Vec::new();
         let mut sizes = Vec::new();
+        let paired = insn_sizes.len() == insn_pcs.len();
         for (index, &pc) in insn_pcs.iter().enumerate() {
             if pc < start || pc >= end { continue; }
-            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(index).unwrap_or(&4) } else { 4 };
+            let sz = if paired { insn_sizes.get(index).copied().unwrap_or(0) } else if is_arm64 { 4 } else { 0 };
+            if sz == 0 { continue; }
             pcs.push(pc);
             sizes.push(sz);
         }
@@ -893,21 +895,17 @@ pub fn parameter_value_names_with_resolved_indirects_and_arch_and_pcs(
         .enumerate()
         .map(|(index, &pc)| {
             let position = file_offset.saturating_add(pc.saturating_sub(base));
-            let sz = *sizes.get(index).unwrap_or(&4) as u64;
+            let sz_u32 = sizes.get(index).copied().unwrap_or(if fixed_width && is_arm64 { 4 } else { 0 });
+            let sz = sz_u32 as u64;
             let pc_end = pc.saturating_add(sz);
             let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
-            // ARM64 4-byte decode only for now; variable-length decode remains conservative.
-            let sz_u32 = *sizes.get(index).unwrap_or(&4);
-            if sz_u32 != 4 {
+            if sz_u32 == 0 || data_ranges.iter().any(|&(lo, hi, _)| position < hi && end_pos > lo) {
                 return IrOperation::TargetSpecific;
             }
-            let Some(word) = super::read_arm64_u32(code, base, pc) else {
-                return IrOperation::TargetSpecific;
-            };
-            if data_ranges.iter().any(|&(lo, hi, _)| position < hi && end_pos > lo) {
-                IrOperation::TargetSpecific
-            } else {
-                lift_operation(decode(word, pc), pc)
+            // Architecture-gated decode/lift; unsupported sizes/architectures remain conservative.
+            match super::decode_lift_for_arch(code, base, pc, sz_u32, architecture) {
+                Some((_word, _op, portable)) => portable,
+                None => IrOperation::TargetSpecific,
             }
         })
         .collect::<Vec<_>>();
