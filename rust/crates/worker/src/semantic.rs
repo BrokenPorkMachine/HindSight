@@ -8147,17 +8147,134 @@ pub(crate) fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-/// Architecture-aware decode+lift dispatch. ARM64 4-byte instructions use the existing
-/// ARM64 decoder/lifter; other architectures/sizes are conservatively unsupported for
-/// semantic lifting (no fixed-width ARM64 mis-decode of variable-length streams).
+/// Architecture-aware decode+lift dispatch.
+/// - ARM64 4-byte instructions use the existing ARM64 decoder/lifter.
+/// - x86-64/x86 uses iced-x86 for variable-length boundary/control-flow lifting into the shared
+///   portable IR where evidence is clear (branches, calls, returns, nop); other semantics remain
+///   conservatively `TargetSpecific`/`Opaque` (no fabricated values/effects/equivalence).
+/// - Unsupported architectures/sizes are conservatively unsupported for semantic lifting.
 fn decode_lift_for_arch(code: &[u8], base: u64, pc: u64, size: u32, architecture: &str) -> Option<(u32, Operation, IrOperation)> {
-    if is_arm64_arch(architecture) && size == 4 {
-        let word = read_arm64_u32(code, base, pc)?;
-        let operation = decode(word, pc);
-        let portable = lift_operation(operation, pc);
-        return Some((word, operation, portable));
+    if is_arm64_arch(architecture) {
+        if size == 4 {
+            let word = read_arm64_u32(code, base, pc)?;
+            let operation = decode(word, pc);
+            let portable = lift_operation(operation, pc);
+            return Some((word, operation, portable));
+        }
+        return None;
+    }
+    if is_x86_64_arch(architecture) {
+        return decode_lift_x86_64(code, base, pc, size);
     }
     None
+}
+
+fn decode_lift_x86_64(code: &[u8], base: u64, pc: u64, size_hint: u32) -> Option<(u32, Operation, IrOperation)> {
+    let off = usize::try_from(pc.checked_sub(base)?).ok()?;
+    let available = code.get(off..)?;
+    if available.is_empty() {
+        return None;
+    }
+    let decode_len = if size_hint > 0 {
+        (size_hint as usize).min(available.len())
+    } else {
+        available.len().min(15)
+    };
+    if decode_len == 0 {
+        return None;
+    }
+    let bytes = &available[..decode_len];
+    let mut decoder = iced_x86::Decoder::with_ip(64, bytes, pc, iced_x86::DecoderOptions::NONE);
+    let instr = decoder.decode();
+    if instr.is_invalid() || instr.len() == 0 {
+        return None;
+    }
+    if size_hint > 0 && instr.len() != size_hint as usize {
+        // Size mismatch with provided map: be conservative.
+        return None;
+    }
+    let word = if bytes.len() >= 4 {
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        let mut b = [0u8; 4];
+        b[..bytes.len()].copy_from_slice(bytes);
+        u32::from_le_bytes(b)
+    };
+
+    let unknown_gpr = IrRegister { class: IrRegisterClass::General, index: 0, bits: 64 };
+    let is_near = instr.op_count() >= 1 && matches!(instr.op0_kind(), iced_x86::OpKind::NearBranch16 | iced_x86::OpKind::NearBranch32 | iced_x86::OpKind::NearBranch64);
+    let near_target = if is_near { Some(instr.near_branch64()) } else { None };
+
+    let portable = match instr.mnemonic() {
+        iced_x86::Mnemonic::Jmp => {
+            if let Some(target) = near_target {
+                IrOperation::Branch { target }
+            } else {
+                // Indirect target not modeled; keep control-flow barrier conservatively.
+                IrOperation::IndirectBranch { target: unknown_gpr }
+            }
+        }
+        iced_x86::Mnemonic::Call => {
+            if let Some(target) = near_target {
+                IrOperation::DirectCall { target }
+            } else {
+                // Indirect target not modeled; keep call/control-flow barrier conservatively.
+                IrOperation::IndirectCall { target: unknown_gpr }
+            }
+        }
+        iced_x86::Mnemonic::Ret | iced_x86::Mnemonic::Iret | iced_x86::Mnemonic::Iretd | iced_x86::Mnemonic::Iretq => {
+            IrOperation::Return { target: None }
+        }
+        iced_x86::Mnemonic::Nop => IrOperation::Nop,
+        _ if is_x86_conditional_branch_mnemonic(instr.mnemonic()) => {
+            if let Some(target) = near_target {
+                if let Some(pred) = x86_mnemonic_to_flag_predicate(instr.mnemonic()) {
+                    IrOperation::ConditionalBranch { target, condition: IrCondition::Flags(pred) }
+                } else {
+                    IrOperation::TargetSpecific
+                }
+            } else {
+                IrOperation::TargetSpecific
+            }
+        }
+        _ => IrOperation::TargetSpecific,
+    };
+
+    // Operation enum is ARM64-decoder-centric; use Opaque for x86 evidence-backed lifted/control-flow forms.
+    let operation = Operation::Opaque;
+    Some((word, operation, portable))
+}
+
+fn is_x86_conditional_branch_mnemonic(m: iced_x86::Mnemonic) -> bool {
+    use iced_x86::Mnemonic;
+    matches!(m,
+        Mnemonic::Jo | Mnemonic::Jno | Mnemonic::Jb | Mnemonic::Jae | Mnemonic::Je | Mnemonic::Jne |
+        Mnemonic::Jbe | Mnemonic::Ja | Mnemonic::Js | Mnemonic::Jns | Mnemonic::Jp | Mnemonic::Jnp |
+        Mnemonic::Jl | Mnemonic::Jge | Mnemonic::Jle | Mnemonic::Jg
+    )
+}
+
+fn x86_mnemonic_to_flag_predicate(m: iced_x86::Mnemonic) -> Option<IrFlagPredicate> {
+    use iced_x86::Mnemonic;
+    Some(match m {
+        Mnemonic::Je => IrFlagPredicate::Equal,         // ZF=1
+        Mnemonic::Jne => IrFlagPredicate::NotEqual,     // ZF=0
+        Mnemonic::Jb => IrFlagPredicate::CarrySet,      // CF=1
+        Mnemonic::Jae => IrFlagPredicate::CarryClear,   // CF=0
+        Mnemonic::Js => IrFlagPredicate::Negative,      // SF=1
+        Mnemonic::Jns => IrFlagPredicate::NonNegative,  // SF=0
+        Mnemonic::Jo => IrFlagPredicate::Overflow,      // OF=1
+        Mnemonic::Jno => IrFlagPredicate::NoOverflow,   // OF=0
+        Mnemonic::Ja => IrFlagPredicate::UnsignedHigher,       // CF=0 and ZF=0
+        Mnemonic::Jbe => IrFlagPredicate::UnsignedLowerOrSame, // CF=1 or ZF=1
+        Mnemonic::Jge => IrFlagPredicate::SignedGreaterOrEqual,
+        Mnemonic::Jl => IrFlagPredicate::SignedLess,
+        Mnemonic::Jg => IrFlagPredicate::SignedGreater,
+        Mnemonic::Jle => IrFlagPredicate::SignedLessOrEqual,
+        // Parity (PF) has no sound direct mapping in this predicate model; keep conservative.
+        Mnemonic::Jp | Mnemonic::Jnp => return None,
+        _ => return None,
+    })
 }
 
 pub(crate) fn arm64_is_aligned(base: u64, addr: u64) -> bool {
@@ -8945,6 +9062,8 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
     let end = base.saturating_add(code.len() as u64);
     let mut out = if is_arm64 {
         String::from("AArch64 register semantics v54; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n")
+    } else if is_x86_64_arch(architecture) {
+        format!("Architecture-aware instruction stream preview for {architecture}; x86-64 control-flow decode/lift is partially supported (branches/calls/returns/nops), other semantics remain conservative.\n")
     } else {
         format!("Architecture-aware instruction stream preview for {architecture}; semantic decode/lift not implemented for this architecture, conservative listing only.\n")
     };
@@ -9013,13 +9132,32 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
         }
 
         if !is_arm64 {
-            // Conservative variable-length/unknown-architecture listing: use provided PC/size map, no decode/lift.
+            // Conservative variable-length/unknown-architecture listing: prefer provided PC/size map.
+            // For x86-64, attempt architecture-gated control-flow decode/lift for evidence-backed listing.
             for &pc in &pcs {
                 let sz = insn_size_map.get(&pc).copied().unwrap_or(0);
                 let position = file_offset.saturating_add(pc.saturating_sub(base));
                 let end_pos = file_offset.saturating_add(pc.saturating_add(sz as u64).saturating_sub(base));
                 let data = data_ranges.iter().any(|&(lo_r, hi_r, _)| position < hi_r && end_pos > lo_r);
-                out.push_str(&format!("  {pc:#018x}  size={sz} {}\n", if data { "data" } else { "semantic decode unsupported (conservative)" }));
+                let label = if data {
+                    "data".to_string()
+                } else if sz == 0 {
+                    "semantic decode unsupported (conservative)".to_string()
+                } else if let Some((_w, _op, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) {
+                    match portable {
+                        IrOperation::Branch { target } => format!("branch {target:#x}"),
+                        IrOperation::ConditionalBranch { target, condition } => format!("conditional-branch {target:#x} ({condition:?})"),
+                        IrOperation::DirectCall { target } => format!("call {target:#x}"),
+                        IrOperation::IndirectCall { .. } => "indirect-call (conservative)".to_string(),
+                        IrOperation::IndirectBranch { .. } => "indirect-branch (conservative)".to_string(),
+                        IrOperation::Return { .. } => "return".to_string(),
+                        IrOperation::Nop => "nop".to_string(),
+                        _ => "decoded (semantics conservative)".to_string(),
+                    }
+                } else {
+                    "semantic decode unsupported (conservative)".to_string()
+                };
+                out.push_str(&format!("  {pc:#018x}  size={sz} {label}\n"));
                 if out.len() >= MAX_OUTPUT { break; }
             }
             out.push_str("}\n");
