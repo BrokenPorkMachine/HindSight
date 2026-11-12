@@ -1989,7 +1989,15 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  // alias also lands on the same address; conflicting non-ObjC names stay
  // unresolved rather than being guessed.
  let name=if names.len()==1{names.iter().next().copied()}else{facts.objc_function_names.get(&start).map(String::as_str)};
- let architecture=if le32(&window[8..12])&0x00ffffff==2{"arm64e"}else{"arm64"};
+ let cputype=le32(&window[4..8]);
+ let cpusubtype=le32(&window[8..12]);
+ let architecture=match cputype {
+  0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e" } else { "arm64" },
+  0x0100_0007 => "x86_64",
+  0x0000_000c => "arm",
+  0x0000_0007 => "i386",
+  _ => "arm64",
+ };
  let external=super::signatures::external_prototype_database(digest)?;
  let project_types=super::signatures::external_project_type_dependencies(digest,architecture)?;
  let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
