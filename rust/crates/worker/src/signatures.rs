@@ -2158,21 +2158,36 @@ fn render_arm64_body(
     start: u64, end: u64, display_name: &str, signature: Option<&Signature>,
     symbols: &[(u64,String)], signatures: &BTreeMap<u64,(String,Signature)>,
     code: &[u8], base: u64, file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
-    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, object_layout:Option<&super::objc::ClassLayout>, architecture:&str,
+    tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, object_layout:Option<&super::objc::ClassLayout>, provided_insn_pcs:&[u64], provided_insn_sizes:&[u32], architecture:&str,
 ) -> Option<String> {
     let arch = architecture.to_ascii_lowercase();
     let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
     if start < base || start >= end { return None; }
-    // ARM64 fixed-width synthesis fallback for current signature rendering; variable-length streams need pc/size maps and arch-aware decode.
-    if !is_arm64 { return None; }
-    if !super::semantic::arm64_is_aligned(base, start) { return None; }
     let lo = usize::try_from(start - base).ok()?;
     let hi = usize::try_from(end.min(base.saturating_add(code.len() as u64)) - base).ok()?;
     if lo >= hi || hi > code.len() { return None; }
     let body_code = &code[lo..hi];
-    let count = body_code.len() / usize::try_from(super::semantic::ARM64_INSN_BYTES).ok()?;
-    let insn_pcs: Vec<u64> = (0..count).map(|i| start + i as u64 * super::semantic::ARM64_INSN_BYTES).collect();
-    let insn_sizes: Vec<u32> = vec![u32::try_from(super::semantic::ARM64_INSN_BYTES).ok()?; insn_pcs.len()];
+
+    let mut insn_pcs: Vec<u64> = Vec::new();
+    let mut insn_sizes: Vec<u32> = Vec::new();
+    if !provided_insn_pcs.is_empty() {
+        let paired = provided_insn_sizes.len() == provided_insn_pcs.len();
+        for (i, &pc) in provided_insn_pcs.iter().enumerate() {
+            if pc < start || pc >= end { continue; }
+            let sz = if paired { *provided_insn_sizes.get(i).unwrap_or(&4) } else { 4 };
+            insn_pcs.push(pc);
+            insn_sizes.push(sz);
+        }
+    }
+    if insn_pcs.is_empty() {
+        // ARM64 fixed-width synthesis fallback when no usable PC/size map is provided.
+        if !is_arm64 { return None; }
+        if !super::semantic::arm64_is_aligned(base, start) { return None; }
+        let count = body_code.len() / usize::try_from(super::semantic::ARM64_INSN_BYTES).ok()?;
+        insn_pcs = (0..count).map(|i| start + i as u64 * super::semantic::ARM64_INSN_BYTES).collect();
+        insn_sizes = vec![u32::try_from(super::semantic::ARM64_INSN_BYTES).ok()?; insn_pcs.len()];
+    }
+    if insn_pcs.is_empty() { return None; }
     let stable_stack=super::semantic::stack_pointer_is_stable_with_arch_and_pcs(code,base,start,end,&insn_pcs,&insn_sizes,architecture);
     let pc_set: std::collections::BTreeSet<u64> = insn_pcs.iter().copied().collect();
     let switch_evidence=parse_switch_evidence(jump_tables);
@@ -2574,7 +2589,7 @@ fn recover_internal(
         if let Some(context) = &arm64 {
             let end = starts.get(i+1).copied().unwrap_or(scan_end);
             let layout=object_layout_for_imp(context.objc_layouts,start,name,signature);
-            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors,layout,context.architecture) {
+            if let Some(body) = render_arm64_body(start, end, name, signature, symbols, &by_address, context.code, context.base, context.file_offset, context.data_ranges, context.parameter_evidence, context.tail_calls, context.jump_tables, context.objc_selectors,layout,&[],&[],context.architecture) {
                 if pseudo.len() + body.len() > 58_000 { break; }
                 pseudo.push_str(&body);
                 pseudo.push('\n');
@@ -2621,7 +2636,7 @@ fn recover_internal(
         let branch = 0xd61f_01c0u32.to_le_bytes(); // br x14
         let body = super::render_arm64_body(0x1000, 0x1004, "_switch", None, &[],
             &std::collections::BTreeMap::new(), &branch, 0x1000, 0, &[], "", &[], report,
-            &std::collections::BTreeMap::new(), None, "arm64").expect("rendered candidate switch");
+            &std::collections::BTreeMap::new(), None, &[], &[], "arm64").expect("rendered candidate switch");
         assert!(body.contains("proven unsigned range: CMP/B.HI x8<=3"), "{body}");
         assert!(body.contains("normalized index: w8=(w0-5) modulo 2^32"), "{body}");
         assert!(body.contains("normalized selector bits 0x5"), "{body}");
@@ -2790,7 +2805,7 @@ fn recover_internal(
         let layout=member_fixture();
         let signature=objc_method("-[Widget value]","q16@0:8").unwrap();
         let code=[0xf9400400u32,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let body=render_arm64_body(0x1000,0x1008,"-[Widget value]",Some(&signature),&[],&BTreeMap::new(),&code,0x1000,0,&[],"",&[],"",&BTreeMap::new(), Some(&layout), "arm64").unwrap();
+        let body=render_arm64_body(0x1000,0x1008,"-[Widget value]",Some(&signature),&[],&BTreeMap::new(),&code,0x1000,0,&[],"",&[],"",&BTreeMap::new(), Some(&layout), &[], &[], "arm64").unwrap();
         assert!(body.contains("x0 = self->x0;"),"{body}");
         assert!(!body.contains("self->self"),"{body}");
     }
@@ -3269,7 +3284,7 @@ fn recover_internal(
         let pointer = Signature { language: "C", source: "test", declaration: "void *pointer(void);".into() };
         assert!(!signature_returns_void(Some(&pointer)));
         let code = 0xd65f03c0u32.to_le_bytes();
-        let body = render_arm64_body(0x1000, 0x1004, "_pointer", Some(&pointer), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new(), None, "arm64").unwrap();
+        let body = render_arm64_body(0x1000, 0x1004, "_pointer", Some(&pointer), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         assert!(body.contains("return x0;"), "{body}");
         assert!(!body.contains("void return supported"), "{body}");
     }
@@ -3298,7 +3313,7 @@ fn recover_internal(
         let call = render_linear_statement("call(0x2000);",0x1000,0x1000,&[],&signatures,None,"",&[],0x1000,false,&BTreeMap::new(), &[], &[], "arm64");
         assert!(call.starts_with("make(x0, /* hidden result buffer */ result_buffer<CGAffineTransform>(x8));"), "{call}");
         let branch=0x14000400u32.to_le_bytes();
-        let tail=render_arm64_body(0x1000,0x1004,"_caller",None,&[],&signatures,&branch,0x1000,0,&[],"",&[(0x1000,0x1000,0x2000)],"",&BTreeMap::new(), None, "arm64").unwrap();
+        let tail=render_arm64_body(0x1000,0x1004,"_caller",None,&[],&signatures,&branch,0x1000,0,&[],"",&[(0x1000,0x1000,0x2000)],"",&BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         assert!(tail.contains("make(x0, /* hidden result buffer */ result_buffer<CGAffineTransform>(x8))"), "{tail}");
     }
     #[test] fn variadic_calls_show_fixed_prototype_and_unknown_anonymous_arguments() {
@@ -3377,7 +3392,7 @@ fn recover_internal(
             let signature = Signature { language: "C", source: "test", declaration: format!("{result} take(int value, double scale);") };
             let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
             let code = [0x5280_0540u32, 0x1e6e_1000, 0x1400_03fe].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-            let body = render_arm64_body(0x1000, 0x100c, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1008,0x2000)], "", &BTreeMap::new(), None, "arm64").unwrap();
+            let body = render_arm64_body(0x1000, 0x100c, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1008,0x2000)], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
             assert!(body.contains("take((int)0x2a, 1.0);"), "{body}");
             assert!(body.contains("constant argument evidence:"), "{body}");
             assert!(body.contains("proven_by=[0x1000]"), "{body}");
@@ -3386,7 +3401,7 @@ fn recover_internal(
         let signature = Signature { language: "C", source: "test", declaration: "double take(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j);".into() };
         let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
         let code = [0x1e6e_1008u32, 0x1e7e_1009, 0x6d00_27e8, 0x1400_03fd].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let body = render_arm64_body(0x1000, 0x1010, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x100c,0x2000)], "", &BTreeMap::new(), None, "arm64").unwrap();
+        let body = render_arm64_body(0x1000, 0x1010, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x100c,0x2000)], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         assert!(body.contains("return take(d0, d1, d2, d3, d4, d5, d6, d7, 1.0, -1.0);"), "{body}");
         assert!(body.contains("stack_store=0x1008"), "{body}");
     }
@@ -3397,7 +3412,7 @@ fn recover_internal(
             ("__Z3fooiz", "foo(x0, /* variadic arguments unresolved; Apple arm64 stack ABI */)"),
         ] {
             let signatures = BTreeMap::from([(0x2000, (mangled.into(), symbol(mangled).unwrap()))]);
-            let body = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, "arm64").unwrap();
+            let body = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
             assert!(body.contains(expected), "{body}");
             assert!(body.contains("tail-call candidate"), "{body}");
         }
@@ -3411,7 +3426,7 @@ fn recover_internal(
         ] {
             let signature = Signature { language: "C", source: "test", declaration: declaration.into() };
             let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
-            let body = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, "arm64").unwrap();
+            let body = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &code, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
             assert!(body.contains(expected), "{body}");
         }
     }
@@ -3420,7 +3435,7 @@ fn recover_internal(
         let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
         let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[], "arm64");
         let branch = 0x14000400u32.to_le_bytes();
-        let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, "arm64").unwrap();
+        let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         for output in [call, tail] {
             for expected in ["load_stack_argument<signed char>(sp + 0x0, 1)", "load_stack_argument<short>(sp + 0x2, 2)", "load_stack_argument<int>(sp + 0x4, 4)", "load_stack_argument<float>(sp + 0x8, 4)"] {
                 assert!(output.contains(expected), "{output}");
@@ -3432,7 +3447,7 @@ fn recover_internal(
         let signatures = BTreeMap::from([(0x2000, ("_take".into(), signature))]);
         let call = render_linear_statement("call(0x2000);", 0x1000, 0x1000, &[], &signatures, None, "", &[], 0x1000, false, &BTreeMap::new(), &[], &[], "arm64");
         let branch = 0x14000400u32.to_le_bytes();
-        let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, "arm64").unwrap();
+        let tail = render_arm64_body(0x1000, 0x1004, "_caller", None, &[], &signatures, &branch, 0x1000, 0, &[], "", &[(0x1000,0x1000,0x2000)], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         for output in [call, tail] {
             for expected in ["aggregate_from_stack<NSRange>(sp + 0x0, 16)", "aggregate_from_stack<CGPoint>(sp + 0x10, 16)", "aggregate_from_pointer<CGAffineTransform>(load64(sp + 0x20))"] {
                 assert!(output.contains(expected), "{output}");
@@ -3654,7 +3669,7 @@ fn recover_internal(
         let rendered=replace_instruction_register_names("x0 = x0 + 0x8; x1 = *(x0);",&names.inputs[&0x1000],Some(&names.outputs[&0x1000]));
         assert_eq!(rendered,"x0 = owner + 0x8; x1 = *(x0);");
         let body_code=[0xa9400400u32,0xd65f03c0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>(); // ldp x0,x1,[x0]
-        let body=render_arm64_body(0x1000,0x1008,"_load",Some(&signature),&[],&BTreeMap::new(),&body_code,0x1000,0,&[],"",&[],"",&BTreeMap::new(), None, "arm64").unwrap();
+        let body=render_arm64_body(0x1000,0x1008,"_load",Some(&signature),&[],&BTreeMap::new(),&body_code,0x1000,0,&[],"",&[],"",&BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         assert!(body.contains("pair_addr_1000 = owner; x0 = *(pair_addr_1000); x1 = *(pair_addr_1000 + 0x8);"),"{body}");
         let inputs=BTreeMap::from([("x0".into(),"owner".into())]);
         assert_eq!(replace_instruction_register_names("x0(\"x0 = x0;\", x0); /* x0 */",&inputs,None),"x0(\"x0 = x0;\", owner); /* x0 */");
@@ -3664,7 +3679,7 @@ fn recover_internal(
         let signature = Signature { language: "C", declaration: "long count(long value);".into(), source: "test prototype" };
         let code = [0xb400_0060u32, 0x9100_1002, 0x17ff_fffe, 0xd65f_03c0]
             .into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-        let body = render_arm64_body(0x1000, 0x1010, "_count", Some(&signature), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new(), None, "arm64").unwrap();
+        let body = render_arm64_body(0x1000, 0x1010, "_count", Some(&signature), &[], &BTreeMap::new(), &code, 0x1000, 0, &[], "", &[], "", &BTreeMap::new(), None, &[], &[], "arm64").unwrap();
         assert!(body.contains("while (!(value == 0))"), "{body}");
         assert!(body.contains("0x0000000000001004: x2 = value + 0x4;"), "{body}");
         assert!(!body.contains("x0 + 0x4;"), "{body}");
