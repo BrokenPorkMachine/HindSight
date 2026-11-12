@@ -8609,6 +8609,11 @@ fn x86_memory_address(instr: &iced_x86::Instruction, op: u32) -> Option<(IrMemor
             let target = instr.memory_displacement64();
             return Some((IrMemoryAddress::PcRelative { offset: 0, target }, size));
         }
+        if base_reg == iced_x86::Register::None {
+            // Absolute displacement-only memory operand; represent as an absolute target conservatively.
+            let target = instr.memory_displacement64();
+            return Some((IrMemoryAddress::PcRelative { offset: 0, target }, size));
+        }
         let base = x86_to_ir_register(base_reg)?;
         Some((IrMemoryAddress::BaseOffset { base, offset: disp }, size))
     } else if base_reg != iced_x86::Register::None {
@@ -8617,7 +8622,7 @@ fn x86_memory_address(instr: &iced_x86::Instruction, op: u32) -> Option<(IrMemor
         let scale = instr.memory_index_scale() as u8;
         Some((IrMemoryAddress::BaseIndex { base, index, extension: None, scale }, size))
     } else {
-        // disp + index*scale (no base) - not representable in current IrMemoryAddress forms conservatively.
+        // index*scale + disp (no base) not representable in current IR; keep conservative.
         None
     }
 }
