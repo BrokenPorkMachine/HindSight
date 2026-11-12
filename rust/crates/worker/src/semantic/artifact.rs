@@ -2388,7 +2388,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             IrOperation::DirectCall { target } if target == start => self_prototype.is_some(),
             IrOperation::DirectCall { target } => {
                 call_prototypes.contains_key(&target)
-                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, "arm64").is_some_and(|summary| {
+                    && (is_objc_msgsend_stub || is_known_runtime_helper || calls::analyze_callee_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, &arch).is_some_and(|summary| {
                         let callee_saved_gprs = 0x7ff8_0000; // x19 through x30
                         let callee_saved_vectors = 0x0000_ff00; // low 64-bit v8 through v15
                         summary.complete
@@ -2512,7 +2512,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         // of what the callee does. The observation is capped and explicitly
         // scoped; it never replaces the caller-visible ABI contract.
         let tree = match portable {
-            IrOperation::DirectCall { target } => match calls::analyze_callee_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, "arm64") {
+            IrOperation::DirectCall { target } => match calls::analyze_callee_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, &arch) {
                 Some(summary) => {
                     let mut tree = tree;
                     tree.attributes = calls::with_callee_payload(tree.attributes, &summary);
@@ -2530,7 +2530,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 let mut tree = tree;
                 tree.attributes = calls::with_non_returning_payload(
                     tree.attributes,
-                    calls::prove_non_returning_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, "arm64"),
+                    calls::prove_non_returning_with_resolved_indirects_and_arch(code, base, target, CALLEE_WINDOW, &resolved_indirect_targets, &arch),
                 );
                 tree
             }

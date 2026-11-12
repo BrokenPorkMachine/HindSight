@@ -8136,9 +8136,11 @@ fn call_scan_window_pcs(
 ) -> Option<Vec<u64>> {
     if function_start < base || callsite < function_start { return None; }
     if insn_pcs.is_empty() {
-        if (function_start - base) % 4 != 0 || (callsite - base) % 4 != 0 { return None; }
-        let call_index = usize::try_from(callsite - base).ok()?.checked_div(4)?;
-        let function_index = usize::try_from(function_start - base).ok()?.checked_div(4)?;
+        if (function_start - base) % 4 != 0 { return None; }
+        let call_off = callsite.checked_sub(base)?;
+        if call_off % 4 != 0 { return None; }
+        let call_index = usize::try_from(call_off / 4).ok()?;
+        let function_index = usize::try_from((function_start - base) / 4).ok()?;
         if call_index < function_index { return None; }
         let start_index = call_index.saturating_sub(64).max(function_index);
         return Some((start_index..call_index).map(|i| base.saturating_add(i as u64 * 4)).collect());
@@ -8147,6 +8149,7 @@ fn call_scan_window_pcs(
     let mut in_fn: Vec<u64> = insn_pcs.iter().copied().filter(|&pc| pc >= function_start && pc < callsite).collect();
     in_fn.sort_unstable();
     in_fn.dedup();
+    if in_fn.is_empty() { return None; }
     let take = in_fn.len().min(64);
     Some(in_fn[in_fn.len().saturating_sub(take)..].to_vec())
 }
