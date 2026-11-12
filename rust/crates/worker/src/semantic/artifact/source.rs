@@ -4054,6 +4054,8 @@ pub(super) fn canonical_boolean_callee_with_pcs(
         if count == 0 { return false; }
         let mut trees = Vec::new();
         let mut operations = Vec::new();
+        let mut pcs = Vec::with_capacity(count);
+        let mut sizes = Vec::with_capacity(count);
         for index in 0..count {
             let off = index * 4;
             let Some(bytes) = code.get(off..off + 4) else { return false; };
@@ -4065,8 +4067,10 @@ pub(super) fn canonical_boolean_callee_with_pcs(
                 tree("unsupported-operation", None, object([]), vec![])
             }));
             operations.push(operation);
+            pcs.push(pc);
+            sizes.push(4);
         }
-        return recover_with_types(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], &[], &[]).is_ok();
+        return recover_with_types(start, &trees, &operations, signature.clone(), &BTreeMap::new(), &[], &pcs, &sizes).is_ok();
     }
     if insn_pcs.len() > 128 { return false; }
     let sizes_ok = insn_sizes.is_empty() || insn_sizes.len() == insn_pcs.len();
