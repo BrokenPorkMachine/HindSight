@@ -8400,6 +8400,19 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
             };
             Some(IrOperation::Compare { kind, left, right })
         }
+        M::Inc | M::Dec => {
+            // INC/DEC modify destination by 1; x86 flags differ from ADD/SUB w.r.t. CF, but arithmetic
+            // data-flow effect on the register is representable. Keep conservative if operand not a GPR.
+            if instr.op_count() != 1 || instr.op0_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let op = if instr.mnemonic() == M::Inc { IrBinaryOp::Add } else { IrBinaryOp::Subtract };
+            Some(IrOperation::Binary {
+                destination: dst,
+                operator: op,
+                left: IrOperand::Register(dst),
+                right: IrOperand::Constant(1),
+            })
+        }
         _ => None,
     }
 }
