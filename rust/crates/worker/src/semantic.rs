@@ -8528,14 +8528,23 @@ fn known_call_flow_with_pcs(code: &[u8], base: u64, function_start: u64, callsit
 
 fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Option<Flow> {
     let is_arm64 = is_arm64_arch(architecture);
+    // Call-argument flow analysis currently relies on ARM64 semantic rendering/state; keep non-ARM64 conservative.
     if !is_arm64 { return None; }
     let pcs = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture)?;
+    let size_map: std::collections::BTreeMap<u64, u32> = if insn_sizes.len() == insn_pcs.len() && !insn_pcs.is_empty() {
+        insn_pcs.iter().copied().zip(insn_sizes.iter().copied()).collect()
+    } else {
+        std::collections::BTreeMap::new()
+    };
     let mut flow = Flow::new();
-    for (_i, &pc) in pcs.iter().enumerate() {
-        let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
-            // map by position in provided full pc list if possible
-            insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
-        } else { 4 };
+    for &pc in &pcs {
+        let sz = if let Some(&sz) = size_map.get(&pc) {
+            sz
+        } else if insn_pcs.is_empty() && is_arm64 {
+            4
+        } else {
+            return None; // conservative for unknown variable-length size
+        };
         let Some((_word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
             return None; // conservative for unsupported/variable-length decode
         };
@@ -8610,15 +8619,25 @@ pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, functio
 
 pub fn known_call_stack_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(usize, u8, u64, String)> {
     let is_arm64 = is_arm64_arch(architecture);
+    // Stack argument recovery currently relies on ARM64 semantic/ABI rendering; keep non-ARM64 conservative.
     if !is_arm64 { return Vec::new(); }
     let Some(pcs) = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture) else { return Vec::new(); };
+    let size_map: std::collections::BTreeMap<u64, u32> = if insn_sizes.len() == insn_pcs.len() && !insn_pcs.is_empty() {
+        insn_pcs.iter().copied().zip(insn_sizes.iter().copied()).collect()
+    } else {
+        std::collections::BTreeMap::new()
+    };
     let mut flow = Flow::new();
     let mut stack_aliases = std::collections::BTreeMap::<u8, Vec<u64>>::new();
     let mut stack = std::collections::BTreeMap::<usize, (u8, u64, String)>::new();
     for &pc in &pcs {
-        let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
-            insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
-        } else { 4 };
+        let sz = if let Some(&sz) = size_map.get(&pc) {
+            sz
+        } else if insn_pcs.is_empty() && is_arm64 {
+            4
+        } else {
+            return Vec::new(); // conservative for unknown variable-length size
+        };
         let Some((_word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
             return Vec::new(); // conservative for unsupported/variable-length decode
         };
