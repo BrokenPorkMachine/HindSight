@@ -8130,6 +8130,17 @@ impl SsaOutputBudget {
 
 pub(crate) const ARM64_INSN_BYTES: u64 = 4;
 
+fn is_arm64_arch(architecture: &str) -> bool {
+    let arch = architecture.to_ascii_lowercase();
+    matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64")
+}
+
+#[allow(dead_code)]
+fn is_x86_64_arch(architecture: &str) -> bool {
+    let arch = architecture.to_ascii_lowercase();
+    matches!(arch.as_str(), "x86_64" | "x86-64" | "amd64")
+}
+
 pub(crate) fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
     let off = usize::try_from(pc.checked_sub(base)?).ok()?;
     let bytes = code.get(off..off.checked_add(usize::try_from(ARM64_INSN_BYTES).ok()?)?)?;
@@ -8137,11 +8148,10 @@ pub(crate) fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
 }
 
 /// Architecture-aware decode+lift dispatch. ARM64 4-byte instructions use the existing
-/// ARM64 decoder/lifter; other architectures/sizes are conservatively unsupported here.
+/// ARM64 decoder/lifter; other architectures/sizes are conservatively unsupported for
+/// semantic lifting (no fixed-width ARM64 mis-decode of variable-length streams).
 fn decode_lift_for_arch(code: &[u8], base: u64, pc: u64, size: u32, architecture: &str) -> Option<(u32, Operation, IrOperation)> {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
-    if is_arm64 && size == 4 {
+    if is_arm64_arch(architecture) && size == 4 {
         let word = read_arm64_u32(code, base, pc)?;
         let operation = decode(word, pc);
         let portable = lift_operation(operation, pc);
@@ -8184,8 +8194,7 @@ fn call_scan_window_pcs(
     insn_pcs: &[u64],
     architecture: &str,
 ) -> Option<Vec<u64>> {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = is_arm64_arch(architecture);
     if function_start < base || callsite < function_start { return None; }
     if insn_pcs.is_empty() {
         // Fixed-width ARM64 fallback only.
@@ -8215,8 +8224,7 @@ fn known_call_flow_with_pcs(code: &[u8], base: u64, function_start: u64, callsit
 }
 
 fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Option<Flow> {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = is_arm64_arch(architecture);
     if !is_arm64 { return None; }
     let pcs = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture)?;
     let mut flow = Flow::new();
@@ -8298,8 +8306,7 @@ pub fn known_call_stack_argument_values_with_pcs(code: &[u8], base: u64, functio
 }
 
 pub fn known_call_stack_argument_values_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64, callsite: u64, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> Vec<(usize, u8, u64, String)> {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = is_arm64_arch(architecture);
     if !is_arm64 { return Vec::new(); }
     let Some(pcs) = call_scan_window_pcs(base, function_start, callsite, insn_pcs, architecture) else { return Vec::new(); };
     let mut flow = Flow::new();
@@ -8617,8 +8624,7 @@ pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u
 pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>, insn_pcs: &[u64], insn_sizes: &[u32], architecture: &str) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
     use std::collections::{BTreeMap, VecDeque};
     let mut result = BTreeMap::new();
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = is_arm64_arch(architecture);
     if !is_arm64 { return result; }
     // ARM64 fixed-width decode path when no explicit PC/size map is provided.
     // Variable-length streams can provide `insn_pcs`/`insn_sizes`, but decode remains ARM64 4-byte until x86-64 lifting is implemented.
@@ -8841,8 +8847,7 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     insn_sizes: &[u32],
     architecture: &str,
 ) -> bool {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = is_arm64_arch(architecture);
     if !is_arm64 { return false; }
     if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
     let fixed_width = insn_pcs.is_empty();
@@ -8926,8 +8931,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
     _insn_sizes: &[u32],
     architecture: &str,
 ) -> String {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = is_arm64_arch(architecture);
     if !is_arm64 {
         // Variable-length/non-ARM64 decode+lift render not yet implemented in this path; conservative.
         return String::new();
@@ -9023,7 +9027,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                     data,
                 };
             }
-            if let Some((word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, &arch) {
+            if let Some((word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) {
                 LiftedInstruction { address: pc, word, portable, operation, data }
             } else {
                 LiftedInstruction {
