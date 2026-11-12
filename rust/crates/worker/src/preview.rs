@@ -2213,6 +2213,33 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
    pc = pc.saturating_add(4);
   }
   (pcs, sizes)
+ } else if matches!(arch_lc.as_str(), "x86_64" | "x86-64" | "amd64") {
+  let available_end = end.min(map.address + code.len() as u64);
+  let high = available_end.min(start.saturating_add(128 * 15));
+  if start >= map.address && high > start {
+   let lo = (start - map.address) as usize;
+   let hi = (high - map.address) as usize;
+   if hi <= code.len() && lo < hi {
+    let body = &code[lo..hi];
+    let mut decoder = iced_x86::Decoder::with_ip(64, body, start, iced_x86::DecoderOptions::NONE);
+    let mut pcs = Vec::new();
+    let mut sizes = Vec::new();
+    while decoder.can_decode() && pcs.len() < 128 {
+     let ip = decoder.ip();
+     if ip >= end { break; }
+     let instr = decoder.decode();
+     let sz = instr.len() as u32;
+     if sz == 0 { break; }
+     pcs.push(ip);
+     sizes.push(sz);
+    }
+    (pcs, sizes)
+   } else {
+    (Vec::new(), Vec::new())
+   }
+  } else {
+   (Vec::new(), Vec::new())
+  }
  } else {
   (Vec::new(), Vec::new())
  };
