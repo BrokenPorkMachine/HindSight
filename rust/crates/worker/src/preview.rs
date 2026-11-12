@@ -457,7 +457,8 @@ fn proven_objc_dispatch_slot(address:u64,indirect_facts:&[(String,String,u64)],b
  names.len()==1&&names.iter().next().is_some_and(|name|ordinary_objc_dispatch(name))
 }
 
-fn objc_msgsend_stub_selector(file:&mut File,window:&[u8],size:u64,target:u64,indirect_facts:&[(String,String,u64)])->io::Result<Option<String>>{
+fn objc_msgsend_stub_selector(file:&mut File,window:&[u8],size:u64,target:u64,indirect_facts:&[(String,String,u64)],architecture:&str)->io::Result<Option<String>>{
+ if !super::semantic::is_arm64_arch(architecture){ return Ok(None); }
  let section_list=sections(window);
  let Some(stub_section)=section_for_va(&section_list,target).filter(|section|section.sect=="__objc_stubs") else { return Ok(None); };
  let relative=target-stub_section.addr;
@@ -2161,14 +2162,16 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  let fn_code=code.get(start.saturating_sub(map.address) as usize .. end.saturating_sub(map.address).min(code.len() as u64) as usize).unwrap_or(&[]);
  let arch_lc_proto = architecture.to_ascii_lowercase();
  if matches!(arch_lc_proto.as_str(), "arm64" | "arm64e" | "aarch64") {
+  let insn = super::semantic::ARM64_INSN_BYTES as usize;
   let mut index=0usize;
-  while index*4+4<=fn_code.len() {
-   let chunk=&fn_code[index*4..index*4+4];
-   let _pc=start + index as u64*4;
+  while index*insn+insn<=fn_code.len() {
+   let off=index*insn;
+   let chunk=&fn_code[off..off+insn];
+   let _pc=start + (index as u64)*super::semantic::ARM64_INSN_BYTES;
    let word=u32::from_le_bytes(chunk.try_into().unwrap());
    let Some((target,"call",_))=branch_target(word,_pc) else { index+=1; continue };
    let mut stub_symbol: Option<String> = None;
-   if let Ok(Some(selector))=objc_msgsend_stub_selector(&mut file,&window,size,target,&indirect_facts) {
+   if let Ok(Some(selector))=objc_msgsend_stub_selector(&mut file,&window,size,target,&indirect_facts,architecture) {
     stub_symbol = Some(format!("_objc_msgSend${selector}"));
     if !call_prototypes.iter().any(|(addr,_,_)|*addr==target) {
      if let Some(encodings)=selector_encoding_map.get(&selector) {
