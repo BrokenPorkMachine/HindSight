@@ -9286,19 +9286,24 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
                     }
                 }
                 IrOperation::ConditionalBranch { target, .. } => {
-                    let outcome = if let IrOperation::ConditionalBranch { condition, .. } = last_op {
-                        let mut local_flow = Flow::new();
-                        let mut supported = true;
-                        for &instruction_pc in blocks[bi].instructions.iter().take(blocks[bi].instructions.len().saturating_sub(1)) {
-                            let instruction_index = pcs.iter().position(|&pc| pc == instruction_pc).unwrap();
-                            let operation = lifted_instructions[instruction_index].portable;
-                            if matches!(operation, IrOperation::TargetSpecific) || operation.render(&mut local_flow, instruction_pc).is_none() {
-                                supported = false;
-                                break;
+                    // Condition-evaluation pruning relies on ARM64 semantic rendering/flow; for non-ARM64 keep both edges conservatively.
+                    let outcome = if is_arm64 {
+                        if let IrOperation::ConditionalBranch { condition, .. } = last_op {
+                            let mut local_flow = Flow::new();
+                            let mut supported = true;
+                            for &instruction_pc in blocks[bi].instructions.iter().take(blocks[bi].instructions.len().saturating_sub(1)) {
+                                let instruction_index = pcs.iter().position(|&pc| pc == instruction_pc).unwrap();
+                                let operation = lifted_instructions[instruction_index].portable;
+                                if matches!(operation, IrOperation::TargetSpecific) || operation.render(&mut local_flow, instruction_pc).is_none() {
+                                    supported = false;
+                                    break;
+                                }
                             }
-                        }
-                        if supported { evaluate_ir_condition(condition, &local_flow) } else { None }
-                    } else { None };
+                            if supported { evaluate_ir_condition(condition, &local_flow) } else { None }
+                        } else { None }
+                    } else {
+                        None
+                    };
                     if outcome != Some(false) {
                         if let Some(target) = block_of(target) { successors.push(target); }
                     }
@@ -9381,7 +9386,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             let mut flow = flow0;
             for &p in bpcs {
                 let instruction = &function_ir.instructions[{
-                    let d=p.saturating_sub(function_ir.start); if d%4==0 {(d/4) as usize} else {function_ir.instructions.iter().position(|i| i.address==p).unwrap_or(0)}
+                    function_ir.instructions.iter().position(|i| i.address == p).unwrap_or(0)
                 }.min(function_ir.instructions.len().saturating_sub(1))];
                 if instruction.data {
                     flow.clear();
@@ -9456,7 +9461,7 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             let mut flow = entry.get(&bi).cloned().unwrap_or_else(Flow::new);
             for &p in &block.instructions {
                 let instruction = &function_ir.instructions[{
-                    let d=p.saturating_sub(function_ir.start); if d%4==0 {(d/4) as usize} else {function_ir.instructions.iter().position(|i| i.address==p).unwrap_or(0)}
+                    function_ir.instructions.iter().position(|i| i.address == p).unwrap_or(0)
                 }.min(function_ir.instructions.len().saturating_sub(1))];
                 let statement = if instruction.data {
                     flow.clear();
