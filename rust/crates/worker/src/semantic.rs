@@ -8932,15 +8932,15 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
     architecture: &str,
 ) -> String {
     let is_arm64 = is_arm64_arch(architecture);
-    if !is_arm64 {
-        // Variable-length/non-ARM64 decode+lift render not yet implemented in this path; conservative.
-        return String::new();
-    }
     if code.is_empty() || starts.is_empty() {
         return String::new();
     }
     let end = base.saturating_add(code.len() as u64);
-    let mut out = String::from("AArch64 register semantics v54; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n");
+    let mut out = if is_arm64 {
+        String::from("AArch64 register semantics v54; machine registers, not recovered source variables. Every statement cites its unslid instruction address and word. Exact straight-line constants carry instruction provenance; unknown effects are barriers.\n")
+    } else {
+        format!("Architecture-aware instruction stream preview for {architecture}; semantic decode/lift not implemented for this architecture, conservative listing only.\n")
+    };
 
     for (index, &start) in starts.iter().enumerate().take(MAX_FUNCTIONS) {
         let function_end = starts.get(index + 1).copied().unwrap_or(end).min(end);
@@ -8948,7 +8948,11 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             continue;
         }
         let use_pc_map = !_insn_pcs.is_empty();
-        if !use_pc_map && !arm64_is_aligned(base, start) {
+        if !is_arm64 && !use_pc_map {
+            // No fixed-width synthesis for variable-length/unknown architectures without a PC/size map.
+            continue;
+        }
+        if is_arm64 && !use_pc_map && !arm64_is_aligned(base, start) {
             continue;
         }
         out.push_str(&format!(
@@ -8970,12 +8974,12 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             }
             if list.is_empty() {
                 // Fallback: ARM64 fixed-width synthesis when provided map has no entries in range.
-                if !arm64_is_aligned(base, start) {
-                    (Vec::new(), std::collections::BTreeMap::new())
-                } else {
+                if is_arm64 && arm64_is_aligned(base, start) {
                     let high_addr = base.saturating_add(high as u64);
                     let pcs_v = arm64_fixed_width_pcs_in_range(start, high_addr, base, MAX_WORDS_PER_FUNCTION).unwrap_or_default();
                     (pcs_v, std::collections::BTreeMap::new())
+                } else {
+                    (Vec::new(), std::collections::BTreeMap::new())
                 }
             } else {
                 (list, map)
@@ -8990,6 +8994,21 @@ pub fn render_with_resolved_indirects_and_arch_and_pcs(
             if out.len() >= MAX_OUTPUT {
                 break;
             }
+            continue;
+        }
+
+        if !is_arm64 {
+            // Conservative variable-length/unknown-architecture listing: use provided PC/size map, no decode/lift.
+            for &pc in &pcs {
+                let sz = insn_size_map.get(&pc).copied().unwrap_or(0);
+                let position = file_offset.saturating_add(pc.saturating_sub(base));
+                let end_pos = file_offset.saturating_add(pc.saturating_add(sz as u64).saturating_sub(base));
+                let data = data_ranges.iter().any(|&(lo_r, hi_r, _)| position < hi_r && end_pos > lo_r);
+                out.push_str(&format!("  {pc:#018x}  size={sz} {}\n", if data { "data" } else { "semantic decode unsupported (conservative)" }));
+                if out.len() >= MAX_OUTPUT { break; }
+            }
+            out.push_str("}\n");
+            if out.len() >= MAX_OUTPUT { break; }
             continue;
         }
 
