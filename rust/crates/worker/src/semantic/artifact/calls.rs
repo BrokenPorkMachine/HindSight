@@ -475,6 +475,22 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch(
     resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
     architecture: &str,
 ) -> bool {
+    prove_non_returning_with_resolved_indirects_and_arch_and_pcs(code, base, target, budget, resolved_indirect_targets, architecture, &[], &[])
+}
+
+/// Architecture- and PC/size-map-aware non-return proof.
+/// When instruction PCs/sizes are provided they drive iteration; decode/lift remains ARM64 4-byte only
+/// (non-ARM64 or non-4-byte instructions bail conservatively).
+pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch_and_pcs(
+    code: &[u8],
+    base: u64,
+    target: u64,
+    budget: usize,
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    architecture: &str,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+) -> bool {
     let arch = architecture.to_ascii_lowercase();
     let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
     if !is_arm64 {
@@ -482,42 +498,75 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch(
         // Bail conservatively - no unsound non-returning claim.
         return false;
     }
-    let Some(offset) = target.checked_sub(base).map(|value| value as usize) else {
-        return false;
-    };
-    if offset % 4 != 0 {
-        return false;
-    }
     // Decode the bounded window once, keeping each instruction's control
     // flow. A word that does not decode stops the proof: the callee's
     // behaviour past that point is unknown.
     let mut window: Vec<(u64, Flow)> = Vec::new();
-    let mut cursor = offset;
-    while window.len() < budget {
-        let Some(bytes) = code.get(cursor..cursor + 4) else {
-            break;
-        };
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
-        let pc = base + cursor as u64;
-        let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
-        let flow = match portable {
-            super::super::IrOperation::Branch { target } => Flow::Direct(target),
-            super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
-            super::super::IrOperation::IndirectBranch { .. } => {
-                if let Some(targets) = resolved_indirect_targets.get(&pc) {
-                    Flow::ResolvedIndirect(targets.clone())
-                } else {
-                    Flow::Unknown
-                }
+    if !insn_pcs.is_empty() {
+        let mut started = false;
+        for (i, &pc) in insn_pcs.iter().enumerate() {
+            if !started {
+                if pc == target { started = true; } else { continue; }
             }
-            super::super::IrOperation::Return { .. } => Flow::Returns,
-            super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
-            super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
-            super::super::IrOperation::TargetSpecific => Flow::Unknown,
-            _ => Flow::FallsThrough,
+            if window.len() >= budget { break; }
+            let sz = if insn_sizes.len() == insn_pcs.len() { *insn_sizes.get(i).unwrap_or(&4) } else { 4 };
+            if sz != 4 { break; }
+            let Some(off) = pc.checked_sub(base).and_then(|v| usize::try_from(v).ok()) else { break; };
+            let Some(bytes) = code.get(off..off + 4) else { break; };
+            let word = u32::from_le_bytes(bytes.try_into().unwrap());
+            let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
+            let flow = match portable {
+                super::super::IrOperation::Branch { target } => Flow::Direct(target),
+                super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
+                super::super::IrOperation::IndirectBranch { .. } => {
+                    if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                        Flow::ResolvedIndirect(targets.clone())
+                    } else {
+                        Flow::Unknown
+                    }
+                }
+                super::super::IrOperation::Return { .. } => Flow::Returns,
+                super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
+                super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
+                super::super::IrOperation::TargetSpecific => Flow::Unknown,
+                _ => Flow::FallsThrough,
+            };
+            window.push((pc, flow));
+        }
+    } else {
+        let Some(offset) = target.checked_sub(base).map(|value| value as usize) else {
+            return false;
         };
-        window.push((pc, flow));
-        cursor += 4;
+        if offset % 4 != 0 {
+            return false;
+        }
+        let mut cursor = offset;
+        while window.len() < budget {
+            let Some(bytes) = code.get(cursor..cursor + 4) else {
+                break;
+            };
+            let word = u32::from_le_bytes(bytes.try_into().unwrap());
+            let pc = base + cursor as u64;
+            let portable = super::super::lift_operation(super::super::decode(word, pc), pc);
+            let flow = match portable {
+                super::super::IrOperation::Branch { target } => Flow::Direct(target),
+                super::super::IrOperation::ConditionalBranch { target, .. } => Flow::Conditional(target),
+                super::super::IrOperation::IndirectBranch { .. } => {
+                    if let Some(targets) = resolved_indirect_targets.get(&pc) {
+                        Flow::ResolvedIndirect(targets.clone())
+                    } else {
+                        Flow::Unknown
+                    }
+                }
+                super::super::IrOperation::Return { .. } => Flow::Returns,
+                super::super::IrOperation::DirectCall { target } => Flow::Calls(target),
+                super::super::IrOperation::IndirectCall { .. } => Flow::Unknown,
+                super::super::IrOperation::TargetSpecific => Flow::Unknown,
+                _ => Flow::FallsThrough,
+            };
+            window.push((pc, flow));
+            cursor += 4;
+        }
     }
     if window.is_empty() {
         return false;
