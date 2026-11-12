@@ -2258,15 +2258,17 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  // Rewind? not necessary; further reads use absolute offsets
  let arch_lc = architecture.to_ascii_lowercase();
  let (instruction_pcs, instruction_sizes) = if matches!(arch_lc.as_str(), "arm64" | "arm64e" | "aarch64") {
-  let bound_stride = if is_arm64_jt { 4u64 } else { 16u64 };
+  let insn = super::semantic::ARM64_INSN_BYTES;
+  let bound_stride = if is_arm64_jt { insn } else { 16u64 };
   let fn_end = end.min(map.address + code.len() as u64).min(start.saturating_add(128u64.saturating_mul(bound_stride)));
   let mut pcs = Vec::new();
   let mut sizes = Vec::new();
   let mut pc = start;
-  while pc.saturating_add(4) <= fn_end {
+  let sz = u32::try_from(insn).unwrap_or(4);
+  while pc.saturating_add(insn) <= fn_end {
    pcs.push(pc);
-   sizes.push(4u32);
-   pc = pc.saturating_add(4);
+   sizes.push(sz);
+   pc = pc.saturating_add(insn);
   }
   (pcs, sizes)
  } else if matches!(arch_lc.as_str(), "x86_64" | "x86-64" | "amd64") {
