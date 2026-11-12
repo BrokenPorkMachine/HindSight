@@ -8491,17 +8491,25 @@ pub fn object_member_accesses(code:&[u8], base:u64, start:u64, end:u64, file_off
 pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, start:u64, end:u64, file_offset:u64, data_ranges:&[(u64,u64,u16)], slots:&std::collections::BTreeSet<u64>, resolved_indirect_targets:&std::collections::BTreeMap<u64, Vec<u64>>) -> std::collections::BTreeMap<u64,ObjectMemberAccess> {
     use std::collections::{BTreeMap, VecDeque};
     let mut result = BTreeMap::new();
+    // ARM64 fixed-width decode path; variable-length streams need pc/size maps and architecture-aware decode.
     if start<base || end<=start || (start-base)%4!=0 || (end-start)%4!=0 || (end-start)/4>MAX_WORDS_PER_FUNCTION as u64 { return result; }
     let Some(body)=code.get((start-base) as usize..(end-base) as usize)else{return result};
+    let pcs: Vec<u64> = (0..(body.len()/4)).map(|i| start + i as u64 * 4).collect();
+    let idx_of = |target:u64| -> Option<usize> {
+        let d = target.checked_sub(start)?;
+        if d % 4 != 0 { return None; }
+        let i = (d / 4) as usize;
+        (i < pcs.len()).then_some(i)
+    };
     let operations=body.chunks_exact(4).enumerate().map(|(index,word)|{
-        let pc=start+index as u64*4;let position=file_offset.saturating_add(pc-base);
+        let pc=pcs[index]; let position=file_offset.saturating_add(pc-base);
         if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&position.saturating_add(4)>lo){IrOperation::TargetSpecific}
         else{lift_operation(decode(u32::from_le_bytes(word.try_into().unwrap()),pc),pc)}
     }).collect::<Vec<_>>();
     // A present entry means targets are proven complete (possibly all
     // external exits, i.e. no in-function successors).
     if operations.iter().enumerate().any(|(index,operation)|{
-        let pc=start+index as u64*4;
+        let pc=pcs[index];
         matches!(operation,IrOperation::IndirectBranch{..}) && !resolved_indirect_targets.contains_key(&pc)
     }){return result}
     let mut states=vec![None::<ObjectState>;operations.len()];states[0]=Some(ObjectState::entry());
@@ -8512,15 +8520,15 @@ pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, star
         let mut successors=Vec::new();
         match operations[index]{
             IrOperation::Branch{target}|IrOperation::ConditionalBranch{target,..}=>{
-                if target>=start&&target<end&&(target-start)%4==0{successors.push(((target-start)/4) as usize)}
+                if let Some(ti)=idx_of(target).filter(|&ti| pcs[ti] < end){ successors.push(ti); }
                 if matches!(operations[index],IrOperation::ConditionalBranch{..})&&index+1<operations.len(){successors.push(index+1)}
             }
             IrOperation::Return{..}=>{}
             IrOperation::IndirectBranch{..}=>{
-                let pc=start+index as u64*4;
+                let pc=pcs[index];
                 if let Some(targets)=resolved_indirect_targets.get(&pc){
                     for &target in targets{
-                        if target>=start&&target<end&&(target-start)%4==0{successors.push(((target-start)/4) as usize)}
+                        if let Some(ti)=idx_of(target).filter(|&ti| pcs[ti] < end){ successors.push(ti); }
                     }
                 }
             }
@@ -8546,7 +8554,7 @@ pub fn object_member_accesses_with_resolved_indirects(code:&[u8], base:u64, star
             ObjectValue::IvarAddress(slot)=>(None,Some(slot)),
             _=>continue,
         };
-        result.insert(start+index as u64*4,ObjectMemberAccess{offset,offset_pointer,bytes,floating,write,register,signed,result_bits});
+        result.insert(pcs[index],ObjectMemberAccess{offset,offset_pointer,bytes,floating,write,register,signed,result_bits});
     }
     result
 }
@@ -8644,22 +8652,25 @@ mod object_member_tests {
 
 /// Stack-relative slot names are safe only when every instruction in the
 /// recovered function is understood well enough to prove that SP is unchanged.
+/// ARM64 fixed-width decode path; variable-length streams require architecture-aware decode.
 pub fn stack_pointer_is_stable(code: &[u8], base: u64, function_start: u64, function_end: u64) -> bool {
-    if function_start < base || function_end < function_start || function_end>base.saturating_add(code.len() as u64) || (function_start - base) % 4 != 0 { return false; }
-    let Some(start)=usize::try_from(function_start-base).ok() else{return false};
-    let Some(end)=usize::try_from(function_end.min(base.saturating_add(code.len() as u64))-base).ok() else{return false};
-    if start>end||end>code.len()||start%4!=0||end%4!=0{return false}
-    for (index,bytes) in code[start..end].chunks_exact(4).enumerate(){
-        let pc=function_start.saturating_add(index as u64*4);
-        let operation=decode(u32::from_le_bytes(bytes.try_into().unwrap()),pc);
-        let writeback_changes_sp=|base:Register,writeback:Writeback|base.stack_pointer&&matches!(writeback,Writeback::Pre|Writeback::Post);
-        match operation{
-            Operation::AddImmediate{dst,..}|Operation::AddRegister{dst,..}|Operation::AddExtended{dst,..} if dst.stack_pointer=>return false,
-            Operation::Load{base,address:AddressForm::ImmediateSigned(_,writeback),..}
-            |Operation::Store{base,address:AddressForm::ImmediateSigned(_,writeback),..} if writeback_changes_sp(base,writeback)=>return false,
-            Operation::LoadPair{base,writeback,..}|Operation::StorePair{base,writeback,..} if writeback_changes_sp(base,writeback)=>return false,
-            Operation::Opaque=>return false,
-            _=>{}
+    if function_start < base || function_end < function_start || function_end > base.saturating_add(code.len() as u64) { return false; }
+    let Some(start) = usize::try_from(function_start - base).ok() else { return false };
+    let Some(end) = usize::try_from(function_end.min(base.saturating_add(code.len() as u64)) - base).ok() else { return false };
+    if start > end || end > code.len() { return false }
+    // Fixed-width 4-byte ARM64 instruction stream (default). Variable-length streams need pc/size maps.
+    if (function_start - base) % 4 != 0 || (end - start) % 4 != 0 { return false }
+    for (index, bytes) in code[start..end].chunks_exact(4).enumerate() {
+        let pc = function_start.saturating_add(index as u64 * 4);
+        let operation = decode(u32::from_le_bytes(bytes.try_into().unwrap()), pc);
+        let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
+        match operation {
+            Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
+            Operation::Load { base, address: AddressForm::ImmediateSigned(_, writeback), .. }
+            | Operation::Store { base, address: AddressForm::ImmediateSigned(_, writeback), .. } if writeback_changes_sp(base, writeback) => return false,
+            Operation::LoadPair { base, writeback, .. } | Operation::StorePair { base, writeback, .. } if writeback_changes_sp(base, writeback) => return false,
+            Operation::Opaque => return false,
+            _ => {}
         }
     }
     true
