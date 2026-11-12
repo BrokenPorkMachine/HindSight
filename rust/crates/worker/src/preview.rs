@@ -505,7 +505,7 @@ fn selector_call_xrefs(relocations:&[(u64,String,u32,bool,u32,Option<u64>)],call
 fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
  let mut out=String::new();let mut global=[0u32;32];
  for (bi,&start) in leaders.iter().enumerate().take(4000){let stop=leaders.get(bi+1).copied().unwrap_or(end);let lo=start.saturating_sub(base) as usize;let hi=stop.saturating_sub(base).min(code.len() as u64) as usize;if lo>=hi||hi>code.len(){continue}out.push_str(&format!("B{bi:04} {start:#018x}\n"));let mut local=global;
-  for (ii,ch) in code[lo..hi].chunks_exact(4).enumerate(){let pc=start+ii as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let w=le32(ch);if let Some(line)=ssa_hint(w,&mut local){out.push_str(&format!("  {pc:#018x}  {line}\n"));}else{let mut b=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,b.as_mut_ptr(),b.len())};if known!=1{out.push_str(&format!("  {pc:#018x}  opaque barrier: incoming versions not propagated past unknown semantics\n"));local=[0u32;32];}}if out.len()>60_000{return out}}
+  let mut ii=0usize;while lo+ii*4+4<=hi{let pc=start+ii as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let ch=&code[lo+ii*4..lo+ii*4+4];let w=le32(ch);if let Some(line)=ssa_hint(w,&mut local){out.push_str(&format!("  {pc:#018x}  {line}\n"));}else{let mut b=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,b.as_mut_ptr(),b.len())};if known!=1{out.push_str(&format!("  {pc:#018x}  opaque barrier: incoming versions not propagated past unknown semantics\n"));local=[0u32;32];}}if out.len()>60_000{return out}ii+=1}
   for r in 0..32{global[r]=global[r].max(local[r]);}
  }
  if out.is_empty(){out.push_str("No modeled instructions were available for SSA renaming.\n");}out
@@ -756,7 +756,7 @@ fn swift_context_graph(file:&mut File,window:&[u8],size:u64)->io::Result<String>
  }
  if count==0{out.push_str("No Swift context descriptors passed bounded relative-pointer validation.\n");}Ok(out)
 }
-fn last_defs_for_block(code:&[u8],base:u64,start:u64,end:u64)->[Option<u64>;32]{let mut defs=[None;32];let lo=start.saturating_sub(base) as usize;let hi=end.saturating_sub(base).min(code.len() as u64) as usize;if lo>=hi||hi>code.len(){return defs}for (i,ch) in code[lo..hi].chunks_exact(4).enumerate(){if let Some(r)=modeled_def_reg(le32(ch)){defs[r]=Some(start+i as u64*4)}}defs}
+fn last_defs_for_block(code:&[u8],base:u64,start:u64,end:u64)->[Option<u64>;32]{let mut defs=[None;32];let lo=start.saturating_sub(base) as usize;let hi=end.saturating_sub(base).min(code.len() as u64) as usize;if lo>=hi||hi>code.len(){return defs}let mut i=0usize;while lo+i*4+4<=hi{let pc=start+i as u64*4;let ch=&code[lo+i*4..lo+i*4+4];if let Some(r)=modeled_def_reg(le32(ch)){defs[r]=Some(pc)}i+=1}defs}
 fn phi_operand_trace(leaders:&[u64],starts:&[u64],edges:&[(u64,u64,&str)],code:&[u8],base:u64,end:u64)->String{
  use std::collections::BTreeSet;const MAX_PHI_OPERAND_BLOCKS:usize=20_000;let n=leaders.len();
  if n>MAX_PHI_OPERAND_BLOCKS{return format!("Phi operand provenance omitted because the CFG has {n} blocks, above the {MAX_PHI_OPERAND_BLOCKS}-block bounded operand-analysis budget.\n")}
@@ -808,7 +808,7 @@ fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u6
   if entry<base||entry>=code_end{continue}
   let end=starts.get(index+1).copied().unwrap_or(code_end).min(code_end).min(entry.saturating_add(128));
   let lo=(entry-base) as usize;let hi=(end-base) as usize;let mut defined=0u8;let mut live_in=0u8;
-  for chunk in code[lo..hi].chunks_exact(4){let w=le32(chunk);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){break}live_in|=modeled_argument_uses(w)&!defined;if let Some(r)=modeled_def_reg(w){if r<8{defined|=1u8<<r}}}
+  let mut off=0usize;while lo+off+4<=hi{let w=le32(&code[lo+off..lo+off+4]);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){break}live_in|=modeled_argument_uses(w)&!defined;if let Some(r)=modeled_def_reg(w){if r<8{defined|=1u8<<r}}off+=4}
   if live_in==0{continue}
   let registers=(0..8).filter(|r|live_in&(1u8<<r)!=0).map(|r|format!("x{r}")).collect::<Vec<_>>();
   let highest=8-live_in.leading_zeros() as usize;let name=symbol_name_at(symbols,entry).unwrap_or("<discovered>");
@@ -821,7 +821,7 @@ fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u6
 
 fn explicit_cast_evidence(code:&[u8],base:u64)->String{
  let mut out=String::new();let mut found=0usize;
- for (index,chunk) in code.chunks_exact(4).enumerate(){let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{continue};let pc=base+index as u64*4; /* fixed-width ARM64; variable-length streams need pc map */out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}}
+ let mut index=0usize;while index*4+4<=code.len(){let chunk=&code[index*4..index*4+4];let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{index+=1;continue};let pc=base+index as u64*4; /* fixed-width ARM64; variable-length streams need pc map */out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}index+=1}
  if found==0{out.push_str("No explicit UXTB/UXTH/UXTW/SXTB/SXTH/SXTW encodings were recovered.\n")}
  out
 }
