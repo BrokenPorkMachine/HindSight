@@ -4535,8 +4535,8 @@ impl Recovery {
                     ("address_ast", asts[&load.address].clone().into()),
                     ("read_ast", asts[&load.expression].clone().into()),
                 ]), ranges(pc, semit_span_end(pc, insn_pcs, insn_sizes, start, trees_len))));
-                let mut evidence = ir
-                    .get(((load.pc - start) / 4) as usize)
+                let mut evidence = index_of_pc(load.pc, insn_pcs, start, trees_len)
+                    .and_then(|i| ir.get(i))
                     .into_iter()
                     .cloned()
                     .chain(std::iter::once(declaration.to_owned()))
@@ -4583,8 +4583,8 @@ impl Recovery {
             } else {
                 effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&effect.guard], store));
             }
-            let mut evidence = ir
-                .get(((effect.pc - start) / 4) as usize)
+            let mut evidence = index_of_pc(effect.pc, insn_pcs, start, trees_len)
+                .and_then(|i| ir.get(i))
                 .into_iter()
                 .cloned()
                 .chain(std::iter::once(declaration.to_owned()))
