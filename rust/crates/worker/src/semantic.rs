@@ -8366,6 +8366,20 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
                 right: IrOperand::Constant(disp as u64),
             })
         }
+        M::Movzx => {
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let src = x86_to_ir_register(instr.op1_register())?;
+            let from = match src.bits { 8 | 16 | 32 => src.bits, _ => return None };
+            Some(IrOperation::Extend { destination: dst, source: src, signed: false, from })
+        }
+        M::Movsx | M::Movsxd => {
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register || instr.op1_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let src = x86_to_ir_register(instr.op1_register())?;
+            let from = match src.bits { 8 | 16 | 32 => src.bits, _ => return None };
+            Some(IrOperation::Extend { destination: dst, source: src, signed: true, from })
+        }
         M::Add | M::Sub | M::And | M::Or | M::Xor => {
             if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register { return None; }
             let dst = x86_to_ir_register(instr.op0_register())?;
