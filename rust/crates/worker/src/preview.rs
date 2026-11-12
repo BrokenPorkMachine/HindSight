@@ -2077,10 +2077,12 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
   Some(super::signatures::Signature { language: "C", declaration: decl.to_owned(), source: "known Objective-C runtime ABI contract" })
  };
  let fn_code=code.get(start.saturating_sub(map.address) as usize .. end.saturating_sub(map.address).min(code.len() as u64) as usize).unwrap_or(&[]);
- for (index,chunk) in fn_code.chunks_exact(4).enumerate() {
+ let mut index=0usize;
+ while index*4+4<=fn_code.len() {
+  let chunk=&fn_code[index*4..index*4+4];
   let _pc=start + index as u64*4;
   let word=u32::from_le_bytes(chunk.try_into().unwrap());
-  let Some((target,"call",_))=branch_target(word,_pc) else { continue };
+  let Some((target,"call",_))=branch_target(word,_pc) else { index+=1; continue };
   let mut stub_symbol: Option<String> = None;
   if let Ok(Some(selector))=objc_msgsend_stub_selector(&mut file,&window,size,target,&indirect_facts) {
    stub_symbol = Some(format!("_objc_msgSend${selector}"));
@@ -2109,6 +2111,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
     }
    }
   }
+  index+=1;
  }
  call_prototypes.sort_by(|left,right|(left.0,&left.1,&left.2.declaration).cmp(&(right.0,&right.1,&right.2.declaration)));
  call_prototypes.dedup_by(|left,right|left.0==right.0&&left.1==right.1&&left.2.declaration==right.2.declaration);
