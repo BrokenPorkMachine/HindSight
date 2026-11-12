@@ -8545,12 +8545,13 @@ pub fn object_member_accesses_with_resolved_indirects_and_pcs(code:&[u8], base:u
     // ARM64 fixed-width decode path when no explicit PC/size map is provided.
     // Variable-length streams can provide `insn_pcs`/`insn_sizes`, but decode remains ARM64 4-byte until x86-64 lifting is implemented.
     let fixed_width = insn_pcs.is_empty();
-    if start<base || end<=start || (fixed_width && ((start-base)%4!=0 || (end-start)%4!=0)) || (fixed_width && (end-start)/4>MAX_WORDS_PER_FUNCTION as u64) { return result; }
+    if start<base || end<=start || (fixed_width && (start-base)%4!=0) { return result; }
     let Some(body_end)=end.checked_sub(base).and_then(|d| usize::try_from(d).ok()).map(|e| e.min(code.len())) else { return result; };
     let Some(body_start)=start.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return result; };
     if body_start >= body_end || body_end > code.len() { return result; }
     let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
         let count = (body_end - body_start) / 4;
+        if count > MAX_WORDS_PER_FUNCTION { return result; }
         let pcs = (0..count).map(|i| start + i as u64 * 4).collect::<Vec<_>>();
         (pcs, vec![4; count])
     } else {
