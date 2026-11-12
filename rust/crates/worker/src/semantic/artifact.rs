@@ -1719,21 +1719,25 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     }
 
     if is_x86_64 {
-        // Bounded, sound x86_64/x86-64 support: instruction boundaries/PCs/sizes are decoded via iced-x86
-        // and propagated, but lifting into the shared typed semantic IR/AST/source pipeline and ABI adaptation
-        // are not yet implemented. Emit conservative, evidence-backed artifacts with no fabricated behavior.
-        let mut rendering = String::from("/* x86_64 instruction boundaries decoded (iced-x86); lifting into shared typed semantic IR/AST/source not yet implemented. Conservative unsupported review only; no source/export/equivalence claim. */\n");
+        // Bounded, sound x86_64/x86-64 support: iced-x86 instruction boundaries/PCs/sizes are decoded
+        // and partially lifted into shared IR/AST evidence for a conservative subset. Full lifting into
+        // the shared typed semantic IR/AST/source pipeline, CFG/SSA/dataflow/source recovery, and ABI
+        // adaptation remain incomplete; artifacts stay blocked and non-equivalence/non-export.
+        let mut rendering = String::from("/* x86_64 instruction boundaries decoded (iced-x86) with partial conservative lifting. Full shared semantic/source recovery and ABI adaptation not implemented; review-only, no source/export/equivalence claim. */\n");
         let mut statements: Vec<String> = Vec::new();
+        let mut models: Vec<IrOperation> = Vec::new();
+        let mut ir_ids: Vec<String> = Vec::new();
         for (index, &pc) in insn_pcs.iter().enumerate() {
             let sz = *insn_sizes.get(index).unwrap_or(&0) as usize;
             let pc_end = pc.saturating_add(sz as u64);
             let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { continue; };
             let bytes = code.get(off..off.saturating_add(sz).min(code.len())).unwrap_or(&[]);
-            let (op, node, ir_text) = x86_64_lift_instruction(pc, bytes);
-            let evidence = ir_text;
+            let (op, _node, ir_text) = x86_64_lift_instruction(pc, bytes);
+            let evidence = ir_text.clone();
             let ty = match op {
                 IrOperation::Nop | IrOperation::Branch { .. } | IrOperation::DirectCall { .. } | IrOperation::Return { .. } => "x86_64 partially lifted (conservative)",
                 IrOperation::Load { .. } | IrOperation::Store { .. } => "x86_64 partially lifted memory/stack op (conservative)",
+                IrOperation::Assign { .. } | IrOperation::Binary { .. } => "x86_64 partially lifted data op (conservative)",
                 _ => "x86_64 instruction boundary decoded; lifting incomplete",
             };
             let kind = match op {
@@ -1743,17 +1747,86 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 IrOperation::DirectCall { .. } => "direct-call",
                 _ => "unsupported-operation",
             };
-            statements.push(builder.ast(
+            let ast_id = builder.ast(
                 kind,
                 Some(ty),
                 vec![],
                 &evidence,
                 (pc, pc_end),
                 object([("architecture", "x86_64".into()), ("size", (sz as u64).into()), ("status", match op { IrOperation::TargetSpecific => "unsupported".into(), _ => "partial-lift".into() }), ("ir_text", evidence.clone().into())]),
-            )?);
+            )?;
+            let ir = builder.record(
+                "ir",
+                "derived",
+                object([
+                    ("artifact_kind", "instruction-ir".into()),
+                    ("pc", address(pc)),
+                    ("size", (sz as u64).into()),
+                    ("architecture", "x86_64".into()),
+                    ("portable_op", format!("{op:?}").into()),
+                    ("ir_text", evidence.clone().into()),
+                    ("shared_ir_available", (!matches!(op, IrOperation::TargetSpecific)).into()),
+                ]),
+                ranges(pc, pc_end),
+            )?;
+            builder.edge(&ir, &ast_id, "renders-as")?;
+            statements.push(ast_id);
+            ir_ids.push(ir);
+            models.push(op);
             rendering.push_str(&format!("  {pc:#018x}: {evidence}\n"));
             let _ = index;
-            // `op` available for future integration into shared pipeline; conservative artifact remains blocked.
+        }
+        // Conservative CFG from partially lifted control-flow ops only (no fabricated edges).
+        let count = insn_pcs.len();
+        let idx_of_pc = |target: u64| -> Option<usize> { insn_pcs.binary_search(&target).ok() };
+        let mut successors: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for i in 0..count {
+            match models.get(i).copied().unwrap_or(IrOperation::TargetSpecific) {
+                IrOperation::Branch { target } => {
+                    if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
+                }
+                IrOperation::Return { .. } => {}
+                IrOperation::DirectCall { .. } | IrOperation::Nop | IrOperation::Assign { .. } | IrOperation::Binary { .. } | IrOperation::Load { .. } | IrOperation::Store { .. } => {
+                    if i + 1 < count { successors[i].push(i + 1); }
+                }
+                IrOperation::ConditionalBranch { target, .. } => {
+                    if let Some(ti) = idx_of_pc(target) { successors[i].push(ti); }
+                    if i + 1 < count { successors[i].push(i + 1); }
+                }
+                _ => {
+                    // Unknown/target-specific: conservatively assume fallthrough only when within decoded stream.
+                    if i + 1 < count { successors[i].push(i + 1); }
+                }
+            }
+            successors[i].sort_unstable();
+            successors[i].dedup();
+        }
+        let mut block_ids: Vec<String> = Vec::new();
+        for i in 0..count {
+            let pc = insn_pcs[i];
+            let pc_end = pc.saturating_add(*insn_sizes.get(i).unwrap_or(&0) as u64);
+            let succ_addrs: Vec<V> = successors[i].iter().map(|&s| address(insn_pcs[s])).collect();
+            let bid = builder.record(
+                "cfg-block",
+                "derived",
+                object([
+                    ("artifact_kind", "cfg-block".into()),
+                    ("start", address(pc)),
+                    ("end", address(pc_end)),
+                    ("successors", array(succ_addrs)),
+                    ("architecture", "x86_64".into()),
+                ]),
+                ranges(pc, pc_end),
+            )?;
+            if let Some(ir) = ir_ids.get(i) { builder.edge(ir, &bid, "in-block")?; }
+            block_ids.push(bid);
+        }
+        for (i, succs) in successors.iter().enumerate() {
+            for &s in succs {
+                if let (Some(from), Some(to)) = (block_ids.get(i), block_ids.get(s)) {
+                    builder.edge(from, to, "cfg-edge")?;
+                }
+            }
         }
         let root = builder.ast(
             "function",
@@ -1761,7 +1834,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             statements,
             &rendering,
             (start, stream_end.max(start)),
-            object([("architecture", "x86_64".into()), ("lifting", "not-implemented".into()), ("contract", "instruction-boundaries-decoded; semantic lifting and source recovery not implemented".into())]),
+            object([("architecture", "x86_64".into()), ("lifting", "partial-conservative".into()), ("contract", "iced-x86 boundaries/sizes decoded; partial IR/AST lifting and conservative CFG only; full semantic/source recovery and ABI adaptation not implemented".into())]),
         )?;
         let root_mirror = builder.record(
             "ast-node",
@@ -1776,7 +1849,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             object([
                 ("artifact_kind", "unsupported-architecture-lifting".into()),
                 ("architecture", "x86_64".into()),
-                ("reason", "x86_64 instruction boundaries/PC-size maps decoded (iced-x86), but lifting into shared typed semantic IR/AST/source pipeline and ABI adaptation are not implemented".into()),
+                ("reason", "x86_64 instruction boundaries/PC-size maps decoded (iced-x86) with partial conservative lifting and CFG scaffolding, but full lifting into shared typed semantic IR/AST/source pipeline, source recovery, and ABI adaptation are not implemented".into()),
                 ("conservative", true.into()),
             ]),
             ranges(start, stream_end.max(start)),
@@ -1785,7 +1858,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         if registers.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Strict interpreter blocked: x86_64 lifting not implemented".to_string(),
+                "Strict interpreter blocked: x86_64 lifting/ABI adaptation not implemented".to_string(),
             ));
         }
         return Ok(builder.finish(root, rendering, instructions, truncated, exhausted).json());
