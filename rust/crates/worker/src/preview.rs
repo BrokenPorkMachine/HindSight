@@ -2195,11 +2195,11 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  // Rewind? not necessary; further reads use absolute offsets
  let arch_lc = architecture.to_ascii_lowercase();
  let (instruction_pcs, instruction_sizes) = if matches!(arch_lc.as_str(), "arm64" | "arm64e" | "aarch64") {
-  let fn_end = end.min(map.address + code.len() as u64);
+  let fn_end = end.min(map.address + code.len() as u64).min(start.saturating_add(128 * 4));
   let mut pcs = Vec::new();
   let mut sizes = Vec::new();
   let mut pc = start;
-  while pc.saturating_add(4) <= fn_end && pcs.len() < 128 {
+  while pc.saturating_add(4) <= fn_end {
    pcs.push(pc);
    sizes.push(4u32);
    pc = pc.saturating_add(4);

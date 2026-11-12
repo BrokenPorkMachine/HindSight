@@ -2930,7 +2930,7 @@ fn end_pc(start: u64, trees_len: usize, insn_pcs: &[u64], insn_sizes: &[u32]) ->
     } else if let (Some(&last_pc), Some(&last_sz)) = (insn_pcs.last(), insn_sizes.get(insn_pcs.len().saturating_sub(1))) {
         last_pc + last_sz as u64
     } else if let Some(&last_pc) = insn_pcs.last() {
-        last_pc + 4
+        semit_span_end(last_pc, insn_pcs, &[], start, trees_len)
     } else {
         start
     }
@@ -4055,6 +4055,16 @@ pub(super) fn canonical_boolean_callee(code: &[u8], start: u64, signature: &Sour
     }
     recover(start, &trees, &operations, signature.clone(), &BTreeMap::new()).is_ok()
 }
+
+fn semit_span_end(pc: u64, insn_pcs: &[u64], insn_sizes: &[u32], start: u64, trees_len: usize) -> u64 {
+    if let Some(i) = index_of_pc(pc, insn_pcs, start, trees_len) {
+        if !insn_sizes.is_empty() && i < insn_sizes.len() { return pc + insn_sizes[i] as u64; }
+        if insn_pcs.is_empty() { return start + (i as u64 + 1) * 4; }
+        return insn_pcs.get(i + 1).copied().unwrap_or(pc + 4);
+    }
+    pc + 4
+}
+
 impl Recovery {
     pub(super) fn emit(
         &self,
@@ -4065,6 +4075,7 @@ impl Recovery {
         start: u64,
         objc_method: Option<(&str,&str)>,
         insn_pcs: &[u64],
+        insn_sizes: &[u32],
         trees_len: usize,
     ) -> io::Result<(String, String)> {
         let ordered_mixed_accesses = !self.external_loads.is_empty() && !self.external_stores.is_empty();
@@ -4168,7 +4179,7 @@ impl Recovery {
             let origins = array(
                 node.origins
                     .iter()
-                    .map(|pc| object([("start", address(*pc)), ("end", address(*pc + 4))])),
+                    .map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end(*pc, insn_pcs, insn_sizes, start, trees_len)))])),
             );
             let machine_type = if node.kind == "source-call" && node.source_type.as_ref().is_some_and(|ty| ty.bits == 0) {
                 "void"
@@ -4279,7 +4290,7 @@ impl Recovery {
                     None,
                     vec![asts[&variable.value].clone(), asts[&variable.initial].clone()],
                     &index_of_pc(loop_pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
-                    array([object([("start", address(loop_pc)), ("end", address(loop_pc + 4))])]),
+                    array([object([("start", address(loop_pc)), ("end", address(semit_span_end(loop_pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                     object([("template", "uint64_t $0 = $1".into()), ("role", self.dag.nodes[variable.value].role.into())]),
                 )?;
                 loop_children.push(binding);
@@ -4313,7 +4324,7 @@ impl Recovery {
                             None,
                             vec![asts[&load.address].clone(), asts[&load.expression].clone(), asts[&load.guard].clone()],
                             &evidence,
-                            array([object([("start", address(load.pc)), ("end", address(load.pc + 4))])]),
+                            array([object([("start", address(load.pc)), ("end", address(semit_span_end(load.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                             object([
                                 ("bytes", load.bytes.into()),
                                 ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
@@ -4331,7 +4342,7 @@ impl Recovery {
                             ("guard_ast", asts[&load.guard].clone().into()),
                             ("address_ast", asts[&load.address].clone().into()),
                             ("read_ast", asts[&load.expression].clone().into()),
-                        ]), ranges(load.pc, load.pc + 4)));
+                        ]), ranges(load.pc, semit_span_end(load.pc, insn_pcs, insn_sizes, start, trees_len))));
                     }
                     LoopBodyEvent::Assignment(assignment) => {
                         let target = &rendered[&assignment.destination];
@@ -4344,7 +4355,7 @@ impl Recovery {
                             None,
                             vec![asts[&assignment.destination].clone(), asts[&assignment.value].clone()],
                             &evidence,
-                            array([object([("start", address(assignment.pc)), ("end", address(assignment.pc + 4))])]),
+                            array([object([("start", address(assignment.pc)), ("end", address(semit_span_end(assignment.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                             object([("template", "$0 = $1".into())]),
                         )?;
                         loop_children.push(ast);
@@ -4380,7 +4391,7 @@ impl Recovery {
                             None,
                             vec![asts[&store.address].clone(), asts[&store.value].clone(), asts[&store.guard].clone()],
                             &evidence,
-                            array([object([("start", address(store.pc)), ("end", address(store.pc + 4))])]),
+                            array([object([("start", address(store.pc)), ("end", address(semit_span_end(store.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                             object([
                                 ("bytes", store.bytes.into()),
                                 ("partition", partition.into()),
@@ -4398,14 +4409,14 @@ impl Recovery {
                             ("bytes", store.bytes.into()),
                             ("ordering", ordering.into()),
                             ("guard_ast", asts[&store.guard].clone().into()),
-                        ]), ranges(store.pc, store.pc + 4)));
+                        ]), ranges(store.pc, semit_span_end(store.pc, insn_pcs, insn_sizes, start, trees_len))));
                     }
                 }
             }
             loop_code.push_str("    }\n");
             let evidence = source_loop.pcs.iter().filter_map(|pc| index_of_pc(*pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).cloned())
                 .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
-            let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(*pc + 4))])));
+            let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end(*pc, insn_pcs, insn_sizes, start, trees_len)))])));
             let ast = builder.ast_spans(
                 "source-while",
                 None,
@@ -4451,7 +4462,7 @@ impl Recovery {
                     None,
                     vec![asts[&call.expression].clone(), asts[&call.guard].clone()],
                     &evidence,
-                    array([object([("start", address(call.pc)), ("end", address(call.pc + 4))])]),
+                    array([object([("start", address(call.pc)), ("end", address(semit_span_end(call.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                     object([("template", "call-result = call(arguments)".into()), ("ordering", "instruction order with caller memory effects".into())]),
                 )?);
                 continue;
@@ -4491,7 +4502,7 @@ impl Recovery {
                     ("guard_ast", asts[&load.guard].clone().into()),
                     ("address_ast", asts[&load.address].clone().into()),
                     ("read_ast", asts[&load.expression].clone().into()),
-                ]), ranges(pc, pc + 4)));
+                ]), ranges(pc, semit_span_end(pc, insn_pcs, insn_sizes, start, trees_len))));
                 let mut evidence = ir
                     .get(((load.pc - start) / 4) as usize)
                     .into_iter()
@@ -4505,7 +4516,7 @@ impl Recovery {
                     None,
                     vec![asts[&load.address].clone(), asts[&load.expression].clone(), asts[&load.guard].clone()],
                     &evidence,
-                    array([object([("start", address(load.pc)), ("end", address(load.pc + 4))])]),
+                    array([object([("start", address(load.pc)), ("end", address(semit_span_end(load.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                     object([
                         ("bytes", load.bytes.into()),
                         ("partition", if load.volatile { "declaration-proven volatile pointer" } else { "declaration-proven ordinary pointer" }.into()),
@@ -4552,7 +4563,7 @@ impl Recovery {
                 None,
                 vec![asts[&effect.address].clone(), asts[&effect.value].clone(), asts[&effect.guard].clone()],
                 &evidence,
-                array([object([("start", address(effect.pc)), ("end", address(effect.pc + 4))])]),
+                array([object([("start", address(effect.pc)), ("end", address(semit_span_end(effect.pc, insn_pcs, insn_sizes, start, trees_len)))])]),
                 object([
                     ("bytes", effect.bytes.into()),
                     ("partition", partition.into()),
@@ -4570,7 +4581,7 @@ impl Recovery {
                 ("bytes", effect.bytes.into()),
                 ("ordering", ordering.into()),
                 ("guard_ast", asts[&effect.guard].clone().into()),
-            ]), ranges(pc, pc + 4)));
+            ]), ranges(pc, semit_span_end(pc, insn_pcs, insn_sizes, start, trees_len))));
         }
         let return_code = if s.result_bits == 0 {
             "    return;\n".to_owned()
@@ -5144,7 +5155,7 @@ mod tests {
         assert_eq!(recovery.project_types.len(),1);
         let mut builder=Builder::new(&"a".repeat(64),0x1000,0x1008,"arm64",Some("hs_test"),Value::Null).expect("artifact builder");
         let ir=vec!["ldr w0, [x0, #4]".to_owned(),"ret".to_owned()];
-        recovery.emit(&mut builder,"int hs_test(Point *point);",&ir,&BTreeMap::new(),0x1000,None,&[],2)
+        recovery.emit(&mut builder,"int hs_test(Point *point);",&ir,&BTreeMap::new(),0x1000,None,&[],&[],2)
             .expect("source and memory read AST emission");
         let read_ast=builder.ast.values().find(|node|matches!(node,Value::Object(fields)
             if fields.get("kind")==Some(&Value::from("source-memory-read")))).expect("serialized read AST");
@@ -5180,7 +5191,7 @@ mod tests {
         assert_eq!(recovery.project_types.len(),1);
         let mut builder=Builder::new(&"a".repeat(64),0x1000,0x1008,"arm64",Some("hs_test"),Value::Null).expect("artifact builder");
         let ir=vec!["str w1, [x0, #4]".to_owned(),"ret".to_owned()];
-        recovery.emit(&mut builder,"void hs_test(Point *point, int value);",&ir,&BTreeMap::new(),0x1000,None,&[],3)
+        recovery.emit(&mut builder,"void hs_test(Point *point, int value);",&ir,&BTreeMap::new(),0x1000,None,&[],&[],3)
             .expect("source and memory AST emission");
         let source=builder.nodes.values().find_map(|node|match node {
             Value::Object(fields)=>fields.get("payload").and_then(|payload|match payload {

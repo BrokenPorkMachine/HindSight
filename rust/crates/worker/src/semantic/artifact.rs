@@ -1166,8 +1166,14 @@ fn aspan_end_pc(pc: u64, insn_pcs: &[u64], start: u64, count: usize, fallback_en
     if let Some(i) = aindex_of(pc, insn_pcs, start, count) {
         if insn_pcs.is_empty() { start + (i as u64 + 1) * 4 }
         else { insn_pcs.get(i + 1).copied().unwrap_or(fallback_end) }
-    } else {
+    } else if insn_pcs.is_empty() {
         pc + 4
+    } else {
+        // Variable-length stream: unknown size without explicit size map; use next known PC or fallback.
+        match insn_pcs.binary_search(&pc) {
+            Ok(i) => insn_pcs.get(i + 1).copied().unwrap_or(fallback_end),
+            Err(i) => insn_pcs.get(i).copied().unwrap_or(fallback_end),
+        }
     }
 }
 
@@ -1243,7 +1249,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     } else {
         insn_pcs.last().map(|p| p + 4).unwrap_or(start)
     };
-    let instructions = if !_input_instruction_pcs.is_empty() { insn_pcs.len() as u64 } else { (end - start) / 4 };
+    let instructions = if _input_instruction_pcs.is_empty() || is_arm64 { (end - start) / 4 } else { insn_pcs.len() as u64 };
     let exhausted = instructions > 128;
     let truncated = high < end;
     let direct_targets = if _input_instruction_pcs.is_empty() {
@@ -2347,7 +2353,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("predecessor", predecessor.map(|index| (index as u64).into()).unwrap_or(V::Null)),
                 ("version", u64::from(*version).into()),
             ])))),
-        ]), ranges(function.cfg.blocks[phi.block].start, function.cfg.blocks[phi.block].start + 4))?;
+        ]), ranges(function.cfg.blocks[phi.block].start, aspan_end_pc(function.cfg.blocks[phi.block].start, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
         builder.edge(&block_ids[phi.block], &id, "merges-memory")?;
         memory_definitions.insert((phi.partition, phi.version), id);
     }
@@ -2573,7 +2579,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("predecessor", predecessor.map(|index| (index as u64).into()).unwrap_or(V::Null)),
                     ("value", value.name(phi.location).into()),
                 ])))),
-            ]), ranges(function.cfg.blocks[block_index].start, function.cfg.blocks[block_index].start + 4))?;
+            ]), ranges(function.cfg.blocks[block_index].start, aspan_end_pc(function.cfg.blocks[block_index].start, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
             for (_, incoming) in &phi.incoming {
                 for segment in &incoming.segments {
                     if let Some(definition) = file_definitions.get(&(phi.location, segment.origin)) {
@@ -2621,7 +2627,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             Ok(recovery) => {
                 let declaration = source_declaration.as_ref().expect("recovered source has a validated declaration");
                 let objc_method=objc_header.as_deref().map(|header|(signatures[0].0.as_str(),header));
-                let (root, node) = recovery.emit(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method, &[], trees.len())?;
+                let (root, node) = recovery.emit(&mut builder, declaration, &ir_ids, &memory_evidence_by_pc, start, objc_method, &insn_pcs, &insn_sizes, trees.len())?;
                 statements.push(root);
                 recovered_source = Some(node);
             }
