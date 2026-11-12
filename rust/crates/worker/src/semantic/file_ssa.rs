@@ -525,15 +525,19 @@ pub(super) fn build_file_ssa(function: &FunctionIr) -> FileSsa {
 }
 
 /// The index of the instruction at an address.
-/// Uses instruction addresses when available (PC/size-map aware) with fixed-width ARM64 fallback.
+/// Prefers exact address lookup (PC/size-map aware); falls back to the nearest
+/// instruction at or before `pc` without assuming fixed instruction width.
 fn instruction_index(function: &FunctionIr, pc: u64) -> usize {
     if let Some(index) = function.instructions.iter().position(|instruction| instruction.address == pc) {
         return index;
     }
-    if pc >= function.start {
-        ((pc - function.start) / 4) as usize
-    } else {
-        0
+    if function.instructions.is_empty() {
+        return 0;
+    }
+    match function.instructions.binary_search_by_key(&pc, |instruction| instruction.address) {
+        Ok(index) => index,
+        Err(0) => 0,
+        Err(insert) => insert.saturating_sub(1).min(function.instructions.len().saturating_sub(1)),
     }
 }
 
