@@ -1122,25 +1122,25 @@ impl Tree {
             ),
         }
     }
-    fn emit(&self, builder: &mut Builder, evidence: &str, pc: u64) -> io::Result<(String, String)> {
+    fn emit(&self, builder: &mut Builder, evidence: &str, pc: u64, pc_end: u64) -> io::Result<(String, String)> {
         let children = self
             .children
             .iter()
-            .map(|child| child.emit(builder, evidence, pc))
+            .map(|child| child.emit(builder, evidence, pc, pc_end))
             .collect::<io::Result<Vec<_>>>()?;
         let id = builder.ast(
             self.kind,
             self.ty.as_deref(),
             children.iter().map(|(id, _)| id.clone()).collect(),
             evidence,
-            (pc, pc + 4),
+            (pc, pc_end),
             self.attributes.clone(),
         )?;
         let mirror = builder.record(
             "ast-node",
             "derived",
             object([("ast_id", id.clone().into()), ("kind", self.kind.into())]),
-            ranges(pc, pc + 4),
+            ranges(pc, pc_end),
         )?;
         builder.edge(evidence, &mirror, "renders-as")?;
         for (_, child_mirror) in children {
@@ -1196,16 +1196,20 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         resolved_indirect_targets,
         resolved_indirect_cases,
         resolved_indirect_index_info,
+        instruction_pcs: _input_instruction_pcs,
+        instruction_sizes: _input_instruction_sizes,
     } = input;
     let arch = architecture.to_ascii_lowercase();
     let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let _is_x86_64 = matches!(arch.as_str(), "x86_64" | "x86-64" | "amd64");
     if !is_arm64 {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("reconstruction lifting not yet implemented for architecture '{architecture}'"),
         ));
     }
-    if start < base || end <= start || (start - base) % 4 != 0 || (end - start) % 4 != 0 {
+    let fixed_width_4 = is_arm64 && _input_instruction_pcs.is_empty();
+    if start < base || end <= start || (fixed_width_4 && ((start - base) % 4 != 0 || (end - start) % 4 != 0)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Invalid reconstruction function bounds",
@@ -1809,7 +1813,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ),
                 ("file_offset", address(position)),
             ]),
-            ranges(pc, pc + 4),
+            ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
         )?;
         let decoded = builder.record(
             "decode",
@@ -1822,7 +1826,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     (!matches!(portable, IrOperation::TargetSpecific)).into(),
                 ),
             ]),
-            ranges(pc, pc + 4),
+            ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
         )?;
         builder.edge(&raw, &decoded, "decodes-to")?;
         let effects = portable.gpr_effects();
@@ -1847,7 +1851,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ),
                 ("barrier", effects.barrier.into()),
             ]),
-            ranges(pc, pc + 4),
+            ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
         )?;
         builder.edge(&decoded, &ir, "lifts-to")?;
         let mut reasons = Vec::new();
@@ -1974,7 +1978,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         "conservative whole captured function".into(),
                     ),
                 ]),
-                ranges(pc, pc + 4),
+                ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
             )?;
             builder.edge(&ir, &unknown, "derives")?;
         }
@@ -2058,7 +2062,8 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 builder.edge(&proof, &ir, "supports")?;
             }
         }
-        let (ast, mirror) = tree.emit(&mut builder, &ir, pc)?;
+        let pc_end = aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end);
+        let (ast, mirror) = tree.emit(&mut builder, &ir, pc, pc_end)?;
         statements.push(ast);
         statement_mirrors.push(mirror);
         rendering.push_str(&format!("loc_{pc:x}: {}\n", tree.render()));
@@ -2171,7 +2176,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     array(block.dominators.iter().map(|index| (*index as u64).into())),
                 ),
             ]),
-            ranges(block.start, block.start + 4),
+            ranges(block.start, aspan_end_pc(block.start, &insn_pcs, start, insn_pcs.len(), stream_end)),
         )?;
         builder.edge(&ir_ids[index], &id, "controls")?;
         block_ids.push(id);
@@ -2185,7 +2190,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     ("source", address(block.start)),
                     ("target", address(function.cfg.blocks[successor].start)),
                 ]),
-                ranges(block.start, block.start + 4),
+                ranges(block.start, aspan_end_pc(block.start, &insn_pcs, start, insn_pcs.len(), stream_end)),
             )?;
             builder.edge(&block_ids[index], &edge, "controls")?;
             builder.edge(&edge, &block_ids[successor], "flows-to")?;
@@ -2215,7 +2220,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 "definition",
                 "derived",
                 ssa_payload(value),
-                ranges(pc, pc + 4),
+                ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)),
             )?;
             builder.edge(&ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "defines")?;
             definitions.insert(value.name(), id);
@@ -2239,7 +2244,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 })),
             );
             let pc = function.cfg.blocks[index].start;
-            let id = builder.record("phi", "derived", payload, ranges(pc, pc + 4))?;
+            let id = builder.record("phi", "derived", payload, ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
             definitions.insert(phi.value.name(), id);
         }
     }
@@ -2252,12 +2257,12 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                     "definition",
                     "derived",
                     ssa_payload(value),
-                    ranges(start, start + 4),
+                    ranges(start, aspan_end_pc(start, &insn_pcs, start, insn_pcs.len(), stream_end.max(start+4))),
                 )?;
                 definitions.insert(value.name(), id.clone());
                 id
             };
-            let id = builder.record("use", "derived", ssa_payload(value), ranges(pc, pc + 4))?;
+            let id = builder.record("use", "derived", ssa_payload(value), ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
             builder.edge(&definition, &id, "flows-to")?;
             builder.edge(&id, &ir_ids[aindex_of(pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses")?;
         }
@@ -2273,7 +2278,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                         "definition",
                         "derived",
                         ssa_payload(*value),
-                        ranges(start, start + 4),
+                        ranges(start, aspan_end_pc(start, &insn_pcs, start, insn_pcs.len(), stream_end.max(start+4))),
                     )?;
                     definitions.insert(value.name(), id.clone());
                     id
@@ -2316,7 +2321,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("partition", version.partition.name().into()),
                 ("version", u64::from(written).into()),
                 ("origin", "instruction".into()),
-            ]), ranges(version.pc, version.pc + 4))?;
+            ]), ranges(version.pc, aspan_end_pc(version.pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
             builder.edge(&ir_ids[aindex_of(version.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "defines-memory")?;
             memory_evidence_by_pc.entry(version.pc).or_default().push(id.clone());
             memory_definitions.insert((version.partition, written), id);
@@ -2339,7 +2344,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("version", u64::from(version.read_version).into()),
             ("ordered", version.ordered.into()),
             ("exclusive", version.exclusive.into()),
-        ]), ranges(version.pc, version.pc + 4))?;
+        ]), ranges(version.pc, aspan_end_pc(version.pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
         builder.edge(definition, &id, "flows-to")?;
         builder.edge(&id, &ir_ids[aindex_of(version.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], "uses-memory")?;
         memory_evidence_by_pc.entry(version.pc).or_default().push(id);
@@ -2361,7 +2366,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("writes", array(writes.into_iter().map(V::from))),
             ("ordered", versions.iter().any(|version| version.ordered).into()),
             ("exclusive", versions.iter().any(|version| version.exclusive).into()),
-        ]), ranges(*pc, *pc + 4))?;
+        ]), ranges(*pc, aspan_end_pc(*pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
         builder.edge(&ir_ids[aindex_of(*pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, "accesses-memory")?;
         access_ids.insert(*pc, id);
     }
@@ -2378,7 +2383,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             ("mnemonic", event.mnemonic.into()),
             ("domain", event.domain.map(V::from).unwrap_or(V::Null)),
             ("memory_values_changed", false.into()),
-        ]), ranges(event.pc, event.pc + 4))?;
+        ]), ranges(event.pc, aspan_end_pc(event.pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
         builder.edge(&ir_ids[aindex_of(event.pc, &insn_pcs, start, ir_ids.len()).unwrap_or(0)], &id, relation)?;
         if let Some(block_index) = function.cfg.blocks.iter().position(|block| block.instructions.contains(&event.pc)) {
             let nearest = |before: bool| -> Option<u64> {
@@ -2478,7 +2483,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
             let use_id = builder.record("file-use", "derived", object([
                 ("location", location_name(FileLocation::Flag(*bit)).into()),
                 ("value", value.name(FileLocation::Flag(*bit)).into()),
-            ]), ranges(pc, pc + 4))?;
+            ]), ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
             for segment in &value.segments {
                 if let Some(definition) = file_definitions.get(&(FileLocation::Flag(*bit), segment.origin)) {
                     builder.edge(definition, &use_id, "flows-to")?;
@@ -2503,7 +2508,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 ("byte_ranges", array(value.segments.iter().map(|segment| object([
                     ("offset", segment.offset.into()), ("bytes", segment.bytes.into()),
                 ])))),
-            ]), ranges(pc, pc + 4))?;
+            ]), ranges(pc, aspan_end_pc(pc, &insn_pcs, start, insn_pcs.len(), stream_end)))?;
             for segment in &value.segments {
                 if let Some(definition) = file_definitions.get(&(location, segment.origin)) {
                     builder.edge(definition, &use_id, "flows-to")?;

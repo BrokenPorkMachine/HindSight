@@ -2182,7 +2182,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
   }
  }
  // Rewind? not necessary; further reads use absolute offsets
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native,resolved_indirect_targets,resolved_indirect_cases,resolved_indirect_index_info};
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native,resolved_indirect_targets,resolved_indirect_cases,resolved_indirect_index_info,instruction_pcs:Vec::new(),instruction_sizes:Vec::new()};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)

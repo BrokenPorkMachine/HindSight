@@ -60,6 +60,12 @@ pub struct Input<'a> {
     /// Proven jump-table index/bound hints for resolved indirect branches,
     /// keyed by instruction PC (e.g. index register, case-range, normalization).
     pub resolved_indirect_index_info: std::collections::BTreeMap<u64, String>,
+    /// Optional instruction PCs for variable-length instruction streams.
+    /// Empty means fixed-width 4-byte ARM64 indexing applies.
+    pub instruction_pcs: Vec<u64>,
+    /// Optional instruction sizes aligned with `instruction_pcs`.
+    /// Empty means fixed-width 4-byte ARM64 instructions apply.
+    pub instruction_sizes: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
