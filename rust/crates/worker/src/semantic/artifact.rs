@@ -1177,6 +1177,88 @@ fn aspan_end_pc(pc: u64, insn_pcs: &[u64], start: u64, count: usize, fallback_en
     }
 }
 
+/// Conservative x86_64/x86-64 instruction lifting scaffold (iced-x86).
+/// Sound by construction: only instructions with clear, evidence-backed mappings to the shared IR
+/// are lifted; all others fall back to `IrOperation::TargetSpecific` with unsupported trees.
+/// ABI adaptation and full semantic coverage are incomplete.
+fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String) {
+    use iced_x86::{Mnemonic, OpKind, Register};
+    let mut decoder = iced_x86::Decoder::with_ip(64, bytes, pc, iced_x86::DecoderOptions::NONE);
+    let instr = decoder.decode();
+    let sz = instr.len().max(bytes.len().min(15));
+    let ir_text = format!("{pc:#x}: {:?} ({} bytes; partial x86_64 lift)", instr, sz);
+    let unsupported = || (
+        IrOperation::TargetSpecific,
+        tree("unsupported-operation", Some(format!("x86_64 {:?} not yet lifted", instr.mnemonic())), object([("architecture", "x86_64".into()), ("mnemonic", format!("{:?}", instr.mnemonic()).into()), ("size", (sz as u64).into()), ("status", "unsupported".into())]), vec![]),
+        ir_text.clone(),
+    );
+    let xreg = |r: Register| -> Option<IrRegister> {
+        Some(match r {
+            Register::RAX|Register::EAX|Register::AX|Register::AL|Register::AH => IrRegister{class: IrRegisterClass::General, index: 0, bits: 64},
+            Register::RCX|Register::ECX|Register::CX|Register::CL|Register::CH => IrRegister{class: IrRegisterClass::General, index: 1, bits: 64},
+            Register::RDX|Register::EDX|Register::DX|Register::DL|Register::DH => IrRegister{class: IrRegisterClass::General, index: 2, bits: 64},
+            Register::RBX|Register::EBX|Register::BX|Register::BL|Register::BH => IrRegister{class: IrRegisterClass::General, index: 3, bits: 64},
+            Register::RSP|Register::ESP|Register::SP|Register::SPL => IrRegister{class: IrRegisterClass::StackPointer, index: 31, bits: 64},
+            Register::RBP|Register::EBP|Register::BP|Register::BPL => IrRegister{class: IrRegisterClass::General, index: 5, bits: 64},
+            Register::RSI|Register::ESI|Register::SI|Register::SIL => IrRegister{class: IrRegisterClass::General, index: 6, bits: 64},
+            Register::RDI|Register::EDI|Register::DI|Register::DIL => IrRegister{class: IrRegisterClass::General, index: 7, bits: 64},
+            Register::R8|Register::R8D|Register::R8W|Register::R8L => IrRegister{class: IrRegisterClass::General, index: 8, bits: 64},
+            Register::R9|Register::R9D|Register::R9W|Register::R9L => IrRegister{class: IrRegisterClass::General, index: 9, bits: 64},
+            Register::R10|Register::R10D|Register::R10W|Register::R10L => IrRegister{class: IrRegisterClass::General, index: 10, bits: 64},
+            Register::R11|Register::R11D|Register::R11W|Register::R11L => IrRegister{class: IrRegisterClass::General, index: 11, bits: 64},
+            Register::R12|Register::R12D|Register::R12W|Register::R12L => IrRegister{class: IrRegisterClass::General, index: 12, bits: 64},
+            Register::R13|Register::R13D|Register::R13W|Register::R13L => IrRegister{class: IrRegisterClass::General, index: 13, bits: 64},
+            Register::R14|Register::R14D|Register::R14W|Register::R14L => IrRegister{class: IrRegisterClass::General, index: 14, bits: 64},
+            Register::R15|Register::R15D|Register::R15W|Register::R15L => IrRegister{class: IrRegisterClass::General, index: 15, bits: 64},
+            _ => return None,
+        })
+    };
+    match instr.mnemonic() {
+        Mnemonic::Nop => (
+            IrOperation::Nop,
+            tree("no-op", None, object([("architecture","x86_64".into())]), vec![]),
+            format!("{pc:#x}: nop"),
+        ),
+        Mnemonic::Ret | Mnemonic::Retf => (
+            IrOperation::Return { target: None },
+            tree("return", None, object([("architecture","x86_64".into()), ("mnemonic", format!("{:?}", instr.mnemonic()).into())]), vec![]),
+            ir_text.clone(),
+        ),
+        Mnemonic::Int3 => (
+            IrOperation::TargetSpecific,
+            tree("trap", Some("int3".to_string()), object([("architecture","x86_64".into()),("mnemonic","int3".into())]), vec![]),
+            format!("{pc:#x}: int3"),
+        ),
+        Mnemonic::Jmp => {
+            if instr.op_count() == 1 && matches!(instr.op0_kind(), OpKind::NearBranch16|OpKind::NearBranch32|OpKind::NearBranch64) {
+                let target = instr.near_branch64();
+                (IrOperation::Branch { target }, tree("goto", None, object([("architecture","x86_64".into()),("target", address(target))]), vec![]), format!("{pc:#x}: jmp {target:#x}"))
+            } else { unsupported() }
+        }
+        Mnemonic::Call => {
+            if instr.op_count() == 1 && matches!(instr.op0_kind(), OpKind::NearBranch16|OpKind::NearBranch32|OpKind::NearBranch64) {
+                let target = instr.near_branch64();
+                (IrOperation::DirectCall { target }, tree("direct-call", None, object([("architecture","x86_64".into()),("target", address(target))]), vec![]), format!("{pc:#x}: call {target:#x}"))
+            } else { unsupported() }
+        }
+        Mnemonic::Push => {
+            if instr.op_count() == 1 && instr.op0_kind() == OpKind::Register {
+                if let Some(src) = xreg(instr.op0_register()) {
+                    (IrOperation::Store { address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8 }, value: IrOperand::Register(src), bytes: 8, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: -8, pre_index: true}) }, tree("unsupported-operation", Some("x86_64 push (stack write+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","push".into()),("status","partial".into())]), vec![]), ir_text)
+                } else { unsupported() }
+            } else { unsupported() }
+        }
+        Mnemonic::Pop => {
+            if instr.op_count() == 1 && instr.op0_kind() == OpKind::Register {
+                if let Some(dst) = xreg(instr.op0_register()) {
+                    (IrOperation::Load { destination: dst, address: IrMemoryAddress::BaseOffset { base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 0 }, bytes: 8, signed: false, writeback: Some(IrWriteback{base: IrRegister{class: IrRegisterClass::StackPointer,index:31,bits:64}, offset: 8, pre_index: false}) }, tree("unsupported-operation", Some("x86_64 pop (stack read+adjust lifted partially)".to_string()), object([("architecture","x86_64".into()),("mnemonic","pop".into()),("status","partial".into())]), vec![]), ir_text)
+                } else { unsupported() }
+            } else { unsupported() }
+        }
+        _ => unsupported(),
+    }
+}
+
 pub fn build(input: Input<'_>) -> io::Result<String> {
     build_mode(input, None)
 }
@@ -1531,17 +1613,33 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
         for (index, &pc) in insn_pcs.iter().enumerate() {
             let sz = *insn_sizes.get(index).unwrap_or(&0) as usize;
             let pc_end = pc.saturating_add(sz as u64);
-            let evidence = format!("{pc:#x}: <unsupported x86_64 instruction; {sz} bytes>");
-            let ty = format!("x86_64 instruction ({sz} bytes); lifting not implemented");
+            let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { continue; };
+            let bytes = code.get(off..off.saturating_add(sz).min(code.len())).unwrap_or(&[]);
+            let (op, node, ir_text) = x86_64_lift_instruction(pc, bytes);
+            let evidence = ir_text;
+            let ty = match op {
+                IrOperation::Nop | IrOperation::Branch { .. } | IrOperation::DirectCall { .. } | IrOperation::Return { .. } => "x86_64 partially lifted (conservative)",
+                IrOperation::Load { .. } | IrOperation::Store { .. } => "x86_64 partially lifted memory/stack op (conservative)",
+                _ => "x86_64 instruction boundary decoded; lifting incomplete",
+            };
+            let kind = match op {
+                IrOperation::Nop => "no-op",
+                IrOperation::Return { .. } => "return",
+                IrOperation::Branch { .. } => "goto",
+                IrOperation::DirectCall { .. } => "direct-call",
+                _ => "unsupported-operation",
+            };
             statements.push(builder.ast(
-                "unsupported-operation",
-                Some(ty.as_str()),
+                kind,
+                Some(ty),
                 vec![],
                 &evidence,
                 (pc, pc_end),
-                object([("architecture", "x86_64".into()), ("size", (sz as u64).into()), ("status", "unsupported".into())]),
+                object([("architecture", "x86_64".into()), ("size", (sz as u64).into()), ("status", match op { IrOperation::TargetSpecific => "unsupported".into(), _ => "partial-lift".into() }), ("ir_text", evidence.clone().into())]),
             )?);
-            rendering.push_str(&format!("  {pc:#018x}: /* {sz} bytes */ <x86_64 instruction; lifting unsupported>\n"));
+            rendering.push_str(&format!("  {pc:#018x}: {evidence}\n"));
+            let _ = index;
+            // `op` available for future integration into shared pipeline; conservative artifact remains blocked.
         }
         let root = builder.ast(
             "function",
