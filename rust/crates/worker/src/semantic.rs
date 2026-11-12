@@ -8510,6 +8510,22 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
                 right: IrOperand::Constant(mask),
             })
         }
+        M::Imul => {
+            // Two-operand IMUL reg, reg/mem? support reg,reg only conservatively as dst = dst * src.
+            // Three-operand and one-operand forms (widening/implicit operands) remain conservative.
+            if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Register {
+                let dst = x86_to_ir_register(instr.op0_register())?;
+                let src = x86_to_ir_register(instr.op1_register())?;
+                return Some(IrOperation::MultiplyAdd {
+                    destination: dst,
+                    left: dst,
+                    right: src,
+                    addend: None,
+                    subtract: false,
+                });
+            }
+            None
+        }
         _ => None,
     }
 }
