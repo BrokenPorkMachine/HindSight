@@ -7751,11 +7751,17 @@ fn build_ssa(function: &FunctionIr) -> SsaAnalysis {
     let mut result = SsaAnalysis { phis: (0..blocks.len()).map(|_| Vec::new()).collect(), instructions: BTreeMap::new(), origin_records: Vec::new(), live_ranges: Vec::new(), memory_versions: Vec::new(), memory_phis: Vec::new(), system_events: Vec::new(), call_clobbers: Vec::new() };
     if blocks.is_empty() { return result; }
     let instruction_at = |pc: u64| {
-        let idx = if function.instructions.is_empty() { 0 } else {
-            let delta = pc.saturating_sub(function.start);
-            if delta % 4 == 0 { (delta / 4) as usize } else { function.instructions.iter().position(|i| i.address == pc).unwrap_or(0) }
-        };
-        &function.instructions[idx.min(function.instructions.len().saturating_sub(1))]
+        if function.instructions.is_empty() {
+            // unreachable in normal use; caller guards on non-empty blocks/instructions
+            panic!("instruction lookup on empty function");
+        }
+        match function.instructions.binary_search_by_key(&pc, |i| i.address) {
+            Ok(idx) => &function.instructions[idx],
+            Err(_) => {
+                // Fallback for unexpected PC (should not occur for well-formed CFGs); keep behavior conservative.
+                &function.instructions[0]
+            }
+        }
     };
     let mut definitions = vec![0u32; blocks.len()];
     let mut uses = vec![0u32; blocks.len()];
