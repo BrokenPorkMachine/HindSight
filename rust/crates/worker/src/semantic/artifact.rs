@@ -3136,7 +3136,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     // strict source/ABI proofs fail. This is code for analyst repair, never a
     // substitute proof of compilability or an invented original prototype.
     if !has_recovered_source {
-        let text=executable::review_source_with_sizes(start,&trees,&review_blocked_pcs,truncated,&insn_pcs,&insn_sizes);
+        let text=executable::review_source_with_sizes_and_arch(start,&trees,&review_blocked_pcs,truncated,&insn_pcs,&insn_sizes,&arch);
         {
             let review = builder.record("metadata", "derived", object([
                 ("artifact_kind", "best-effort-source".into()), ("source", text.into()),
@@ -3163,7 +3163,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     let program = if strict_blocked {
         Err("truncated, unsupported or unresolved shared effect".into())
     } else {
-        executable::Program::new_with_pcs_and_sizes(start, trees, insn_pcs.clone(), insn_sizes.clone())
+        executable::Program::new_with_pcs_and_sizes_and_arch(start, trees, insn_pcs.clone(), insn_sizes.clone(), &arch)
     };
     match program {
         Ok(program) => {
