@@ -907,8 +907,10 @@ fn caller_callee_constraints(
 /// width the definition proves, not a source type: a caller observes the
 /// machine representation, the callee side states the declared type, and the
 /// constraint solver keeps the two as separate claims.
-fn observed_argument_widths(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64)->std::collections::BTreeMap<u64,std::collections::BTreeMap<u8,u8>>{
+/// ARM64-specific 4-byte instruction scan; non-ARM64 returns no observations conservatively.
+fn observed_argument_widths(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,architecture:&str)->std::collections::BTreeMap<u64,std::collections::BTreeMap<u8,u8>>{
  let mut out=std::collections::BTreeMap::new();
+ if !super::semantic::is_arm64_arch(architecture) { return out; }
  for &(_,site,_) in calls.iter().take(2000){
   let lo=site.saturating_sub(base) as usize;
   let function_start=starts.iter().copied().rfind(|start|*start<=site).unwrap_or(base);
@@ -2450,7 +2452,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  }
  let objc_selector_calls=objc_selector_call_evidence(&mut file,&window,size,&code,map.address,&calls,&signature_symbols,&indirect_facts)?;
  let external_prototypes=super::signatures::external_prototype_database(digest)?;
- let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address);
+ let observed_argument_widths=observed_argument_widths(&calls,&starts,&code,map.address,&analyze_arch);
  let solved=caller_callee_constraints(&calls,&signature_symbols,&external_prototypes,&observed_argument_widths);
  let prototype_conflicts=super::semantic::artifact::constraint_report(&solved);
  let (mut signature_report,reconstructed_pseudocode)=super::signatures::recover_arm64(&starts,&signature_symbols,&objc_classes,&calls,scan_end,&code,map.address,map.offset,&data_ranges,&call_values,&tail_call_facts,&jump_tables,&objc_selector_calls,&external_prototypes,&objc_layouts,&analyze_arch);
