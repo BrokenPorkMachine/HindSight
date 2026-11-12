@@ -782,16 +782,40 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
     insn_pcs: &[u64],
     insn_sizes: &[u32],
 ) -> ParameterNameAnalysis {
+    parameter_value_names_with_resolved_indirects_and_arch_and_pcs(code, base, start, end, file_offset, data_ranges, seeds, resolved_indirect_targets, insn_pcs, insn_sizes, "arm64")
+}
+
+/// Architecture-aware parameter name analysis. Uses PC/size maps when provided; fixed-width fallback
+/// and decode/lift are ARM64-only and conservatively gated for other architectures.
+#[allow(clippy::too_many_arguments)]
+pub fn parameter_value_names_with_resolved_indirects_and_arch_and_pcs(
+    code: &[u8],
+    base: u64,
+    start: u64,
+    end: u64,
+    file_offset: u64,
+    data_ranges: &[(u64, u64, u16)],
+    seeds: &[ParameterNameSeed],
+    resolved_indirect_targets: &BTreeMap<u64, Vec<u64>>,
+    insn_pcs: &[u64],
+    insn_sizes: &[u32],
+    architecture: &str,
+) -> ParameterNameAnalysis {
     const MAX_NAME_ANALYSIS_WORDS: usize = 512;
     let fail = |reason| ParameterNameAnalysis {
         blocker: Some(reason),
         ..Default::default()
     };
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if !is_arm64 {
+        return fail("unsupported architecture for parameter name analysis");
+    }
     let fixed_width = insn_pcs.is_empty();
     if start < base || end <= start {
         return fail("function bounds or instruction budget");
     }
-    if fixed_width && (start - base) % 4 != 0 {
+    if fixed_width && !super::arm64_is_aligned(base, start) {
         return fail("function bounds or instruction budget");
     }
     let Some(body_end) = end.checked_sub(base).and_then(|d| usize::try_from(d).ok()).map(|e| e.min(code.len())) else {
@@ -804,11 +828,19 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
         return fail("function bytes unavailable");
     }
     let (pcs, sizes): (Vec<u64>, Vec<u32>) = if fixed_width {
-        let count = (body_end - body_start) / 4;
+        let bounded_end = base.saturating_add(body_end as u64);
+        let Some(count) = super::arm64_fixed_width_count(start, bounded_end, base) else {
+            return fail("function bounds or instruction budget");
+        };
         if count == 0 || count > MAX_NAME_ANALYSIS_WORDS {
             return fail("function bounds or instruction budget");
         }
-        let pcs = (0..count).map(|i| start + i as u64 * 4).collect();
+        let Some(pcs) = super::arm64_fixed_width_pcs_in_range(start, bounded_end, base, count) else {
+            return fail("function bounds or instruction budget");
+        };
+        if pcs.is_empty() || pcs.len() != count {
+            return fail("function bounds or instruction budget");
+        }
         let sizes = vec![4; count];
         (pcs, sizes)
     } else {
@@ -850,9 +882,7 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
     }
     let idx_of = |target: u64| -> Option<usize> {
         if fixed_width {
-            let d = target.checked_sub(start)?;
-            if d % 4 != 0 { return None; }
-            let i = (d / 4) as usize;
+            let i = super::arm64_fixed_width_index(start, target)?;
             (i < pcs.len()).then_some(i)
         } else {
             pcs.binary_search(&target).ok()
@@ -866,12 +896,14 @@ pub fn parameter_value_names_with_resolved_indirects_and_pcs(
             let sz = *sizes.get(index).unwrap_or(&4) as u64;
             let pc_end = pc.saturating_add(sz);
             let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
-            let Some(off) = pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return IrOperation::TargetSpecific; };
             // ARM64 4-byte decode only for now; variable-length decode remains conservative.
-            if *sizes.get(index).unwrap_or(&4) != 4 || off.saturating_add(sz as usize) > code.len() {
+            let sz_u32 = *sizes.get(index).unwrap_or(&4);
+            if sz_u32 != 4 {
                 return IrOperation::TargetSpecific;
             }
-            let word = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
+            let Some(word) = super::read_arm64_u32(code, base, pc) else {
+                return IrOperation::TargetSpecific;
+            };
             if data_ranges.iter().any(|&(lo, hi, _)| position < hi && end_pos > lo) {
                 IrOperation::TargetSpecific
             } else {

@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 
 mod names;
-pub use names::{parameter_value_names, parameter_value_names_with_resolved_indirects, parameter_value_names_with_resolved_indirects_and_pcs, ParameterNameSeed, ParameterNameAnalysis};
+pub use names::{parameter_value_names, parameter_value_names_with_resolved_indirects, parameter_value_names_with_resolved_indirects_and_pcs, parameter_value_names_with_resolved_indirects_and_arch_and_pcs, ParameterNameSeed, ParameterNameAnalysis};
 mod files;
 mod file_ssa;
 #[cfg(test)]
@@ -8128,19 +8128,19 @@ impl SsaOutputBudget {
     }
 }
 
-const ARM64_INSN_BYTES: u64 = 4;
+pub(crate) const ARM64_INSN_BYTES: u64 = 4;
 
-fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
+pub(crate) fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
     let off = usize::try_from(pc.checked_sub(base)?).ok()?;
     let bytes = code.get(off..off.checked_add(usize::try_from(ARM64_INSN_BYTES).ok()?)?)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-fn arm64_is_aligned(base: u64, addr: u64) -> bool {
+pub(crate) fn arm64_is_aligned(base: u64, addr: u64) -> bool {
     addr >= base && (addr - base) % ARM64_INSN_BYTES == 0
 }
 
-fn arm64_fixed_width_count(start: u64, end: u64, base: u64) -> Option<usize> {
+pub(crate) fn arm64_fixed_width_count(start: u64, end: u64, base: u64) -> Option<usize> {
     if start < base || end < start { return None; }
     let start_off = start.checked_sub(base)?;
     let end_off = end.checked_sub(base)?;
@@ -8148,17 +8148,17 @@ fn arm64_fixed_width_count(start: u64, end: u64, base: u64) -> Option<usize> {
     usize::try_from(end_off.saturating_sub(start_off) / ARM64_INSN_BYTES).ok()
 }
 
-fn arm64_fixed_width_index(start: u64, target: u64) -> Option<usize> {
+pub(crate) fn arm64_fixed_width_index(start: u64, target: u64) -> Option<usize> {
     let d = target.checked_sub(start)?;
     if d % ARM64_INSN_BYTES != 0 { return None; }
     usize::try_from(d / ARM64_INSN_BYTES).ok()
 }
 
-fn arm64_fixed_width_byte_window(max_insns: usize) -> usize {
+pub(crate) fn arm64_fixed_width_byte_window(max_insns: usize) -> usize {
     max_insns.saturating_mul(ARM64_INSN_BYTES as usize)
 }
 
-fn arm64_fixed_width_pcs_in_range(start: u64, end: u64, base: u64, limit: usize) -> Option<Vec<u64>> {
+pub(crate) fn arm64_fixed_width_pcs_in_range(start: u64, end: u64, base: u64, limit: usize) -> Option<Vec<u64>> {
     let count = arm64_fixed_width_count(start, end, base)?.min(limit);
     Some((0..count).map(|i| start.saturating_add(i as u64 * ARM64_INSN_BYTES)).collect())
 }
