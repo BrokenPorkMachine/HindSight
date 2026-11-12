@@ -2022,11 +2022,21 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  if unsafe{re_verify_fd(file.as_raw_fd(),expected.as_ptr(),size,error.as_mut_ptr(),error.len())}!=0{return Err(io::Error::new(io::ErrorKind::InvalidData,unsafe{CStr::from_ptr(error.as_ptr())}.to_string_lossy().into_owned()));}
  let window=read_window(&mut file,size)?;
  if window.len()<32||&window[..4]!=[0xcf,0xfa,0xed,0xfe]||le32(&window[4..8])!=0x0100000c{return Err(invalid("Reconstruction currently requires a thin little-endian AArch64 Mach-O"));}
+
+ let cputype=le32(&window[4..8]);
+ let cpusubtype=le32(&window[8..12]);
+ let architecture=match cputype {
+  0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e" } else { "arm64" },
+  0x0100_0007 => "x86_64",
+  0x0000_000c => "arm",
+  0x0000_0007 => "i386",
+  _ => "arm64",
+ };
  let map=mapping(&window,size).map_err(|message|io::Error::new(io::ErrorKind::InvalidData,message))?;if map.encrypted{return Err(invalid("Encrypted code cannot be reconstructed"));}
  let code=read_exact_range(&mut file,map.offset,map.bytes.min(4*1024*1024) as usize)?;
  let data_ranges=data_in_code_ranges(&mut file,&window,size)?;
- let mut facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges,"arm64")?;
- merge_runtime_objc(&mut facts,path,&window,map.address,map.address+code.len() as u64,"arm64");
+ let mut facts=function_boundary_facts(&mut file,&window,&map,size,&code,&data_ranges,architecture)?;
+ merge_runtime_objc(&mut facts,path,&window,map.address,map.address+code.len() as u64,architecture);
  let export_names=export_function_names(&facts.export_trie,&window,&facts.starts,map.address+code.len() as u64);
  // Use the same validated export/stub names as analysis. Undefined nlist
  // symbols alone do not identify the address of an imported call target.
@@ -2060,15 +2070,7 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
  // alias also lands on the same address; conflicting non-ObjC names stay
  // unresolved rather than being guessed.
  let name=if names.len()==1{names.iter().next().copied()}else{facts.objc_function_names.get(&start).map(String::as_str)};
- let cputype=le32(&window[4..8]);
- let cpusubtype=le32(&window[8..12]);
- let architecture=match cputype {
-  0x0100_000c => if cpusubtype & 0x00ff_ffff == 2 { "arm64e" } else { "arm64" },
-  0x0100_0007 => "x86_64",
-  0x0000_000c => "arm",
-  0x0000_0007 => "i386",
-  _ => "arm64",
- };
+
  let external=super::signatures::external_prototype_database(digest)?;
  let project_types=super::signatures::external_project_type_dependencies(digest,architecture)?;
  let signatures=super::signatures::source_candidates(start,&names.iter().copied().collect::<Vec<_>>(),&facts.objc_classes,&external);
