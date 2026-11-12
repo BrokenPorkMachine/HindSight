@@ -8437,6 +8437,36 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
                 right: IrOperand::Constant(1),
             })
         }
+        M::Shl | M::Sal | M::Shr | M::Sar => {
+            // Shift register by immediate or CL count. x86 flag effects are not modeled in shared IR.
+            if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register { return None; }
+            let dst = x86_to_ir_register(instr.op0_register())?;
+            let kind = match instr.mnemonic() {
+                M::Shl | M::Sal => IrShiftKind::Left,
+                M::Shr => IrShiftKind::LogicalRight,
+                M::Sar => IrShiftKind::ArithmeticRight,
+                _ => return None,
+            };
+            match instr.op1_kind() {
+                OpKind::Immediate8 => {
+                    let amount = instr.immediate8() & 0x3f;
+                    Some(IrOperation::Shift { destination: dst, source: dst, kind, amount })
+                }
+                OpKind::Register => {
+                    // Only CL count is architecturally valid for x86 variable shifts.
+                    let count_reg = instr.op1_register();
+                    if count_reg != iced_x86::Register::CL { return None; }
+                    let amount = x86_to_ir_register(count_reg)?;
+                    let vkind = match kind {
+                        IrShiftKind::Left => IrVariableShiftKind::Left,
+                        IrShiftKind::LogicalRight => IrVariableShiftKind::LogicalRight,
+                        IrShiftKind::ArithmeticRight => IrVariableShiftKind::ArithmeticRight,
+                    };
+                    Some(IrOperation::VariableShift { destination: dst, source: dst, amount, kind: vkind })
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
