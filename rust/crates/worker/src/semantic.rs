@@ -8947,9 +8947,9 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     use std::collections::{BTreeMap, VecDeque};
     let mut result = BTreeMap::new();
     let is_arm64 = is_arm64_arch(architecture);
+    // Must-analysis is currently ARM64/ObjC-ABI-specific; keep non-ARM64 conservative.
     if !is_arm64 { return result; }
-    // ARM64 fixed-width decode path when no explicit PC/size map is provided.
-    // Variable-length streams can provide `insn_pcs`/`insn_sizes`, but decode remains ARM64 4-byte until x86-64 lifting is implemented.
+    // Prefer provided PC/size maps; use explicit ARM64 fixed-width fallback only when no PC map is provided.
     let fixed_width = insn_pcs.is_empty();
     if start<base || end<=start || (fixed_width && !arm64_is_aligned(base, start)) { return result; }
     let Some(body_end)=end.checked_sub(base).and_then(|d| usize::try_from(d).ok()).map(|e| e.min(code.len())) else { return result; };
@@ -8961,7 +8961,7 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
         if count > MAX_WORDS_PER_FUNCTION { return result; }
         let Some(pcs) = arm64_fixed_width_pcs_in_range(start, bounded_end, base, count) else { return result; };
         if pcs.is_empty() || pcs.len() != count { return result; }
-        let sizes = vec![4; pcs.len()];
+        let sizes = vec![u32::try_from(ARM64_INSN_BYTES).unwrap_or(4); pcs.len()];
         (pcs, sizes)
     } else {
         let mut pcs = Vec::new();
@@ -8969,7 +8969,7 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
         let paired = insn_sizes.len() == insn_pcs.len();
         for (index, &pc) in insn_pcs.iter().enumerate() {
             if pc < start || pc >= end { continue; }
-            let sz = if paired { insn_sizes.get(index).copied().unwrap_or(0) } else { 0 };
+            let sz = if paired { insn_sizes.get(index).copied().unwrap_or(0) } else if is_arm64 { u32::try_from(ARM64_INSN_BYTES).unwrap_or(4) } else { 0 };
             if sz == 0 { continue; }
             pcs.push(pc);
             sizes.push(sz);
@@ -8987,14 +8987,14 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
     };
     let operations=pcs.iter().enumerate().map(|(index,&pc)|{
         let position=file_offset.saturating_add(pc-base);
-        let sz_u32 = *sizes.get(index).unwrap_or(&if is_arm64 { 4 } else { 0 });
+        let sz_u32 = sizes.get(index).copied().unwrap_or(if fixed_width && is_arm64 { u32::try_from(ARM64_INSN_BYTES).unwrap_or(4) } else { 0 });
         let sz = sz_u32 as u64;
         let pc_end = pc.saturating_add(sz);
         let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
         if sz_u32 == 0 || data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){
             return IrOperation::TargetSpecific;
         }
-        // Architecture-aware decode+lift; unsupported sizes/architectures are conservative.
+        // Architecture-gated decode+lift; unsupported sizes/architectures are conservative.
         match decode_lift_for_arch(code, base, pc, sz_u32, architecture) {
             Some((_word, _op, portable)) => portable,
             None => IrOperation::TargetSpecific,
