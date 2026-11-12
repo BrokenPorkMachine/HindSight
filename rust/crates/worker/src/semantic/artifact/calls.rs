@@ -621,7 +621,7 @@ pub(crate) fn prove_non_returning_with_resolved_indirects_and_arch_and_pcs(
             Flow::Calls(target) => {
                 // The callee calls onward. It still returns to this frame
                 // unless that callee never returns.
-                if !prove_non_returning_with_resolved_indirects_and_arch(code, base, target, budget.min(64), resolved_indirect_targets, "arm64") {
+                if !prove_non_returning_with_resolved_indirects_and_arch(code, base, target, budget.min(64), resolved_indirect_targets, architecture) {
                     return false;
                 }
             }
