@@ -1329,31 +1329,55 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                 } else { unsupported() }
             } else { unsupported() } // general xor semantics/flags not modeled
         }
-        // mov reg, imm / mov reg, reg (limited, conservative). 32-bit GPR writes zero-extend on x86-64.
-        Mnemonic::Mov if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register => {
-            if let Some((dst, dst_bits)) = xreg(instr.op0_register()) {
-                match instr.op1_kind() {
-                    k if matches!(k, OpKind::Immediate8|OpKind::Immediate16|OpKind::Immediate32|OpKind::Immediate64|OpKind::Immediate8to16|OpKind::Immediate8to32|OpKind::Immediate8to64|OpKind::Immediate32to64) => {
-                        if let Some(imm) = imm_operand(instr.op1_kind(), &instr) {
-                            if dst_bits >= 32 {
-                                let value = if dst_bits == 32 { imm & 0xffff_ffff } else { imm };
-                                (IrOperation::Assign { destination: dst, value: IrOperand::Constant(value) },
-                                 tree("move", Some("x86_64 mov immediate (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
+        // mov forms (limited, conservative): reg<-imm, reg<-reg (64-bit), and simple RIP-relative 64-bit mem ops.
+        Mnemonic::Mov if instr.op_count() == 2 => {
+            if instr.op0_kind() == OpKind::Register {
+                if let Some((dst, dst_bits)) = xreg(instr.op0_register()) {
+                    match instr.op1_kind() {
+                        k if matches!(k, OpKind::Immediate8|OpKind::Immediate16|OpKind::Immediate32|OpKind::Immediate64|OpKind::Immediate8to16|OpKind::Immediate8to32|OpKind::Immediate8to64|OpKind::Immediate32to64) => {
+                            if let Some(imm) = imm_operand(instr.op1_kind(), &instr) {
+                                if dst_bits >= 32 {
+                                    let value = if dst_bits == 32 { imm & 0xffff_ffff } else { imm };
+                                    (IrOperation::Assign { destination: dst, value: IrOperand::Constant(value) },
+                                     tree("move", Some("x86_64 mov immediate (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
+                                     ir_text)
+                                } else { unsupported() }
+                            } else { unsupported() }
+                        }
+                        OpKind::Register => {
+                            if let Some((src, src_bits)) = xreg(instr.op1_register()) {
+                                if dst_bits == 64 && src_bits == 64 {
+                                    (IrOperation::Assign { destination: dst, value: IrOperand::Register(src) },
+                                     tree("move", Some("x86_64 mov reg,reg 64-bit (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
+                                     ir_text)
+                                } else { unsupported() } // sub-64 or mixed-width moves have x86-specific semantics
+                            } else { unsupported() }
+                        }
+                        OpKind::Memory => {
+                            // mov r64, [rip + disp32]: simple RIP-relative 64-bit load.
+                            if dst_bits == 64 && instr.memory_base() == Register::RIP && instr.memory_index() == Register::None {
+                                let addr = instr.memory_displacement64();
+                                let next_pc = pc.saturating_add(sz as u64);
+                                let offset = (addr as i64).wrapping_sub(next_pc as i64);
+                                (IrOperation::Load { destination: dst, address: IrMemoryAddress::PcRelative { offset, target: addr }, bytes: 8, signed: false, writeback: None },
+                                 tree("unsupported-operation", Some("x86_64 rip-relative load (partially lifted)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into()),("address",address(addr))]), vec![]),
                                  ir_text)
                             } else { unsupported() }
-                        } else { unsupported() }
+                        }
+                        _ => unsupported(),
                     }
-                    OpKind::Register => {
-                        if let Some((src, src_bits)) = xreg(instr.op1_register()) {
-                            if dst_bits == 64 && src_bits == 64 {
-                                (IrOperation::Assign { destination: dst, value: IrOperand::Register(src) },
-                                 tree("move", Some("x86_64 mov reg,reg 64-bit (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into())]), vec![]),
-                                 ir_text)
-                            } else { unsupported() } // sub-64 or mixed-width moves have x86-specific semantics
-                        } else { unsupported() }
-                    }
-                    _ => unsupported(), // memory operands, etc. not yet lifted
-                }
+                } else { unsupported() }
+            } else if instr.op0_kind() == OpKind::Memory && instr.op1_kind() == OpKind::Register {
+                if let Some((src, src_bits)) = xreg(instr.op1_register()) {
+                    if src_bits == 64 && instr.memory_base() == Register::RIP && instr.memory_index() == Register::None {
+                        let addr = instr.memory_displacement64();
+                        let next_pc = pc.saturating_add(sz as u64);
+                        let offset = (addr as i64).wrapping_sub(next_pc as i64);
+                        (IrOperation::Store { address: IrMemoryAddress::PcRelative { offset, target: addr }, value: IrOperand::Register(src), bytes: 8, writeback: None },
+                         tree("unsupported-operation", Some("x86_64 rip-relative store (partially lifted)".to_string()), object([("architecture","x86_64".into()),("mnemonic","mov".into()),("status","partial".into()),("address",address(addr))]), vec![]),
+                         ir_text)
+                    } else { unsupported() }
+                } else { unsupported() }
             } else { unsupported() }
         }
         // sub/add rsp, imm: common stack adjustment (flags not modeled). Only when destination is SP and 64-bit form.
@@ -1367,6 +1391,17 @@ fn x86_64_lift_instruction(pc: u64, bytes: &[u8]) -> (IrOperation, Tree, String)
                          ir_text)
                     } else { unsupported() }
                 } else { unsupported() } // general add/sub with flags/effects not safely modeled yet
+            } else { unsupported() }
+        }
+        // lea r64, [rip + disp32]: PC-relative address computation (common for PIC/GOT/data refs).
+        Mnemonic::Lea if instr.op_count() == 2 && instr.op0_kind() == OpKind::Register && instr.op1_kind() == OpKind::Memory => {
+            if let Some((dst, dst_bits)) = xreg(instr.op0_register()) {
+                if dst_bits == 64 && instr.memory_base() == Register::RIP && instr.memory_index() == Register::None {
+                    let addr = instr.memory_displacement64();
+                    (IrOperation::Address { destination: dst, value: addr, page: false },
+                     tree("move", Some("x86_64 lea rip-relative (conservative)".to_string()), object([("architecture","x86_64".into()),("mnemonic","lea".into()),("status","partial".into()),("address",address(addr))]), vec![]),
+                     ir_text)
+                } else { unsupported() } // complex addressing modes need careful modeling
             } else { unsupported() }
         }
         _ => unsupported(),
