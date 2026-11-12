@@ -4035,13 +4035,16 @@ pub(super) fn recover_with_types(
 /// memory-free leaf has canonical Boolean representation. Callers separately
 /// establish the callee's complete return/effect/ABI summary.
 pub(super) fn canonical_boolean_callee(code: &[u8], start: u64, signature: &SourceSignature) -> bool {
+    // ARM64 fixed-width 4-byte decode path. Variable-length streams require architecture-aware decode.
     if code.is_empty() || code.len() > 128 * 4 || code.len() % 4 != 0 {
         return false;
     }
     let mut trees = Vec::new();
     let mut operations = Vec::new();
-    for (index, bytes) in code.chunks_exact(4).enumerate() {
-        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+    let count = code.len() / 4;
+    for index in 0..count {
+        let off = index * 4;
+        let word = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
         let pc = start + index as u64 * 4;
         let decoded = decode(word, pc);
         let operation = lift_operation(decoded, pc);

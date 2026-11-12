@@ -2193,7 +2193,22 @@ fn reconstruction_request(path:&str,digest:&str,size:&str,start:&str,end:&str,id
   index+=1;
  }
  // Rewind? not necessary; further reads use absolute offsets
- let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native,resolved_indirect_targets,resolved_indirect_cases,resolved_indirect_index_info,instruction_pcs:Vec::new(),instruction_sizes:Vec::new()};
+ let arch_lc = architecture.to_ascii_lowercase();
+ let (instruction_pcs, instruction_sizes) = if matches!(arch_lc.as_str(), "arm64" | "arm64e" | "aarch64") {
+  let fn_end = end.min(map.address + code.len() as u64);
+  let mut pcs = Vec::new();
+  let mut sizes = Vec::new();
+  let mut pc = start;
+  while pc.saturating_add(4) <= fn_end && pcs.len() < 128 {
+   pcs.push(pc);
+   sizes.push(4u32);
+   pc = pc.saturating_add(4);
+  }
+  (pcs, sizes)
+ } else {
+  (Vec::new(), Vec::new())
+ };
+ let input=super::reconstruction::Input{code:&code,base:map.address,start,end,file_offset:map.offset,data_ranges:&data_ranges,source:digest,architecture,name,boundary_sources:sources,signatures,call_prototypes,project_types,native,resolved_indirect_targets,resolved_indirect_cases,resolved_indirect_index_info,instruction_pcs,instruction_sizes};
  let artifact=if let Some(registers)=registers{super::semantic::interpret_artifact(input,registers)}else{super::semantic::reconstruct_artifact(input)}?;
  if fingerprint(&before)!=fingerprint(&file.metadata()?){return Err(io::Error::new(io::ErrorKind::InvalidData,"Captured source changed during reconstruction"));}
  if artifact.len()>16*1024*1024{return Err(invalid("Reconstruction artifact output budget exceeded"));}Ok(artifact)

@@ -1247,9 +1247,11 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
     let exhausted = instructions > 128;
     let truncated = high < end;
     let direct_targets = if _input_instruction_pcs.is_empty() {
-        body.chunks_exact(4).enumerate().filter_map(|(index, bytes)| {
+        (0..(body.len() / 4)).filter_map(|index| {
+            let off = index * 4;
+            if off + 4 > body.len() { return None; }
             let pc = apc_at(index, &insn_pcs, start);
-            let word = u32::from_le_bytes(bytes.try_into().unwrap());
+            let word = u32::from_le_bytes(body[off..off + 4].try_into().ok()?);
             match lift_operation(decode(word, pc), pc) {
                 IrOperation::DirectCall { target } => Some(target),
                 _ => None,
