@@ -2160,8 +2160,7 @@ fn render_arm64_body(
     code: &[u8], base: u64, file_offset: u64, data_ranges: &[(u64,u64,u16)], parameter_evidence: &str,
     tail_calls: &[(u64,u64,u64)], jump_tables: &str, objc_selectors: &BTreeMap<u64,String>, object_layout:Option<&super::objc::ClassLayout>, provided_insn_pcs:&[u64], provided_insn_sizes:&[u32], architecture:&str,
 ) -> Option<String> {
-    let arch = architecture.to_ascii_lowercase();
-    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    let is_arm64 = super::semantic::is_arm64_arch(architecture);
     if start < base || start >= end { return None; }
     let lo = usize::try_from(start - base).ok()?;
     let hi = usize::try_from(end.min(base.saturating_add(code.len() as u64)) - base).ok()?;
@@ -2500,9 +2499,9 @@ fn render_arm64_body(
                     if let Some(name) = target_name {
                         let target_signature = signatures.get(&target).map(|(_,signature)| signature);
                         let args = abi_parameters(target_signature);
-                        let known = super::semantic::known_call_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, "arm64");
-                        let known_float = super::semantic::known_call_float_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, "arm64");
-                        let known_stack = super::semantic::known_call_stack_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, "arm64");
+                        let known = super::semantic::known_call_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, architecture);
+                        let known_float = super::semantic::known_call_float_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, architecture);
+                        let known_stack = super::semantic::known_call_stack_argument_values_with_arch_and_pcs(code, base, start, address, &insn_pcs, &insn_sizes, architecture);
                         let (mut rendered, evidence) = render_call_arguments(&args, &known, &known_float, &known_stack);
                         let evidence_note = if evidence.is_empty() { String::new() } else { format!("; constant argument evidence: {}", evidence.join(", ")) };
                         let arguments = if args.is_empty() && target_signature.is_none() {

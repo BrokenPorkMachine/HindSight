@@ -8130,13 +8130,13 @@ impl SsaOutputBudget {
 
 pub(crate) const ARM64_INSN_BYTES: u64 = 4;
 
-fn is_arm64_arch(architecture: &str) -> bool {
+pub(crate) fn is_arm64_arch(architecture: &str) -> bool {
     let arch = architecture.to_ascii_lowercase();
     matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64")
 }
 
 #[allow(dead_code)]
-fn is_x86_64_arch(architecture: &str) -> bool {
+pub(crate) fn is_x86_64_arch(architecture: &str) -> bool {
     let arch = architecture.to_ascii_lowercase();
     matches!(arch.as_str(), "x86_64" | "x86-64" | "amd64")
 }
