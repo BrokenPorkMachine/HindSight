@@ -821,13 +821,17 @@ fn modeled_argument_uses(w:u32)->u8{
  uses
 }
 
-fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
+fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)],architecture:&str)->String{
+ if !super::semantic::is_arm64_arch(architecture){
+  return "Entry-block parameter candidate scan skipped for non-ARM64 architecture; variable-length/architecture-specific ABI analysis not yet implemented.\n".into();
+ }
+ let insn=super::semantic::ARM64_INSN_BYTES as usize;
  let mut out=String::new();let code_end=base.saturating_add(code.len() as u64);let mut found=0usize;
  for (index,&entry) in starts.iter().take(2000).enumerate(){
   if entry<base||entry>=code_end{continue}
   let end=starts.get(index+1).copied().unwrap_or(code_end).min(code_end).min(entry.saturating_add(128));
   let lo=(entry-base) as usize;let hi=(end-base) as usize;let mut defined=0u8;let mut live_in=0u8;
-  let mut off=0usize;while lo+off+4<=hi{let w=le32(&code[lo+off..lo+off+4]);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){break}live_in|=modeled_argument_uses(w)&!defined;if let Some(r)=modeled_def_reg(w){if r<8{defined|=1u8<<r}}off+=4}
+  let mut off=0usize;while lo+off+insn<=hi{let w=le32(&code[lo+off..lo+off+insn]);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){break}live_in|=modeled_argument_uses(w)&!defined;if let Some(r)=modeled_def_reg(w){if r<8{defined|=1u8<<r}}off+=insn}
   if live_in==0{continue}
   let registers=(0..8).filter(|r|live_in&(1u8<<r)!=0).map(|r|format!("x{r}")).collect::<Vec<_>>();
   let highest=8-live_in.leading_zeros() as usize;let name=symbol_name_at(symbols,entry).unwrap_or("<discovered>");
@@ -838,9 +842,13 @@ fn function_parameter_candidates(starts:&[u64],code:&[u8],base:u64,symbols:&[(u6
  out
 }
 
-fn explicit_cast_evidence(code:&[u8],base:u64)->String{
+fn explicit_cast_evidence(code:&[u8],base:u64,architecture:&str)->String{
+ if !super::semantic::is_arm64_arch(architecture){
+  return "Explicit integer-cast scan skipped for non-ARM64 architecture; variable-length/architecture-specific cast evidence not yet implemented.\n".into();
+ }
+ let insn=super::semantic::ARM64_INSN_BYTES as usize;
  let mut out=String::new();let mut found=0usize;
- let mut index=0usize;while index*4+4<=code.len(){let chunk=&code[index*4..index*4+4];let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{index+=1;continue};let pc=base+index as u64*4; /* fixed-width ARM64; variable-length streams need pc map */out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}index+=1}
+ let mut index=0usize;while index*insn+insn<=code.len(){let off=index*insn;let chunk=&code[off..off+insn];let w=le32(chunk);let Some((rd,rn,operation,result))=explicit_integer_cast(w) else{index+=1;continue};let pc=base+(index as u64)*super::semantic::ARM64_INSN_BYTES;out.push_str(&format!("{pc:#018x} x{rd}<-x{rn} cast={operation} result-shape={result} classification=explicit-integer-cast provenance=decoded-bitfield-alias\n"));found+=1;if out.len()>18_000{break}index+=1}
  if found==0{out.push_str("No explicit UXTB/UXTH/UXTW/SXTB/SXTH/SXTW encodings were recovered.\n")}
  out
 }
@@ -956,11 +964,15 @@ fn definition_value_width(w:u32)->u8{
  }
 }
 
-fn call_argument_provenance(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)])->String{
+fn call_argument_provenance(calls:&[(u64,u64,u64)],starts:&[u64],code:&[u8],base:u64,symbols:&[(u64,String)],architecture:&str)->String{
+ if !super::semantic::is_arm64_arch(architecture){
+  return format!("Call argument/parameter/cast provenance skipped for non-ARM64 architecture ({architecture}); variable-length/architecture-specific ABI and register-provenance analysis not yet implemented.\n");
+ }
+ let insn=super::semantic::ARM64_INSN_BYTES as usize;
  let mut arguments=String::new();
- for &(func,site,target) in calls.iter().take(2000){let lo=site.saturating_sub(base) as usize;let function_start=func.saturating_sub(base) as usize;let start=lo.saturating_sub(16*4).max(function_start.min(lo));let mut defs:[Option<(u64,u32)>;8]=[None;8];if lo<=code.len(){let scan_hi=lo.min(code.len());let mut si=0usize;while start+si+4<=scan_hi{let w=le32(&code[start+si..start+si+4]);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];si+=4;continue}if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some((base+start as u64+si as u64,w));}}si+=4}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|(pc,w)|format!("x{r}<-{pc:#x} shape={}",definition_value_shape(w)))).collect::<Vec<_>>();arguments.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee} observed-argument-register-definitions={} args=[{}] return-register=x0\n",args.len(),args.join(", ")));if arguments.len()>18_000{break}}
+ for &(func,site,target) in calls.iter().take(2000){let lo=site.saturating_sub(base) as usize;let function_start=func.saturating_sub(base) as usize;let start=lo.saturating_sub(16*insn).max(function_start.min(lo));let mut defs:[Option<(u64,u32)>;8]=[None;8];if lo<=code.len(){let scan_hi=lo.min(code.len());let mut si=0usize;while start+si+insn<=scan_hi{let off=start+si;let w=le32(&code[off..off+insn]);if (w&0x7c000000)==0x14000000||is_conditional(w)||is_terminal(w){defs=[None;8];si+=insn;continue}if let Some(r)=modeled_def_reg(w){if r<8{defs[r]=Some((base+off as u64,w));}}si+=insn}}let callee=symbol_name_at(symbols,target).unwrap_or("<target>");let args=(0..8).filter_map(|r|defs[r].map(|(pc,w)|format!("x{r}<-{pc:#x} shape={}",definition_value_shape(w)))).collect::<Vec<_>>();arguments.push_str(&format!("call {site:#018x} in {func:#018x} -> {target:#018x} {callee} observed-argument-register-definitions={} args=[{}] return-register=x0\n",args.len(),args.join(", ")));if arguments.len()>18_000{break}}
  if arguments.is_empty(){arguments.push_str("No direct calls were available for bounded argument provenance.\n")}
- format!("AArch64 PCS signature evidence: x0-x7 are integer/pointer argument and result registers. Incoming parameter candidates are entry-block uses before a modeled definition; outgoing arguments are nearby modeled definitions; cast rows require exact extension encodings. Value shapes do not distinguish pointers from same-width integers. No source-level types or callee prototypes are inferred.\n\nIncoming parameter candidates\n=============================\n{}\nOutgoing call arguments\n=======================\n{}\nExplicit integer casts\n======================\n{}",function_parameter_candidates(starts,code,base,symbols),arguments,explicit_cast_evidence(code,base))
+ format!("AArch64 PCS signature evidence: x0-x7 are integer/pointer argument and result registers. Incoming parameter candidates are entry-block uses before a modeled definition; outgoing arguments are nearby modeled definitions; cast rows require exact extension encodings. Value shapes do not distinguish pointers from same-width integers. No source-level types or callee prototypes are inferred.\n\nIncoming parameter candidates\n=============================\n{}\nOutgoing call arguments\n=======================\n{}\nExplicit integer casts\n======================\n{}",function_parameter_candidates(starts,code,base,symbols,architecture),arguments,explicit_cast_evidence(code,base,architecture))
 }
 
 fn annotated_disassembly(code:&[u8],base:u64,symbols:&[(u64,String)],relocations:&[(u64,String,u32,bool,u32,Option<u64>)],architecture:&str)->String{
@@ -2423,7 +2435,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");
  let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end,&analyze_arch);
  analysis_progress(61,"structure","Bounded dominator, phi, and SSA structure completed.");
- let swift_contexts=swift_context_graph(&mut file,&window,size)?;let mut call_values=call_argument_provenance(&calls,&starts,&code,map.address,&symbols);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations,&analyze_arch);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
+ let swift_contexts=swift_context_graph(&mut file,&window,size)?;let mut call_values=call_argument_provenance(&calls,&starts,&code,map.address,&symbols,&analyze_arch);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations,&analyze_arch);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
  analysis_progress(69,"runtime","Objective-C, Swift, chained-fixup, and annotated-code evidence completed.");
  let interblock_values=interblock_value_flow(&calls,&code,map.address,&leaders,&symbols,&analyze_arch);let predecessor_values=predecessor_value_flow(&code,map.address,&leaders,&edges,scan_end,&analyze_arch);let propagated_values=iterative_value_flow(&code,map.address,&leaders,&edges,scan_end,&analyze_arch);let indirect_calls=indirect_call_resolution(&code,map.address,&leaders,&relocations,&symbols,&analyze_arch);
  analysis_progress(75,"value-flow","Bounded inter-block value flow and indirect-call evidence completed.");
@@ -3422,7 +3434,7 @@ mod tests {
  fn reports_entry_block_register_uses_as_parameter_candidates() {
   let words=[0x9100_0408u32,0xf900_03e1,0xd65f_03c0];
   let code=words.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
-  let report=function_parameter_candidates(&[0x1000],&code,0x1000,&[]);
+  let report=function_parameter_candidates(&[0x1000],&code,0x1000,&[],"arm64");
   assert!(report.contains("parameter-registers=[x0, x1]"));
   assert!(report.contains("highest-abi-position=2"));
  }
