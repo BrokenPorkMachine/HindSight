@@ -4685,7 +4685,7 @@ impl Recovery {
             Some(&s.result_spelling),
             effect_asts.into_iter().chain(std::iter::once(asts[&self.result].clone())).collect(),
             declaration,
-            (start, start + ir.len() as u64 * 4),
+            (start, end_pc(start, trees_len, insn_pcs, insn_sizes)),
             object([
                 ("name", s.name.clone().into()),
                 ("return_paths", (self.paths as u64).into()),
