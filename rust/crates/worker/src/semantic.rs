@@ -8385,8 +8385,20 @@ fn decode_lift_x86_64_data_op(instr: &iced_x86::Instruction) -> Option<IrOperati
             Some(IrOperation::Binary { destination: dst, operator: op, left, right })
         }
         M::Cmp | M::Test => {
-            // Comparisons set flags; without x86 flag SSA/flow modeling, keep conservative.
-            None
+            // Lift comparisons to shared IR where operands are representable; flag semantics remain
+            // architecture-specific in downstream analysis and are handled conservatively when unknown.
+            if instr.op_count() != 2 { return None; }
+            let kind = if instr.mnemonic() == M::Cmp { IrCompareKind::Compare } else { IrCompareKind::Test };
+            let left = match instr.op0_kind() {
+                OpKind::Register => x86_to_ir_register(instr.op0_register())?,
+                _ => return None,
+            };
+            let right = match instr.op1_kind() {
+                OpKind::Register => IrCompareOperand::Register { register: x86_to_ir_register(instr.op1_register())?, shift: None },
+                _ if x86_imm_operand(instr, 1).is_some() => IrCompareOperand::Immediate(x86_imm_operand(instr, 1)?),
+                _ => return None,
+            };
+            Some(IrOperation::Compare { kind, left, right })
         }
         _ => None,
     }
