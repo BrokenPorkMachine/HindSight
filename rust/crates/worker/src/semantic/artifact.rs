@@ -2101,7 +2101,7 @@ fn build_mode(input: Input<'_>, registers: Option<[u64; 8]>) -> io::Result<Strin
                 let reg_num: Option<u8> = if dispatch.class == IrRegisterClass::General { Some(dispatch.index) } else { None };
                 if let Some(reg) = reg_num {
                     if index > 0 {
-                        let prev_pc = pc - 4;
+                        let prev_pc = apc_at(index - 1, &insn_pcs, start);
                         if let Some((r, sym, slot)) = resolved_got_load_reg.get(&prev_pc).cloned() {
                             if r == reg && !sym.starts_with("PAGE:") {
                                 if let Some(target_slot) = slot {
