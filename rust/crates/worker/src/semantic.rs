@@ -8136,6 +8136,20 @@ pub(crate) fn read_arm64_u32(code: &[u8], base: u64, pc: u64) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
+/// Architecture-aware decode+lift dispatch. ARM64 4-byte instructions use the existing
+/// ARM64 decoder/lifter; other architectures/sizes are conservatively unsupported here.
+fn decode_lift_for_arch(code: &[u8], base: u64, pc: u64, size: u32, architecture: &str) -> Option<(u32, Operation, IrOperation)> {
+    let arch = architecture.to_ascii_lowercase();
+    let is_arm64 = matches!(arch.as_str(), "arm64" | "arm64e" | "aarch64");
+    if is_arm64 && size == 4 {
+        let word = read_arm64_u32(code, base, pc)?;
+        let operation = decode(word, pc);
+        let portable = lift_operation(operation, pc);
+        return Some((word, operation, portable));
+    }
+    None
+}
+
 pub(crate) fn arm64_is_aligned(base: u64, addr: u64) -> bool {
     addr >= base && (addr - base) % ARM64_INSN_BYTES == 0
 }
@@ -8211,10 +8225,9 @@ fn known_call_flow_with_arch_and_pcs(code: &[u8], base: u64, function_start: u64
             // map by position in provided full pc list if possible
             insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
         } else { 4 };
-        if sz != 4 { return None; } // conservative for variable-length until arch-aware decode
-        let word = read_arm64_u32(code, base, pc)?;
-        let operation = decode(word, pc);
-        let portable = lift_operation(operation, pc);
+        let Some((_word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
+            return None; // conservative for unsupported/variable-length decode
+        };
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) {
             return None;
         }
@@ -8296,10 +8309,9 @@ pub fn known_call_stack_argument_values_with_arch_and_pcs(code: &[u8], base: u64
         let sz = if !insn_pcs.is_empty() && insn_sizes.len() == insn_pcs.len() {
             insn_pcs.iter().position(|&p| p == pc).and_then(|idx| insn_sizes.get(idx).copied()).unwrap_or(4)
         } else { 4 };
-        if sz != 4 { return Vec::new(); } // conservative for variable-length until arch-aware decode
-        let Some(word) = read_arm64_u32(code, base, pc) else { return Vec::new() };
-        let operation = decode(word, pc);
-        let portable = lift_operation(operation, pc);
+        let Some((_word, operation, portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
+            return Vec::new(); // conservative for unsupported/variable-length decode
+        };
         if matches!(portable, IrOperation::Branch { .. } | IrOperation::ConditionalBranch { .. } | IrOperation::IndirectBranch { .. } | IrOperation::Return { .. }) { return Vec::new(); }
         if matches!(portable, IrOperation::DirectCall { .. } | IrOperation::IndirectCall { .. }) { flow.clear(); stack.clear(); stack_aliases.clear(); continue; }
         let sp_changed = matches!(operation,
@@ -8648,13 +8660,15 @@ pub fn object_member_accesses_with_resolved_indirects_and_arch_and_pcs(code:&[u8
         let sz = *sizes.get(index).unwrap_or(&4) as u64;
         let pc_end = pc.saturating_add(sz);
         let end_pos = file_offset.saturating_add(pc_end.saturating_sub(base));
-        let Some(off)=pc.checked_sub(base).and_then(|d| usize::try_from(d).ok()) else { return IrOperation::TargetSpecific; };
-        // ARM64 4-byte decode only for now; variable-length decode remains conservative.
-        let isz = *sizes.get(index).unwrap_or(&4) as usize;
-        if isz != 4 || off.saturating_add(isz)>code.len() { return IrOperation::TargetSpecific; }
-        let word=u32::from_le_bytes(code[off..off+4].try_into().unwrap());
-        if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){IrOperation::TargetSpecific}
-        else{lift_operation(decode(word,pc),pc)}
+        if data_ranges.iter().any(|&(lo,hi,_)|position<hi&&end_pos>lo){
+            return IrOperation::TargetSpecific;
+        }
+        // Architecture-aware decode+lift; unsupported sizes/architectures are conservative.
+        let sz_u32 = *sizes.get(index).unwrap_or(&4);
+        match decode_lift_for_arch(code, base, pc, sz_u32, architecture) {
+            Some((_word, _op, portable)) => portable,
+            None => IrOperation::TargetSpecific,
+        }
     }).collect::<Vec<_>>();
     // A present entry means targets are proven complete (possibly all
     // external exits, i.e. no in-function successors).
@@ -8851,9 +8865,9 @@ pub fn stack_pointer_is_stable_with_arch_and_pcs(
     };
     for (i, &pc) in pcs.iter().enumerate() {
         let sz = *sizes.get(i).unwrap_or(&4);
-        if sz != 4 { return false; } // conservative: unknown variable-length/non-ARM64 instruction may affect SP
-        let Some(word) = read_arm64_u32(code, base, pc) else { return false };
-        let operation = decode(word, pc);
+        let Some((_word, operation, _portable)) = decode_lift_for_arch(code, base, pc, sz, architecture) else {
+            return false; // conservative: unknown variable-length/non-decodable instruction may affect SP
+        };
         let writeback_changes_sp = |base: Register, writeback: Writeback| base.stack_pointer && matches!(writeback, Writeback::Pre | Writeback::Post);
         match operation {
             Operation::AddImmediate { dst, .. } | Operation::AddRegister { dst, .. } | Operation::AddExtended { dst, .. } if dst.stack_pointer => return false,
