@@ -3749,13 +3749,13 @@ pub(super) fn recover_with_types_and_arch(
                             if tgt_tree.kind == "conditional-goto" {
                                 // Only follow if it targets the next sequential instruction.
                                 let tgt = number(tgt_tree, "target");
-                                if index_of_pc(tgt, insn_pcs, start, trees.len()) != Some(idx + 1) { return Some(idx); }
+                                if index_of_pc_with_arch(tgt, insn_pcs, start, trees.len(), architecture) != Some(idx + 1) { return Some(idx); }
                                 idx = idx.checked_add(1)?;
                                 steps += 1;
                                 continue;
                             }
                             let tgt = number(tgt_tree, "target");
-                            let tgt_idx = index_of_pc(tgt, insn_pcs, start, trees.len())?;
+                            let tgt_idx = index_of_pc_with_arch(tgt, insn_pcs, start, trees.len(), architecture)?;
                             idx = tgt_idx;
                             steps += 1;
                         }
@@ -4298,7 +4298,7 @@ impl Recovery {
             let evidence = node
                 .origins
                 .iter()
-                .filter_map(|pc| index_of_pc(*pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)))
+                .filter_map(|pc| index_of_pc_with_arch(*pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)))
                 .cloned()
                 .chain(std::iter::once(declaration.to_owned()))
                 .collect::<Vec<_>>();
@@ -4415,7 +4415,7 @@ impl Recovery {
                     "source-loop-binding",
                     None,
                     vec![asts[&variable.value].clone(), asts[&variable.initial].clone()],
-                    &index_of_pc(loop_pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
+                    &index_of_pc_with_arch(loop_pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)).into_iter().cloned().chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>(),
                     array([object([("start", address(loop_pc)), ("end", address(semit_span_end_with_arch(loop_pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])]),
                     object([("template", "uint64_t $0 = $1".into()), ("role", self.dag.nodes[variable.value].role.into())]),
                 )?;
@@ -4440,7 +4440,7 @@ impl Recovery {
                         } else {
                             loop_code.push_str(&format!("        if ({}) {{\n{}        }}\n", rendered[&load.guard], statement));
                         }
-                        let mut evidence = index_of_pc(load.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
+                        let mut evidence = index_of_pc_with_arch(load.pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)).into_iter().cloned()
                             .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                         evidence.extend(memory_evidence_by_pc.get(&load.pc).into_iter().flatten().cloned());
                         let ordering = "per-iteration instruction order under the recovered path guard";
@@ -4474,7 +4474,7 @@ impl Recovery {
                         let target = &rendered[&assignment.destination];
                         let value = &rendered[&assignment.value];
                         loop_code.push_str(&format!("        {target} = {value};\n"));
-                        let evidence = index_of_pc(assignment.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
+                        let evidence = index_of_pc_with_arch(assignment.pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)).into_iter().cloned()
                             .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                         let ast = builder.ast_spans(
                             "source-loop-assignment",
@@ -4507,7 +4507,7 @@ impl Recovery {
                         } else {
                             loop_code.push_str(&format!("        if ({}) {{\n{}        }}\n", rendered[&store.guard], statement));
                         }
-                        let mut evidence = index_of_pc(store.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
+                        let mut evidence = index_of_pc_with_arch(store.pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)).into_iter().cloned()
                             .chain(std::iter::once(declaration.to_owned()))
                             .collect::<Vec<_>>();
                         evidence.extend(memory_evidence_by_pc.get(&store.pc).into_iter().flatten().cloned());
@@ -4540,7 +4540,7 @@ impl Recovery {
                 }
             }
             loop_code.push_str("    }\n");
-            let evidence = source_loop.pcs.iter().filter_map(|pc| index_of_pc(*pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).cloned())
+            let evidence = source_loop.pcs.iter().filter_map(|pc| index_of_pc_with_arch(*pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)).cloned())
                 .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
             let origins = array(source_loop.pcs.iter().map(|pc| object([("start", address(*pc)), ("end", address(semit_span_end_with_arch(*pc, insn_pcs, insn_sizes, start, trees_len, architecture)))])));
             let ast = builder.ast_spans(
@@ -4581,7 +4581,7 @@ impl Recovery {
                 } else {
                     effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&call.guard], call_assignment));
                 }
-                let evidence = index_of_pc(call.pc, insn_pcs, start, trees_len).and_then(|i| ir.get(i)).into_iter().cloned()
+                let evidence = index_of_pc_with_arch(call.pc, insn_pcs, start, trees_len, architecture).and_then(|i| ir.get(i)).into_iter().cloned()
                     .chain(std::iter::once(declaration.to_owned())).collect::<Vec<_>>();
                 effect_asts.push(builder.ast_spans(
                     "source-call-event",
@@ -4629,7 +4629,7 @@ impl Recovery {
                     ("address_ast", asts[&load.address].clone().into()),
                     ("read_ast", asts[&load.expression].clone().into()),
                 ]), ranges(pc, semit_span_end_with_arch(pc, insn_pcs, insn_sizes, start, trees_len, architecture))));
-                let mut evidence = index_of_pc(load.pc, insn_pcs, start, trees_len)
+                let mut evidence = index_of_pc_with_arch(load.pc, insn_pcs, start, trees_len, architecture)
                     .and_then(|i| ir.get(i))
                     .into_iter()
                     .cloned()
@@ -4677,7 +4677,7 @@ impl Recovery {
             } else {
                 effects_code.push_str(&format!("    if ({}) {{\n{}    }}\n", rendered[&effect.guard], store));
             }
-            let mut evidence = index_of_pc(effect.pc, insn_pcs, start, trees_len)
+            let mut evidence = index_of_pc_with_arch(effect.pc, insn_pcs, start, trees_len, architecture)
                 .and_then(|i| ir.get(i))
                 .into_iter()
                 .cloned()
