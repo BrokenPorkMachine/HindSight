@@ -9489,7 +9489,18 @@ pub fn render(
     starts: &[u64],
     data_ranges: &[(u64, u64, u16)],
 ) -> String {
-    render_with_resolved_indirects(code, base, file_offset, starts, data_ranges, &std::collections::BTreeMap::new())
+    render_with_arch(code, base, file_offset, starts, data_ranges, "arm64")
+}
+
+pub fn render_with_arch(
+    code: &[u8],
+    base: u64,
+    file_offset: u64,
+    starts: &[u64],
+    data_ranges: &[(u64, u64, u16)],
+    architecture: &str,
+) -> String {
+    render_with_resolved_indirects_and_arch(code, base, file_offset, starts, data_ranges, &std::collections::BTreeMap::new(), architecture)
 }
 
 pub fn render_with_resolved_indirects(
@@ -9500,7 +9511,19 @@ pub fn render_with_resolved_indirects(
     data_ranges: &[(u64, u64, u16)],
     resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
 ) -> String {
-    render_with_resolved_indirects_and_pcs(code, base, file_offset, starts, data_ranges, resolved_indirect_targets, &[], &[], "arm64")
+    render_with_resolved_indirects_and_arch(code, base, file_offset, starts, data_ranges, resolved_indirect_targets, "arm64")
+}
+
+pub fn render_with_resolved_indirects_and_arch(
+    code: &[u8],
+    base: u64,
+    file_offset: u64,
+    starts: &[u64],
+    data_ranges: &[(u64, u64, u16)],
+    resolved_indirect_targets: &std::collections::BTreeMap<u64, Vec<u64>>,
+    architecture: &str,
+) -> String {
+    render_with_resolved_indirects_and_pcs(code, base, file_offset, starts, data_ranges, resolved_indirect_targets, &[], &[], architecture)
 }
 
 pub fn render_with_resolved_indirects_and_pcs(
