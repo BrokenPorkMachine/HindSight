@@ -328,8 +328,12 @@ fn platform_metadata(window:&[u8])->String{
 }
 fn block_index(leaders:&[u64], address:u64)->Option<usize>{let i=leaders.partition_point(|&x|x<=address);if i==0{None}else{Some(i-1)}}
 fn modeled_def_reg(w:u32)->Option<usize>{let rd=(w&31) as usize;if rd==31{return None}if (w&0x1f800000)==0x11000000||(w&0x1f200000)==0x0b000000||(w&0x1f000000)==0x0a000000||(w&0x1f800000)==0x12800000||(w&0x1f000000)==0x10000000||(w&0x1f800000)==0x13000000||((w&0x3f000000)==0x39000000&&((w>>22)&3)!=0){Some(rd)}else{None}}
-fn structural_analysis(leaders:&[u64], starts:&[u64], edges:&[(u64,u64,&str)], code:&[u8], base:u64, end:u64)->(String,String,String){
+fn structural_analysis(leaders:&[u64], starts:&[u64], edges:&[(u64,u64,&str)], code:&[u8], base:u64, end:u64, architecture:&str)->(String,String,String){
  use std::collections::{BTreeMap,BTreeSet};
+ if !super::semantic::is_arm64_arch(architecture){
+  let note="Structural dominator/phi/frontier analysis skipped for non-ARM64 architecture; architecture/PC-size-aware structural analysis not yet implemented.\n".to_string();
+  return (note.clone(),note.clone(),note);
+ }
  const MAX_STRUCTURAL_BLOCKS:usize=20_000;
  let n=leaders.len();if n==0||starts.is_empty(){return (String::new(),String::new(),String::new())}
  if n>MAX_STRUCTURAL_BLOCKS{
@@ -339,7 +343,7 @@ fn structural_analysis(leaders:&[u64], starts:&[u64], edges:&[(u64,u64,&str)], c
  let mut pred=vec![BTreeSet::<usize>::new();n];
  for &(from,to,kind) in edges{if kind=="call"{continue}if let(Some(a),Some(b))=(block_index(leaders,from),block_index(leaders,to)){if a<n&&b<n&&a!=b&&function_for(starts,leaders[a])==function_for(starts,leaders[b]){pred[b].insert(a);}}}
  let function_entries:BTreeSet<u64>=starts.iter().copied().collect();
- for i in 0..n.saturating_sub(1){if function_entries.contains(&leaders[i+1]){continue}let block_end=leaders[i+1];if block_end<=base||block_end>end{continue}let last=block_end.saturating_sub(4);let off=last.saturating_sub(base) as usize;if off+4<=code.len(){let w=le32(&code[off..off+4]);if !is_terminal(w){pred[i+1].insert(i);}}}
+ for i in 0..n.saturating_sub(1){if function_entries.contains(&leaders[i+1]){continue}let block_end=leaders[i+1];if block_end<=base||block_end>end{continue}let insn=super::semantic::ARM64_INSN_BYTES;let last=block_end.saturating_sub(insn);let off=last.saturating_sub(base) as usize;let insn_us=insn as usize;if off+insn_us<=code.len(){let w=le32(&code[off..off+insn_us]);if !is_terminal(w){pred[i+1].insert(i);}}}
 
  // Beta.13 scalability rule: dominators are solved per function instead of
  // allocating an all-program dominator set for every basic block. The previous
@@ -521,10 +525,14 @@ fn selector_call_xrefs(relocations:&[(u64,String,u32,bool,u32,Option<u64>)],call
  for &(func,site,target) in calls.iter(){if let Some(name)=symbol_name_at(symbols,target){if objc_dispatch_entry(name){out.push_str(&format!("{site:#018x}  function {func:#018x} direct call -> {name}\n"));count+=1;if out.len()>60_000{return out}}}}
  if count==0{out.push_str("No selector/message-send xrefs were proven by symbols or Mach-O relocations in the bounded code pass.\n");}out
 }
-fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64)->String{
+fn ssa_rename_trace(code:&[u8],base:u64,leaders:&[u64],end:u64,architecture:&str)->String{
+ if !super::semantic::is_arm64_arch(architecture){
+  return "SSA rename trace skipped for non-ARM64 architecture; architecture/PC-size-aware SSA renaming not yet implemented.\n".into();
+ }
+ let insn=super::semantic::ARM64_INSN_BYTES as usize;
  let mut out=String::new();let mut global=[0u32;32];
  for (bi,&start) in leaders.iter().enumerate().take(4000){let stop=leaders.get(bi+1).copied().unwrap_or(end);let lo=start.saturating_sub(base) as usize;let hi=stop.saturating_sub(base).min(code.len() as u64) as usize;if lo>=hi||hi>code.len(){continue}out.push_str(&format!("B{bi:04} {start:#018x}\n"));let mut local=global;
-  let mut ii=0usize;while lo+ii*4+4<=hi{let pc=start+ii as u64*4; /* fixed-width ARM64; variable-length streams need pc map */let ch=&code[lo+ii*4..lo+ii*4+4];let w=le32(ch);if let Some(line)=ssa_hint(w,&mut local){out.push_str(&format!("  {pc:#018x}  {line}\n"));}else{let mut b=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,b.as_mut_ptr(),b.len())};if known!=1{out.push_str(&format!("  {pc:#018x}  opaque barrier: incoming versions not propagated past unknown semantics\n"));local=[0u32;32];}}if out.len()>60_000{return out}ii+=1}
+  let mut ii=0usize;while lo+ii*insn+insn<=hi{let pc=start+(ii as u64)*super::semantic::ARM64_INSN_BYTES;let off=lo+ii*insn;let ch=&code[off..off+insn];let w=le32(ch);if let Some(line)=ssa_hint(w,&mut local){out.push_str(&format!("  {pc:#018x}  {line}\n"));}else{let mut b=[0 as c_char;192];let known=unsafe{re_arm64_decode(w,pc,b.as_mut_ptr(),b.len())};if known!=1{out.push_str(&format!("  {pc:#018x}  opaque barrier: incoming versions not propagated past unknown semantics\n"));local=[0u32;32];}}if out.len()>60_000{return out}ii+=1}
   for r in 0..32{global[r]=global[r].max(local[r]);}
  }
  if out.is_empty(){out.push_str("No modeled instructions were available for SSA renaming.\n");}out
@@ -2433,7 +2441,7 @@ pub fn analyze(path:&str,digest:&str,size:&str,id:&str)->io::Result<String>{
  analysis_progress(44,"decode","Instruction scan completed; constructing bounded control-flow topology.");
  leaders.retain(|x|*x>=map.address&&*x<scan_end&&(if analyze_is_arm64 { (*x-map.address)%4==0 } else { true }));leaders.sort_unstable();leaders.dedup();let block_count=leaders.len();let cfg_limit=leaders.len().min(4000);let mut cfg_edges=vec![Vec::<(u64,u64,&str)>::new();cfg_limit];for &(from,to,k) in &edges{if let Some(block)=block_index(&leaders,from){if block<cfg_limit&&cfg_edges[block].len()<16{cfg_edges[block].push((from,to,k));}}}let mut cfg=String::new();for n in 0..cfg_limit{let start=leaders[n];let end=leaders.get(n+1).copied().unwrap_or(scan_end);cfg.push_str(&format!("block B{n:04} {start:#018x}..{end:#018x}\n"));for &(from,to,k) in &cfg_edges[n]{cfg.push_str(&format!("    {k:<11} {from:#018x} -> {to:#018x}\n"));}if cfg.len()>60_000{break}}
  analysis_progress(54,"cfg","CFG leaders and direct edges recovered; solving bounded per-function structure.");
- let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end,&analyze_arch);
+ let (dominators,phi_nodes,dominance_frontiers)=structural_analysis(&leaders,&starts,&edges,&code,map.address,scan_end,&analyze_arch);let ssa_renamed=ssa_rename_trace(&code,map.address,&leaders,scan_end,&analyze_arch);let phi_operands=phi_operand_trace(&leaders,&starts,&edges,&code,map.address,scan_end,&analyze_arch);
  analysis_progress(61,"structure","Bounded dominator, phi, and SSA structure completed.");
  let swift_contexts=swift_context_graph(&mut file,&window,size)?;let mut call_values=call_argument_provenance(&calls,&starts,&code,map.address,&symbols,&analyze_arch);let annotated_disassembly=annotated_disassembly(&code,map.address,&symbols,&relocations,&analyze_arch);let chained_fixups=chained_fixups_summary(&mut file,&window,size)?;let chained_starts=chained_page_starts(&mut file,&window,size)?;let objc_protocols=objc_protocol_property_graph(&mut file,&window,size)?;let swift_fields=swift_field_graph(&mut file,&window,size)?;let swift_field_records=swift_field_records(&mut file,&window,size)?;let chained_pointers=chained_pointer_records(&mut file,&window,size)?;let chained_multistarts=chained_multistart_records(&mut file,&window,size)?;let arm64e_pointers=arm64e_pointer_records(&mut file,&window,size)?;let swift_field_ownership=swift_field_ownership(&mut file,&window,size)?;
  analysis_progress(69,"runtime","Objective-C, Swift, chained-fixup, and annotated-code evidence completed.");
